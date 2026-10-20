@@ -153,6 +153,9 @@ jobs:
     needs: [web, build]
     runs-on: ubuntu-latest
     steps:
+      # checkout first: `clean: true` deletes the workspace, so it would wipe
+      # artifacts downloaded before it.
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           pattern: release-*
@@ -160,16 +163,15 @@ jobs:
           merge-multiple: true
       - name: Show assets
         run: ls -lh assets/
-      # `docs/releases/<version>.md`, when present, is the release body. Otherwise
-      # GitHub generates notes from the commit range.
-      - uses: actions/checkout@v4
+      # `docs/releases/v<version>.md`, when present, is the release body.
+      # Otherwise GitHub generates notes from the commit range.
       - name: Resolve release notes
         id: notes
         shell: bash
         env:
           VERSION: ${{ needs.web.outputs.version }}
         run: |
-          path="docs/releases/${VERSION}.md"
+          path="docs/releases/v${VERSION}.md"
           if [[ -f "$path" ]]; then
             echo "path=$path" >> "$GITHUB_OUTPUT"
             echo "Using $path"
