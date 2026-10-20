@@ -35,10 +35,32 @@ Job order: `web` (dashboard assets) → `build` (three-way matrix with
 `--features embedded-web`, so `web/dist` is compiled into the binary via
 `include_dir!`) → `release` (attach assets).
 
+The `release` job checks out the repo **before** downloading artifacts:
+`actions/checkout` defaults to `clean: true` and deletes the workspace, which
+would remove the archives downloaded ahead of it.
+
+### Release notes
+
+The release body comes from `docs/releases/v<version>.md` when that file exists
+in the run's checkout; otherwise GitHub generates notes from the commit range.
+The title is `ZeroLite <version>`.
+
+Write the file before tagging, in the tagged commit, or the run silently falls
+back to generated notes (`No release notes file` in the `Resolve release notes`
+step). A `workflow_dispatch` run for an existing tag updates that release in
+place, notes and assets included, which is the cheapest way to repair a bad
+publish.
+
 > **Pit:** Cargo `default` features do **not** include `embedded-web`. A plain
 > `cargo build --bin zeroclaw` leaves the dashboard on disk only; replacing the
 > binary on a Pi will not update the WebUI. Local builds must use
 > `scripts/dev/build-cli-local.sh` (see [`build-cli-local.md`](./build-cli-local.md)).
+
+> **Pit:** these archives carry `embedded-web` only. `plugins-wasm` is not a
+> default feature either, so `zeroclaw plugin` is absent and upstream v0.8.6's
+> WASM plugin host is not shipped. Build with
+> `--features embedded-web,plugins-wasm-cranelift` to get it; Cranelift is not
+> available on ARM32, which these three targets do not cover.
 
 ### glibc compatibility of the arm64 build
 
