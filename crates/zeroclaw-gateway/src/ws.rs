@@ -4,7 +4,10 @@
 //! key-name redaction heuristic. Approval decisions bind to `request_id`; this
 //! transport forwards the summary without rebuilding it from raw arguments.
 
-use super::AppState;
+use super::{
+    AppState, GW_SESSION_PREFIX, gateway_cancel_key, register_cancel_token,
+    remove_cancel_token_if_current,
+};
 use crate::ws_approval::{PendingApprovals, WsApprovalChannel, new_pending_approvals};
 use axum::{
     extract::{
@@ -20,6 +23,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::channel::ChannelApprovalResponse;
+use zeroclaw_api::ingress::{IngressContext, SourceClass, Transport, TrustClass, TurnOrigin};
+use zeroclaw_runtime::agent::SteeringInput;
 use zeroclaw_runtime::sop::approval::{
     ApprovalDecision as SopApprovalDecision, ApprovalPrincipal as SopApprovalPrincipal,
 };
@@ -42,25 +47,16 @@ const WS_APPROVAL_TIMEOUT_SECS: u64 = 120;
 /// or, worse, tools route to an arbitrary seeded channel.
 const WS_CHANNEL_KEY: &str = "wss";
 
-/// Bound WebSocket text egress so a stalled client cannot hold `join!` /
-/// the session lock forever after the agent turn has finished or cancelled.
-const WS_EGRESS_SEND_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Send one text frame, bounded so a stalled socket cannot hold the turn open.
-/// `false` means the viewer could not be reached: the caller detaches from the
-/// socket, it does not cancel the turn (see `process_chat_message`).
-async fn send_ws_text_bounded<S>(sender: &mut S, text: String) -> bool
-where
-    S: futures_util::Sink<Message> + Unpin,
-{
-    matches!(
-        tokio::time::timeout(
-            WS_EGRESS_SEND_TIMEOUT,
-            sender.send(Message::Text(text.into())),
-        )
-        .await,
-        Ok(Ok(()))
-    )
+fn gateway_steering_input(content: String) -> SteeringInput {
+    SteeringInput::new(content).with_ingress(IngressContext {
+        message_id: None,
+        source_class: SourceClass::External,
+        sender: None,
+        transport: Transport::Gateway,
+        trust: TrustClass::Untrusted,
+        origin: TurnOrigin::Interactive,
+        internal_principal: None,
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -218,9 +214,6 @@ pub async fn handle_ws_chat(
     .into_response()
 }
 
-/// Gateway session key prefix to avoid collisions with channel sessions.
-const GW_SESSION_PREFIX: &str = "gw_";
-
 fn websocket_ping_interval(
     config: &zeroclaw_config::schema::Config,
 ) -> Option<tokio::time::Interval> {
@@ -291,11 +284,7 @@ fn ws_consolidation_model(
         .providers
         .models
         .find(provider_type, provider_alias)?;
-    // Three elements, not upstream's four: this fork's
-    // `build_session_model_provider` builds through
-    // `create_routed_model_provider_with_options` and therefore has no
-    // `model_route_resolver` to hand back.
-    let (provider, _, resolved_model) =
+    let (provider, _, resolved_model, _) =
         zeroclaw_runtime::agent::agent::build_session_model_provider(
             config,
             provider_ref,
@@ -352,12 +341,17 @@ where
         };
         match resolved {
             Some(Ok(outcome)) => {
-                let config = state.config.read();
-                zeroclaw_runtime::sop::drive_resumed_broker_action(
+                let config = state.config.read().clone();
+                zeroclaw_runtime::sop::drive_resumed_broker_action_with_capability(
                     &config,
                     std::sync::Arc::clone(engine),
                     state.sop_audit.clone(),
+                    state.sop_driver_handles.as_ref(),
                     &outcome,
+                    Some(zeroclaw_runtime::live_config_authority::AgentExecutionCapability::from_parts(
+                        state.config.clone(),
+                        state.agent_lifecycle.clone(),
+                    )),
                 );
                 serde_json::json!({
                     "type": "sop_approval_result",
@@ -410,6 +404,9 @@ async fn handle_socket(
 
     // Resolve session ID: use provided or generate a new UUID
     let session_id = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    // Transcript identity keeps the raw display id (`gw_{session_id}`) so
+    // existing persisted histories and metadata rows stay resumable across
+    // reconnects.
     let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
     // Match the sanitized form persisted by memory backend migrations.
     let mut memory_session_id = zeroclaw_api::session_keys::sanitize_session_key(&session_id);
@@ -439,26 +436,47 @@ async fn handle_socket(
     let mut effective_name: Option<String> = None;
     let mut stored_messages = Vec::new();
     if let Some(ref backend) = state.session_backend {
-        let messages = backend.load(&session_key);
+        // Fail closed: an unreadable transcript must not become an empty
+        // history that a later turn authoritatively persists over the
+        // existing durable session. Terminate this connection instead.
+        let messages = match backend.try_load(&session_key) {
+            Ok(messages) => messages,
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "session_key": session_key,
+                            "error": format!("{}", e),
+                        })),
+                    "Failed to load WS session transcript; refusing to open with unverified history"
+                );
+                let err = serde_json::json!({
+                    "type": "error",
+                    "message": "session restore unavailable; retry the connection",
+                    "code": "SESSION_RESTORE_UNAVAILABLE"
+                });
+                let _ = sender.send(Message::Text(err.to_string().into())).await;
+                return;
+            }
+        };
         if !messages.is_empty() {
             message_count = messages.len();
             stored_messages = messages;
             resumed = true;
         }
-        // Set session name if provided (non-empty) on connect
+        // Resolve the requested/stored name for the initial frame. Publishing
+        // metadata waits until agent construction is lifecycle-admitted below.
         if let Some(ref name) = session_name
             && !name.is_empty()
         {
-            let _ = backend.set_session_name(&session_key, name);
             effective_name = Some(name.clone());
         }
         // If no name was provided via query param, load the stored name
         if effective_name.is_none() {
             effective_name = backend.get_session_name(&session_key).unwrap_or(None);
         }
-        // Stamp the agent alias so future /api/sessions queries and
-        // per-agent filters can attribute this session to its agent.
-        let _ = backend.set_session_agent_alias(&session_key, &agent_alias);
     }
 
     // Send session_start message to client
@@ -537,6 +555,31 @@ async fn handle_socket(
         }
     }
 
+    let construction_reservation =
+        match state.agent_lifecycle.reserve_admission(agent_alias.clone()) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                let err = serde_json::json!({
+                    "type": "error",
+                    "message": error.to_string(),
+                    "code": "AGENT_LIFECYCLE_UNAVAILABLE"
+                });
+                let _ = sender.send(Message::Text(err.to_string().into())).await;
+                return;
+            }
+        };
+    let turn_generation = state.agent_lifecycle.alias_generation(&agent_alias);
+    let config = state.config.read().clone();
+    if let Some(ref backend) = state.session_backend {
+        if let Some(ref name) = session_name
+            && !name.is_empty()
+        {
+            let _ = backend.set_session_name(&session_key, name);
+        }
+        // Stamp attribution only while the same alias generation is admitted.
+        let _ = backend.set_session_agent_alias(&session_key, &agent_alias);
+    }
+
     let session_cwd = match resolve_ws_session_cwd(requested_cwd.as_deref(), &config, &agent_alias)
     {
         Ok(cwd) => cwd,
@@ -556,9 +599,13 @@ async fn handle_socket(
         return;
     }
 
+    let execution_capability = zeroclaw_runtime::AgentExecutionCapability::from_parts(
+        state.config.clone(),
+        state.agent_lifecycle.clone(),
+    );
     let mut agent =
-        match zeroclaw_runtime::agent::Agent::from_live_config_with_session_cwd_and_mcp_backchannel(
-            Arc::clone(&state.config),
+        match zeroclaw_runtime::agent::Agent::from_live_config_with_session_cwd_and_mcp_backchannel_with_capability(
+            state.config.clone(),
             &agent_alias,
             Some(&session_cwd),
             true,
@@ -568,6 +615,7 @@ async fn handle_socket(
             state.sop_engine.clone(),
             state.sop_audit.clone(),
             Some(state.canvas_store.clone()),
+            Some(execution_capability),
         )
         .await
         {
@@ -608,12 +656,31 @@ async fn handle_socket(
     // Read the generation before seeding so a write landing in between shows
     // up as a changed generation on the next turn, which is the safe direction.
     let connect_generation = state.session_queue.generation(&session_key);
-    if !stored_messages.is_empty() {
-        agent.seed_history(&stored_messages);
-    }
-    let mut persisted_watermark = PersistedWatermark {
-        generation: connect_generation,
-        len: stored_messages.len(),
+    let restored = match restore_agent_history(
+        state.session_backend.as_deref(),
+        &mut agent,
+        &session_key,
+        &stored_messages,
+    ) {
+        Ok(restored) => restored,
+        Err(()) => {
+            let err = serde_json::json!({
+                "type": "error",
+                "message": "session restore unavailable; retry the connection",
+                "code": "SESSION_RESTORE_UNAVAILABLE"
+            });
+            let _ = sender.send(Message::Text(err.to_string().into())).await;
+            return;
+        }
+    };
+    let restore_trim_event = restored.trim_event;
+    let mut persisted_watermark = if restored.persisted {
+        note_own_transcript_write(&state.session_queue, &session_key, &agent)
+    } else {
+        PersistedWatermark {
+            generation: connect_generation,
+            len: stored_messages.len(),
+        }
     };
 
     let (approval_event_tx, mut approval_event_rx) =
@@ -646,12 +713,35 @@ async fn handle_socket(
             "Seeded {} channel(s) into dashboard agent session",
         );
     }
+    // Construction is complete. Keep only the generation token for future
+    // turns so an idle socket does not block agent deletion.
+    drop(construction_reservation);
+
+    // Seeding happens before the connection's agent setup is complete. Forward
+    // its one-shot trim outcome only after channels are registered, so restore
+    // notifications cannot race setup or be emitted twice.
+    if let Some(frame) = restore_trim_event.and_then(history_trimmed_frame_for) {
+        let _ = sender.send(Message::Text(frame.to_string().into())).await;
+    }
 
     // Process the first message if it was not a connect frame
     if let Some(ref text) = first_msg_fallback {
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) {
             if parsed["type"].as_str() == Some("message") {
                 if let Some(content) = first_chat_message_content(text) {
+                    let _turn_lease =
+                        match state.reserve_agent_turn_at(agent_alias.clone(), turn_generation) {
+                            Ok(lease) => lease,
+                            Err(error) => {
+                                let err = serde_json::json!({
+                                    "type": "error",
+                                    "message": error.to_string(),
+                                    "code": "AGENT_LIFECYCLE_UNAVAILABLE"
+                                });
+                                let _ = sender.send(Message::Text(err.to_string().into())).await;
+                                return;
+                            }
+                        };
                     let _session_guard = match state.session_queue.acquire(&session_key).await {
                         Ok(guard) => guard,
                         Err(e) => {
@@ -826,6 +916,21 @@ async fn handle_socket(
                     continue;
                 }
 
+                let _turn_lease = match state
+                    .reserve_agent_turn_at(agent_alias.clone(), turn_generation)
+                {
+                    Ok(lease) => lease,
+                    Err(error) => {
+                        let err = serde_json::json!({
+                            "type": "error",
+                            "message": error.to_string(),
+                            "code": "AGENT_LIFECYCLE_UNAVAILABLE"
+                        });
+                        let _ = sender.send(Message::Text(err.to_string().into())).await;
+                        continue;
+                    }
+                };
+
                 // Acquire session lock to serialize concurrent turns
                 let _session_guard = match state.session_queue.acquire(&session_key).await {
                     Ok(guard) => guard,
@@ -959,51 +1064,64 @@ fn session_queue_ws_error_code(error: &crate::session_queue::SessionQueueError) 
     }
 }
 
-fn persist_conversation_messages(
+/// Replace the session's durable transcript and breadcrumb flag with
+/// `durable`/`breadcrumb_present`, unless the session was deleted between the
+/// turn starting and this post-turn persistence — in which case the
+/// `aborted` / `done` / `error` frames are still sent to the client, but the
+/// row `DELETE /api/sessions/{id}` just wiped is not re-created.
+///
+/// The existence probe and the replacement run inside the backend's guarded
+/// `replace_conversation_state_if_exists`, not as two separate operations: a
+/// bare `session_exists` check followed by a replace is a check-then-act
+/// race, and a delete committing between the two would be silently undone by
+/// the replace recreating the session row/files.
+///
+/// Returns `false` when the durable write itself failed (logged with session
+/// context), so the caller does not report the turn as durably persisted
+/// when the store disagrees. A skipped write (session already gone) returns
+/// `true`: there is nothing left to persist.
+fn replace_conversation_state_unless_deleted(
     backend: &dyn zeroclaw_infra::session_backend::SessionBackend,
     session_key: &str,
-    messages: &[zeroclaw_providers::ConversationMessage],
-) {
-    // if the user deleted the session between the turn starting and
-    // the post-turn persistence, don't resurrect it. The `aborted` / `done`
-    // / `error` frames are still sent to the client; we just refuse to
-    // re-create the row that `DELETE /api/sessions/{id}` just wiped.
-    if !backend.session_exists(session_key) {
-        return;
-    }
-    for message in messages {
-        let zeroclaw_providers::ConversationMessage::Chat(message) = message else {
-            continue;
-        };
-        if message.role == "system" {
-            continue;
+    durable: &[zeroclaw_providers::ChatMessage],
+    breadcrumb_present: bool,
+) -> bool {
+    match backend.replace_conversation_state_if_exists(session_key, durable, breadcrumb_present) {
+        Ok(_) => true,
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "session_key": session_key,
+                        "error": format!("{}", e),
+                    })),
+                "Failed to persist authoritative post-turn conversation state"
+            );
+            false
         }
-        let _ = backend.append(session_key, message);
     }
 }
 
-fn persist_trimmed_session_history(
+/// Replace the session's durable transcript and breadcrumb flag with the
+/// agent's own authoritative post-turn history, as one state. Appending only
+/// the turn's delta on top of a transcript the agent's loop already trimmed
+/// underneath it can resurrect turns the live agent dropped; replacing with
+/// `agent.history()` keeps the store in sync with what the agent actually
+/// retains.
+fn persist_agent_conversation_state(
     backend: &dyn zeroclaw_infra::session_backend::SessionBackend,
     session_key: &str,
     agent: &zeroclaw_runtime::agent::Agent,
-) {
-    if !backend.session_exists(session_key) {
-        return;
-    }
-    let messages = agent.session_transcript_messages();
-    if let Err(error) = backend.replace_messages(session_key, &messages) {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                .with_attrs(::serde_json::json!({
-                    "session_key": session_key,
-                    "error": format!("{error}"),
-                    "kept_messages": messages.len(),
-                })),
-            "failed to rewrite session history after context trim"
-        );
-    }
+) -> bool {
+    let durable = zeroclaw_providers::durable_chat_messages(agent.history());
+    replace_conversation_state_unless_deleted(
+        backend,
+        session_key,
+        &durable,
+        agent.history_has_trim_breadcrumb(),
+    )
 }
 
 /// What a connection's execution history reflects: the session's transcript
@@ -1016,44 +1134,109 @@ struct PersistedWatermark {
 
 /// Record that this connection just wrote `agent`'s history as the session's
 /// transcript, and return the watermark that write leaves behind.
-///
-/// The length is read back from the store rather than projected from the agent:
-/// the two gateway write paths do not store the same shape (a normal turn
-/// appends chat turns only, a durable trim rewrites the provider-expanded
-/// projection), so only the store knows what it holds. Reading it the same way
-/// `refresh_history_if_advanced` does is what makes the comparison mean
-/// "nobody else wrote", not "the agent happens to project this length".
 fn note_own_transcript_write(
-    backend: &dyn zeroclaw_infra::session_backend::SessionBackend,
     queue: &crate::session_queue::SessionActorQueue,
     session_key: &str,
+    agent: &zeroclaw_runtime::agent::Agent,
 ) -> PersistedWatermark {
     PersistedWatermark {
         generation: queue.advance_generation(session_key),
-        len: backend.load(session_key).len(),
+        len: zeroclaw_providers::durable_chat_messages(agent.history()).len(),
     }
 }
 
-/// Rebuild a connection's execution history from the persisted transcript when
-/// another writer advanced it since this connection last synced: typically the
-/// detached turn a reconnecting socket queued behind, or a delete and
-/// recreation under the same key. Runs while holding the session permit, which
-/// every gateway transcript writer takes, so the transcript cannot move again
-/// before the turn that follows. Clears before re-seeding so nothing is
-/// duplicated.
-///
-/// The generation is sampled *before* the transcript, mirroring the connect
-/// path: a write landing in between then shows up as a changed generation on
-/// the next turn. Reading the store first would let a writer that does not take
-/// the permit slip into the gap and be recorded as already-synced, leaving a
-/// stale history in place.
+/// Outcome of seeding an agent from a persisted transcript.
+struct RestoredHistory {
+    /// Trim notice produced by seeding, to forward to the client.
+    trim_event: Option<zeroclaw_api::agent::TurnEvent>,
+    /// Whether seeding trimmed and the retained projection was written back.
+    persisted: bool,
+}
+
+/// Seed `agent` from a persisted transcript the way a fresh connection does.
+/// `Err` means the history cannot be trusted and the caller must not run on
+/// it; the reason has already been logged.
+fn restore_agent_history(
+    backend: Option<&dyn zeroclaw_infra::session_backend::SessionBackend>,
+    agent: &mut zeroclaw_runtime::agent::Agent,
+    session_key: &str,
+    messages: &[zeroclaw_providers::ChatMessage],
+) -> Result<RestoredHistory, ()> {
+    if messages.is_empty() {
+        return Ok(RestoredHistory {
+            trim_event: None,
+            persisted: false,
+        });
+    }
+    // Breadcrumb provenance is the backend's own canonical record alongside
+    // the transcript, never inferred from message text: a genuine first user
+    // turn that happens to equal the localized breadcrumb string must keep its
+    // turn-boundary role, and a crumb persisted under another locale must stay
+    // classified as synthetic. Sessions from before this was tracked (`None`)
+    // restore as `false`, matching the fallback for backends that don't
+    // support it. Ownership must be set BEFORE seeding: seeding trims
+    // immediately if the restored transcript is over the structured cap, and
+    // that seed-time trim reads the agent's current breadcrumb flag to decide
+    // whether a leading synthetic marker counts as a real turn.
+    let trim_event = match backend.map(|backend| backend.get_session_trim_breadcrumb(session_key)) {
+        Some(Err(e)) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "session_key": session_key,
+                        "error": format!("{}", e),
+                    })),
+                "Failed to read trim breadcrumb provenance for WS restore; refusing to open with unverified history"
+            );
+            return Err(());
+        }
+        Some(Ok(opt)) => {
+            agent.set_history_has_trim_breadcrumb(opt.unwrap_or(false));
+            agent.seed_history_with_event(messages)
+        }
+        None => {
+            agent.set_history_has_trim_breadcrumb(false);
+            agent.seed_history_with_event(messages)
+        }
+    };
+    // Seed-time trim only fires when the restored history exceeded the
+    // structured cap, so it dropped rows, not just relabeled them. Mirror the
+    // ACP restore contract: persist the retained projection and corrected
+    // breadcrumb before the session goes live, or a reconnect/restart before
+    // the next prompt reloads the untrimmed durable prefix and repeats the
+    // trim, leaving the live agent and the durable session disagreeing.
+    let mut persisted = false;
+    if trim_event.is_some()
+        && let Some(backend) = backend
+        && backend.session_exists(session_key)
+    {
+        if !persist_agent_conversation_state(backend, session_key, agent) {
+            return Err(());
+        }
+        persisted = true;
+    }
+    Ok(RestoredHistory {
+        trim_event,
+        persisted,
+    })
+}
+
+/// Rebuild a connection's execution history from the persisted transcript
+/// when another writer advanced it since this connection last synced:
+/// typically the detached turn a reconnecting socket queued behind, or a
+/// delete and recreation under the same key. Runs while holding the session
+/// permit, which every gateway transcript writer takes, so the transcript
+/// cannot move again before the turn that follows. Clears before re-seeding
+/// so nothing is duplicated; returns the trim notice re-seeding may produce.
 fn refresh_history_if_advanced(
     backend: &dyn zeroclaw_infra::session_backend::SessionBackend,
     queue: &crate::session_queue::SessionActorQueue,
     agent: &mut zeroclaw_runtime::agent::Agent,
     session_key: &str,
     persisted_watermark: &mut PersistedWatermark,
-) {
+) -> Result<Option<zeroclaw_api::agent::TurnEvent>, ()> {
     let generation = queue.generation(session_key);
     let persisted = backend.load(session_key);
     let current = PersistedWatermark {
@@ -1061,7 +1244,7 @@ fn refresh_history_if_advanced(
         len: persisted.len(),
     };
     if current == *persisted_watermark {
-        return;
+        return Ok(None);
     }
     ::zeroclaw_log::record!(
         INFO,
@@ -1077,8 +1260,45 @@ fn refresh_history_if_advanced(
         "session transcript moved since this connection synced; rebuilding execution history"
     );
     agent.clear_history();
-    agent.seed_history(&persisted);
-    *persisted_watermark = current;
+    let restored = restore_agent_history(Some(backend), agent, session_key, &persisted)?;
+    *persisted_watermark = if restored.persisted {
+        note_own_transcript_write(queue, session_key, agent)
+    } else {
+        current
+    };
+    Ok(restored.trim_event)
+}
+
+/// The `history_trimmed` frame for a trim notice, or `None` for any other event.
+fn history_trimmed_frame_for(event: zeroclaw_api::agent::TurnEvent) -> Option<serde_json::Value> {
+    let zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
+        dropped_messages,
+        dropped_turns,
+        kept_turns,
+        reason,
+        token_budget,
+        tokens_before,
+        tokens_after,
+        tokens_before_source,
+        tokens_after_source,
+        unsatisfiable_floor,
+        retained_context: _,
+    } = event
+    else {
+        return None;
+    };
+    Some(history_trimmed_ws_frame(
+        dropped_messages,
+        dropped_turns,
+        kept_turns,
+        &reason,
+        token_budget,
+        tokens_before,
+        tokens_after,
+        tokens_before_source.map(|s| s.as_str()),
+        tokens_after_source.map(|s| s.as_str()),
+        unsatisfiable_floor,
+    ))
 }
 
 /// One frame from the client socket, as seen by the mid-turn forward loop.
@@ -1131,44 +1351,42 @@ fn has_assistant_chat_message(messages: &[zeroclaw_providers::ConversationMessag
     })
 }
 
-/// The `history_trimmed` frame — **a report of an in-memory trim, not of a
-/// rewritten session store.**
-///
-/// The trim itself happens inside the turn (`maybe_compact_durable_history` /
-/// `recompact_durable_history_after_loop_trim`), and this frame is forwarded
-/// while the turn is still running. The store is rewritten later, once the turn
-/// future resolves (`persist_trimmed_session_history`). So a client that
-/// re-reads `/api/sessions/{id}/messages` on this frame gets the *pre-trim*
-/// transcript.
-///
-/// Consumers must therefore cut their own view locally from `kept_turns` — the
-/// count of user-turn boundaries the runtime kept, which is also the number of
-/// user bubbles a dashboard shows (tool rounds arrive as agent tool cards and
-/// the trim breadcrumb is flagged `synthetic`). The WebUI and Zerocode both do
-/// exactly that. A consumer that genuinely needs the rewritten store must wait
-/// for the turn to end, not for this frame.
 fn history_trimmed_ws_frame(
     dropped_messages: usize,
+    dropped_turns: usize,
     kept_turns: usize,
     reason: &str,
-    tokens_after: Option<usize>,
-    tokens_before: Option<usize>,
-    dropped_turns: Option<usize>,
+    token_budget: Option<u64>,
+    tokens_before: Option<u64>,
+    tokens_after: Option<u64>,
+    tokens_before_source: Option<&str>,
+    tokens_after_source: Option<&str>,
+    unsatisfiable_floor: Option<bool>,
 ) -> serde_json::Value {
     let mut frame = serde_json::json!({
         "type": "history_trimmed",
         "dropped_messages": dropped_messages,
+        "dropped_turns": dropped_turns,
         "kept_turns": kept_turns,
         "reason": reason,
     });
-    if let Some(v) = tokens_after {
-        frame["tokens_after"] = serde_json::json!(v);
+    if let Some(token_budget) = token_budget {
+        frame["token_budget"] = token_budget.into();
     }
-    if let Some(v) = tokens_before {
-        frame["tokens_before"] = serde_json::json!(v);
+    if let Some(tokens_before) = tokens_before {
+        frame["tokens_before"] = tokens_before.into();
     }
-    if let Some(v) = dropped_turns {
-        frame["dropped_turns"] = serde_json::json!(v);
+    if let Some(tokens_after) = tokens_after {
+        frame["tokens_after"] = tokens_after.into();
+    }
+    if let Some(tokens_before_source) = tokens_before_source {
+        frame["tokens_before_source"] = tokens_before_source.into();
+    }
+    if let Some(tokens_after_source) = tokens_after_source {
+        frame["tokens_after_source"] = tokens_after_source.into();
+    }
+    if let Some(unsatisfiable_floor) = unsatisfiable_floor {
+        frame["unsatisfiable_floor"] = unsatisfiable_floor.into();
     }
     frame
 }
@@ -1247,6 +1465,54 @@ fn is_observability_telemetry(event: &serde_json::Value) -> bool {
     event.get("source").and_then(serde_json::Value::as_str) == Some("observability")
 }
 
+fn resolve_done_context_limits(
+    usage_budget: Option<u64>,
+    usage_model_window: Option<u64>,
+    active_limits: zeroclaw_config::schema::ResolvedContextLimits,
+) -> (u64, Option<u64>) {
+    (
+        usage_budget.unwrap_or(active_limits.context_token_budget as u64),
+        usage_model_window.or_else(|| {
+            active_limits
+                .configured_model_context_window()
+                .map(|tokens| tokens as u64)
+        }),
+    )
+}
+
+/// Terminal-frame budget/window for the `done` event.
+///
+/// `final_limits` is the route that actually served the LAST call, carried out
+/// of the turn loop. When present it is AUTHORITATIVE and overrides the
+/// usage-derived values, which can be stale: an earlier usage-bearing route
+/// before a final no-usage call (e.g. a vision reply without token usage) would
+/// otherwise leave the frame on the earlier route's numbers. Only when no call
+/// was served this turn (a cache hit) does `final_limits` become `None`, and the
+/// frame falls back to the usage values, then to `fallback_limits`.
+fn done_frame_context_limits(
+    final_limits: Option<zeroclaw_config::schema::ResolvedContextLimits>,
+    usage_budget: Option<u64>,
+    usage_model_window: Option<u64>,
+    fallback_limits: Option<zeroclaw_config::schema::ResolvedContextLimits>,
+) -> (u64, Option<u64>) {
+    match final_limits {
+        Some(limits) => (
+            limits.context_token_budget as u64,
+            limits.configured_model_context_window().map(|t| t as u64),
+        ),
+        None => resolve_done_context_limits(
+            usage_budget,
+            usage_model_window,
+            fallback_limits.unwrap_or(zeroclaw_config::schema::ResolvedContextLimits {
+                model_context_window: zeroclaw_config::schema::UNCONFIGURED_CONTEXT_WINDOW_FALLBACK,
+                context_token_budget: 0,
+                model_context_window_source:
+                    zeroclaw_config::schema::ModelContextWindowSource::CompatibilityFallback,
+            }),
+        ),
+    }
+}
+
 /// Per-provider usage snapshot in the `usage_by_provider` done-frame array.
 /// Tracks ALL billable attempts (accepted + rejected Reliable attempts).
 /// The scalar `cost_usd` in the done frame is the sum of `usage_by_provider[*].cost_usd`,
@@ -1278,56 +1544,34 @@ struct UsageFold {
     last_provider_ref: Option<String>,
     last_model: Option<String>,
     last_input_tokens: Option<u64>,
-    /// Prompt-cache hits summed over the turn's calls. A *subset* of
-    /// [`Self::total_input_tokens`], so never additive with it: the rate is
-    /// `cached ÷ input`. Absent when every provider stayed silent, which makes
-    /// any rate a lower bound.
-    cached_input_tokens: Option<u64>,
-    /// LLM calls in this turn — the server's own step count. It is not how the
-    /// client counts steps (it counts `usage` frames); it exists so a client
-    /// that reconnected mid-turn can reconcile the turn it just finished,
-    /// having missed that turn's earlier `usage` frames.
-    steps: u64,
+    last_context_token_budget: Option<u64>,
+    last_model_context_window: Option<u64>,
     usage_by_provider: std::collections::HashMap<(String, String), ProviderUsageEntry>,
 }
 
 impl UsageFold {
-    /// Fold one `TurnEvent::Usage` into the totals and return the per-step
-    /// `usage` frame forwarded to the client.
-    ///
-    /// Callers pass only `TurnEvent::Usage`; any other variant is ignored and
-    /// yields `None`.
-    ///
-    /// `steps` counts LLM calls, not frames that happened to carry numbers: a
-    /// `Usage` whose fields are all `None` still closes a step, because the
-    /// response was accepted and the provider simply reported nothing. That is
-    /// what makes `steps` server-authoritative — the web client also needs it
-    /// as the per-step boundary of a turn (see `webui-message-flow-plan.md`).
-    ///
-    /// The frame passes the three nullable fields through as-is; the client
-    /// decides whether it can show a cache-hit rate at all.
-    fn apply(&mut self, event: zeroclaw_api::agent::TurnEvent) -> Option<serde_json::Value> {
+    fn apply(&mut self, event: zeroclaw_api::agent::TurnEvent) {
         let zeroclaw_api::agent::TurnEvent::Usage {
             input_tokens,
             cached_input_tokens,
             output_tokens,
             cost_usd,
+            context_token_budget,
+            model_context_window,
             provider_ref,
             model: served_model,
             accepted,
-            // Billing totals and the accepted-serving snapshot describe
-            // provider-measured usage only. The display estimate is a
-            // context-meter concern and is labelled on the RPC
-            // `context_usage` surface, not folded into this ledger.
+            // Deliberately ignored. This fold is the billing/accounting
+            // ledger: totals, the per-(provider, model) breakdown, and the
+            // accepted-serving snapshot must all describe provider-measured
+            // usage only. The display estimate is a context-meter concern and
+            // is carried to clients on the RPC `context_usage` surface, which
+            // labels it via `input_tokens_source`.
             estimated_input_tokens: _,
         } = event
         else {
-            return None;
+            return;
         };
-        self.steps += 1;
-        if let Some(ct) = cached_input_tokens {
-            self.cached_input_tokens = Some(self.cached_input_tokens.unwrap_or(0) + ct);
-        }
         // Turn-wide billing totals accumulate every billable attempt,
         // including rejected ones (`accepted: false` is billing-only
         // telemetry per the TurnEvent::Usage contract). Only the
@@ -1341,6 +1585,8 @@ impl UsageFold {
         if accepted {
             self.last_provider_ref = Some(provider_ref.clone());
             self.last_model = Some(served_model.clone());
+            self.last_context_token_budget = context_token_budget;
+            self.last_model_context_window = model_context_window;
             if let Some(it) = input_tokens {
                 self.last_input_tokens = Some(it);
             } else {
@@ -1375,16 +1621,6 @@ impl UsageFold {
         if let Some(cu) = cost_usd {
             entry.cost_usd += cu;
         }
-
-        // Per-step telemetry frame. Sent as-is (nullable fields included) so the
-        // client can advance its step boundary and its live token/cache row
-        // without waiting for the terminal `done` frame.
-        Some(serde_json::json!({
-            "type": "usage",
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            "cached_input_tokens": cached_input_tokens,
-        }))
     }
 
     /// Sorted per-(provider, model) breakdown in wire order; drains the map.
@@ -1428,12 +1664,6 @@ struct DoneFrameMeta<'a> {
     max_context_tokens: u64,
     model_context_window: Option<u64>,
     last_input_tokens: Option<u64>,
-    /// Prompt-cache hits for the turn. A *subset* of `input_tokens`, never
-    /// additive; the rate is `cached ÷ input`.
-    cached_input_tokens: Option<u64>,
-    /// LLM calls in the finished turn; lets a client that observed only part
-    /// of the turn reconcile it against the gateway's own count.
-    steps: u64,
     last_serving_provider_ref: Option<&'a str>,
     last_serving_model: Option<&'a str>,
 }
@@ -1458,8 +1688,6 @@ fn build_done_frame_json(
         "provider_ref": meta.provider_ref,
         "max_context_tokens": meta.max_context_tokens,
         "last_input_tokens": meta.last_input_tokens,
-        "cached_input_tokens": meta.cached_input_tokens,
-        "steps": meta.steps,
         "last_serving_provider_ref": meta.last_serving_provider_ref,
         "last_serving_model": meta.last_serving_model,
         "usage_by_provider": usage_by_provider.iter().map(|e| serde_json::json!({
@@ -1512,13 +1740,28 @@ async fn process_chat_message(
     // history from a transcript that has since moved; rebuild from the
     // persisted transcript before running on the stale snapshot.
     if let Some(ref backend) = state.session_backend {
-        refresh_history_if_advanced(
+        match refresh_history_if_advanced(
             backend.as_ref(),
             &state.session_queue,
             agent,
             session_key,
             persisted_watermark,
-        );
+        ) {
+            Ok(trim_event) => {
+                if let Some(frame) = trim_event.and_then(history_trimmed_frame_for) {
+                    let _ = sender.send(Message::Text(frame.to_string().into())).await;
+                }
+            }
+            Err(()) => {
+                let err = serde_json::json!({
+                    "type": "error",
+                    "message": "session restore unavailable; retry the connection",
+                    "code": "SESSION_RESTORE_UNAVAILABLE"
+                });
+                let _ = sender.send(Message::Text(err.to_string().into())).await;
+                return false;
+            }
+        }
     }
 
     let (turn_alias, turn_provider, turn_model) = agent.attribution_fields();
@@ -1538,25 +1781,11 @@ async fn process_chat_message(
         ))
     });
 
-    // Resolve context budget for this agent. Wire field is named
-    // `max_context_tokens` and carries the agent's effective context window
-    // (same source Zerocode's context meter and the runtime trimmer use), so
-    // the meter denominator always matches what the trimmer treats as full.
-    let max_context_tokens = {
-        let cfg = state.config.read();
-        cfg.effective_context_window(&turn_alias) as u64
-    };
-
-    // Broadcast agent_start event. `session_id` is what `event_matches_session`
-    // keys on, so without it the frame is treated as a global event, dropped by
-    // `is_global_chat_event` (which only admits `cron_result`), and never
-    // reaches the chat socket — leaving a client unable to observe a turn
-    // boundary at all. The web composer counts a turn per `agent_start`.
+    // Broadcast agent_start event
     let _ = state.event_tx.send(serde_json::json!({
         "type": "agent_start",
         "model_provider": provider_label,
         "model": turn_model,
-        "session_id": session_id,
     }));
 
     // Set session state to running
@@ -1568,19 +1797,20 @@ async fn process_chat_message(
     // ── Cancellation token lifecycle ─────────────────────────────
     // Create a token before the turn starts so the abort endpoint
     // can cancel it. Remove it after the turn completes regardless
-    // of outcome (normal, error, or cancelled).
-    let cancel_token = tokio_util::sync::CancellationToken::new();
-    {
-        state
-            .cancel_tokens
-            .lock()
-            .expect("cancel_tokens lock poisoned")
-            .insert(session_key.to_string(), cancel_token.clone());
-    }
+    // of outcome (normal, error, or cancelled). Registration uses the
+    // process-local cancellation key shared with the webhook SSE transport,
+    // while persistence stays on the raw transcript key.
+    let cancel_token = Arc::new(tokio_util::sync::CancellationToken::new());
+    register_cancel_token(
+        &state.cancel_tokens,
+        &gateway_cancel_key(session_id),
+        Arc::clone(&cancel_token),
+    );
 
     // Channel for streaming turn events from the agent.
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
-    let (steering_tx, mut steering_rx) = tokio::sync::mpsc::channel::<String>(32);
+    let (steering_tx, mut steering_rx) =
+        tokio::sync::mpsc::channel::<zeroclaw_runtime::agent::SteeringInput>(32);
 
     let content_owned = content.to_string();
     let session_key_owned = session_key.to_string();
@@ -1608,7 +1838,7 @@ async fn process_chat_message(
                         .turn_streamed_with_steering_state(
                             &content_owned,
                             event_tx,
-                            Some(cancel_token.clone()),
+                            Some(cancel_token.as_ref().clone()),
                             Some(&mut steering_rx),
                         )
                         .instrument(span),
@@ -1631,10 +1861,6 @@ async fn process_chat_message(
     // events only) that the done/cancel frames render.
     let mut usage_fold = UsageFold::default();
 
-    // When durable trim fires mid-turn, rewrite the session store from the
-    // agent's compacted history after the turn future releases `&mut agent`.
-    let history_trim_seen = std::sync::atomic::AtomicBool::new(false);
-
     // The socket is a viewer of the turn, not its owner. Once the client is
     // gone (close frame, transport error, end of stream, or a failed write)
     // this loop stops touching the socket but keeps draining `event_rx` so the
@@ -1645,296 +1871,243 @@ async fn process_chat_message(
     // re-polling a closed receiver hot-loops the select and starves the abort
     // endpoint.
     let forward_fut = async {
+        let mut cancel_drained = false;
         let mut client_gone = false;
         loop {
             tokio::select! {
-                biased;
-                _ = cancel_token.cancelled() => {
-                    let drained: Vec<_> = pending_approvals.lock().drain().collect();
-                    drop(drained);
-                    // Stop forwarding immediately so a stuck WS `sender.send`
-                    // cannot hold `join!` open after cancel. Dropping this
-                    // loop closes `event_rx` consumption; the turn future
-                    // observes cancel on its own select boundaries / channel
-                    // close and exits (or is force-dropped by turn_cancel_after).
-                    break;
-                }
-                client_msg = receiver.next(), if !client_gone => {
-                    let text = match classify_client_frame(client_msg) {
-                        ClientFrame::Text(text) => text,
-                        ClientFrame::Ping(payload) => {
-                            if sender.send(Message::Pong(payload)).await.is_err() {
-                                detach_mid_turn(session_key, &turn_id, pending_approvals);
-                                client_gone = true;
+                            biased;
+                            _ = cancel_token.cancelled(), if !cancel_drained => {
+                                let drained: Vec<_> = pending_approvals.lock().drain().collect();
+                                drop(drained);
+                                cancel_drained = true;
+                                // Fall through; the agent loop will now wake from the
+                                // approval await, see the cancel token, and propagate
+                                // a ToolLoopCancelled error which closes event_rx and
+                                // breaks this loop on the `event_rx.recv()` arm below.
                             }
-                            continue;
-                        }
-                        ClientFrame::Ignore => continue,
-                        ClientFrame::Gone => {
-                            detach_mid_turn(session_key, &turn_id, pending_approvals);
-                            client_gone = true;
-                            continue;
-                        }
-                    };
-                    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text) else {
-                        let err = serde_json::json!({
-                            "type": "error",
-                            "message": "Invalid JSON. Send {\"type\":\"message\",\"content\":\"your text\"}",
-                            "code": "INVALID_JSON"
-                        });
-                        let _ = sender.send(Message::Text(err.to_string().into())).await;
-                        continue;
-                    };
-                    match parsed["type"].as_str() {
-                        Some("approval_response") => {
-                            // A SOP-kind frame is a gate resolution (keyed by run_id),
-                            // not a tool-prompt response (keyed by request_id). Resolve
-                            // it here too so it is answered mid-turn instead of being
-                            // silently dropped on the request_id path below.
-                            if handle_ws_sop_frame(
-                                &parsed,
-                                state,
-                                session_id,
-                                auth_subject,
-                                &mut *sender,
-                            )
-                            .await
-                            {
-                                continue;
-                            }
-                            let request_id = parsed["request_id"].as_str().unwrap_or("");
-                            let decision = match parsed["decision"].as_str().unwrap_or("") {
-                                "approve" => Some(ChannelApprovalResponse::Approve),
-                                "always" => Some(ChannelApprovalResponse::AlwaysApprove),
-                                "deny" => Some(ChannelApprovalResponse::Deny),
-                                _ => None,
-                            };
-                            if request_id.is_empty() || decision.is_none() {
-                                continue;
-                            }
-                            if let Some(tx) = pending_approvals.lock().remove(request_id) {
-                                let _ = tx.send(decision.expect("checked above"));
-                            } else {
-                                ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"request_id": request_id})), "approval_response with no matching pending request (mid-turn)");
-                            }
-                        }
-                        Some("message") => {
-                            let content = parsed["content"].as_str().unwrap_or("").to_string();
-                            if content.is_empty() {
-                                let err = serde_json::json!({
-                                    "type": "error",
-                                    "message": "Message content cannot be empty",
-                                    "code": "EMPTY_CONTENT"
-                                });
-                                let _ = sender.send(Message::Text(err.to_string().into())).await;
-                                continue;
-                            }
-                            match steering_tx.try_send(content) {
-                                Ok(()) => {}
-                                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            client_msg = receiver.next(), if !client_gone => {
+                                let text = match classify_client_frame(client_msg) {
+                                    ClientFrame::Text(text) => text,
+                                    ClientFrame::Ping(payload) => {
+                                        if sender.send(Message::Pong(payload)).await.is_err() {
+                                            detach_mid_turn(session_key, &turn_id, pending_approvals);
+                                            client_gone = true;
+                                        }
+                                        continue;
+                                    }
+                                    ClientFrame::Ignore => continue,
+                                    ClientFrame::Gone => {
+                                        detach_mid_turn(session_key, &turn_id, pending_approvals);
+                                        client_gone = true;
+                                        continue;
+                                    }
+                                };
+                                let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text) else {
                                     let err = serde_json::json!({
                                         "type": "error",
-                                        "message": "Steering queue is full for the running turn",
-                                        "code": "STEERING_QUEUE_FULL"
+                                        "message": "Invalid JSON. Send {\"type\":\"message\",\"content\":\"your text\"}",
+                                        "code": "INVALID_JSON"
                                     });
                                     let _ = sender.send(Message::Text(err.to_string().into())).await;
+                                    continue;
+                                };
+                                match parsed["type"].as_str() {
+                                    Some("approval_response") => {
+                                        // A SOP-kind frame is a gate resolution (keyed by run_id),
+                                        // not a tool-prompt response (keyed by request_id). Resolve
+                                        // it here too so it is answered mid-turn instead of being
+                                        // silently dropped on the request_id path below.
+                                        if handle_ws_sop_frame(
+                                            &parsed,
+                                            state,
+                                            session_id,
+                                            auth_subject,
+                                            &mut *sender,
+                                        )
+                                        .await
+                                        {
+                                            continue;
+                                        }
+                                        let request_id = parsed["request_id"].as_str().unwrap_or("");
+                                        let decision = match parsed["decision"].as_str().unwrap_or("") {
+                                            "approve" => Some(ChannelApprovalResponse::Approve),
+                                            "always" => Some(ChannelApprovalResponse::AlwaysApprove),
+                                            "deny" => Some(ChannelApprovalResponse::Deny),
+                                            _ => None,
+                                        };
+                                        if request_id.is_empty() || decision.is_none() {
+                                            continue;
+                                        }
+                                        if let Some(tx) = pending_approvals.lock().remove(request_id) {
+                                            let _ = tx.send(decision.expect("checked above"));
+                                        } else {
+                                            ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"request_id": request_id})), "approval_response with no matching pending request (mid-turn)");
+                                        }
+                                    }
+                                    Some("message") => {
+                                        let content = parsed["content"].as_str().unwrap_or("").to_string();
+                                        if content.is_empty() {
+                                            let err = serde_json::json!({
+                                                "type": "error",
+                                                "message": "Message content cannot be empty",
+                                                "code": "EMPTY_CONTENT"
+                                            });
+                                            let _ = sender.send(Message::Text(err.to_string().into())).await;
+                                            continue;
+                                        }
+                                        match steering_tx.try_send(gateway_steering_input(content)) {
+                                            Ok(()) => {}
+                                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                                let err = serde_json::json!({
+                                                    "type": "error",
+                                                    "message": "Steering queue is full for the running turn",
+                                                    "code": "STEERING_QUEUE_FULL"
+                                                });
+                                                let _ = sender.send(Message::Text(err.to_string().into())).await;
+                                            }
+                                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                                let err = serde_json::json!({
+                                                    "type": "error",
+                                                    "message": "Running turn is no longer accepting steering messages",
+                                                    "code": "STEERING_CLOSED"
+                                                });
+                                                let _ = sender.send(Message::Text(err.to_string().into())).await;
+                                            }
+                                        }
+                                    }
+                                    _ => {}
                                 }
-                                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                                    let err = serde_json::json!({
-                                        "type": "error",
-                                        "message": "Running turn is no longer accepting steering messages",
-                                        "code": "STEERING_CLOSED"
+                            }
+                            approval = approval_event_rx.recv() => {
+                                let Some(event) = approval else { continue };
+                                if let TurnEvent::ApprovalRequest {
+                                    request_id,
+                                    tool_name,
+                                    arguments_summary,
+                                    timeout_secs,
+                                } = event {
+                                    if client_gone {
+                                        // Nobody is attached to answer: drop the parked
+                                        // oneshot so the approval channel resolves it as an
+                                        // unreachable-operator deny now, not at the timeout.
+                                        drop(pending_approvals.lock().remove(&request_id));
+                                        continue;
+                                    }
+                                    let frame = serde_json::json!({
+                                        "type": "approval_request",
+                                        "request_id": request_id,
+                                        "tool": tool_name,
+                                        "arguments_summary": arguments_summary,
+                                        "timeout_secs": timeout_secs,
                                     });
-                                    let _ = sender.send(Message::Text(err.to_string().into())).await;
+                                    if sender.send(Message::Text(frame.to_string().into())).await.is_err() {
+                                        detach_mid_turn(session_key, &turn_id, pending_approvals);
+                                        client_gone = true;
+                                    }
+                                }
+                            }
+                            _ = tick_websocket_ping(ping_interval), if !client_gone => {
+                                if sender.send(Message::Ping(Vec::new().into())).await.is_err() {
+                                    detach_mid_turn(session_key, &turn_id, pending_approvals);
+                                    client_gone = true;
+                                }
+                            }
+                                event_opt = event_rx.recv() => {
+                                let Some(event) = event_opt else { break };
+                                let ws_msg = match event {
+            usage_event @ TurnEvent::Usage { .. } => {
+                                        // The fold below is the production event path under
+                                        // test (see UsageFold regression tests): billing
+                                        // aggregates every billable attempt while the
+                                        // accepted-serving snapshot advances on accepted
+                                        // events only.
+                                        usage_fold.apply(usage_event);
+                                        continue;
+                                    }
+                                    TurnEvent::Chunk { ref delta } => {
+                                        accumulated_text.push_str(delta);
+                                        serde_json::json!({ "type": "chunk", "content": delta })
+                                    }
+                                    TurnEvent::Thinking { delta } => {
+                                        serde_json::json!({ "type": "thinking", "content": delta })
+                                    }
+                                    TurnEvent::ToolCall { id, name, args } => {
+                                        serde_json::json!({ "type": "tool_call", "id": id, "name": name, "args": args })
+                                    }
+                                    TurnEvent::ToolResult {
+                                        id, name, output, ..
+                                    } => {
+                                        serde_json::json!({ "type": "tool_result", "id": id, "name": name, "output": output })
+                                    }
+                                    TurnEvent::ApprovalRequest {
+                                        request_id,
+                                        tool_name,
+                                        arguments_summary,
+                                        timeout_secs,
+                                    } => {
+                                        if client_gone {
+                                            drop(pending_approvals.lock().remove(&request_id));
+                                            continue;
+                                        }
+                                        serde_json::json!({
+                                            "type": "approval_request",
+                                            "request_id": request_id,
+                                            "tool": tool_name,
+                                            "arguments_summary": arguments_summary,
+                                            "timeout_secs": timeout_secs,
+                                        })
+                                    }
+                                    TurnEvent::HistoryTrimmed {
+                                        dropped_messages,
+                                        dropped_turns,
+                                        kept_turns,
+                                        reason,
+                                        token_budget,
+                                        tokens_before,
+                                        tokens_after,
+                                        tokens_before_source,
+                                        tokens_after_source,
+                                        unsatisfiable_floor,
+                                        retained_context: _,
+                                    } => history_trimmed_ws_frame(
+                                        dropped_messages,
+                                        dropped_turns,
+                                        kept_turns,
+                                        &reason,
+                                        token_budget,
+                                        tokens_before,
+                                        tokens_after,
+                                        tokens_before_source.map(|s| s.as_str()),
+                                        tokens_after_source.map(|s| s.as_str()),
+                                        unsatisfiable_floor,
+                                    ),
+                                    TurnEvent::Plan { entries } => serde_json::json!({
+                                        "type": "plan",
+                                        "entries": entries,
+                                    }),
+                                    _ => continue,
+                                };
+                                if client_gone {
+                                    continue;
+                                }
+                                if sender.send(Message::Text(ws_msg.to_string().into())).await.is_err() {
+                                    detach_mid_turn(session_key, &turn_id, pending_approvals);
+                                    client_gone = true;
                                 }
                             }
                         }
-                        _ => {}
-                    }
-                }
-                approval = approval_event_rx.recv() => {
-                    let Some(event) = approval else { continue };
-                    if let TurnEvent::ApprovalRequest {
-                        request_id,
-                        tool_name,
-                        arguments_summary,
-                        timeout_secs,
-                    } = event {
-                        if client_gone {
-                            // Nobody is attached to answer: drop the parked
-                            // oneshot so the approval channel resolves it as an
-                            // unreachable-operator deny now, not at the timeout.
-                            drop(pending_approvals.lock().remove(&request_id));
-                            continue;
-                        }
-                        let frame = serde_json::json!({
-                            "type": "approval_request",
-                            "request_id": request_id,
-                            "tool": tool_name,
-                            "arguments_summary": arguments_summary,
-                            "timeout_secs": timeout_secs,
-                        });
-                        if sender.send(Message::Text(frame.to_string().into())).await.is_err() {
-                            detach_mid_turn(session_key, &turn_id, pending_approvals);
-                            client_gone = true;
-                        }
-                    }
-                }
-                _ = tick_websocket_ping(ping_interval), if !client_gone => {
-                    if sender.send(Message::Ping(Vec::new().into())).await.is_err() {
-                        detach_mid_turn(session_key, &turn_id, pending_approvals);
-                        client_gone = true;
-                    }
-                }
-                    event_opt = event_rx.recv() => {
-                    let Some(event) = event_opt else { break };
-                    let ws_msg = match event {
-                        usage_event @ TurnEvent::Usage { .. } => {
-                            // The fold is the production event path under
-                            // test (see UsageFold regression tests): billing
-                            // aggregates every billable attempt while the
-                            // accepted-serving snapshot advances on accepted
-                            // events only. Its return value is the per-step
-                            // `usage` frame the web composer counts steps
-                            // with, so it is forwarded like any other frame.
-                            match usage_fold.apply(usage_event) {
-                                Some(frame) => frame,
-                                None => continue,
-                            }
-                        }
-                        TurnEvent::Chunk { ref delta } => {
-                            accumulated_text.push_str(delta);
-                            serde_json::json!({ "type": "chunk", "content": delta })
-                        }
-                        TurnEvent::Thinking { delta } => {
-                            serde_json::json!({ "type": "thinking", "content": delta })
-                        }
-                        TurnEvent::ToolCall { id, name, args } => {
-                            serde_json::json!({ "type": "tool_call", "id": id, "name": name, "args": args })
-                        }
-                        TurnEvent::ToolResult {
-                            id, name, output, ..
-                        } => {
-                            serde_json::json!({ "type": "tool_result", "id": id, "name": name, "output": output })
-                        }
-                        TurnEvent::ApprovalRequest {
-                            request_id,
-                            tool_name,
-                            arguments_summary,
-                            timeout_secs,
-                        } => {
-                            if client_gone {
-                                drop(pending_approvals.lock().remove(&request_id));
-                                continue;
-                            }
-                            serde_json::json!({
-                                "type": "approval_request",
-                                "request_id": request_id,
-                                "tool": tool_name,
-                                "arguments_summary": arguments_summary,
-                                "timeout_secs": timeout_secs,
-                            })
-                        }
-                        TurnEvent::HistoryTrimmed {
-                            dropped_messages,
-                            kept_turns,
-                            reason,
-                            tokens_after,
-                            tokens_before,
-                            dropped_turns,
-                        } => {
-                            history_trim_seen.store(
-                                true,
-                                std::sync::atomic::Ordering::Relaxed,
-                            );
-                            if let Some(tokens) = tokens_after {
-                                usage_fold.last_input_tokens = Some(tokens as u64);
-                            }
-                            history_trimmed_ws_frame(
-                                dropped_messages,
-                                kept_turns,
-                                &reason,
-                                tokens_after,
-                                tokens_before,
-                                dropped_turns,
-                            )
-                        }
-                        TurnEvent::Plan { entries } => serde_json::json!({
-                            "type": "plan",
-                            "entries": entries,
-                        }),
-                        _ => continue,
-                    };
-                    if client_gone {
-                        continue;
-                    }
-                    if !send_ws_text_bounded(sender, ws_msg.to_string()).await {
-                        detach_mid_turn(session_key, &turn_id, pending_approvals);
-                        client_gone = true;
-                    }
-                }
-            }
         }
         client_gone
     };
 
-    let turn_cancel_grace = Duration::from_secs(crate::gateway_turn_cancel_after(
-        &state.config.read().gateway,
-    ));
-    let joined = tokio::select! {
-        biased;
-        outcome = async { tokio::join!(turn_fut, forward_fut) } => Some(outcome),
-        _ = async {
-            cancel_token.cancelled().await;
-            tokio::time::sleep(turn_cancel_grace).await;
-        } => None,
-    };
-
-    if history_trim_seen.load(std::sync::atomic::Ordering::Relaxed)
-        && let Some(ref backend) = state.session_backend
-    {
-        persist_trimmed_session_history(backend.as_ref(), session_key, agent);
-    }
+    let (result, client_gone) = tokio::join!(turn_fut, forward_fut);
 
     // ── Remove cancel token (turn finished) ──────────────────────
-    {
-        state
-            .cancel_tokens
-            .lock()
-            .expect("cancel_tokens lock poisoned")
-            .remove(session_key);
-    }
-
-    let Some((result, client_gone)) = joined else {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Cancel)
-                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                .with_attrs(::serde_json::json!({
-                    "model_provider": provider_label,
-                    "model": turn_model,
-                    "session_key": session_key,
-                    "turn_cancel_after": turn_cancel_grace.as_secs(),
-                    "trace_id": turn_id,
-                })),
-            "turn_cancel_forced"
-        );
-        if let Some(ref backend) = state.session_backend
-            && backend.session_exists(session_key)
-        {
-            let _ = backend.set_session_state(session_key, "idle", None);
-        }
-        let aborted = aborted_frame(&usage_fold);
-        let _ = send_ws_text_bounded(sender, aborted.to_string()).await;
-        let _ = state.event_tx.send(serde_json::json!({
-            "type": "agent_end",
-            "model_provider": provider_label,
-            "model": turn_model,
-        }));
-        // The turn future was force-dropped before it could report whether the
-        // viewer was gone; the caller's own arms notice a dead socket.
-        return false;
-    };
+    remove_cancel_token_if_current(
+        &state.cancel_tokens,
+        &gateway_cancel_key(session_id),
+        &cancel_token,
+    );
 
     // Check if this turn was cancelled. `turn_streamed` propagates
     // `ToolLoopCancelled` through anyhow, so we detect it here.
@@ -1944,72 +2117,55 @@ async fn process_chat_message(
     };
 
     if was_cancelled {
-        if let Some(ref backend) = state.session_backend {
-            let still_exists = backend.session_exists(session_key);
-            if still_exists && !history_trim_seen.load(std::sync::atomic::Ordering::Relaxed) {
-                match &result {
-                    Err(error) if !error.new_messages.is_empty() => {
-                        persist_conversation_messages(
-                            backend.as_ref(),
-                            session_key,
-                            &error.new_messages,
-                        );
-                        if !has_assistant_chat_message(&error.new_messages) {
-                            let marker = zeroclaw_runtime::i18n::get_required_cli_string(
-                                "turn-interrupted-by-user",
-                            );
-                            let truncated = if accumulated_text.is_empty() {
-                                marker
-                            } else {
-                                format!("{accumulated_text}\n\n{marker}")
-                            };
-                            let assistant_msg =
-                                zeroclaw_providers::ChatMessage::assistant(&truncated);
-                            // Re-check before the raw append — the user can
-                            // delete the session between the outer check and
-                            // here; `persist_conversation_messages` already
-                            // re-checks internally.
-                            if backend.session_exists(session_key) {
-                                let _ = backend.append(session_key, &assistant_msg);
-                            }
-                        }
-                    }
-                    _ => {
-                        let marker = zeroclaw_runtime::i18n::get_required_cli_string(
-                            "turn-interrupted-by-user",
-                        );
-                        let truncated = if accumulated_text.is_empty() {
-                            marker
-                        } else {
-                            format!("{accumulated_text}\n\n{marker}")
-                        };
-                        let assistant_msg = zeroclaw_providers::ChatMessage::assistant(&truncated);
-                        if backend.session_exists(session_key) {
-                            let _ = backend.append(session_key, &assistant_msg);
-                        }
-                    }
-                }
-            }
-            // Record what this turn left in the store so a follow-up on the
-            // same socket does not rebuild a transcript it already holds.
-            *persisted_watermark =
-                note_own_transcript_write(backend.as_ref(), &state.session_queue, session_key);
+        if let Some(ref backend) = state.session_backend
+            && backend.session_exists(session_key)
+        {
+            // Persist the agent's authoritative post-turn history as one state,
+            // even when the turn produced noDelta or was hard-cancelled. The
+            // live agent may have already trimmed older turns before the
+            // cancellation was observed; persisting only a delta marker would
+            // leave the durable store with the pre-trim transcript that the
+            // next restore would resurrect.
+            let needs_marker = match &result {
+                Err(error) => !has_assistant_chat_message(&error.new_messages),
+                Ok(_) => false,
+            };
+            let durable = if needs_marker {
+                let marker =
+                    zeroclaw_runtime::i18n::get_required_cli_string("turn-interrupted-by-user");
+                let truncated = if accumulated_text.is_empty() {
+                    marker
+                } else {
+                    format!("{accumulated_text}\n\n{marker}")
+                };
+                let mut d = zeroclaw_providers::durable_chat_messages(agent.history());
+                d.push(zeroclaw_providers::ChatMessage::assistant(&truncated));
+                d
+            } else {
+                zeroclaw_providers::durable_chat_messages(agent.history())
+            };
+            let crumb = agent.history_has_trim_breadcrumb();
+            replace_conversation_state_unless_deleted(
+                backend.as_ref(),
+                session_key,
+                &durable,
+                crumb,
+            );
+            *persisted_watermark = PersistedWatermark {
+                generation: state.session_queue.advance_generation(session_key),
+                len: durable.len(),
+            };
         }
 
-        // Idle before the aborted frame so a stalled WS client cannot leave
-        // the session stuck in `running`.
+        // Inform the client the turn was aborted
+        let aborted = serde_json::json!({ "type": "aborted" });
+        let _ = sender.send(Message::Text(aborted.to_string().into())).await;
+
         if let Some(ref backend) = state.session_backend
             && backend.session_exists(session_key)
         {
             let _ = backend.set_session_state(session_key, "idle", None);
         }
-
-        // Inform the client the turn was aborted. The token totals and step
-        // count accumulated so far ride along: a cancelled turn still consumed
-        // them, and without them the client's live session row would silently
-        // lose the work the user just paid for.
-        let aborted = aborted_frame(&usage_fold);
-        let _ = send_ws_text_bounded(sender, aborted.to_string()).await;
 
         // Broadcast agent_end event
         let cancel_model = usage_fold.last_model.as_deref().unwrap_or(&turn_model);
@@ -2048,17 +2204,9 @@ async fn process_chat_message(
     match result {
         Ok(outcome) => {
             if let Some(ref backend) = state.session_backend {
-                if history_trim_seen.load(std::sync::atomic::Ordering::Relaxed) {
-                    // Full rewrite already applied above from agent.history.
-                } else {
-                    persist_conversation_messages(
-                        backend.as_ref(),
-                        session_key,
-                        &outcome.new_messages,
-                    );
-                }
+                persist_agent_conversation_state(backend.as_ref(), session_key, agent);
                 *persisted_watermark =
-                    note_own_transcript_write(backend.as_ref(), &state.session_queue, session_key);
+                    note_own_transcript_write(&state.session_queue, session_key, agent);
             }
 
             // Fire-and-forget memory consolidation so facts from WS sessions
@@ -2080,7 +2228,7 @@ async fn process_chat_message(
                     let memory_config = state.config.read().memory.clone();
                     let user_msg = content.to_string();
                     let assistant_resp = outcome.response.clone();
-                    let live_config = Arc::clone(&state.config);
+                    let live_config = state.config.clone();
                     zeroclaw_spawn::spawn!(async move {
                         let config = live_config.read().clone();
                         let Some((model_provider, model, temperature)) =
@@ -2146,38 +2294,26 @@ async fn process_chat_message(
             // the breakdown the single source of truth.
             let cost_usd = UsageFold::total_cost_usd(&usage_by_provider_vec);
 
-            // Resolve context_window from the last-served provider's config.
-            // The served model must match the entry's configured primary model;
-            // fallback/vision/override models omit the window so clients fall
-            // back to the trim budget instead of understating fullness.
-            // Use the last served model from usage events when available so
-            // the terminal metadata is one coherent tuple with the provider.
-            let effective_model = usage_fold.last_model.as_deref().unwrap_or(&turn_model);
-            let model_context_window = if let Some(ref provider_ref) = usage_fold.last_provider_ref
-            {
-                state
-                    .config
-                    .read()
-                    .model_provider_context_window_opt(provider_ref, effective_model)
-                    .map(|v| v as u64)
-            } else {
-                let (_, live_provider, live_model) = agent.attribution_fields();
-                if live_provider.is_empty() {
-                    None
-                } else {
-                    state
-                        .config
-                        .read()
-                        .model_provider_context_window_opt(&live_provider, &live_model)
-                        .map(|v| v as u64)
-                }
-            };
-            // Full provider_ref for the done frame: last served ref when
-            // available, otherwise fall back to the turn-start provider label.
+            let active_provider = outcome.provider_name.clone();
+            let active_model = outcome.model.clone();
+            // The route that actually served the FINAL call is authoritative for
+            // the terminal frame (see `done_frame_context_limits`). Resolve from
+            // the final route only when no call was served (e.g. a cache hit).
+            let fallback_limits = outcome
+                .final_context_limits
+                .is_none()
+                .then(|| agent.context_limits_for_route(&active_provider, &active_model));
+            let (max_context_tokens, model_context_window) = done_frame_context_limits(
+                outcome.final_context_limits,
+                usage_fold.last_context_token_budget,
+                usage_fold.last_model_context_window,
+                fallback_limits,
+            );
+            let effective_model = usage_fold.last_model.as_deref().unwrap_or(&active_model);
             let provider_ref_full = usage_fold
                 .last_provider_ref
                 .as_deref()
-                .unwrap_or(&provider_label);
+                .unwrap_or(&active_provider);
             let meta = DoneFrameMeta {
                 full_response: &outcome.response,
                 input_tokens: usage_fold.total_input_tokens,
@@ -2190,8 +2326,6 @@ async fn process_chat_message(
                 max_context_tokens,
                 model_context_window,
                 last_input_tokens: usage_fold.last_input_tokens,
-                cached_input_tokens: usage_fold.cached_input_tokens,
-                steps: usage_fold.steps,
                 last_serving_provider_ref: usage_fold.last_provider_ref.as_deref(),
                 last_serving_model: usage_fold.last_model.as_deref(),
             };
@@ -2205,7 +2339,7 @@ async fn process_chat_message(
             let safeguard_notice = outcome.safeguard_fallback.as_ref();
             let done = build_done_frame_json(&meta, &usage_by_provider_vec);
             for frame in success_terminal_ws_frames(safeguard_notice, done) {
-                let _ = send_ws_text_bounded(sender, frame.to_string()).await;
+                let _ = sender.send(Message::Text(frame.to_string().into())).await;
             }
 
             // Set session state to idle
@@ -2244,12 +2378,10 @@ async fn process_chat_message(
             );
         }
         Err(e) => {
-            if let Some(ref backend) = state.session_backend
-                && !e.new_messages.is_empty()
-            {
-                persist_conversation_messages(backend.as_ref(), session_key, &e.new_messages);
+            if let Some(ref backend) = state.session_backend {
+                persist_agent_conversation_state(backend.as_ref(), session_key, agent);
                 *persisted_watermark =
-                    note_own_transcript_write(backend.as_ref(), &state.session_queue, session_key);
+                    note_own_transcript_write(&state.session_queue, session_key, agent);
             }
 
             // Set session state to error
@@ -2340,21 +2472,6 @@ where
     frame
 }
 
-/// The terminal frame for a user-cancelled turn.
-///
-/// Carries the same totals as `done`, because a cancelled turn still spent
-/// what it spent: the client's live session row counts those steps and tokens
-/// instead of dropping the turn on the floor.
-fn aborted_frame(fold: &UsageFold) -> serde_json::Value {
-    serde_json::json!({
-        "type": "aborted",
-        "input_tokens": fold.total_input_tokens,
-        "output_tokens": fold.total_output_tokens,
-        "cached_input_tokens": fold.cached_input_tokens,
-        "steps": fold.steps,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2364,193 +2481,6 @@ mod tests {
         routing::{get, post},
     };
     use tokio_tungstenite::{connect_async, tungstenite::Message as ClientMessage};
-
-    /// One accepted `TurnEvent::Usage` on a fixed provider/model, so the
-    /// step-count and cache tests read like the event stream rather than like
-    /// a field list. Tests that need to vary the serving route or the
-    /// accepted/rejected flag use [`usage_event`] instead.
-    fn accepted_usage_event(
-        input: Option<u64>,
-        cached: Option<u64>,
-        output: Option<u64>,
-    ) -> zeroclaw_api::agent::TurnEvent {
-        zeroclaw_api::agent::TurnEvent::Usage {
-            input_tokens: input,
-            cached_input_tokens: cached,
-            output_tokens: output,
-            cost_usd: None,
-            provider_ref: "test.provider".to_string(),
-            model: "test-model".to_string(),
-            accepted: true,
-            estimated_input_tokens: None,
-        }
-    }
-
-    #[test]
-    fn usage_frame_accumulates_steps_tokens_and_cache_across_calls() {
-        let mut fold = UsageFold::default();
-
-        let first = fold
-            .apply(accepted_usage_event(Some(100), Some(80), Some(10)))
-            .expect("a usage event yields a frame");
-        assert_eq!(
-            first,
-            serde_json::json!({
-                "type": "usage",
-                "input_tokens": 100,
-                "output_tokens": 10,
-                "cached_input_tokens": 80,
-            })
-        );
-
-        // Second call reports no cache detail — normal for a provider whose
-        // prompt-cache flag is off. It must not reset the running cache sum.
-        let second = fold
-            .apply(accepted_usage_event(Some(200), None, Some(20)))
-            .expect("a usage event yields a frame");
-        assert_eq!(second["cached_input_tokens"], serde_json::Value::Null);
-
-        assert_eq!(fold.steps, 2, "one step per LLM call");
-        assert_eq!(fold.total_input_tokens, Some(300));
-        assert_eq!(fold.total_output_tokens, Some(30));
-        assert_eq!(fold.cached_input_tokens, Some(80));
-        assert_eq!(
-            fold.last_input_tokens,
-            Some(200),
-            "last_input_tokens is replaced, not summed"
-        );
-    }
-
-    #[test]
-    fn usage_fold_does_not_bill_estimated_input_tokens() {
-        let mut fold = UsageFold::default();
-        let frame = fold
-            .apply(zeroclaw_api::agent::TurnEvent::Usage {
-                input_tokens: None,
-                cached_input_tokens: None,
-                output_tokens: None,
-                cost_usd: None,
-                provider_ref: "llamacpp.default".into(),
-                model: "local-model".into(),
-                accepted: true,
-                estimated_input_tokens: Some(4_200),
-            })
-            .expect("a usage event yields a frame");
-        assert!(
-            frame["input_tokens"].is_null(),
-            "the usage frame must not present the estimate as measured input"
-        );
-        assert!(
-            frame.get("estimated_input_tokens").is_none(),
-            "billing frames do not carry the display estimate"
-        );
-        assert_eq!(fold.total_input_tokens, None);
-        assert_eq!(fold.last_input_tokens, None);
-        let entries = fold.take_sorted_entries();
-        assert_eq!(entries[0].input_tokens, 0);
-        assert_eq!(UsageFold::total_cost_usd(&entries), None);
-    }
-
-    #[test]
-    fn usage_frame_without_reported_numbers_still_closes_a_step() {
-        let mut fold = UsageFold::default();
-
-        let frame = fold
-            .apply(accepted_usage_event(None, None, None))
-            .expect("a usage event yields a frame");
-
-        // `None` means "unavailable for this call", not zero: the step is
-        // counted, the sums stay `None` rather than claiming a zero-token turn.
-        assert_eq!(fold.steps, 1);
-        assert_eq!(fold.total_input_tokens, None);
-        assert_eq!(fold.total_output_tokens, None);
-        assert_eq!(fold.cached_input_tokens, None);
-        assert_eq!(fold.last_input_tokens, None);
-        assert_eq!(
-            frame,
-            serde_json::json!({
-                "type": "usage",
-                "input_tokens": null,
-                "output_tokens": null,
-                "cached_input_tokens": null,
-            }),
-            "nullable fields are passed through as null, never coerced to 0"
-        );
-    }
-
-    #[test]
-    fn cached_input_tokens_never_folds_into_input_totals() {
-        let mut fold = UsageFold::default();
-
-        // On OpenAI-compatible backends `cached_input_tokens` is a *subset* of
-        // `input_tokens`. Adding it again would inflate context occupancy.
-        fold.apply(accepted_usage_event(Some(1000), Some(900), Some(5)));
-
-        assert_eq!(fold.total_input_tokens, Some(1000));
-        assert_eq!(fold.last_input_tokens, Some(1000));
-        assert_eq!(fold.cached_input_tokens, Some(900));
-    }
-
-    #[test]
-    fn aborted_frame_carries_the_turn_totals() {
-        assert_eq!(
-            aborted_frame(&UsageFold {
-                steps: 3,
-                total_input_tokens: Some(120),
-                total_output_tokens: Some(7),
-                cached_input_tokens: Some(64),
-                last_input_tokens: Some(120),
-                ..Default::default()
-            }),
-            serde_json::json!({
-                "type": "aborted",
-                "input_tokens": 120,
-                "output_tokens": 7,
-                "cached_input_tokens": 64,
-                "steps": 3,
-            })
-        );
-        assert_eq!(
-            aborted_frame(&UsageFold::default()),
-            serde_json::json!({
-                "type": "aborted",
-                "input_tokens": null,
-                "output_tokens": null,
-                "cached_input_tokens": null,
-                "steps": 0,
-            }),
-            "a cancelled turn with no reported usage still reports zero steps"
-        );
-    }
-
-    #[test]
-    fn agent_start_broadcast_reaches_only_its_own_session() {
-        // Regression: the turn-boundary frame used to be broadcast without a
-        // `session_id`, so `event_matches_session` classified it as a global
-        // event and `is_global_chat_event` (cron_result only) dropped it —
-        // the chat socket never saw a turn boundary.
-        let frame = serde_json::json!({
-            "type": "agent_start",
-            "model_provider": "anthropic",
-            "model": "claude-test",
-            "session_id": "operator-1",
-        });
-        assert!(event_matches_session(&frame, "operator-1"));
-        assert!(
-            !event_matches_session(&frame, "operator-2"),
-            "a turn boundary must not leak into another session's socket"
-        );
-
-        let unscoped = serde_json::json!({
-            "type": "agent_start",
-            "model_provider": "anthropic",
-            "model": "claude-test",
-        });
-        assert!(
-            !event_matches_session(&unscoped, "operator-1"),
-            "an unscoped agent_start stays a global event and is not delivered"
-        );
-    }
 
     #[test]
     fn ws_terminal_failure_uses_localized_message_without_reclassifying_diagnostic() {
@@ -2572,11 +2502,134 @@ mod tests {
     }
 
     #[test]
-    fn websocket_handler_projects_anthropic_empty_terminal_stream_as_user_error() {
-        run_ws_regression(
-            "ws-empty-terminal-regression",
-            websocket_handler_projects_anthropic_empty_terminal_stream_as_user_error_inner,
+    fn done_context_limits_prefer_active_usage_route() {
+        let stale_startup_limits = zeroclaw_config::schema::ResolvedContextLimits {
+            model_context_window: 200_000,
+            context_token_budget: 180_000,
+            model_context_window_source:
+                zeroclaw_config::schema::ModelContextWindowSource::Configured,
+        };
+        assert_eq!(
+            resolve_done_context_limits(Some(7_200), Some(8_000), stale_startup_limits),
+            (7_200, Some(8_000)),
+            "the done frame must report the route that produced the usage event"
         );
+    }
+
+    #[test]
+    fn done_context_limits_fall_back_to_agent_active_route_without_usage() {
+        let active_limits = zeroclaw_config::schema::ResolvedContextLimits {
+            model_context_window: 8_000,
+            context_token_budget: 0,
+            model_context_window_source:
+                zeroclaw_config::schema::ModelContextWindowSource::Configured,
+        };
+        assert_eq!(
+            resolve_done_context_limits(None, None, active_limits),
+            (0, Some(8_000)),
+        );
+    }
+
+    #[test]
+    fn done_context_limits_omit_unknown_compatibility_capacity() {
+        let active_limits = zeroclaw_config::schema::ResolvedContextLimits {
+            model_context_window: zeroclaw_config::schema::UNCONFIGURED_CONTEXT_WINDOW_FALLBACK,
+            context_token_budget: 16_000,
+            model_context_window_source:
+                zeroclaw_config::schema::ModelContextWindowSource::CompatibilityFallback,
+        };
+        assert_eq!(
+            resolve_done_context_limits(None, None, active_limits),
+            (16_000, None),
+        );
+    }
+
+    // B4: the final served route overrides stale usage values in the terminal
+    // frame. A route switch after an earlier usage-bearing call (a no-usage
+    // vision reply) must report the FINAL route, not the earlier one.
+    #[test]
+    fn done_frame_prefers_final_served_route_over_stale_usage() {
+        let final_vision = zeroclaw_config::schema::ResolvedContextLimits {
+            model_context_window: 8_000,
+            context_token_budget: 7_200,
+            model_context_window_source:
+                zeroclaw_config::schema::ModelContextWindowSource::Configured,
+        };
+        // Earlier usage-bearing text route left 180k/200k on the wire trackers.
+        assert_eq!(
+            done_frame_context_limits(Some(final_vision), Some(180_000), Some(200_000), None),
+            (7_200, Some(8_000)),
+            "a final no-usage vision route must override the earlier text route's usage numbers"
+        );
+    }
+
+    // B4: with no served call (cache hit), the frame falls back to usage values,
+    // then to the resolved fallback route — preserving legacy behavior.
+    #[test]
+    fn done_frame_falls_back_when_no_call_served() {
+        let fallback = zeroclaw_config::schema::ResolvedContextLimits {
+            model_context_window: 200_000,
+            context_token_budget: 180_000,
+            model_context_window_source:
+                zeroclaw_config::schema::ModelContextWindowSource::Configured,
+        };
+        // No final route, no usage: fall back to the resolved route.
+        assert_eq!(
+            done_frame_context_limits(None, None, None, Some(fallback)),
+            (180_000, Some(200_000)),
+        );
+        // No final route but usage present: usage wins (legacy path).
+        assert_eq!(
+            done_frame_context_limits(None, Some(7_200), Some(8_000), Some(fallback)),
+            (7_200, Some(8_000)),
+        );
+    }
+
+    #[test]
+    fn usage_less_final_route_clears_the_previous_context_fill() {
+        let mut fold = UsageFold::default();
+        fold.apply(usage_event(
+            "openai.default",
+            "model-a",
+            Some(1_024),
+            None,
+            Some(64),
+            None,
+            true,
+        ));
+        fold.apply(usage_event(
+            "openai.default",
+            "model-a",
+            None,
+            None,
+            Some(32),
+            None,
+            true,
+        ));
+
+        assert_eq!(fold.total_input_tokens, Some(1_024));
+        assert_eq!(fold.total_output_tokens, Some(96));
+        assert_eq!(fold.last_input_tokens, None);
+    }
+
+    #[test]
+    fn websocket_handler_projects_anthropic_empty_terminal_stream_as_user_error() {
+        // This production-shaped fixture exceeds the Linux test harness's
+        // default stack; isolate only this test instead of weakening CI-wide
+        // stack limits or dropping the real WebSocket boundary coverage.
+        std::thread::Builder::new()
+            .name("ws-empty-terminal-regression".to_string())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("test runtime")
+                    .block_on(websocket_handler_projects_anthropic_empty_terminal_stream_as_user_error_inner());
+            })
+            .expect("spawn WebSocket regression thread")
+            .join()
+            .expect("WebSocket regression thread must not panic");
     }
 
     async fn websocket_handler_projects_anthropic_empty_terminal_stream_as_user_error_inner() {
@@ -2745,70 +2798,36 @@ data: {\"type\":\"message_stop\"}\n\n",
         mock_server.abort();
     }
 
-    /// End-to-end proof of the P0 wire contract: a real turn, a real WebSocket,
-    /// and an Anthropic-shaped fixture that reports prompt-cache hits.
-    #[tokio::test]
-    async fn websocket_turn_forwards_usage_and_agent_start_frames() {
-        // Production-shaped fixture: isolate on its own thread with a larger
-        // stack, same as the empty-terminal regression above.
+    #[test]
+    fn websocket_connect_persists_a_restore_time_trim_before_going_live() {
+        // Same contract as the ACP/RPC restore-persistence regressions: an
+        // over-cap restored transcript trims in memory as soon as the socket
+        // upgrade seeds it, before the session ever goes live. That retained
+        // projection and its corrected breadcrumb must already be durable at
+        // that point, so a reconnect that never sends a `message` frame does
+        // not reload the untrimmed prefix and repeat the trim. Runs on a
+        // larger-stack thread for the same reason as the sibling WebSocket
+        // regression above: real agent construction exceeds the default test
+        // harness stack.
         std::thread::Builder::new()
-            .name("ws-usage-frame-regression".to_string())
+            .name("ws-restore-trim-regression".to_string())
             .stack_size(8 * 1024 * 1024)
             .spawn(|| {
                 tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                     .expect("test runtime")
-                    .block_on(websocket_turn_forwards_usage_and_agent_start_frames_inner());
+                    .block_on(
+                        websocket_connect_persists_a_restore_time_trim_before_going_live_inner(),
+                    );
             })
             .expect("spawn WebSocket regression thread")
             .join()
             .expect("WebSocket regression thread must not panic");
     }
 
-    async fn websocket_turn_forwards_usage_and_agent_start_frames_inner() {
-        // One text block, `end_turn`, with `cache_read_input_tokens` set — the
-        // shape that exercises the `usage` frame's cache field.
-        let sse = "event: message_start\n\
-data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-test\",\"usage\":{\"input_tokens\":314,\"cache_read_input_tokens\":42}}}\n\n\
-event: content_block_start\n\
-data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
-event: content_block_delta\n\
-data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n\
-event: content_block_stop\n\
-data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
-event: message_delta\n\
-data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":27}}\n\n\
-event: message_stop\n\
-data: {\"type\":\"message_stop\"}\n\n";
-        let mock_app = Router::new().route(
-            "/v1/messages",
-            post(move |Json(request): Json<serde_json::Value>| async move {
-                if request["stream"].as_bool() == Some(true) {
-                    ([(header::CONTENT_TYPE, "text/event-stream")], sse).into_response()
-                } else {
-                    Json(serde_json::json!({
-                        "id": "msg_1",
-                        "type": "message",
-                        "role": "assistant",
-                        "model": "claude-test",
-                        "content": [{"type": "text", "text": "hi"}],
-                        "stop_reason": "end_turn",
-                        "usage": {"input_tokens": 314, "output_tokens": 27}
-                    }))
-                    .into_response()
-                }
-            }),
-        );
-        let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind local Anthropic fixture");
-        let mock_addr = mock_listener.local_addr().expect("fixture address");
-        let mock_server = zeroclaw_spawn::spawn!(async move {
-            axum::serve(mock_listener, mock_app)
-                .await
-                .expect("local Anthropic fixture serves");
-        });
+    async fn websocket_connect_persists_a_restore_time_trim_before_going_live_inner() {
+        use zeroclaw_infra::session_backend::SessionBackend;
 
         let tmp = tempfile::tempdir().expect("temporary gateway workspace");
         let workspace = tmp.path().join("workspace");
@@ -2819,17 +2838,19 @@ data: {\"type\":\"message_stop\"}\n\n";
             ..Default::default()
         };
         config.memory.backend = "none".to_string();
-        config.reliability.provider_retries = 0;
+        // A deliberately unreachable provider: no chat turn is ever issued
+        // by this test, so agent construction must succeed without a live
+        // network round trip.
         config.providers.models.anthropic.insert(
             "fixture".to_string(),
             zeroclaw_config::schema::AnthropicModelProviderConfig {
                 base: zeroclaw_config::schema::ModelProviderConfig {
                     api_key: Some("test-key".to_string()),
-                    uri: Some(format!("http://{mock_addr}")),
+                    uri: Some("http://127.0.0.1:1".to_string()),
                     model: Some("claude-test".to_string()),
                     ..Default::default()
                 },
-                server_fallback_models: Vec::new(),
+                ..Default::default()
             },
         );
         config.risk_profiles.insert(
@@ -2838,7 +2859,10 @@ data: {\"type\":\"message_stop\"}\n\n";
         );
         config.runtime_profiles.insert(
             "fixture".to_string(),
-            zeroclaw_config::schema::RuntimeProfileConfig::default(),
+            zeroclaw_config::schema::RuntimeProfileConfig {
+                max_history_messages: Some(2),
+                ..Default::default()
+            },
         );
         config.agents.insert(
             "web".to_string(),
@@ -2853,7 +2877,25 @@ data: {\"type\":\"message_stop\"}\n\n";
                 ..Default::default()
             },
         );
-        let state = crate::api::tests::test_state(config);
+
+        let backend: Arc<dyn SessionBackend> =
+            Arc::new(zeroclaw_infra::session_store::SessionStore::new(tmp.path()).unwrap());
+        let session_id = "restore-trim-session";
+        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+        let over_cap = vec![
+            zeroclaw_providers::ChatMessage::user("turn one request"),
+            zeroclaw_providers::ChatMessage::assistant("turn one answer"),
+            zeroclaw_providers::ChatMessage::user("turn two request"),
+            zeroclaw_providers::ChatMessage::assistant("turn two answer"),
+            zeroclaw_providers::ChatMessage::user("turn three request"),
+            zeroclaw_providers::ChatMessage::assistant("turn three answer"),
+        ];
+        backend
+            .replace_conversation_state(&session_key, &over_cap, false)
+            .unwrap();
+
+        let mut state = crate::api::tests::test_state(config);
+        state.session_backend = Some(backend.clone());
         let gateway_app = Router::new()
             .route("/ws/chat", get(handle_ws_chat))
             .with_state(state);
@@ -2867,9 +2909,12 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .expect("local WebSocket gateway serves");
         });
 
-        let (mut client, _) = connect_async(format!("ws://{gateway_addr}/ws/chat?agent=web"))
-            .await
-            .expect("WebSocket upgrade");
+        let (mut client, _) = connect_async(format!(
+            // This URL connects only to the test's loopback listener.
+            "ws://{gateway_addr}/ws/chat?agent=web&session_id={session_id}" // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
+        ))
+        .await
+        .expect("WebSocket upgrade");
         let first = client
             .next()
             .await
@@ -2881,101 +2926,727 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .expect("text session_start")
                 .contains("session_start")
         );
+
+        // The handler seeds and restore-trims the agent only after it
+        // receives its first frame (a `connect` control frame or the
+        // fallback path below), so send exactly that and nothing else: no
+        // `message` chat frame ever follows, mirroring a reconnect that
+        // never issues another prompt.
         client
             .send(ClientMessage::Text(r#"{"type":"connect"}"#.into()))
             .await
             .expect("connect frame");
-        let _ = client
+        let connected = client
             .next()
             .await
             .expect("connected frame")
             .expect("connected");
-        client
-            .send(ClientMessage::Text(
-                r#"{"type":"message","content":"test"}"#.into(),
-            ))
-            .await
-            .expect("chat message");
-
-        // Read until the turn terminates, then keep reading: `agent_start` is
-        // published on the shared event bus, and this socket's broadcast
-        // receiver is not polled while `process_chat_message` owns the loop, so
-        // it is delivered once the turn has handed control back.
-        let mut frames: Vec<serde_json::Value> = Vec::new();
-        loop {
-            let frame = tokio::time::timeout(Duration::from_secs(10), client.next())
-                .await
-                .expect("gateway response deadline")
-                .expect("gateway stays connected")
-                .expect("gateway frame");
-            let json: serde_json::Value =
-                serde_json::from_str(&frame.into_text().expect("text gateway frame"))
-                    .expect("JSON gateway frame");
-            let terminal = json["type"] == "done" || json["type"] == "error";
-            frames.push(json);
-            if terminal {
-                break;
-            }
-        }
-        let mut agent_start = None;
-        for _ in 0..4 {
-            let Ok(Some(Ok(frame))) =
-                tokio::time::timeout(Duration::from_secs(2), client.next()).await
-            else {
-                break;
-            };
-            let json: serde_json::Value =
-                serde_json::from_str(&frame.into_text().expect("text gateway frame"))
-                    .expect("JSON gateway frame");
-            if json["type"] == "agent_start" {
-                agent_start = Some(json);
-                break;
-            }
-        }
-
-        let kinds: Vec<&str> = frames.iter().filter_map(|f| f["type"].as_str()).collect();
-        let done = frames
-            .iter()
-            .find(|f| f["type"] == "done")
-            .unwrap_or_else(|| panic!("turn must complete, got frames {kinds:?}"));
-        let usage = frames
-            .iter()
-            .find(|f| f["type"] == "usage")
-            .unwrap_or_else(|| panic!("usage frame must be forwarded, got frames {kinds:?}"));
-
-        // The per-step frame is the client's only step boundary and its only
-        // source of the cache-hit rate. Anthropic reports `input_tokens`
-        // *excluding* cache reads, so the provider normalizes the prompt to
-        // `uncached + cache_read + cache_create` — which is why 314 + 42 = 356
-        // here, and why the client must never add `cached_input_tokens` again.
-        assert_eq!(usage["input_tokens"], 356);
-        assert_eq!(usage["output_tokens"], 27);
-        assert_eq!(usage["cached_input_tokens"], 42);
         assert!(
-            !frames.iter().any(|f| f["type"] == "chunk_reset"),
-            "chunk_reset is a dead frame and must stay dead"
+            connected
+                .into_text()
+                .expect("text connected")
+                .contains("connected")
         );
+        drop(client);
 
-        // `done` reconciles the turn for a client that missed earlier frames.
-        assert_eq!(done["input_tokens"], 356);
-        assert_eq!(done["output_tokens"], 27);
-        assert_eq!(done["steps"], 1, "one LLM call, one step");
-        assert_eq!(done["cached_input_tokens"], 42);
+        // Give the server task a moment to finish the restore-time
+        // persistence that runs before it starts waiting on the socket for
+        // more frames.
+        tokio::time::sleep(Duration::from_millis(200)).await;
 
-        // And the turn boundary reaches the chat socket, session-scoped.
-        let start = agent_start.unwrap_or_else(|| {
-            panic!("agent_start must reach the chat socket, got frames {kinds:?}")
-        });
-        assert_eq!(start["type"], "agent_start");
+        let stored = backend.load(&session_key);
         assert!(
-            start["session_id"]
-                .as_str()
-                .is_some_and(|id| !id.is_empty()),
-            "the turn boundary must be session-scoped or the socket filters it out"
+            stored.len() < over_cap.len(),
+            "restore-time trim must persist the retained (capped) transcript, not the \
+             untrimmed rows it was seeded from: {stored:?}"
+        );
+        assert!(
+            !stored
+                .iter()
+                .any(|message| message.content == "turn one request"),
+            "the oldest trimmed turn must not survive in the durable store: {stored:?}"
+        );
+        assert_eq!(
+            backend.get_session_trim_breadcrumb(&session_key).unwrap(),
+            Some(true),
+            "restore-time trim must persist the corrected breadcrumb"
         );
 
         gateway_server.abort();
-        mock_server.abort();
+    }
+
+    /// Production-shaped WebSocket fixtures exceed the Linux test harness's
+    /// default thread stack; run them on a dedicated 8 MiB thread with a
+    /// current-thread runtime instead of weakening CI-wide stack limits.
+    fn run_ws_regression<Fut>(name: &'static str, test: impl FnOnce() -> Fut + Send + 'static)
+    where
+        Fut: std::future::Future<Output = ()>,
+    {
+        std::thread::Builder::new()
+            .name(name.to_string())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("test runtime")
+                    .block_on(test());
+            })
+            .expect("spawn WebSocket regression thread")
+            .join()
+            .expect("WebSocket regression thread must not panic");
+    }
+
+    /// Text the parked provider fixture finishes with once released.
+    const PARKED_TURN_RESPONSE: &str = "finished while nobody was watching";
+
+    /// Anthropic-shaped SSE prefix. The fixture sends this immediately so the
+    /// gateway turn is provably in flight, then parks until released.
+    const PARKED_STREAM_HEAD: &str = "event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_test\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-test\",\"usage\":{\"input_tokens\":1}}}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n";
+
+    fn parked_stream_tail() -> String {
+        format!(
+            "event: content_block_delta\n\
+data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{PARKED_TURN_RESPONSE}\"}}}}\n\n\
+event: content_block_stop\n\
+data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n\
+event: message_delta\n\
+data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"output_tokens\":1}}}}\n\n\
+event: message_stop\n\
+data: {{\"type\":\"message_stop\"}}\n\n"
+        )
+    }
+
+    type WsClient = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    /// A real gateway whose `web` agent talks to a local Anthropic-shaped
+    /// fixture that parks every streaming completion until the test releases
+    /// it, so a turn can be held in flight while the client goes away.
+    struct ParkedTurnFixture {
+        state: AppState,
+        backend: Arc<dyn zeroclaw_infra::session_backend::SessionBackend>,
+        gateway_addr: std::net::SocketAddr,
+        /// The body of every streaming request the provider fixture receives,
+        /// in arrival order.
+        request_seen: tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>,
+        /// How many parked completions may finish; the n-th request finishes
+        /// once this reaches n.
+        released: tokio::sync::watch::Sender<usize>,
+        servers: Vec<tokio::task::JoinHandle<()>>,
+        _tmp: tempfile::TempDir,
+    }
+
+    impl ParkedTurnFixture {
+        async fn spawn() -> Self {
+            let (request_seen_tx, request_seen) =
+                tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
+            let (released, released_rx) = tokio::sync::watch::channel(0usize);
+            let arrivals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mock_app = Router::new().route(
+                "/v1/messages",
+                post(move |Json(request): Json<serde_json::Value>| {
+                    let request_seen_tx = request_seen_tx.clone();
+                    let mut released_rx = released_rx.clone();
+                    let index = arrivals.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    async move {
+                        assert_eq!(
+                            request["stream"].as_bool(),
+                            Some(true),
+                            "gateway chat turns stream from the provider"
+                        );
+                        let head = futures_util::stream::once(async move {
+                            let _ = request_seen_tx.send(request);
+                            Ok::<_, std::io::Error>(axum::body::Bytes::from_static(
+                                PARKED_STREAM_HEAD.as_bytes(),
+                            ))
+                        });
+                        let tail = futures_util::stream::once(async move {
+                            let _ = released_rx.wait_for(|released| *released >= index).await;
+                            Ok::<_, std::io::Error>(axum::body::Bytes::from(parked_stream_tail()))
+                        });
+                        (
+                            [(header::CONTENT_TYPE, "text/event-stream")],
+                            axum::body::Body::from_stream(head.chain(tail)),
+                        )
+                    }
+                }),
+            );
+            let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind parked provider fixture");
+            let mock_addr = mock_listener.local_addr().expect("fixture address");
+            let mock_server = zeroclaw_spawn::spawn!(async move {
+                axum::serve(mock_listener, mock_app)
+                    .await
+                    .expect("parked provider fixture serves");
+            });
+
+            let tmp = tempfile::tempdir().expect("temporary gateway workspace");
+            let workspace = tmp.path().join("workspace");
+            std::fs::create_dir_all(&workspace).expect("gateway workspace");
+            let mut config = zeroclaw_config::schema::Config {
+                data_dir: workspace.clone(),
+                config_path: tmp.path().join("config.toml"),
+                ..Default::default()
+            };
+            config.memory.backend = "none".to_string();
+            config.reliability.provider_retries = 0;
+            config.providers.models.anthropic.insert(
+                "fixture".to_string(),
+                zeroclaw_config::schema::AnthropicModelProviderConfig {
+                    base: zeroclaw_config::schema::ModelProviderConfig {
+                        api_key: Some("test-key".to_string()),
+                        uri: Some(format!("http://{mock_addr}")),
+                        model: Some("claude-test".to_string()),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            );
+            config.risk_profiles.insert(
+                "fixture".to_string(),
+                zeroclaw_config::schema::RiskProfileConfig::default(),
+            );
+            config.runtime_profiles.insert(
+                "fixture".to_string(),
+                zeroclaw_config::schema::RuntimeProfileConfig::default(),
+            );
+            config.agents.insert(
+                "web".to_string(),
+                zeroclaw_config::schema::AliasedAgentConfig {
+                    model_provider: "anthropic.fixture".into(),
+                    risk_profile: "fixture".into(),
+                    runtime_profile: "fixture".into(),
+                    workspace: zeroclaw_config::multi_agent::AgentWorkspaceConfig {
+                        path: Some(workspace.clone()),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            );
+
+            let backend = zeroclaw_infra::make_session_backend(&workspace, "sqlite")
+                .expect("sqlite session backend");
+            let state = AppState {
+                session_backend: Some(backend.clone()),
+                ..crate::api::tests::test_state(config)
+            };
+            let gateway_app = Router::new()
+                .route("/ws/chat", get(handle_ws_chat))
+                .with_state(state.clone());
+            let gateway_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind local WebSocket gateway");
+            let gateway_addr = gateway_listener.local_addr().expect("gateway address");
+            let gateway_server = zeroclaw_spawn::spawn!(async move {
+                axum::serve(gateway_listener, gateway_app)
+                    .await
+                    .expect("local WebSocket gateway serves");
+            });
+
+            Self {
+                state,
+                backend,
+                gateway_addr,
+                request_seen,
+                released,
+                servers: vec![mock_server, gateway_server],
+                _tmp: tmp,
+            }
+        }
+
+        /// Open a chat socket on `session_id` and return it with the
+        /// `session_start` frame the gateway greets it with.
+        async fn connect(&self, session_id: &str) -> (WsClient, serde_json::Value) {
+            let (mut client, _) = connect_async(format!(
+                // This URL connects only to the test's loopback listener.
+                "ws://{}/ws/chat?agent=web&session_id={session_id}", // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
+                self.gateway_addr
+            ))
+            .await
+            .expect("WebSocket upgrade");
+            let session_start = next_text_frame(&mut client).await;
+            assert_eq!(session_start["type"], "session_start");
+            (client, session_start)
+        }
+
+        /// Send a chat message and block until the provider fixture holds the
+        /// turn's streaming request, i.e. the turn is provably in flight.
+        /// Returns that request body.
+        async fn start_parked_turn(
+            &mut self,
+            client: &mut WsClient,
+            content: &str,
+        ) -> serde_json::Value {
+            send_chat(client, content).await;
+            self.next_provider_request().await
+        }
+
+        /// The next streaming request the provider fixture receives.
+        async fn next_provider_request(&mut self) -> serde_json::Value {
+            tokio::time::timeout(Duration::from_secs(10), self.request_seen.recv())
+                .await
+                .expect("provider request deadline")
+                .expect("provider fixture observes the turn's request")
+        }
+
+        /// A live turn holds its abort token for the session for its whole
+        /// duration; that is what `POST /api/sessions/{id}/abort` cancels.
+        fn has_live_turn(&self, session_key: &str) -> bool {
+            self.state
+                .cancel_tokens
+                .lock()
+                .expect("cancel_tokens lock")
+                .contains_key(session_key)
+        }
+
+        fn session_state(&self, session_key: &str) -> Option<String> {
+            self.backend
+                .get_session_state(session_key)
+                .expect("session state")
+                .map(|state| state.state)
+        }
+
+        /// Let the next parked completion finish with `PARKED_TURN_RESPONSE`.
+        fn release_next(&self) {
+            self.released.send_modify(|released| *released += 1);
+        }
+
+        /// Wait until the gateway has finished the turn: the abort token is
+        /// gone and the persisted session state has settled back to `idle`.
+        async fn wait_for_turn_to_settle(&self, session_key: &str) {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while self.has_live_turn(session_key)
+                    || self.session_state(session_key).as_deref() != Some("idle")
+                {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            })
+            .await
+            .expect("turn settles within the deadline");
+        }
+
+        fn shutdown(self) {
+            for server in self.servers {
+                server.abort();
+            }
+        }
+    }
+
+    async fn send_chat(client: &mut WsClient, content: &str) {
+        client
+            .send(ClientMessage::Text(
+                serde_json::json!({"type": "message", "content": content})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .expect("chat message");
+    }
+
+    /// `(role, text)` per message of an Anthropic-shaped request body, with
+    /// block-array content flattened to its concatenated text.
+    fn provider_messages(request: &serde_json::Value) -> Vec<(String, String)> {
+        request["messages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|message| {
+                let role = message["role"].as_str().unwrap_or_default().to_string();
+                let text = match &message["content"] {
+                    serde_json::Value::String(text) => text.clone(),
+                    serde_json::Value::Array(blocks) => blocks
+                        .iter()
+                        .filter_map(|block| block["text"].as_str())
+                        .collect::<Vec<_>>()
+                        .join(""),
+                    _ => String::new(),
+                };
+                (role, text)
+            })
+            .collect()
+    }
+
+    async fn next_text_frame(client: &mut WsClient) -> serde_json::Value {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let frame = client
+                    .next()
+                    .await
+                    .expect("gateway frame")
+                    .expect("gateway transport");
+                if let ClientMessage::Text(text) = frame {
+                    break serde_json::from_str::<serde_json::Value>(&text)
+                        .expect("JSON gateway frame");
+                }
+            }
+        })
+        .await
+        .expect("gateway frame deadline")
+    }
+
+    /// Detach the viewer mid-turn: close handshake, drop the socket, then give
+    /// the gateway a moment to observe it. Under the old contract this is the
+    /// point where the turn was cancelled — its abort token vanished within
+    /// milliseconds and the transcript ended with the interruption marker.
+    async fn disconnect_viewer(client: WsClient) {
+        let mut client = client;
+        client.close(None).await.expect("client close frame");
+        drop(client);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+
+    #[test]
+    fn websocket_client_disconnect_mid_turn_lets_the_turn_finish_and_persist() {
+        run_ws_regression(
+            "ws-detach-survives",
+            websocket_client_disconnect_mid_turn_lets_the_turn_finish_and_persist_inner,
+        );
+    }
+
+    async fn websocket_client_disconnect_mid_turn_lets_the_turn_finish_and_persist_inner() {
+        // Regression: navigating away, closing the tab, or a dropped
+        // connection must not cancel a running agent turn. The turn
+        // finishes unattended, persists its real response, and a later socket
+        // on the same session resumes the completed transcript.
+        let mut fixture = ParkedTurnFixture::spawn().await;
+        let session_id = "detach-regression";
+        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+        let (mut client, session_start) = fixture.connect(session_id).await;
+        assert_eq!(session_start["resumed"], false);
+
+        let prompt = "keep working while I am away";
+        fixture.start_parked_turn(&mut client, prompt).await;
+        assert!(
+            fixture.has_live_turn(&session_key),
+            "an in-flight turn registers its abort token"
+        );
+
+        disconnect_viewer(client).await;
+        assert!(
+            fixture.has_live_turn(&session_key),
+            "a client disconnect must not cancel the running turn"
+        );
+        assert_eq!(
+            fixture.session_state(&session_key).as_deref(),
+            Some("running"),
+            "the detached turn is still reported as running"
+        );
+
+        // Nobody is attached; let the provider finish the turn.
+        fixture.release_next();
+        fixture.wait_for_turn_to_settle(&session_key).await;
+
+        let transcript = fixture.backend.load(&session_key);
+        let turns: Vec<(&str, &str)> = transcript
+            .iter()
+            .map(|message| (message.role.as_str(), message.content.as_str()))
+            .collect();
+        // The runtime prefixes the persisted user turn with its date stamp;
+        // the prompt itself is what must survive.
+        assert!(
+            matches!(turns.as_slice(), [("user", user), ("assistant", PARKED_TURN_RESPONSE)] if user.ends_with(prompt)),
+            "the detached turn persists its real response, not an interruption marker: {turns:?}"
+        );
+        let interrupted =
+            zeroclaw_runtime::i18n::get_required_cli_string("turn-interrupted-by-user");
+        assert!(
+            !transcript
+                .iter()
+                .any(|message| message.content.contains(&interrupted)),
+            "no message carries the interruption marker: {turns:?}"
+        );
+
+        // Reattach: a new socket on the same session resumes the finished turn.
+        let (client, session_start) = fixture.connect(session_id).await;
+        assert_eq!(session_start["resumed"], true);
+        assert_eq!(session_start["message_count"], transcript.len());
+        drop(client);
+        fixture.shutdown();
+    }
+
+    #[test]
+    fn reconnect_during_detached_turn_refreshes_history_before_the_follow_up() {
+        run_ws_regression(
+            "ws-detach-reconnect-history",
+            reconnect_during_detached_turn_refreshes_history_before_the_follow_up_inner,
+        );
+    }
+
+    async fn reconnect_during_detached_turn_refreshes_history_before_the_follow_up_inner() {
+        // A socket that reconnects while the detached turn is still running
+        // seeds its agent from the transcript as persisted at that moment. Its
+        // follow-up waits for that turn on the session permit and must then
+        // run on the transcript the turn persisted, not on the stale snapshot.
+        let mut fixture = ParkedTurnFixture::spawn().await;
+        let session_id = "detach-reconnect";
+        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+        let first_prompt = "start the long task";
+        let follow_up = "now continue from where that left off";
+
+        let (mut first, _) = fixture.connect(session_id).await;
+        let first_request = fixture.start_parked_turn(&mut first, first_prompt).await;
+        let first_messages = provider_messages(&first_request);
+        assert!(
+            matches!(first_messages.last(), Some((role, text)) if role == "user" && text.ends_with(first_prompt)),
+            "the first turn carries its own prompt: {first_messages:?}"
+        );
+        disconnect_viewer(first).await;
+        assert!(fixture.has_live_turn(&session_key));
+
+        // Reconnect before the detached turn finishes: nothing is persisted
+        // yet, so this socket's history snapshot is empty.
+        let (mut second, session_start) = fixture.connect(session_id).await;
+        assert_eq!(session_start["resumed"], false);
+        assert_eq!(session_start["message_count"], 0);
+
+        // The follow-up queues behind the running turn on the session permit;
+        // it must not start a concurrent turn.
+        send_chat(&mut second, follow_up).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            fixture.has_live_turn(&session_key),
+            "the detached turn is still the live turn"
+        );
+        assert!(
+            fixture.request_seen.try_recv().is_err(),
+            "the follow-up waits for the permit instead of reaching the provider"
+        );
+
+        // Let the first turn finish. The queued follow-up then runs, and its
+        // provider request must include what the first turn persisted.
+        fixture.release_next();
+        let second_request = fixture.next_provider_request().await;
+        let messages = provider_messages(&second_request);
+        let tail: Vec<(&str, &str)> = messages
+            .iter()
+            .rev()
+            .take(3)
+            .rev()
+            .map(|(role, text)| (role.as_str(), text.as_str()))
+            .collect();
+        assert!(
+            matches!(
+                tail.as_slice(),
+                [("user", earlier), ("assistant", PARKED_TURN_RESPONSE), ("user", latest)]
+                    if earlier.ends_with(first_prompt) && latest.ends_with(follow_up)
+            ),
+            "the follow-up runs on the transcript the detached turn persisted: {messages:?}"
+        );
+
+        // The follow-up completes on the attached socket with its own response.
+        fixture.release_next();
+        let done = loop {
+            let frame = next_text_frame(&mut second).await;
+            match frame["type"].as_str() {
+                Some("done") => break frame,
+                Some("error") => panic!("follow-up turn failed: {frame}"),
+                _ => {}
+            }
+        };
+        assert_eq!(done["full_response"], PARKED_TURN_RESPONSE);
+        fixture.wait_for_turn_to_settle(&session_key).await;
+
+        let transcript = fixture.backend.load(&session_key);
+        let turns: Vec<(&str, &str)> = transcript
+            .iter()
+            .map(|message| (message.role.as_str(), message.content.as_str()))
+            .collect();
+        assert!(
+            matches!(
+                turns.as_slice(),
+                [
+                    ("user", earlier),
+                    ("assistant", PARKED_TURN_RESPONSE),
+                    ("user", latest),
+                    ("assistant", PARKED_TURN_RESPONSE),
+                ] if earlier.ends_with(first_prompt) && latest.ends_with(follow_up)
+            ),
+            "both turns persist in order without duplication: {turns:?}"
+        );
+        drop(second);
+        fixture.shutdown();
+    }
+
+    #[test]
+    fn stale_socket_rebuilds_after_delete_and_equal_length_recreate() {
+        run_ws_regression(
+            "ws-delete-recreate",
+            stale_socket_rebuilds_after_delete_and_equal_length_recreate_inner,
+        );
+    }
+
+    async fn stale_socket_rebuilds_after_delete_and_equal_length_recreate_inner() {
+        // An idle socket keeps the history it loaded. If its session is
+        // deleted and recreated under the same id with a transcript of the
+        // same length, its next turn must run on the new transcript, not send
+        // the deleted conversation to the provider.
+        let mut fixture = ParkedTurnFixture::spawn().await;
+        let session_id = "delete-recreate";
+        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+
+        let (mut old, _) = fixture.connect(session_id).await;
+        fixture
+            .start_parked_turn(&mut old, "deleted conversation prompt")
+            .await;
+        fixture.release_next();
+        while next_text_frame(&mut old).await["type"] != "done" {}
+        fixture.wait_for_turn_to_settle(&session_key).await;
+        let old_len = fixture.backend.load(&session_key).len();
+
+        let response = crate::api::handle_api_session_delete(
+            axum::extract::State(fixture.state.clone()),
+            HeaderMap::new(),
+            axum::extract::Path(session_id.to_string()),
+        )
+        .await
+        .into_response();
+        assert!(
+            response.status().is_success(),
+            "delete: {}",
+            response.status()
+        );
+
+        let (mut new, _) = fixture.connect(session_id).await;
+        fixture
+            .start_parked_turn(&mut new, "recreated conversation prompt")
+            .await;
+        fixture.release_next();
+        while next_text_frame(&mut new).await["type"] != "done" {}
+        fixture.wait_for_turn_to_settle(&session_key).await;
+        assert_eq!(
+            fixture.backend.load(&session_key).len(),
+            old_len,
+            "the recreated transcript has the same length the old socket saw"
+        );
+
+        send_chat(&mut old, "follow-up on the old socket").await;
+        let request = fixture.next_provider_request().await;
+        let texts: Vec<String> = provider_messages(&request)
+            .into_iter()
+            .map(|(_, text)| text)
+            .collect();
+        assert!(
+            !texts
+                .iter()
+                .any(|text| text.contains("deleted conversation prompt")),
+            "the old socket must not send the deleted conversation: {texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|text| text.contains("recreated conversation prompt")),
+            "the old socket runs on the recreated transcript: {texts:?}"
+        );
+        fixture.release_next();
+        drop(old);
+        drop(new);
+        fixture.shutdown();
+    }
+
+    #[test]
+    fn delete_waits_for_a_running_turn_before_removing_its_transcript() {
+        run_ws_regression(
+            "ws-delete-serialized",
+            delete_waits_for_a_running_turn_before_removing_its_transcript_inner,
+        );
+    }
+
+    async fn delete_waits_for_a_running_turn_before_removing_its_transcript_inner() {
+        // Deletion takes the session permit after cancelling the running
+        // turn, so the turn unwinds before its transcript is removed and
+        // nothing it persists can outlive the delete.
+        let mut fixture = ParkedTurnFixture::spawn().await;
+        let session_id = "delete-serialized";
+        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+        let (mut client, _) = fixture.connect(session_id).await;
+        fixture
+            .start_parked_turn(&mut client, "work in progress")
+            .await;
+        let before = fixture.state.session_queue.generation(&session_key);
+
+        let response = crate::api::handle_api_session_delete(
+            axum::extract::State(fixture.state.clone()),
+            HeaderMap::new(),
+            axum::extract::Path(session_id.to_string()),
+        )
+        .await
+        .into_response();
+
+        assert!(
+            response.status().is_success(),
+            "delete: {}",
+            response.status()
+        );
+        assert!(
+            !fixture.has_live_turn(&session_key),
+            "delete returned only after the cancelled turn released the session"
+        );
+        assert!(
+            fixture.backend.load(&session_key).is_empty(),
+            "nothing the turn persisted outlived the delete"
+        );
+        assert!(fixture.state.session_queue.generation(&session_key) > before);
+        fixture.release_next();
+        drop(client);
+        fixture.shutdown();
+    }
+
+    #[test]
+    fn session_abort_still_cancels_a_detached_turn() {
+        run_ws_regression(
+            "ws-detach-abort",
+            session_abort_still_cancels_a_detached_turn_inner,
+        );
+    }
+
+    async fn session_abort_still_cancels_a_detached_turn_inner() {
+        // The explicit abort endpoint remains the one thing that cancels a
+        // turn, and it keeps working after the viewer has gone: the detached
+        // turn neither hot-loops nor outlives an abort.
+        let mut fixture = ParkedTurnFixture::spawn().await;
+        let session_id = "detach-then-abort";
+        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+        let (mut client, _) = fixture.connect(session_id).await;
+        fixture
+            .start_parked_turn(&mut client, "keep working until I say stop")
+            .await;
+
+        disconnect_viewer(client).await;
+        assert!(fixture.has_live_turn(&session_key));
+
+        let response = crate::api::handle_api_session_abort(
+            axum::extract::State(fixture.state.clone()),
+            HeaderMap::new(),
+            axum::extract::Path(session_id.to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        fixture.wait_for_turn_to_settle(&session_key).await;
+
+        let transcript = fixture.backend.load(&session_key);
+        let interrupted =
+            zeroclaw_runtime::i18n::get_required_cli_string("turn-interrupted-by-user");
+        assert!(
+            transcript.iter().any(
+                |message| message.role == "assistant" && message.content.contains(&interrupted)
+            ),
+            "an explicit abort persists the interruption marker: {transcript:?}"
+        );
+        assert!(
+            !transcript
+                .iter()
+                .any(|message| message.content.contains(PARKED_TURN_RESPONSE)),
+            "the aborted turn never received the provider's response"
+        );
+        fixture.release_next();
+        fixture.shutdown();
     }
 
     #[tokio::test]
@@ -3151,19 +3822,29 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[test]
     fn restore_trim_uses_live_history_trimmed_frame_shape() {
-        let frame =
-            history_trimmed_ws_frame(12, 3, "message limit", Some(4_200), Some(9_000), Some(2));
+        let frame = history_trimmed_frame_for(zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
+            dropped_messages: 12,
+            dropped_turns: 4,
+            kept_turns: 3,
+            reason: "message limit".into(),
+            token_budget: None,
+            tokens_before: None,
+            tokens_after: None,
+            tokens_before_source: None,
+            tokens_after_source: None,
+            unsatisfiable_floor: None,
+            retained_context: None,
+        })
+        .expect("history trim event should produce a frame");
 
         assert_eq!(
             frame,
             serde_json::json!({
                 "type": "history_trimmed",
                 "dropped_messages": 12,
+                "dropped_turns": 4,
                 "kept_turns": 3,
                 "reason": "message limit",
-                "tokens_after": 4_200,
-                "tokens_before": 9_000,
-                "dropped_turns": 2,
             })
         );
     }
@@ -3268,6 +3949,30 @@ data: {\"type\":\"message_stop\"}\n\n";
     fn no_safeguard_notice_yields_no_frame() {
         // No notice drained this turn → no `safeguard_fallback` frame is sent.
         assert!(safeguard_fallback_ws_frame(None).is_none());
+    }
+
+    #[test]
+    fn history_trimmed_frame_carries_token_accounting_when_present() {
+        let frame = history_trimmed_ws_frame(
+            12,
+            4,
+            3,
+            "context token budget exceeded",
+            Some(500_000),
+            Some(612_000),
+            Some(117_000),
+            Some("provider"),
+            Some("calibrated"),
+            None,
+        );
+
+        assert_eq!(frame["type"], "history_trimmed");
+        assert_eq!(frame["dropped_turns"], 4);
+        assert_eq!(frame["token_budget"], 500_000);
+        assert_eq!(frame["tokens_before"], 612_000);
+        assert_eq!(frame["tokens_after"], 117_000);
+        assert_eq!(frame["tokens_before_source"], "provider");
+        assert_eq!(frame["tokens_after_source"], "calibrated");
     }
 
     #[test]
@@ -3814,764 +4519,6 @@ data: {\"type\":\"message_stop\"}\n\n";
         );
     }
 
-    #[tokio::test]
-    async fn cancel_plus_grace_force_tears_down_hung_join() {
-        let cancel = tokio_util::sync::CancellationToken::new();
-        let cancel_for_select = cancel.clone();
-        let grace = std::time::Duration::from_millis(40);
-        let started = std::time::Instant::now();
-
-        let join_handle = zeroclaw_spawn::spawn!(async move {
-            let turn = futures_util::future::pending::<()>();
-            let forward = futures_util::future::pending::<()>();
-            tokio::select! {
-                biased;
-                _ = async { tokio::join!(turn, forward) } => unreachable!("hung join must not complete"),
-                _ = async {
-                    cancel_for_select.cancelled().await;
-                    tokio::time::sleep(grace).await;
-                } => {}
-            }
-        });
-
-        cancel.cancel();
-        tokio::time::timeout(std::time::Duration::from_millis(500), join_handle)
-            .await
-            .expect("force teardown must finish within grace")
-            .expect("join task must not panic");
-        assert!(
-            started.elapsed() >= grace,
-            "force path must wait for turn_cancel_after grace"
-        );
-    }
-
-    /// A sink whose every send fails immediately, standing in for a socket the
-    /// viewer has already closed.
-    struct ClosedSink;
-
-    impl futures_util::Sink<Message> for ClosedSink {
-        type Error = axum::Error;
-
-        fn poll_ready(
-            self: std::pin::Pin<&mut Self>,
-            _cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<Result<(), Self::Error>> {
-            std::task::Poll::Ready(Err(axum::Error::new("closed")))
-        }
-
-        fn start_send(self: std::pin::Pin<&mut Self>, _item: Message) -> Result<(), Self::Error> {
-            Err(axum::Error::new("closed"))
-        }
-
-        fn poll_flush(
-            self: std::pin::Pin<&mut Self>,
-            _cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<Result<(), Self::Error>> {
-            std::task::Poll::Ready(Ok(()))
-        }
-
-        fn poll_close(
-            self: std::pin::Pin<&mut Self>,
-            _cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<Result<(), Self::Error>> {
-            std::task::Poll::Ready(Ok(()))
-        }
-    }
-
-    #[tokio::test]
-    async fn ws_egress_failure_reports_the_viewer_gone_without_cancelling_the_turn() {
-        let mut sink = ClosedSink;
-        let cancel = tokio_util::sync::CancellationToken::new();
-        assert!(
-            !send_ws_text_bounded(&mut sink, "{}".to_string()).await,
-            "a frame the viewer cannot receive is reported as a failed send"
-        );
-        assert!(
-            !cancel.is_cancelled(),
-            "a failed send must not cancel the turn: the socket is a viewer of the \
-             turn, not its owner"
-        );
-        assert_eq!(
-            WS_EGRESS_SEND_TIMEOUT,
-            std::time::Duration::from_secs(5),
-            "production WS egress bound stays at 5s"
-        );
-    }
-
-    /// Production-shaped WebSocket fixtures exceed the Linux test harness's
-    /// default thread stack; run them on a dedicated 8 MiB thread with a
-    /// current-thread runtime instead of weakening CI-wide stack limits.
-    fn run_ws_regression<Fut>(name: &'static str, test: impl FnOnce() -> Fut + Send + 'static)
-    where
-        Fut: std::future::Future<Output = ()>,
-    {
-        std::thread::Builder::new()
-            .name(name.to_string())
-            .stack_size(8 * 1024 * 1024)
-            .spawn(move || {
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("test runtime")
-                    .block_on(test());
-            })
-            .expect("spawn WebSocket regression thread")
-            .join()
-            .expect("WebSocket regression thread must not panic");
-    }
-
-    /// Text the parked provider fixture finishes with once released.
-    const PARKED_TURN_RESPONSE: &str = "finished while nobody was watching";
-
-    /// Anthropic-shaped SSE prefix. The fixture sends this immediately so the
-    /// gateway turn is provably in flight, then parks until released.
-    const PARKED_STREAM_HEAD: &str = "event: message_start\n\
-data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_test\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-test\",\"usage\":{\"input_tokens\":1}}}\n\n\
-event: content_block_start\n\
-data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n";
-
-    fn parked_stream_tail() -> String {
-        format!(
-            "event: content_block_delta\n\
-data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{PARKED_TURN_RESPONSE}\"}}}}\n\n\
-event: content_block_stop\n\
-data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n\
-event: message_delta\n\
-data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"output_tokens\":1}}}}\n\n\
-event: message_stop\n\
-data: {{\"type\":\"message_stop\"}}\n\n"
-        )
-    }
-
-    type WsClient = tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >;
-
-    /// A real gateway whose `web` agent talks to a local Anthropic-shaped
-    /// fixture that parks every streaming completion until the test releases
-    /// it, so a turn can be held in flight while the client goes away.
-    struct ParkedTurnFixture {
-        state: AppState,
-        backend: Arc<dyn zeroclaw_infra::session_backend::SessionBackend>,
-        gateway_addr: std::net::SocketAddr,
-        /// The body of every streaming request the provider fixture receives,
-        /// in arrival order.
-        request_seen: tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>,
-        /// How many parked completions may finish; the n-th request finishes
-        /// once this reaches n.
-        released: tokio::sync::watch::Sender<usize>,
-        servers: Vec<tokio::task::JoinHandle<()>>,
-        _tmp: tempfile::TempDir,
-    }
-
-    impl ParkedTurnFixture {
-        async fn spawn() -> Self {
-            let (request_seen_tx, request_seen) =
-                tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
-            let (released, released_rx) = tokio::sync::watch::channel(0usize);
-            let arrivals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let mock_app = Router::new().route(
-                "/v1/messages",
-                post(move |Json(request): Json<serde_json::Value>| {
-                    let request_seen_tx = request_seen_tx.clone();
-                    let mut released_rx = released_rx.clone();
-                    let index = arrivals.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-                    async move {
-                        assert_eq!(
-                            request["stream"].as_bool(),
-                            Some(true),
-                            "gateway chat turns stream from the provider"
-                        );
-                        let head = futures_util::stream::once(async move {
-                            let _ = request_seen_tx.send(request);
-                            Ok::<_, std::io::Error>(axum::body::Bytes::from_static(
-                                PARKED_STREAM_HEAD.as_bytes(),
-                            ))
-                        });
-                        let tail = futures_util::stream::once(async move {
-                            let _ = released_rx.wait_for(|released| *released >= index).await;
-                            Ok::<_, std::io::Error>(axum::body::Bytes::from(parked_stream_tail()))
-                        });
-                        (
-                            [(header::CONTENT_TYPE, "text/event-stream")],
-                            axum::body::Body::from_stream(head.chain(tail)),
-                        )
-                    }
-                }),
-            );
-            let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-                .await
-                .expect("bind parked provider fixture");
-            let mock_addr = mock_listener.local_addr().expect("fixture address");
-            let mock_server = zeroclaw_spawn::spawn!(async move {
-                axum::serve(mock_listener, mock_app)
-                    .await
-                    .expect("parked provider fixture serves");
-            });
-
-            let tmp = tempfile::tempdir().expect("temporary gateway workspace");
-            let workspace = tmp.path().join("workspace");
-            std::fs::create_dir_all(&workspace).expect("gateway workspace");
-            let mut config = zeroclaw_config::schema::Config {
-                data_dir: workspace.clone(),
-                config_path: tmp.path().join("config.toml"),
-                ..Default::default()
-            };
-            config.memory.backend = "none".to_string();
-            config.reliability.provider_retries = 0;
-            config.providers.models.anthropic.insert(
-                "fixture".to_string(),
-                zeroclaw_config::schema::AnthropicModelProviderConfig {
-                    base: zeroclaw_config::schema::ModelProviderConfig {
-                        api_key: Some("test-key".to_string()),
-                        uri: Some(format!("http://{mock_addr}")),
-                        model: Some("claude-test".to_string()),
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                },
-            );
-            config.risk_profiles.insert(
-                "fixture".to_string(),
-                zeroclaw_config::schema::RiskProfileConfig::default(),
-            );
-            config.runtime_profiles.insert(
-                "fixture".to_string(),
-                zeroclaw_config::schema::RuntimeProfileConfig::default(),
-            );
-            config.agents.insert(
-                "web".to_string(),
-                zeroclaw_config::schema::AliasedAgentConfig {
-                    model_provider: "anthropic.fixture".into(),
-                    risk_profile: "fixture".into(),
-                    runtime_profile: "fixture".into(),
-                    workspace: zeroclaw_config::multi_agent::AgentWorkspaceConfig {
-                        path: Some(workspace.clone()),
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                },
-            );
-
-            let backend = zeroclaw_infra::make_session_backend(&workspace, "sqlite")
-                .expect("sqlite session backend");
-            let state = AppState {
-                session_backend: Some(backend.clone()),
-                ..crate::api::tests::test_state(config)
-            };
-            let gateway_app = Router::new()
-                .route("/ws/chat", get(handle_ws_chat))
-                .with_state(state.clone());
-            let gateway_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-                .await
-                .expect("bind local WebSocket gateway");
-            let gateway_addr = gateway_listener.local_addr().expect("gateway address");
-            let gateway_server = zeroclaw_spawn::spawn!(async move {
-                axum::serve(gateway_listener, gateway_app)
-                    .await
-                    .expect("local WebSocket gateway serves");
-            });
-
-            Self {
-                state,
-                backend,
-                gateway_addr,
-                request_seen,
-                released,
-                servers: vec![mock_server, gateway_server],
-                _tmp: tmp,
-            }
-        }
-
-        /// Open a chat socket on `session_id` and return it with the
-        /// `session_start` frame the gateway greets it with.
-        async fn connect(&self, session_id: &str) -> (WsClient, serde_json::Value) {
-            let (mut client, _) = connect_async(format!(
-                // This URL connects only to the test's loopback listener.
-                "ws://{}/ws/chat?agent=web&session_id={session_id}", // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
-                self.gateway_addr
-            ))
-            .await
-            .expect("WebSocket upgrade");
-            let session_start = next_text_frame(&mut client).await;
-            assert_eq!(session_start["type"], "session_start");
-            (client, session_start)
-        }
-
-        /// Send a chat message and block until the provider fixture holds the
-        /// turn's streaming request, i.e. the turn is provably in flight.
-        /// Returns that request body.
-        async fn start_parked_turn(
-            &mut self,
-            client: &mut WsClient,
-            content: &str,
-        ) -> serde_json::Value {
-            send_chat(client, content).await;
-            self.next_provider_request().await
-        }
-
-        /// The next streaming request the provider fixture receives.
-        async fn next_provider_request(&mut self) -> serde_json::Value {
-            tokio::time::timeout(Duration::from_secs(10), self.request_seen.recv())
-                .await
-                .expect("provider request deadline")
-                .expect("provider fixture observes the turn's request")
-        }
-
-        /// A live turn holds its abort token for the session for its whole
-        /// duration; that is what `POST /api/sessions/{id}/abort` cancels.
-        fn has_live_turn(&self, session_key: &str) -> bool {
-            self.state
-                .cancel_tokens
-                .lock()
-                .expect("cancel_tokens lock")
-                .contains_key(session_key)
-        }
-
-        fn session_state(&self, session_key: &str) -> Option<String> {
-            self.backend
-                .get_session_state(session_key)
-                .expect("session state")
-                .map(|state| state.state)
-        }
-
-        /// Let the next parked completion finish with `PARKED_TURN_RESPONSE`.
-        fn release_next(&self) {
-            self.released.send_modify(|released| *released += 1);
-        }
-
-        /// Wait until the gateway has finished the turn: the abort token is
-        /// gone and the persisted session state has settled back to `idle`.
-        async fn wait_for_turn_to_settle(&self, session_key: &str) {
-            tokio::time::timeout(Duration::from_secs(10), async {
-                while self.has_live_turn(session_key)
-                    || self.session_state(session_key).as_deref() != Some("idle")
-                {
-                    tokio::time::sleep(Duration::from_millis(25)).await;
-                }
-            })
-            .await
-            .expect("turn settles within the deadline");
-        }
-
-        fn shutdown(self) {
-            for server in self.servers {
-                server.abort();
-            }
-        }
-    }
-
-    async fn send_chat(client: &mut WsClient, content: &str) {
-        client
-            .send(ClientMessage::Text(
-                serde_json::json!({"type": "message", "content": content})
-                    .to_string()
-                    .into(),
-            ))
-            .await
-            .expect("chat message");
-    }
-
-    /// `(role, text)` per message of an Anthropic-shaped request body, with
-    /// block-array content flattened to its concatenated text.
-    fn provider_messages(request: &serde_json::Value) -> Vec<(String, String)> {
-        request["messages"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .map(|message| {
-                let role = message["role"].as_str().unwrap_or_default().to_string();
-                let text = match &message["content"] {
-                    serde_json::Value::String(text) => text.clone(),
-                    serde_json::Value::Array(blocks) => blocks
-                        .iter()
-                        .filter_map(|block| block["text"].as_str())
-                        .collect::<Vec<_>>()
-                        .join(""),
-                    _ => String::new(),
-                };
-                (role, text)
-            })
-            .collect()
-    }
-
-    async fn next_text_frame(client: &mut WsClient) -> serde_json::Value {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let frame = client
-                    .next()
-                    .await
-                    .expect("gateway frame")
-                    .expect("gateway transport");
-                if let ClientMessage::Text(text) = frame {
-                    break serde_json::from_str::<serde_json::Value>(&text)
-                        .expect("JSON gateway frame");
-                }
-            }
-        })
-        .await
-        .expect("gateway frame deadline")
-    }
-
-    /// Detach the viewer mid-turn: close handshake, drop the socket, then give
-    /// the gateway a moment to observe it. Under the old contract this is the
-    /// point where the turn was cancelled — its abort token vanished within
-    /// milliseconds and the transcript ended with the interruption marker.
-    async fn disconnect_viewer(client: WsClient) {
-        let mut client = client;
-        client.close(None).await.expect("client close frame");
-        drop(client);
-        tokio::time::sleep(Duration::from_millis(300)).await;
-    }
-
-    #[test]
-    fn websocket_client_disconnect_mid_turn_lets_the_turn_finish_and_persist() {
-        run_ws_regression(
-            "ws-detach-survives",
-            websocket_client_disconnect_mid_turn_lets_the_turn_finish_and_persist_inner,
-        );
-    }
-
-    async fn websocket_client_disconnect_mid_turn_lets_the_turn_finish_and_persist_inner() {
-        // Regression: navigating away, closing the tab, or a dropped
-        // connection must not cancel a running agent turn. The turn
-        // finishes unattended, persists its real response, and a later socket
-        // on the same session resumes the completed transcript.
-        let mut fixture = ParkedTurnFixture::spawn().await;
-        let session_id = "detach-regression";
-        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
-        let (mut client, session_start) = fixture.connect(session_id).await;
-        assert_eq!(session_start["resumed"], false);
-
-        let prompt = "keep working while I am away";
-        fixture.start_parked_turn(&mut client, prompt).await;
-        assert!(
-            fixture.has_live_turn(&session_key),
-            "an in-flight turn registers its abort token"
-        );
-
-        disconnect_viewer(client).await;
-        assert!(
-            fixture.has_live_turn(&session_key),
-            "a client disconnect must not cancel the running turn"
-        );
-        assert_eq!(
-            fixture.session_state(&session_key).as_deref(),
-            Some("running"),
-            "the detached turn is still reported as running"
-        );
-
-        // Nobody is attached; let the provider finish the turn.
-        fixture.release_next();
-        fixture.wait_for_turn_to_settle(&session_key).await;
-
-        let transcript = fixture.backend.load(&session_key);
-        let turns: Vec<(&str, &str)> = transcript
-            .iter()
-            .map(|message| (message.role.as_str(), message.content.as_str()))
-            .collect();
-        // The prompt itself is what must survive; any prefix the runtime puts
-        // on the persisted user turn is not this test's contract.
-        assert!(
-            matches!(turns.as_slice(), [("user", user), ("assistant", PARKED_TURN_RESPONSE)] if user.ends_with(prompt)),
-            "the detached turn persists its real response, not an interruption marker: {turns:?}"
-        );
-        let interrupted =
-            zeroclaw_runtime::i18n::get_required_cli_string("turn-interrupted-by-user");
-        assert!(
-            !transcript
-                .iter()
-                .any(|message| message.content.contains(&interrupted)),
-            "no message carries the interruption marker: {turns:?}"
-        );
-
-        // Reattach: a new socket on the same session resumes the finished turn.
-        let (client, session_start) = fixture.connect(session_id).await;
-        assert_eq!(session_start["resumed"], true);
-        assert_eq!(session_start["message_count"], transcript.len());
-        drop(client);
-        fixture.shutdown();
-    }
-
-    #[test]
-    fn reconnect_during_detached_turn_refreshes_history_before_the_follow_up() {
-        run_ws_regression(
-            "ws-detach-reconnect-history",
-            reconnect_during_detached_turn_refreshes_history_before_the_follow_up_inner,
-        );
-    }
-
-    async fn reconnect_during_detached_turn_refreshes_history_before_the_follow_up_inner() {
-        // A socket that reconnects while the detached turn is still running
-        // seeds its agent from the transcript as persisted at that moment. Its
-        // follow-up waits for that turn on the session permit and must then
-        // run on the transcript the turn persisted, not on the stale snapshot.
-        let mut fixture = ParkedTurnFixture::spawn().await;
-        let session_id = "detach-reconnect";
-        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
-        let first_prompt = "start the long task";
-        let follow_up = "now continue from where that left off";
-
-        let (mut first, _) = fixture.connect(session_id).await;
-        let first_request = fixture.start_parked_turn(&mut first, first_prompt).await;
-        let first_messages = provider_messages(&first_request);
-        assert!(
-            matches!(first_messages.last(), Some((role, text)) if role == "user" && text.ends_with(first_prompt)),
-            "the first turn carries its own prompt: {first_messages:?}"
-        );
-        disconnect_viewer(first).await;
-        assert!(fixture.has_live_turn(&session_key));
-
-        // Reconnect before the detached turn finishes: nothing is persisted
-        // yet, so this socket's history snapshot is empty.
-        let (mut second, session_start) = fixture.connect(session_id).await;
-        assert_eq!(session_start["resumed"], false);
-        assert_eq!(session_start["message_count"], 0);
-
-        // The follow-up queues behind the running turn on the session permit;
-        // it must not start a concurrent turn.
-        send_chat(&mut second, follow_up).await;
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(
-            fixture.has_live_turn(&session_key),
-            "the detached turn is still the live turn"
-        );
-        assert!(
-            fixture.request_seen.try_recv().is_err(),
-            "the follow-up waits for the permit instead of reaching the provider"
-        );
-
-        // Let the first turn finish. The queued follow-up then runs, and its
-        // provider request must include what the first turn persisted.
-        fixture.release_next();
-        let second_request = fixture.next_provider_request().await;
-        let messages = provider_messages(&second_request);
-        let tail: Vec<(&str, &str)> = messages
-            .iter()
-            .rev()
-            .take(3)
-            .rev()
-            .map(|(role, text)| (role.as_str(), text.as_str()))
-            .collect();
-        assert!(
-            matches!(
-                tail.as_slice(),
-                [("user", earlier), ("assistant", PARKED_TURN_RESPONSE), ("user", latest)]
-                    if earlier.ends_with(first_prompt) && latest.ends_with(follow_up)
-            ),
-            "the follow-up runs on the transcript the detached turn persisted: {messages:?}"
-        );
-
-        // The follow-up completes on the attached socket with its own response.
-        fixture.release_next();
-        let done = loop {
-            let frame = next_text_frame(&mut second).await;
-            match frame["type"].as_str() {
-                Some("done") => break frame,
-                Some("error") => panic!("follow-up turn failed: {frame}"),
-                _ => {}
-            }
-        };
-        assert_eq!(done["full_response"], PARKED_TURN_RESPONSE);
-        fixture.wait_for_turn_to_settle(&session_key).await;
-
-        let transcript = fixture.backend.load(&session_key);
-        let turns: Vec<(&str, &str)> = transcript
-            .iter()
-            .map(|message| (message.role.as_str(), message.content.as_str()))
-            .collect();
-        assert!(
-            matches!(
-                turns.as_slice(),
-                [
-                    ("user", earlier),
-                    ("assistant", PARKED_TURN_RESPONSE),
-                    ("user", latest),
-                    ("assistant", PARKED_TURN_RESPONSE),
-                ] if earlier.ends_with(first_prompt) && latest.ends_with(follow_up)
-            ),
-            "both turns persist in order without duplication: {turns:?}"
-        );
-        drop(second);
-        fixture.shutdown();
-    }
-
-    #[test]
-    fn stale_socket_rebuilds_after_delete_and_equal_length_recreate() {
-        run_ws_regression(
-            "ws-delete-recreate",
-            stale_socket_rebuilds_after_delete_and_equal_length_recreate_inner,
-        );
-    }
-
-    async fn stale_socket_rebuilds_after_delete_and_equal_length_recreate_inner() {
-        // An idle socket keeps the history it loaded. If its session is
-        // deleted and recreated under the same id with a transcript of the
-        // same length, its next turn must run on the new transcript, not send
-        // the deleted conversation to the provider.
-        let mut fixture = ParkedTurnFixture::spawn().await;
-        let session_id = "delete-recreate";
-        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
-
-        let (mut old, _) = fixture.connect(session_id).await;
-        fixture
-            .start_parked_turn(&mut old, "deleted conversation prompt")
-            .await;
-        fixture.release_next();
-        while next_text_frame(&mut old).await["type"] != "done" {}
-        fixture.wait_for_turn_to_settle(&session_key).await;
-        let old_len = fixture.backend.load(&session_key).len();
-
-        let response = crate::api::handle_api_session_delete(
-            axum::extract::State(fixture.state.clone()),
-            HeaderMap::new(),
-            axum::extract::Path(session_id.to_string()),
-        )
-        .await
-        .into_response();
-        assert!(
-            response.status().is_success(),
-            "delete: {}",
-            response.status()
-        );
-
-        let (mut new, _) = fixture.connect(session_id).await;
-        fixture
-            .start_parked_turn(&mut new, "recreated conversation prompt")
-            .await;
-        fixture.release_next();
-        while next_text_frame(&mut new).await["type"] != "done" {}
-        fixture.wait_for_turn_to_settle(&session_key).await;
-        assert_eq!(
-            fixture.backend.load(&session_key).len(),
-            old_len,
-            "the recreated transcript has the same length the old socket saw"
-        );
-
-        send_chat(&mut old, "follow-up on the old socket").await;
-        let request = fixture.next_provider_request().await;
-        let texts: Vec<String> = provider_messages(&request)
-            .into_iter()
-            .map(|(_, text)| text)
-            .collect();
-        assert!(
-            !texts
-                .iter()
-                .any(|text| text.contains("deleted conversation prompt")),
-            "the old socket must not send the deleted conversation: {texts:?}"
-        );
-        assert!(
-            texts
-                .iter()
-                .any(|text| text.contains("recreated conversation prompt")),
-            "the old socket runs on the recreated transcript: {texts:?}"
-        );
-        fixture.release_next();
-        drop(old);
-        drop(new);
-        fixture.shutdown();
-    }
-
-    #[test]
-    fn delete_waits_for_a_running_turn_before_removing_its_transcript() {
-        run_ws_regression(
-            "ws-delete-serialized",
-            delete_waits_for_a_running_turn_before_removing_its_transcript_inner,
-        );
-    }
-
-    async fn delete_waits_for_a_running_turn_before_removing_its_transcript_inner() {
-        // Deletion takes the session permit after cancelling the running
-        // turn, so the turn unwinds before its transcript is removed and
-        // nothing it persists can outlive the delete.
-        let mut fixture = ParkedTurnFixture::spawn().await;
-        let session_id = "delete-serialized";
-        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
-        let (mut client, _) = fixture.connect(session_id).await;
-        fixture
-            .start_parked_turn(&mut client, "work in progress")
-            .await;
-        let before = fixture.state.session_queue.generation(&session_key);
-
-        let response = crate::api::handle_api_session_delete(
-            axum::extract::State(fixture.state.clone()),
-            HeaderMap::new(),
-            axum::extract::Path(session_id.to_string()),
-        )
-        .await
-        .into_response();
-
-        assert!(
-            response.status().is_success(),
-            "delete: {}",
-            response.status()
-        );
-        assert!(
-            !fixture.has_live_turn(&session_key),
-            "delete returned only after the cancelled turn released the session"
-        );
-        assert!(
-            fixture.backend.load(&session_key).is_empty(),
-            "nothing the turn persisted outlived the delete"
-        );
-        assert!(fixture.state.session_queue.generation(&session_key) > before);
-        fixture.release_next();
-        drop(client);
-        fixture.shutdown();
-    }
-
-    #[test]
-    fn session_abort_still_cancels_a_detached_turn() {
-        run_ws_regression(
-            "ws-detach-abort",
-            session_abort_still_cancels_a_detached_turn_inner,
-        );
-    }
-
-    async fn session_abort_still_cancels_a_detached_turn_inner() {
-        // The explicit abort endpoint remains the one thing that cancels a
-        // turn, and it keeps working after the viewer has gone: the detached
-        // turn neither hot-loops nor outlives an abort.
-        let mut fixture = ParkedTurnFixture::spawn().await;
-        let session_id = "detach-then-abort";
-        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
-        let (mut client, _) = fixture.connect(session_id).await;
-        fixture
-            .start_parked_turn(&mut client, "keep working until I say stop")
-            .await;
-
-        disconnect_viewer(client).await;
-        assert!(fixture.has_live_turn(&session_key));
-
-        let response = crate::api::handle_api_session_abort(
-            axum::extract::State(fixture.state.clone()),
-            HeaderMap::new(),
-            axum::extract::Path(session_id.to_string()),
-        )
-        .await
-        .into_response();
-        assert_eq!(response.status(), axum::http::StatusCode::OK);
-        fixture.wait_for_turn_to_settle(&session_key).await;
-
-        let transcript = fixture.backend.load(&session_key);
-        let interrupted =
-            zeroclaw_runtime::i18n::get_required_cli_string("turn-interrupted-by-user");
-        assert!(
-            transcript.iter().any(
-                |message| message.role == "assistant" && message.content.contains(&interrupted)
-            ),
-            "an explicit abort persists the interruption marker: {transcript:?}"
-        );
-        assert!(
-            !transcript
-                .iter()
-                .any(|message| message.content.contains(PARKED_TURN_RESPONSE)),
-            "the aborted turn never received the provider's response"
-        );
-        fixture.release_next();
-        fixture.shutdown();
-    }
-
     #[test]
     fn session_queue_errors_map_to_explicit_websocket_codes() {
         use crate::session_queue::SessionQueueError;
@@ -4593,6 +4540,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
 
     struct DeletedSessionBackend {
         append_calls: std::sync::Mutex<Vec<String>>,
+        rewrite_calls: std::sync::Mutex<Vec<String>>,
     }
 
     impl zeroclaw_infra::session_backend::SessionBackend for DeletedSessionBackend {
@@ -4610,6 +4558,17 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             ));
             Ok(())
         }
+        fn rewrite_messages(
+            &self,
+            session_key: &str,
+            messages: &[zeroclaw_providers::ChatMessage],
+        ) -> std::io::Result<()> {
+            self.rewrite_calls
+                .lock()
+                .unwrap()
+                .push(format!("{}:{}", session_key, messages.len()));
+            Ok(())
+        }
         fn remove_last(&self, _session_key: &str) -> std::io::Result<bool> {
             Ok(false)
         }
@@ -4623,22 +4582,137 @@ data: {{\"type\":\"message_stop\"}}\n\n"
     }
 
     #[test]
-    fn persist_conversation_messages_skips_deleted_session() {
-        use zeroclaw_providers::{ChatMessage, ConversationMessage};
+    fn replace_conversation_state_skips_deleted_session() {
         let backend = DeletedSessionBackend {
             append_calls: std::sync::Mutex::new(Vec::new()),
+            rewrite_calls: std::sync::Mutex::new(Vec::new()),
         };
-        let messages = vec![
-            ConversationMessage::Chat(ChatMessage::user("hi")),
-            ConversationMessage::Chat(ChatMessage::assistant("[interrupted by user]")),
+        let durable = vec![
+            zeroclaw_providers::ChatMessage::user("hi"),
+            zeroclaw_providers::ChatMessage::assistant("[interrupted by user]"),
         ];
 
-        persist_conversation_messages(&backend, "gw_deleted", &messages);
+        replace_conversation_state_unless_deleted(&backend, "gw_deleted", &durable, false);
 
         assert!(
-            backend.append_calls.lock().unwrap().is_empty(),
-            "persist_conversation_messages must not resurrect a session whose \
-             session_exists() returned false (see #7126)"
+            backend.rewrite_calls.lock().unwrap().is_empty(),
+            "replacing durable state must not resurrect a session whose \
+             session_exists() returned false"
+        );
+    }
+
+    /// A backend that implements only the required `SessionBackend`
+    /// primitives (`load`/`append`/`remove_last`/`list_sessions`) and does
+    /// NOT override `rewrite_messages`, exercising the trait's default
+    /// replacement implementation built from those primitives.
+    struct AppendOnlyBackend {
+        messages: std::sync::Mutex<Vec<zeroclaw_providers::ChatMessage>>,
+    }
+
+    impl zeroclaw_infra::session_backend::SessionBackend for AppendOnlyBackend {
+        fn load(&self, _session_key: &str) -> Vec<zeroclaw_providers::ChatMessage> {
+            self.messages.lock().unwrap().clone()
+        }
+        fn append(
+            &self,
+            _session_key: &str,
+            message: &zeroclaw_providers::ChatMessage,
+        ) -> std::io::Result<()> {
+            self.messages.lock().unwrap().push(message.clone());
+            Ok(())
+        }
+        fn remove_last(&self, _session_key: &str) -> std::io::Result<bool> {
+            Ok(self.messages.lock().unwrap().pop().is_some())
+        }
+        fn list_sessions(&self) -> Vec<String> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn append_only_backend_durably_replaces_state_through_the_websocket_persistence_boundary() {
+        // A production `SessionBackend` that only implements the required
+        // append/remove_last primitives must still durably persist the
+        // agent's authoritative post-turn history through the WebSocket
+        // completion path — the default `rewrite_messages` must not
+        // silently no-op and drop the caller's replacement.
+        let backend = AppendOnlyBackend {
+            messages: std::sync::Mutex::new(vec![
+                zeroclaw_providers::ChatMessage::user("stale first turn"),
+                zeroclaw_providers::ChatMessage::assistant("stale reply"),
+            ]),
+        };
+        let authoritative = vec![
+            zeroclaw_providers::ChatMessage::user("trimmed second turn"),
+            zeroclaw_providers::ChatMessage::assistant("final reply"),
+        ];
+
+        replace_conversation_state_unless_deleted(&backend, "gw_append_only", &authoritative, true);
+
+        let persisted = backend.messages.lock().unwrap().clone();
+        assert_eq!(
+            persisted
+                .iter()
+                .map(|m| m.content.clone())
+                .collect::<Vec<_>>(),
+            authoritative
+                .iter()
+                .map(|m| m.content.clone())
+                .collect::<Vec<_>>(),
+            "replacement must durably overwrite the stale transcript, not silently no-op"
+        );
+    }
+
+    /// A backend whose durable replacement always fails, standing in for a
+    /// disk or other operational failure at the WebSocket persistence
+    /// boundary.
+    struct FailingReplaceBackend;
+
+    impl zeroclaw_infra::session_backend::SessionBackend for FailingReplaceBackend {
+        fn load(&self, _session_key: &str) -> Vec<zeroclaw_providers::ChatMessage> {
+            Vec::new()
+        }
+        fn append(
+            &self,
+            _session_key: &str,
+            _message: &zeroclaw_providers::ChatMessage,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn remove_last(&self, _session_key: &str) -> std::io::Result<bool> {
+            Ok(false)
+        }
+        fn list_sessions(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn session_exists(&self, _session_key: &str) -> bool {
+            // Unlike `DeletedSessionBackend`, this session is still live;
+            // only the durable write itself fails.
+            true
+        }
+        fn rewrite_messages(
+            &self,
+            _session_key: &str,
+            _messages: &[zeroclaw_providers::ChatMessage],
+        ) -> std::io::Result<()> {
+            Err(std::io::Error::other(
+                "simulated durable replacement failure",
+            ))
+        }
+    }
+
+    #[test]
+    fn replace_conversation_state_unless_deleted_reports_durable_failure() {
+        // The WebSocket completion path must not claim the turn's history
+        // was durably persisted when the backend actually failed the write:
+        // the caller uses this to decide whether the authoritative-history
+        // guarantee held for this turn.
+        let backend = FailingReplaceBackend;
+        let durable = vec![zeroclaw_providers::ChatMessage::user("hi")];
+
+        assert!(
+            !replace_conversation_state_unless_deleted(&backend, "gw_failing", &durable, false),
+            "a failed durable replacement must be reported to the caller, not swallowed"
         );
     }
 
@@ -4737,13 +4811,6 @@ data: {{\"type\":\"message_stop\"}}\n\n"
 
         // (provider_alias, context_window, expected_model_window,
         // expected_max_context_tokens)
-        //
-        // `max_context_tokens` on this branch is the *effective* window —
-        // `min(model_window, context.max_input_tokens)` — not the bare profile
-        // ceiling. Case 1 asks for a 128_000 ceiling but the provider declares
-        // no window and `glm-5.2` is absent from the local model table, so the
-        // window resolves to `UNCONFIGURED_CONTEXT_WINDOW_FALLBACK` (32_000) and
-        // clamps the ceiling down.
         let cases: &[(&str, Option<usize>, Option<u64>, u64)] = &[
             // Provider has no context_window — field must be absent.
             ("openrouter.default", None, None, 32_000),
@@ -4761,10 +4828,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             runtime_profiles.insert(
                 "coding".to_string(),
                 RuntimeProfileConfig {
-                    context: zeroclaw_config::scattered_types::ContextConfig {
-                        max_input_tokens: Some(expected_max_ctx as usize),
-                        ..Default::default()
-                    },
+                    max_context_tokens: Some(expected_max_ctx as usize),
                     ..RuntimeProfileConfig::default()
                 },
             );
@@ -4798,10 +4862,9 @@ data: {{\"type\":\"message_stop\"}}\n\n"
                 ..Config::default()
             };
 
-            let max_ctx = cfg.effective_context_window("coder") as u64;
-            let model_ctx_window = cfg
-                .model_provider_context_window_opt(provider_alias, "glm-5.2")
-                .map(|v| v as u64);
+            let limits = cfg.resolved_context_limits_for_route("coder", provider_alias, "glm-5.2");
+            let max_ctx = limits.context_token_budget as u64;
+            let model_ctx_window = limits.configured_model_context_window().map(|v| v as u64);
             assert_eq!(
                 model_ctx_window, expected_window,
                 "model_provider_context_window_opt({provider_alias}) must return {expected_window:?}"
@@ -4819,8 +4882,6 @@ data: {{\"type\":\"message_stop\"}}\n\n"
                 max_context_tokens: max_ctx,
                 model_context_window: model_ctx_window,
                 last_input_tokens: Some(100),
-                cached_input_tokens: None,
-                steps: 1,
                 last_serving_provider_ref: Some(provider_alias),
                 last_serving_model: Some("glm-5.2"),
             };
@@ -4875,10 +4936,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             runtime_profiles.insert(
                 "coding".to_string(),
                 RuntimeProfileConfig {
-                    context: zeroclaw_config::scattered_types::ContextConfig {
-                        max_input_tokens: Some(800_000),
-                        ..Default::default()
-                    },
+                    max_context_tokens: Some(800_000),
                     ..RuntimeProfileConfig::default()
                 },
             );
@@ -4916,16 +4974,16 @@ data: {{\"type\":\"message_stop\"}}\n\n"
                 ..Config::default()
             };
 
-            let model_ctx_window = cfg
-                .model_provider_context_window_opt(live_provider_ref, "glm-5.2")
-                .map(|v| v as u64);
+            let limits =
+                cfg.resolved_context_limits_for_route("coder", live_provider_ref, "glm-5.2");
+            let model_ctx_window = limits.configured_model_context_window().map(|v| v as u64);
             assert_eq!(
                 model_ctx_window,
                 Some(1_000_000),
                 "resolver must return B's window for {label}, not A's"
             );
 
-            let max_ctx = cfg.effective_context_window("coder") as u64;
+            let max_ctx = limits.context_token_budget as u64;
             let meta = DoneFrameMeta {
                 full_response: "ok",
                 input_tokens: Some(100),
@@ -4938,8 +4996,6 @@ data: {{\"type\":\"message_stop\"}}\n\n"
                 max_context_tokens: max_ctx,
                 model_context_window: model_ctx_window,
                 last_input_tokens: Some(100),
-                cached_input_tokens: None,
-                steps: 1,
                 last_serving_provider_ref: Some(live_provider_ref),
                 last_serving_model: Some("glm-5.2"),
             };
@@ -4974,10 +5030,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         runtime_profiles.insert(
             "coding".to_string(),
             RuntimeProfileConfig {
-                context: zeroclaw_config::scattered_types::ContextConfig {
-                    max_input_tokens: Some(800_000),
-                    ..Default::default()
-                },
+                max_context_tokens: Some(800_000),
                 ..RuntimeProfileConfig::default()
             },
         );
@@ -5037,15 +5090,14 @@ data: {{\"type\":\"message_stop\"}}\n\n"
 
         let effective_model = fold.last_model.as_deref().unwrap_or("model-a");
         let provider_ref = fold.last_provider_ref.as_deref().unwrap();
-        let model_ctx_window = cfg
-            .model_provider_context_window_opt(provider_ref, effective_model)
-            .map(|v| v as u64);
+        let limits = cfg.resolved_context_limits_for_route("coder", provider_ref, effective_model);
+        let model_ctx_window = limits.configured_model_context_window().map(|v| v as u64);
         assert!(
             model_ctx_window.is_none(),
             "gateway must omit window when served model differs from configured primary"
         );
 
-        let max_ctx = cfg.effective_context_window("coder") as u64;
+        let max_ctx = limits.context_token_budget as u64;
         let meta = DoneFrameMeta {
             full_response: "ok",
             input_tokens: Some(1000),
@@ -5058,8 +5110,6 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             max_context_tokens: max_ctx,
             model_context_window: model_ctx_window,
             last_input_tokens: Some(1000),
-            cached_input_tokens: None,
-            steps: 1,
             last_serving_provider_ref: Some(provider_ref),
             last_serving_model: Some(effective_model),
         };
@@ -5069,11 +5119,10 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             v.get("model_context_window").is_none(),
             "done-frame must omit model_context_window on same-profile fallback"
         );
-        // `max_context_tokens` is the *effective* window on this branch:
-        // `min(model_window, context.max_input_tokens)` = min(200_000, 800_000).
-        // The client falls back to this number as the meter ceiling, which is
-        // the primary's real window — not the profile's 800_000 ceiling.
-        assert_eq!(v["max_context_tokens"], 200_000);
+        assert_eq!(
+            v["max_context_tokens"], 800_000,
+            "the explicit profile budget survives the same-profile fallback (#10068)"
+        );
         assert_eq!(v["last_serving_model"], "model-b");
     }
 
@@ -5137,6 +5186,8 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             cached_input_tokens,
             output_tokens,
             cost_usd,
+            context_token_budget: None,
+            model_context_window: None,
             provider_ref: provider_ref.to_string(),
             model: model.to_string(),
             accepted,
@@ -5205,8 +5256,6 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             max_context_tokens: 800_000,
             model_context_window: Some(1_000_000),
             last_input_tokens: Some(1000),
-            cached_input_tokens: None,
-            steps: 1,
             last_serving_provider_ref: Some("openrouter.a"),
             last_serving_model: Some("model-a"),
         };
@@ -5311,8 +5360,6 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             max_context_tokens: 800_000,
             model_context_window: Some(1_000_000),
             last_input_tokens: None,
-            cached_input_tokens: fold.cached_input_tokens,
-            steps: fold.steps,
             last_serving_provider_ref: Some("ollama.b"),
             last_serving_model: Some("model-b"),
         };
@@ -5353,8 +5400,6 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             max_context_tokens: 800_000,
             model_context_window: None,
             last_input_tokens: None,
-            cached_input_tokens: None,
-            steps: 1,
             last_serving_provider_ref: Some("openrouter.a"),
             last_serving_model: Some("model-a"),
         };

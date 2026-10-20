@@ -876,6 +876,12 @@ impl McpServer {
 
 // ── McpRegistry ───────────────────────────────────────────────────────────
 
+/// Joins an MCP server's name to one of its tools' names in the callable name
+/// the registry exposes: `<server>__<tool>`. MCP tools join a tool registry
+/// after plugin tools, so the plugin host refuses any plugin tool name that
+/// contains this separator.
+pub const MCP_TOOL_NAME_SEPARATOR: &str = "__";
+
 /// Registry of all connected MCP servers, with a flat tool index.
 pub struct McpRegistry {
     servers: Vec<McpServer>,
@@ -901,7 +907,8 @@ impl McpRegistry {
                     let tools = server.tools().await;
                     for tool in &tools {
                         // Prefix prevents name collisions across servers
-                        let prefixed = format!("{}__{}", config.name, tool.name);
+                        let prefixed =
+                            format!("{}{MCP_TOOL_NAME_SEPARATOR}{}", config.name, tool.name);
                         tool_index.insert(prefixed, (server_idx, tool.name.clone()));
                     }
                     servers.push(server);
@@ -1047,7 +1054,7 @@ impl McpRegistry {
             let name = server.name().await;
             let tools = server.tools().await;
             for tool in &tools {
-                let prefixed = format!("{}__{}", name, tool.name);
+                let prefixed = format!("{name}{MCP_TOOL_NAME_SEPARATOR}{}", tool.name);
                 tool_index.insert(prefixed, (idx, tool.name.clone()));
             }
             server_index.insert(name, idx);
@@ -1140,6 +1147,79 @@ impl McpRegistry {
             epoch_gate: Arc::new(RwLock::new(0)),
             serial_gate: None,
             recovery: Arc::new(RecoveryBarrier::new()),
+        }
+    }
+
+    /// Test-only: a registry whose single server answers every JSON-RPC
+    /// request with the same canned `result` and advertises `tool`, so
+    /// `call_tool` routes through the production path. Sibling unit-test
+    /// modules (e.g. `mcp_tool`) use this to drive production `execute`
+    /// end to end without spawning a live MCP child.
+    #[cfg(test)]
+    pub(crate) fn for_test_with_tool_server(
+        server_name: &str,
+        tool: &str,
+        result: serde_json::Value,
+    ) -> Self {
+        use crate::mcp_protocol::{JsonRpcRequest, JsonRpcResponse};
+        use async_trait::async_trait;
+
+        struct CannedTransport {
+            result: serde_json::Value,
+        }
+
+        #[async_trait]
+        impl SharedMcpTransportConn for CannedTransport {
+            async fn send_and_recv(
+                &self,
+                request: &JsonRpcRequest,
+                _lifecycle: &McpRequestLifecycle,
+            ) -> Result<JsonRpcResponse> {
+                Ok(JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    id: request.id.clone(),
+                    result: Some(self.result.clone()),
+                    error: None,
+                })
+            }
+
+            async fn close(&self) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let transport: Arc<dyn SharedMcpTransportConn> = Arc::new(CannedTransport { result });
+        let inner = McpServerInner {
+            config: McpServerConfig {
+                name: server_name.to_string(),
+                ..McpServerConfig::default()
+            },
+            #[cfg(target_has_atomic = "64")]
+            next_id: AtomicU64::new(3),
+            #[cfg(not(target_has_atomic = "64"))]
+            next_id: AtomicU32::new(3),
+            tools: vec![McpToolDef {
+                name: tool.to_string(),
+                description: Some("fake tool".into()),
+                input_schema: serde_json::json!({}),
+            }],
+            capabilities: McpServerCapabilities::default(),
+        };
+        let server = McpServer {
+            inner: Arc::new(Mutex::new(inner)),
+            transport,
+            epoch_gate: Arc::new(RwLock::new(0)),
+            serial_gate: None,
+            recovery: Arc::new(RecoveryBarrier::new()),
+        };
+        let mut tool_index = HashMap::new();
+        tool_index.insert(format!("{server_name}__{tool}"), (0usize, tool.to_string()));
+        let mut server_index = HashMap::new();
+        server_index.insert(server_name.to_string(), 0usize);
+        Self {
+            servers: vec![server],
+            tool_index,
+            server_index,
         }
     }
 
@@ -1263,7 +1343,7 @@ impl McpRegistry {
     /// Split a `<server>__<rest>` prefixed name. Returns None if no prefix.
     pub fn split_prefixed(prefixed: &str) -> Option<(String, String)> {
         prefixed
-            .split_once("__")
+            .split_once(MCP_TOOL_NAME_SEPARATOR)
             .map(|(s, r)| (s.to_string(), r.to_string()))
     }
 

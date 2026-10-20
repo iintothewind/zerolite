@@ -1,10 +1,10 @@
 [workspace]
-members = [".", "crates/zeroclaw-api", "crates/zeroclaw-infra", "crates/zeroclaw-config", "crates/zeroclaw-context", "crates/zeroclaw-dist", "crates/zeroclaw-log", "crates/zeroclaw-log/tests/fixtures/attribution-macro-support", "crates/zeroclaw-log/tests/fixtures/attribution-macro-consumer", "crates/zeroclaw-tls", "crates/zeroclaw-relay-proto", "apps/zerorelay", "crates/zeroclaw-spawn", "crates/zeroclaw-commands", "crates/zeroclaw-providers", "crates/zeroclaw-memory", "crates/zeroclaw-channels", "crates/zeroclaw-tools", "crates/zeroclaw-sop-graph", "crates/zeroclaw-runtime", "crates/zeroclaw-eval", "apps/zerocode", "crates/zeroclaw-plugins", "crates/zeroclaw-plugins/tests/fixtures/channel-fixture", "crates/zeroclaw-plugins/tests/fixtures/channel-egress-fixture", "crates/zeroclaw-plugins/tests/fixtures/egress-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-timeout-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-sequential-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-secret-fixture", "crates/zeroclaw-gateway", "crates/zeroclaw-hardware", "crates/zeroclaw-tool-call-parser", "crates/zeroclaw-macros", "apps/tauri", "tools/fill-translations", "xtask"]
+members = [".", "crates/zeroclaw-api", "crates/zeroclaw-infra", "crates/zeroclaw-config", "crates/zeroclaw-context", "crates/zeroclaw-dist", "crates/zeroclaw-log", "crates/zeroclaw-log/tests/fixtures/attribution-macro-support", "crates/zeroclaw-log/tests/fixtures/attribution-macro-consumer", "crates/zeroclaw-tls", "crates/zeroclaw-relay-proto", "apps/zerorelay", "crates/zeroclaw-spawn", "crates/zeroclaw-commands", "crates/zeroclaw-providers", "crates/zeroclaw-memory", "crates/zeroclaw-channels", "crates/zeroclaw-tools", "crates/zeroclaw-sop-graph", "crates/zeroclaw-runtime", "crates/zeroclaw-eval", "apps/zerocode", "crates/zeroclaw-plugins", "crates/zeroclaw-plugins/tests/fixtures/channel-egress-fixture", "crates/zeroclaw-plugins/tests/fixtures/channel-fixture", "crates/zeroclaw-plugins/tests/fixtures/channel-websocket-fixture", "crates/zeroclaw-plugins/tests/fixtures/egress-fixture", "crates/zeroclaw-plugins/tests/fixtures/memory-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-secret-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-sequential-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-socket-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-timeout-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-websocket-fixture", "crates/zeroclaw-gateway", "crates/zeroclaw-hardware", "crates/zeroclaw-tool-call-parser", "crates/zeroclaw-macros", "apps/tauri", "tools/fill-translations", "xtask"]
 exclude = ["vendor/crossterm-0.29.0"]
 resolver = "2"
 
 [workspace.package]
-version = "1.0.0-lite"
+version = "1.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/zeroclaw-labs/zeroclaw"
@@ -12,32 +12,34 @@ homepage = "https://www.zeroclaw.com"
 rust-version = "1.96.0"
 
 [workspace.dependencies]
-zeroclaw-api = { path = "crates/zeroclaw-api", version = "1.0.0-lite" }
-zeroclaw-infra = { path = "crates/zeroclaw-infra", version = "1.0.0-lite" }
-zeroclaw-config = { path = "crates/zeroclaw-config", version = "1.0.0-lite", default-features = false }
-zeroclaw-context = { path = "crates/zeroclaw-context", version = "1.0.0-lite" }
-zeroclaw-dist = { path = "crates/zeroclaw-dist", version = "1.0.0-lite" }
-zeroclaw-log = { path = "crates/zeroclaw-log", version = "1.0.0-lite" }
-zeroclaw-tls = { path = "crates/zeroclaw-tls", version = "1.0.0-lite" }
-zeroclaw-relay-proto = { path = "crates/zeroclaw-relay-proto", version = "1.0.0-lite" }
-zerorelay = { path = "apps/zerorelay", version = "1.0.0-lite" }
-zeroclaw-spawn = { path = "crates/zeroclaw-spawn", version = "1.0.0-lite" }
-zeroclaw-commands = { path = "crates/zeroclaw-commands", version = "1.0.0-lite" }
-zeroclaw-providers = { path = "crates/zeroclaw-providers", version = "1.0.0-lite" }
-zeroclaw-memory = { path = "crates/zeroclaw-memory", version = "1.0.0-lite" }
-zeroclaw-channels = { path = "crates/zeroclaw-channels", version = "1.0.0-lite", default-features = false }
-zeroclaw-tools = { path = "crates/zeroclaw-tools", version = "1.0.0-lite" }
-zeroclaw-sop-graph = { path = "crates/zeroclaw-sop-graph", version = "1.0.0-lite", default-features = false }
-zeroclaw-runtime = { path = "crates/zeroclaw-runtime", version = "1.0.0-lite", default-features = false }
-zeroclaw-eval = { path = "crates/zeroclaw-eval", version = "1.0.0-lite" }
-zeroclaw-plugins = { path = "crates/zeroclaw-plugins", version = "1.0.0-lite" }
-zeroclaw-gateway = { path = "crates/zeroclaw-gateway", version = "1.0.0-lite" }
-zeroclaw-hardware = { path = "crates/zeroclaw-hardware", version = "1.0.0-lite" }
-zeroclaw-tool-call-parser = { path = "crates/zeroclaw-tool-call-parser", version = "1.0.0-lite" }
-zeroclaw-macros = { path = "crates/zeroclaw-macros", version = "1.0.0-lite" }
-zerocode = { path = "apps/zerocode", version = "1.0.0-lite" }
+zeroclaw-api = { path = "crates/zeroclaw-api", version = "1.1.0" }
+zeroclaw-infra = { path = "crates/zeroclaw-infra", version = "1.1.0" }
+zeroclaw-config = { path = "crates/zeroclaw-config", version = "1.1.0", default-features = false }
+zeroclaw-context = { path = "crates/zeroclaw-context", version = "1.1.0" }
+zeroclaw-dist = { path = "crates/zeroclaw-dist", version = "1.1.0" }
+zeroclaw-log = { path = "crates/zeroclaw-log", version = "1.1.0" }
+zeroclaw-tls = { path = "crates/zeroclaw-tls", version = "1.1.0" }
+zeroclaw-relay-proto = { path = "crates/zeroclaw-relay-proto", version = "1.1.0" }
+zerorelay = { path = "apps/zerorelay", version = "1.1.0" }
+zeroclaw-spawn = { path = "crates/zeroclaw-spawn", version = "1.1.0" }
+zeroclaw-commands = { path = "crates/zeroclaw-commands", version = "1.1.0" }
+zeroclaw-providers = { path = "crates/zeroclaw-providers", version = "1.1.0" }
+zeroclaw-memory = { path = "crates/zeroclaw-memory", version = "1.1.0" }
+zeroclaw-channels = { path = "crates/zeroclaw-channels", version = "1.1.0", default-features = false }
+zeroclaw-tools = { path = "crates/zeroclaw-tools", version = "1.1.0" }
+zeroclaw-sop-graph = { path = "crates/zeroclaw-sop-graph", version = "1.1.0", default-features = false }
+zeroclaw-runtime = { path = "crates/zeroclaw-runtime", version = "1.1.0", default-features = false }
+zeroclaw-eval = { path = "crates/zeroclaw-eval", version = "1.1.0" }
+zeroclaw-plugins = { path = "crates/zeroclaw-plugins", version = "1.1.0" }
+zeroclaw-gateway = { path = "crates/zeroclaw-gateway", version = "1.1.0" }
+zeroclaw-hardware = { path = "crates/zeroclaw-hardware", version = "1.1.0" }
+zeroclaw-tool-call-parser = { path = "crates/zeroclaw-tool-call-parser", version = "1.1.0" }
+zeroclaw-macros = { path = "crates/zeroclaw-macros", version = "1.1.0" }
+zerocode = { path = "apps/zerocode", version = "1.1.0" }
 directories = "6.0"
 sys-locale = "0.3"
+hmac = "0.12"
+zeroize = "1.8"
 
 [package]
 name = "zeroclaw"
@@ -135,7 +137,7 @@ tar = "0.4"
 tempfile = "3.26"
 
 # Zip extraction (plugin registry, self-update archives)
-zip = { version = "8.1", default-features = false, features = ["deflate-flate2"] }
+zip = { version = "9.0.3", default-features = false, features = ["deflate-flate2"] }
 
 # Error handling
 anyhow = "1.0"
@@ -148,7 +150,7 @@ hex = "0.4"
 async-trait = "0.1"
 
 # Memory / persistence (migration.rs, behind agent-runtime)
-rusqlite = { version = "0.37", features = ["bundled"], optional = true }
+rusqlite = { version = "0.40", features = ["bundled"], optional = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 
 # Interactive CLI prompts (memory CLI uses dialoguer unconditionally)
@@ -181,6 +183,15 @@ tower = { version = "0.5", default-features = false, features = ["util"], option
 # it draws on (TIOCGWINSZ). Linux additionally uses it for `desktop --install`,
 # which opens candidate `.desktop` entries with O_NONBLOCK|O_NOFOLLOW so a FIFO
 # or symlink planted in an XDG data dir cannot block or redirect the read.
+# Capability-scoped directory handles (beneath/no-follow). Used by the agent-bundle
+# export to walk a live, agent-writable workspace without re-opening paths by name.
+cap-std = "4"
+# `follow(FollowSymlinks::No)` and `open_dir_nofollow`, which cap-std itself does not
+# expose. Thin trait layer over the cap-std/cap-primitives already compiled above.
+cap-fs-ext = "4"
+
+base64 = { version = "0.22", optional = true }
+ring = { version = "0.17", optional = true }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
@@ -248,6 +259,8 @@ agent-runtime = [
     "dep:crossterm",
     "dep:tokio-tungstenite",
     "dep:rustls",
+    "dep:base64",
+    "dep:ring",
 ]
 
 # Lean channel bundle included in `default`. These channels cover local/editor

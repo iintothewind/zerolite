@@ -35,6 +35,17 @@ struct SessionSlot {
 pub struct SessionGuard {
     _permit: OwnedSemaphorePermit,
     _registration: PendingRegistration,
+    /// The session this guard admits. Lets admission-aware helpers (e.g.
+    /// `SessionStore::insert_admitted`) verify the caller holds the permit
+    /// for the session it is about to mutate.
+    session_id: String,
+}
+
+impl SessionGuard {
+    /// The session id whose admission permit this guard owns.
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
 }
 
 struct PendingRegistration {
@@ -157,6 +168,7 @@ impl SessionActorQueue {
                 Ok(SessionGuard {
                     _permit: permit,
                     _registration: registration,
+                    session_id: session_id.to_string(),
                 })
             }
             Ok(Err(_)) | Err(_) => Err(SessionQueueError::Timeout {
@@ -270,6 +282,17 @@ mod tests {
             err.to_string(),
             "超时错误: session gw_abc 的 sse stream 被占用"
         );
+    }
+
+    #[test]
+    fn transcript_generation_advances_uniquely_per_session() {
+        let queue = SessionActorQueue::new(8, 30, 600);
+        assert_eq!(queue.generation("gw_a"), 0);
+        let first = queue.advance_generation("gw_a");
+        assert_eq!(queue.generation("gw_a"), first);
+        let second = queue.advance_generation("gw_a");
+        assert!(second > first, "a superseded generation never recurs");
+        assert_eq!(queue.generation("gw_b"), 0, "generations are per session");
     }
 
     #[test]

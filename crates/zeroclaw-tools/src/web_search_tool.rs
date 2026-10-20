@@ -424,7 +424,8 @@ impl WebSearchTool {
             .header("Accept-Language", headers.accept_language)
             .header("DNT", "1")
             .send()
-            .await?;
+            .await
+            .map_err(|error| transport_search_failure("duckduckgo", "request", &error))?;
         let status = response.status();
         let final_url_is_block =
             contains_ascii_case_insensitive(response.url().as_str(), "/wr.do?");
@@ -517,7 +518,8 @@ impl WebSearchTool {
             .header("Accept", "application/json")
             .header("X-Subscription-Token", &api_key)
             .send()
-            .await?;
+            .await
+            .map_err(|error| transport_search_failure("brave", "request", &error))?;
 
         if !response.status().is_success() {
             return Err(http_search_failure("brave", response.status()));
@@ -1760,7 +1762,8 @@ impl WebSearchTool {
             .get(&search_url)
             .header("Accept", "application/json")
             .send()
-            .await?;
+            .await
+            .map_err(|error| transport_search_failure("searxng", "request", &error))?;
 
         if !response.status().is_success() {
             return Err(http_search_failure("searxng", response.status()));
@@ -2467,6 +2470,38 @@ mod tests {
             msg.contains("different provider"),
             "blocked status must suggest switching providers, got: {msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn transport_search_failure_redacts_query_bearing_url() {
+        let query = "private 多字节 query";
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("test should reserve a task-owned loopback port");
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .connect_timeout(Duration::from_secs(2))
+            .timeout(Duration::from_secs(3))
+            .build()
+            .expect("test client should build without proxy discovery");
+        let error = client
+            .get(format!("http://{address}/search?q={query}"))
+            .send()
+            .await
+            .expect_err("closed local port should produce a deterministic transport error");
+
+        assert!(error.is_connect());
+        assert!(
+            !error.is_timeout(),
+            "the task-owned closed port must refuse: {error}"
+        );
+        let message = transport_search_failure("duckduckgo", "request", &error).to_string();
+        assert!(message.contains("duckduckgo search failed"));
+        assert!(message.contains("transport=connect"));
+        assert!(!message.contains(query));
+        assert!(!message.contains("%E5%A4%9A"));
+        assert!(!message.contains("http://"));
     }
 
     #[test]
@@ -4120,14 +4155,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_serply_connection_refused_error_is_query_free() {
-        // Bind then drop an ephemeral port so the connect is refused
-        // deterministically without touching the network.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
+        // Reserve the port without listening so parallel tests cannot reuse it
+        // before the request and turn connection refusal into a different error.
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = socket.local_addr().unwrap();
 
         let (_tmp, tool) = serply_tool_with_key("serply-test-key");
         let client = reqwest::Client::builder()
+            .no_proxy()
             .timeout(Duration::from_secs(5))
             .build()
             .expect("client builder should succeed without a proxy");
@@ -4924,30 +4960,48 @@ mod tests {
         );
     }
 
-    /// An HTTP 200 whose chunked body never ends must be rejected once it
-    /// crosses the cap, and the client must stop reading at that point rather
-    /// than buffer to completion. The server here keeps the stream open and
-    /// keeps writing until the client closes the connection; if the client
-    /// only stopped consuming, the server's writes would stall and the
-    /// timeout below would fail the test.
+    /// An unterminated chunked body must be rejected at the cap before JSON
+    /// decoding, and its connection must be abandoned while the Client lives.
+    /// Send exactly cap + 1 body bytes without a terminal chunk, then observe
+    /// EOF or connection reset directly. Successful server writes do not
+    /// measure how much the client consumed: a finite write budget can fit in
+    /// socket buffers before the peer's close becomes visible.
     #[tokio::test]
     async fn test_keenable_oversized_chunked_response_is_rejected_before_decoding() {
+        use std::io::ErrorKind;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         const CHUNK_BYTES: usize = 64 * 1024;
-        // Far more than the cap: only an early close by the client stops it.
-        let total_chunks = KEENABLE_MAX_RESPONSE_BYTES / CHUNK_BYTES * 8;
+        const REQUEST_BYTES: usize = 4096;
+
+        struct AbortServerOnDrop(tokio::task::AbortHandle);
+
+        impl Drop for AbortServerOnDrop {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = zeroclaw_spawn::spawn!(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
-            let mut head = Vec::new();
-            while !head.windows(4).any(|window| window == b"\r\n\r\n") {
-                let mut buffer = [0_u8; 1024];
-                let read = stream.read(&mut buffer).await.expect("read request head");
+            let mut head = [0_u8; REQUEST_BYTES];
+            let mut head_len = 0;
+            while !head[..head_len]
+                .windows(4)
+                .any(|window| window == b"\r\n\r\n")
+            {
+                assert!(
+                    head_len < head.len(),
+                    "request head exceeds fixture capacity"
+                );
+                let read = stream
+                    .read(&mut head[head_len..])
+                    .await
+                    .expect("read request head");
                 assert!(read > 0, "client closed before finishing the request");
-                head.extend_from_slice(&buffer[..read]);
+                head_len += read;
             }
             stream
                 .write_all(
@@ -4957,31 +5011,68 @@ mod tests {
                 .await
                 .expect("write response head");
 
-            // A JSON document that never ends: an open results array whose
-            // first snippet the filler chunks keep extending.
+            // One complete data chunk, but no terminal chunk or complete JSON.
+            // A reader that waits for EOF cannot finish this response.
             let prefix = b"{\"results\":[{\"snippet\":\"";
-            let mut opening = format!("{:x}\r\n", prefix.len()).into_bytes();
-            opening.extend_from_slice(prefix);
-            opening.extend_from_slice(b"\r\n");
+            let body_bytes = KEENABLE_MAX_RESPONSE_BYTES + 1;
+            assert!(prefix.len() < body_bytes, "prefix exceeds fixture body");
+            let mut chunk_header = [0_u8; 32];
+            let chunk_header_len = {
+                let mut cursor = std::io::Cursor::new(&mut chunk_header[..]);
+                std::io::Write::write_fmt(&mut cursor, format_args!("{body_bytes:x}\r\n"))
+                    .expect("format chunk header");
+                usize::try_from(cursor.position()).expect("chunk header fits the fixed buffer")
+            };
             stream
-                .write_all(&opening)
+                .write_all(&chunk_header[..chunk_header_len])
                 .await
-                .expect("write opening chunk");
+                .expect("write chunk header");
+            stream.write_all(prefix).await.expect("write JSON prefix");
 
-            let mut frame = format!("{CHUNK_BYTES:x}\r\n").into_bytes();
-            frame.extend_from_slice(&vec![b'a'; CHUNK_BYTES]);
-            frame.extend_from_slice(b"\r\n");
-            let mut sent = 0_usize;
-            let mut client_closed = false;
-            for _ in 0..total_chunks {
-                if stream.write_all(&frame).await.is_err() {
-                    client_closed = true;
-                    break;
-                }
-                sent += CHUNK_BYTES;
+            let filler = [b'a'; CHUNK_BYTES];
+            let mut sent = prefix.len();
+            while sent < body_bytes {
+                let chunk_len = (body_bytes - sent).min(filler.len());
+                stream
+                    .write_all(&filler[..chunk_len])
+                    .await
+                    .expect("write controlled body");
+                sent += chunk_len;
             }
+            // The reader can abandon after the overflow byte, before this
+            // framing write. A write error still is not the close oracle.
+            match stream.write_all(b"\r\n").await {
+                Ok(()) => {}
+                Err(error) => {
+                    assert!(
+                        matches!(
+                            error.kind(),
+                            ErrorKind::BrokenPipe | ErrorKind::ConnectionReset
+                        ),
+                        "write trailing chunk framing: {error}"
+                    );
+                }
+            }
+
+            let mut close_buffer = [0_u8; 1024];
+            let mut residual_request_bytes = 0;
+            let client_closed = loop {
+                match stream.read(&mut close_buffer).await {
+                    Ok(0) => break true,
+                    Ok(read) => {
+                        residual_request_bytes += read;
+                        assert!(
+                            residual_request_bytes <= REQUEST_BYTES,
+                            "residual request body exceeds fixture capacity"
+                        );
+                    }
+                    Err(error) if error.kind() == ErrorKind::ConnectionReset => break true,
+                    Err(error) => panic!("observe client close: {error}"),
+                }
+            };
             (sent, client_closed)
         });
+        let _server_cleanup = AbortServerOnDrop(server.abort_handle());
 
         let tool = WebSearchTool::new("keenable".to_string(), None, None, 5, 15);
         let client = tool
@@ -4997,6 +5088,7 @@ mod tests {
             msg.contains(&KEENABLE_MAX_RESPONSE_BYTES.to_string()),
             "{msg}"
         );
+        assert!(msg.contains("was not decoded"), "{msg}");
         assert!(!msg.contains("aaaa"), "error echoes the body: {msg}");
 
         let (sent, client_closed) = tokio::time::timeout(Duration::from_secs(20), server)
@@ -5004,10 +5096,9 @@ mod tests {
             .expect("the client must close the connection instead of stalling the server")
             .expect("server task");
         assert!(client_closed, "the client never closed the connection");
-        assert!(
-            sent < total_chunks * CHUNK_BYTES,
-            "the server wrote the whole body ({sent} bytes): the client buffered to completion"
-        );
+        assert_eq!(sent, KEENABLE_MAX_RESPONSE_BYTES + 1);
+        // The close observation above must happen before dropping the Client.
+        drop(client);
     }
 
     // ── Format characterization ──────────────────────────────────────────

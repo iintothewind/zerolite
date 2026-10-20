@@ -5463,3 +5463,16 @@ Let me check the result."#;
         assert_eq!(strip_trailing_terminal_markers("<eom>\n<|eom|>"), "");
     }
 }
+
+pub fn contains_parseable_tool_call(text: &str) -> bool {
+    if looks_like_tool_protocol_example(text) {
+        return false;
+    }
+
+    let (_, calls) = parse_tool_calls(text);
+    !calls.is_empty()
+}
+
+pub fn contains_tool_call_opener(text: &str) -> bool {
+    contains_tool_protocol_tag_marker(text) || text.contains("TOOL_CALL")
+}

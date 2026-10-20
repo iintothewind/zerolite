@@ -1,7 +1,7 @@
 //! REST API handlers for the web dashboard.
 //! All `/api/*` routes require bearer token authentication (PairingGuard).
 
-use super::AppState;
+use super::{AppState, GW_SESSION_PREFIX, gateway_cancel_key, gateway_session_key};
 use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode, header},
@@ -481,6 +481,21 @@ pub async fn handle_api_cron_add(
         shell_output_format,
     } = body;
 
+    let _reservation = match state
+        .agent_lifecycle
+        .reserve_config_mutation(agent_alias.trim())
+    {
+        Ok(reservation) => reservation,
+        Err(error) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": error.to_string()
+                })),
+            )
+                .into_response();
+        }
+    };
     let config = state.config.read().clone();
     if config.agent(&agent_alias).is_none() {
         return (
@@ -602,13 +617,20 @@ pub async fn handle_api_cron_runs(
     let limit = params.limit.unwrap_or(20).clamp(1, 100) as usize;
     let config = state.config.read().clone();
 
-    // Verify the job exists before listing runs.
+    // A missing job is not necessarily a missing history: a successful
+    // auto-delete one-shot removes its job row while its run record is
+    // retained durably. 404 only when neither the job nor any run exists.
     if let Err(e) = zeroclaw_runtime::cron::get_job(&config, &id) {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": format!("Cron job not found: {e}")})),
-        )
-            .into_response();
+        let retained = zeroclaw_runtime::cron::list_runs(&config, &id, 1)
+            .map(|runs| !runs.is_empty())
+            .unwrap_or(false);
+        if !retained {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": format!("Cron job not found: {e}")})),
+            )
+                .into_response();
+        }
     }
 
     match zeroclaw_runtime::cron::list_runs(&config, &id, limit) {
@@ -624,6 +646,11 @@ pub async fn handle_api_cron_runs(
                         "status": r.status,
                         "output": r.output,
                         "duration_ms": r.duration_ms,
+                        "execution": r.execution,
+                        "delivery": r.delivery,
+                        "persistence": r.persistence,
+                        "principal": r.principal,
+                        "executing_agent": r.executing_agent,
                     })
                 })
                 .collect();
@@ -647,6 +674,11 @@ pub async fn handle_api_cron_run(
         return e.into_response();
     }
 
+    let selection = zeroclaw_runtime::live_config_authority::AgentExecutionCapability::from_parts(
+        state.config.clone(),
+        state.agent_lifecycle.clone(),
+    )
+    .capture_selection();
     let config = state.config.read().clone();
 
     let job = match zeroclaw_runtime::cron::get_job(&config, &id) {
@@ -661,11 +693,12 @@ pub async fn handle_api_cron_run(
     };
 
     let event_tx = Some(state.event_tx.clone());
-    let result = zeroclaw_runtime::cron::scheduler::run_manual_job(
+    let result = zeroclaw_runtime::cron::scheduler::run_manual_job_with_selection(
         &config,
         &job,
         zeroclaw_runtime::cron::scheduler::CronDeliveryContext::GatewayManual,
         &event_tx,
+        Some(selection),
     )
     .await;
 
@@ -865,12 +898,23 @@ pub async fn handle_api_cron_settings_patch(
         return e.into_response();
     }
 
-    // Held through the swap below so a concurrent config writer can't land
-    // between this read and the save.
-    let _cfg_guard = std::sync::Arc::clone(&state.config_write_lock)
-        .lock_owned()
-        .await;
-    let mut config = state.config.read().clone();
+    // Admit one serialized config commit: held from this read through the
+    // save-and-publish below so a concurrent config writer can't land
+    // between them. The save runs retained on the commit, so a dropped
+    // request cannot abandon a dispatched save without its publication.
+    let commit = match state.begin_config_commit().await {
+        Ok(commit) => commit,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "config commit refused without any change: the daemon generation is closing"
+                })),
+            )
+                .into_response();
+        }
+    };
+    let mut config = commit.current_config();
 
     if let Some(v) = body.get("enabled").and_then(|v| v.as_bool()) {
         config.scheduler.enabled = v;
@@ -885,15 +929,43 @@ pub async fn handle_api_cron_settings_patch(
         config.mark_dirty("scheduler.max-run-history");
     }
 
-    if let Err(e) = config.save_dirty().await {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to save config: {e}")})),
-        )
-            .into_response();
-    }
-
-    *state.config.write() = config.clone();
+    let revision = match commit.next_revision() {
+        Ok(revision) => revision,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("config revision unavailable: {e}")})),
+            )
+                .into_response();
+        }
+    };
+    let task =
+        zeroclaw_runtime::live_config_authority::spawn_agent_lifecycle_job(Box::pin(async move {
+            if let Err(e) = config.save_dirty().await {
+                return Err(format!("Failed to save config: {e}"));
+            }
+            commit
+                .publish(revision, config.clone())
+                .map_err(|e| format!("Failed to publish config: {e}"))?;
+            Ok(config)
+        }));
+    let config = match task.await {
+        Ok(Ok(config)) => config,
+        Ok(Err(message)) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": message})),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("config commit task failed: {e}")})),
+            )
+                .into_response();
+        }
+    };
 
     Json(serde_json::json!({
         "status": "ok",
@@ -1761,21 +1833,41 @@ pub async fn handle_api_sessions_list(
 /// Resolution prefers **key existence** over punctuation heuristics (WebSocket
 /// clients may pick display ids that contain `_`, e.g. `team_alpha` →
 /// `gw_team_alpha`):
-/// 1. exact `id` if it already exists as a session/cancel key
-/// 2. `gw_{id}` if that exists
-/// 3. namespace fallback: keep a `gw_`-prefixed id as-is; otherwise prefix `gw_`
+/// 1. exact `id` if it already exists as a session key
+/// 2. raw `gw_{id}` if it already exists
+/// 3. the canonical sanitized gateway key
+/// 4. namespace fallback: keep a `gw_`-prefixed id as-is; otherwise use the
+///    canonical sanitized gateway key
 fn resolve_gateway_session_key(id: &str, exists: impl Fn(&str) -> bool) -> String {
     if exists(id) {
         return id.to_string();
     }
     if !id.starts_with("gw_") {
-        let prefixed = format!("gw_{id}");
-        if exists(&prefixed) {
-            return prefixed;
+        let legacy_key = format!("{GW_SESSION_PREFIX}{id}");
+        if exists(&legacy_key) {
+            return legacy_key;
         }
-        return prefixed;
+        return gateway_session_key(id);
     }
     id.to_string()
+}
+
+/// Resolve an API session id to a live process-local cancellation key.
+///
+/// Cancellation registration deliberately keeps the accepted display id raw,
+/// because sanitization would make `team.alpha` and `team_alpha` share a
+/// token. A full persisted key is checked first so callers can pass the
+/// `session_key` returned by `GET /api/sessions`; when the caller passes a
+/// display id, the raw gateway prefix is added exactly once. There is no
+/// sanitized fallback here: guessing from a lossy key could abort a different
+/// live session.
+fn resolve_gateway_cancel_key(id: &str, exists: impl Fn(&str) -> bool) -> Option<String> {
+    if exists(id) {
+        return Some(id.to_string());
+    }
+
+    let display_key = gateway_cancel_key(id);
+    exists(&display_key).then_some(display_key)
 }
 
 /// Display session id used by WebSocket `?session_id=` / event filters.
@@ -1810,13 +1902,6 @@ pub async fn handle_api_session_messages(
             serde_json::json!({
                 "role": m.message.role,
                 "content": m.message.content,
-                // Machinery the runtime wrote into the transcript as a user
-                // message (tool rounds, trim breadcrumb). The dashboard must
-                // not render these as operator bubbles, and only the runtime
-                // can tell them apart — see `is_synthetic_user_message`.
-                "synthetic": zeroclaw_runtime::agent::history_trim::is_synthetic_user_message(
-                    &m.message,
-                ),
                 "created_at": m.created_at.map(|dt| dt.to_rfc3339()),
             })
         })
@@ -1878,29 +1963,11 @@ pub async fn handle_api_session_message_post(
         Err(crate::session_queue::SessionQueueError::Timeout { .. }) => {
             return (
                 StatusCode::REQUEST_TIMEOUT,
-                Json(serde_json::json!({
-                    "error": format!(
-                        "超时错误: session {session_key} 的 sse stream 被占用"
-                    )
-                })),
+                Json(serde_json::json!({"error": "Timed out waiting for session queue"})),
             )
                 .into_response();
         }
     };
-
-    // The existence check above ran before the permit, so a DELETE that held
-    // the permit in the meantime has already wiped the session. Re-check under
-    // the permit: `append` is a bare INSERT with no existence guard, so it
-    // would re-create the row the delete just removed — and because
-    // `session_exists` reads the metadata row `append` re-creates, the session
-    // would come back for every later caller too.
-    if !backend.session_exists(&session_key) {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "Session not found"})),
-        )
-            .into_response();
-    }
 
     let message = zeroclaw_providers::ChatMessage::assistant(&body.content);
     if let Err(e) = backend.append(&session_key, &message) {
@@ -1910,9 +1977,6 @@ pub async fn handle_api_session_message_post(
         )
             .into_response();
     }
-    // Every connected socket holding this session's history must see that the
-    // transcript moved under it; the message count alone cannot tell them,
-    // because a delete and recreation can leave it unchanged.
     state.session_queue.advance_generation(&session_key);
 
     // Match WS `?session_id=` / `event_matches_session` (display id), not the
@@ -1961,17 +2025,24 @@ pub async fn handle_api_session_delete(
 
     let session_key = resolve_gateway_session_key(&id, |key| backend.session_exists(key));
 
-    let token = state
-        .cancel_tokens
-        .lock()
-        .expect("cancel_tokens lock poisoned")
-        .remove(&session_key);
-    if let Some(token) = token {
+    let cancellation = {
+        let mut tokens = state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock poisoned");
+        resolve_gateway_cancel_key(&id, |key| tokens.contains_key(key))
+            .and_then(|cancel_key| tokens.remove(&cancel_key).map(|token| (cancel_key, token)))
+    };
+    if let Some((cancel_key, token)) = cancellation {
         token.cancel();
         ::zeroclaw_log::record!(
             INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_attrs(::serde_json::json!({"session_key": session_key})),
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "session_key": session_key,
+                    "cancel_key": cancel_key,
+                })
+            ),
             "cancelled in-flight turn for deleted session"
         );
     }
@@ -1991,11 +2062,7 @@ pub async fn handle_api_session_delete(
         Err(crate::session_queue::SessionQueueError::Timeout { .. }) => {
             return (
                 StatusCode::REQUEST_TIMEOUT,
-                Json(serde_json::json!({
-                    "error": format!(
-                        "超时错误: session {session_key} 的 sse stream 被占用"
-                    )
-                })),
+                Json(serde_json::json!({"error": "Timed out waiting for session queue"})),
             )
                 .into_response();
         }
@@ -2161,31 +2228,26 @@ pub async fn handle_api_session_abort(
         return e.into_response();
     }
 
-    // Resolve + look up under one lock so underscore-bearing display ids
-    // (e.g. `team_alpha`) match the live `gw_{id}` cancel-token key.
-    let (session_key, token) = {
+    // Resolve + look up under one lock so display ids and full session keys
+    // both address the raw, collision-safe cancellation key.
+    let (cancel_key, token) = {
         let tokens = state
             .cancel_tokens
             .lock()
             .expect("cancel_tokens lock poisoned");
-        let session_key = resolve_gateway_session_key(&id, |key| tokens.contains_key(key));
-        let token = tokens.get(&session_key).cloned();
-        (session_key, token)
+        let cancel_key = resolve_gateway_cancel_key(&id, |key| tokens.contains_key(key));
+        let token = cancel_key
+            .as_deref()
+            .and_then(|key| tokens.get(key).cloned());
+        (cancel_key, token)
     };
 
-    if let Some(token) = token {
+    if let (Some(cancel_key), Some(token)) = (cancel_key, token) {
         token.cancel();
-        if let Some(ref backend) = state.session_backend
-            && backend.session_exists(&session_key)
-        {
-            // Optimistic idle so the UI / session list do not stay on
-            // `running` while the turn is still force-tearing down.
-            let _ = backend.set_session_state(&session_key, "idle", None);
-        }
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_attrs(::serde_json::json!({"session_key": session_key})),
+                .with_attrs(::serde_json::json!({"cancel_key": cancel_key})),
             "session abort requested"
         );
         Json(serde_json::json!({ "status": "aborted" })).into_response()
@@ -2196,6 +2258,7 @@ pub async fn handle_api_session_abort(
 
 // ── Claude Code hook endpoint ────────────────────────────────────
 
+#[cfg(feature = "tool-claude-code-runner")]
 pub async fn handle_claude_code_hook(
     State(state): State<AppState>,
     Json(payload): Json<zeroclaw_tools::claude_code_runner::ClaudeCodeHookEvent>,
@@ -2223,7 +2286,6 @@ pub(crate) mod tests {
     use async_trait::async_trait;
     use axum::response::IntoResponse;
     use http_body_util::BodyExt;
-    use parking_lot::RwLock;
     // Gated on every channel feature whose `AppState` fields below are built
     // with `HashMap::new()`, not just `channel-linq`. With only one of the
     // others enabled the import vanished while its uses remained, so
@@ -2396,9 +2458,11 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn test_state(config: zeroclaw_config::schema::Config) -> AppState {
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
         AppState {
-            config: Arc::new(RwLock::new(config)),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            config: state_authority.live_handle(),
+            config_authority: state_authority.clone(),
+            agent_lifecycle: state_authority.agent_lifecycle(),
             model_provider: Arc::new(MockModelProvider),
             model: "test-model".into(),
             temperature: None,
@@ -2456,6 +2520,7 @@ pub(crate) mod tests {
             reload_tx: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         }
@@ -2631,6 +2696,7 @@ pub(crate) mod tests {
 
     fn memory_entry_with_content(content: String) -> MemoryEntry {
         MemoryEntry {
+            principal_id: None,
             id: "entry-1".into(),
             key: "huge-memory".into(),
             content,
@@ -3189,14 +3255,14 @@ pub(crate) mod tests {
     }
 
     fn link_job_to_test_agent(state: &AppState, job_id: &str) {
-        state
-            .config
-            .write()
-            .agents
-            .get_mut("test-agent")
-            .expect("test-agent configured by with_test_agent")
-            .cron_jobs
-            .push(job_id.to_string());
+        state.publish_test_config(|config| {
+            config
+                .agents
+                .get_mut("test-agent")
+                .expect("test-agent configured by with_test_agent")
+                .cron_jobs
+                .push(job_id.to_string());
+        });
     }
 
     fn config_with_webhook(
@@ -3473,62 +3539,6 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn session_messages_flags_runtime_machinery_as_synthetic() {
-        // The dashboard drops these rows rather than rendering them as operator
-        // bubbles, and it cannot tell them apart on its own: both carriers are
-        // `user` rows, one of the two strings is localized, and either could
-        // change in the runtime without the web client noticing.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let config = zeroclaw_config::schema::Config {
-            data_dir: tmp.path().join("workspace"),
-            config_path: tmp.path().join("config.toml"),
-            ..zeroclaw_config::schema::Config::default()
-        };
-        std::fs::create_dir_all(&config.data_dir).unwrap();
-        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
-        for message in [
-            zeroclaw_providers::ChatMessage::user("read the build script"),
-            zeroclaw_providers::ChatMessage::assistant("calling"),
-            zeroclaw_providers::ChatMessage::user("[Tool results]\n<tool_result>ok</tool_result>"),
-            zeroclaw_runtime::agent::history_trim::breadcrumb(),
-        ] {
-            backend.append("gw_operator-1", &message).unwrap();
-        }
-        let state = test_state_with_session_backend(config, backend);
-
-        let response = handle_api_session_messages(
-            State(state),
-            HeaderMap::new(),
-            Path("operator-1".to_string()),
-        )
-        .await
-        .into_response();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let json = response_json(response).await;
-        let messages = json["messages"].as_array().expect("messages is a list");
-        let flagged: Vec<(&str, bool)> = messages
-            .iter()
-            .map(|m| {
-                (
-                    m["role"].as_str().expect("role is a string"),
-                    m["synthetic"].as_bool().expect("synthetic is a bool"),
-                )
-            })
-            .collect();
-        assert_eq!(
-            flagged,
-            vec![
-                ("user", false),
-                ("assistant", false),
-                ("user", true),
-                ("user", true),
-            ],
-            "the tool round and the breadcrumb are machinery; the real turn is not"
-        );
-    }
-
-    #[tokio::test]
     async fn session_message_post_persists_and_broadcasts_to_session() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = zeroclaw_config::schema::Config {
@@ -3705,75 +3715,6 @@ pub(crate) mod tests {
         assert_eq!(messages[1].content, "queued notification");
     }
 
-    #[tokio::test]
-    async fn session_message_post_does_not_resurrect_a_session_deleted_while_queued() {
-        // The pre-permit existence check cannot see a DELETE that wins the
-        // permit race, and `append` is a bare INSERT: without a re-check under
-        // the permit this POST re-creates the row the delete just wiped.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let config = zeroclaw_config::schema::Config {
-            data_dir: tmp.path().join("workspace"),
-            config_path: tmp.path().join("config.toml"),
-            ..zeroclaw_config::schema::Config::default()
-        };
-        std::fs::create_dir_all(&config.data_dir).unwrap();
-        let backend: Arc<dyn SessionBackend> =
-            Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
-        backend
-            .append(
-                "gw_operator-1",
-                &zeroclaw_providers::ChatMessage::assistant("existing"),
-            )
-            .unwrap();
-        let state = test_state_with_session_backend(config, backend.clone());
-
-        // Stand in for the DELETE: hold the permit so the POST clears its
-        // pre-permit existence check and queues, then wipe the session out
-        // from under it before the permit is released.
-        let session_guard = state.session_queue.acquire("gw_operator-1").await.unwrap();
-        let response_fut = handle_api_session_message_post(
-            State(state),
-            HeaderMap::new(),
-            Path("operator-1".to_string()),
-            Json(
-                serde_json::from_value::<SessionMessagePostBody>(serde_json::json!({
-                    "content": "deploy finished"
-                }))
-                .expect("body should deserialize"),
-            ),
-        );
-        tokio::pin!(response_fut);
-
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), &mut response_fut)
-                .await
-                .is_err(),
-            "POST should wait behind the active session queue guard"
-        );
-        assert!(
-            backend.delete_session("gw_operator-1").unwrap(),
-            "the delete the POST queued behind removes the session"
-        );
-        drop(session_guard);
-
-        let response = tokio::time::timeout(Duration::from_secs(1), response_fut)
-            .await
-            .expect("queued POST should complete")
-            .into_response();
-
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        let json = response_json(response).await;
-        assert_eq!(json["error"], "Session not found");
-        assert!(
-            backend.load("gw_operator-1").is_empty(),
-            "the queued POST must not re-create the deleted session"
-        );
-        assert!(
-            !backend.session_exists("gw_operator-1"),
-            "the deleted session must stay gone for later callers too"
-        );
-    }
-
     #[test]
     fn resolve_gateway_session_key_accepts_full_key_and_display_id() {
         let none = |_key: &str| false;
@@ -3814,6 +3755,43 @@ pub(crate) mod tests {
             resolve_gateway_session_key("team_alpha", both),
             "team_alpha"
         );
+
+        let legacy_dotted = |key: &str| key == "gw_team.alpha";
+        assert_eq!(
+            resolve_gateway_session_key("team.alpha", legacy_dotted),
+            "gw_team.alpha",
+            "existing raw gateway keys remain addressable"
+        );
+        assert_eq!(
+            resolve_gateway_session_key("team.alpha", none),
+            "gw_team_alpha",
+            "new dotted display ids use the canonical sanitized gateway key"
+        );
+    }
+
+    #[test]
+    fn resolve_gateway_cancel_key_accepts_display_and_full_ids_without_collisions() {
+        let dotted = |key: &str| key == "gw_team.alpha";
+        assert_eq!(
+            resolve_gateway_cancel_key("team.alpha", dotted),
+            Some("gw_team.alpha".to_string())
+        );
+        assert_eq!(
+            resolve_gateway_cancel_key("gw_team.alpha", dotted),
+            Some("gw_team.alpha".to_string())
+        );
+
+        let both = |key: &str| key == "gw_team.alpha" || key == "gw_team_alpha";
+        assert_eq!(
+            resolve_gateway_cancel_key("team.alpha", both),
+            Some("gw_team.alpha".to_string()),
+            "dotted display ids must retain their raw cancellation identity"
+        );
+        assert_eq!(
+            resolve_gateway_cancel_key("team_alpha", both),
+            Some("gw_team_alpha".to_string()),
+            "underscored display ids must not collide with dotted ids"
+        );
     }
 
     #[test]
@@ -3835,7 +3813,7 @@ pub(crate) mod tests {
             .cancel_tokens
             .lock()
             .expect("cancel_tokens lock")
-            .insert(session_key.clone(), token.clone());
+            .insert(session_key.clone(), std::sync::Arc::new(token.clone()));
 
         // Same id GET /api/sessions advertises as session_key for abort.
         let response = handle_api_session_abort(State(state), HeaderMap::new(), Path(session_key))
@@ -3859,7 +3837,10 @@ pub(crate) mod tests {
             .cancel_tokens
             .lock()
             .expect("cancel_tokens lock")
-            .insert("gw_operator-1".to_string(), token.clone());
+            .insert(
+                "gw_operator-1".to_string(),
+                std::sync::Arc::new(token.clone()),
+            );
 
         let response = handle_api_session_abort(
             State(state),
@@ -3883,7 +3864,10 @@ pub(crate) mod tests {
             .cancel_tokens
             .lock()
             .expect("cancel_tokens lock")
-            .insert("gw_team_alpha".to_string(), token.clone());
+            .insert(
+                "gw_team_alpha".to_string(),
+                std::sync::Arc::new(token.clone()),
+            );
 
         // List contract: session_id=team_alpha, session_key=gw_team_alpha.
         // Treating "_" as "already a full key" would miss this cancel token.
@@ -3902,6 +3886,197 @@ pub(crate) mod tests {
             "underscore display ids must resolve to gw_ + id, not the bare id"
         );
         assert!(token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn session_abort_accepts_dotted_display_session_id() {
+        let state = test_state(zeroclaw_config::schema::Config::default());
+        let token = tokio_util::sync::CancellationToken::new();
+        state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock")
+            .insert(
+                "gw_team.alpha".to_string(),
+                std::sync::Arc::new(token.clone()),
+            );
+
+        let response = handle_api_session_abort(
+            State(state),
+            HeaderMap::new(),
+            Path("team.alpha".to_string()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["status"], "aborted");
+        assert!(token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn session_abort_accepts_full_dotted_session_key() {
+        let state = test_state(zeroclaw_config::schema::Config::default());
+        let token = tokio_util::sync::CancellationToken::new();
+        state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock")
+            .insert(
+                "gw_team.alpha".to_string(),
+                std::sync::Arc::new(token.clone()),
+            );
+
+        let response = handle_api_session_abort(
+            State(state),
+            HeaderMap::new(),
+            Path("gw_team.alpha".to_string()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["status"], "aborted");
+        assert!(token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn session_abort_keeps_dotted_and_underscored_ids_separate() {
+        let state = test_state(zeroclaw_config::schema::Config::default());
+        let dotted_token = tokio_util::sync::CancellationToken::new();
+        let underscored_token = tokio_util::sync::CancellationToken::new();
+        state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock")
+            .insert(
+                "gw_team.alpha".to_string(),
+                std::sync::Arc::new(dotted_token.clone()),
+            );
+        state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock")
+            .insert(
+                "gw_team_alpha".to_string(),
+                std::sync::Arc::new(underscored_token.clone()),
+            );
+
+        let dotted_response = handle_api_session_abort(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("team.alpha".to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(dotted_response.status(), StatusCode::OK);
+        assert_eq!(response_json(dotted_response).await["status"], "aborted");
+        assert!(dotted_token.is_cancelled());
+        assert!(
+            !underscored_token.is_cancelled(),
+            "aborting team.alpha must not cancel team_alpha"
+        );
+
+        let underscored_response = handle_api_session_abort(
+            State(state),
+            HeaderMap::new(),
+            Path("team_alpha".to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(underscored_response.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(underscored_response).await["status"],
+            "aborted"
+        );
+        assert!(underscored_token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn session_delete_cancels_full_dotted_session_key() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let backend: Arc<dyn SessionBackend> =
+            Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
+        backend
+            .append(
+                "gw_team.alpha",
+                &zeroclaw_providers::ChatMessage::assistant("existing"),
+            )
+            .unwrap();
+        let state = test_state_with_session_backend(config, backend.clone());
+        let token = tokio_util::sync::CancellationToken::new();
+        state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock")
+            .insert("gw_team.alpha".to_string(), Arc::new(token.clone()));
+
+        let response = handle_api_session_delete(
+            State(state),
+            HeaderMap::new(),
+            Path("gw_team.alpha".to_string()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(token.is_cancelled());
+        assert!(
+            !backend.session_exists("gw_team.alpha"),
+            "deletion must target the persisted dotted session key"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_delete_cancels_raw_dotted_turn_for_sanitized_persistence_key() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let backend: Arc<dyn SessionBackend> =
+            Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
+        // This is the persistence identity used by the streamed webhook
+        // path. The live cancellation identity must remain the raw dotted
+        // display id, so deletion has to resolve the two independently.
+        backend
+            .append(
+                "gw_team_alpha",
+                &zeroclaw_providers::ChatMessage::assistant("existing"),
+            )
+            .unwrap();
+        let state = test_state_with_session_backend(config, backend.clone());
+        let token = tokio_util::sync::CancellationToken::new();
+        state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock")
+            .insert("gw_team.alpha".to_string(), Arc::new(token.clone()));
+
+        let response = handle_api_session_delete(
+            State(state),
+            HeaderMap::new(),
+            Path("team.alpha".to_string()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            token.is_cancelled(),
+            "deletion must cancel the raw dotted turn even when persistence is sanitized"
+        );
+        assert!(!backend.session_exists("gw_team_alpha"));
     }
 
     #[tokio::test]
@@ -4123,6 +4298,44 @@ pub(crate) mod tests {
             "state handler must accept underscore display ids from the sessions list"
         );
         assert_eq!(display_json["turn_id"], "turn-1");
+    }
+
+    #[tokio::test]
+    async fn cron_add_refuses_alias_during_destructive_cleanup() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = with_test_agent(zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        });
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(config.clone());
+        let mut cleanup = state.agent_lifecycle.begin_delete("test-agent").unwrap();
+        cleanup.commit_destructive_mutation();
+        let body = || {
+            Json(
+                serde_json::from_value::<CronAddBody>(serde_json::json!({
+                    "agent": "test-agent", "schedule": "*/5 * * * *", "command": "echo hello"
+                }))
+                .unwrap(),
+            )
+        };
+        let response = handle_api_cron_add(State(state.clone()), HeaderMap::new(), body())
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(
+            zeroclaw_runtime::cron::list_jobs(&config)
+                .unwrap()
+                .is_empty()
+        );
+        drop(cleanup);
+        let response = handle_api_cron_add(State(state), HeaderMap::new(), body())
+            .await
+            .into_response();
+        let result = response_json(response).await;
+        assert_eq!(result["status"], "ok", "{result}");
+        assert_eq!(zeroclaw_runtime::cron::list_jobs(&config).unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -5009,8 +5222,9 @@ pub(crate) mod tests {
             zeroclaw_config::schema::CronShellOutputFormat::Wrapped,
             "imperative jobs default to wrapped"
         );
-        // Imperative jobs get UUID ids; the scheduler resolves owning agent
-        // by reverse-lookup against `agent.cron_jobs`, same as
+        // The stored alias resolves ownership when `test-agent` is an enabled
+        // configured agent; the `cron_jobs` claim is the single-enabled-claimant
+        // fallback for rows without one, same as
         // `cron_api_run_executes_shell_job_and_records_run`.
         link_job_to_test_agent(&state, &job.id);
 
@@ -5323,8 +5537,9 @@ pub(crate) mod tests {
         )
         .expect("job added");
 
-        // Imperative jobs get UUID ids; the scheduler resolves owning
-        // agent by reverse-lookup against `agent.cron_jobs`.
+        // The stored alias resolves ownership when `test-agent` is an enabled
+        // configured agent; the `cron_jobs` claim is the single-enabled-claimant
+        // fallback for rows without one.
         link_job_to_test_agent(&state, &job.id);
 
         let response =
@@ -5348,6 +5563,70 @@ pub(crate) mod tests {
             .expect("runs listed");
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].status, "ok");
+    }
+
+    #[tokio::test]
+    async fn cron_runs_endpoint_serves_retained_history_after_job_deletion() {
+        // A successful auto-delete one-shot removes its job row but keeps
+        // its run record; the runs endpoint must serve that durable record
+        // rather than 404 on the missing job — and still 404 when neither
+        // job nor history exists.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(with_test_agent(config));
+        let config = state.config.read().clone();
+
+        let now = chrono::Utc::now();
+        zeroclaw_runtime::cron::record_run(
+            &config,
+            "retained-one-shot",
+            now,
+            now + chrono::Duration::milliseconds(5),
+            "ok",
+            zeroclaw_runtime::cron::RunOutcomes {
+                execution: "ok",
+                delivery: "not_required",
+                persistence: "not_bound",
+            },
+            zeroclaw_runtime::cron::RunProvenance {
+                principal: None,
+                executing_agent: Some("test-agent"),
+                job_source: Some("imperative"),
+            },
+            Some("done"),
+            5,
+        )
+        .unwrap();
+
+        let response = handle_api_cron_runs(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("retained-one-shot".to_string()),
+            axum::extract::Query(CronRunsQuery { limit: None }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        let runs = json["runs"].as_array().expect("runs array");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0]["status"], "ok");
+        assert_eq!(runs[0]["executing_agent"], "test-agent");
+
+        let response = handle_api_cron_runs(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("never-existed".to_string()),
+            axum::extract::Query(CronRunsQuery { limit: None }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

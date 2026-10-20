@@ -10,7 +10,7 @@
 
 ---
 
-ZeroLite is a fork of [ZeroClaw](https://github.com/zeroclaw-labs/zeroclaw). The binary, config file, and commands stay `zeroclaw`. This tree is crate version `1.0.0-lite`; the release tag is `v1.0.0`.
+ZeroLite is a fork of [ZeroClaw](https://github.com/zeroclaw-labs/zeroclaw). The binary, config file, and commands stay `zeroclaw`. This tree is crate version `1.1.0`; the release tag is `v1.1.0`.
 
 It is still one Rust binary: LLM providers (Anthropic, OpenAI, Ollama, and ~20 others), 30+ channels (Discord, Telegram, Matrix, email, voice, webhooks, CLI), and tools (shell, browser, HTTP, hardware, custom MCP servers). Everything runs on your machine, with your keys, in your workspace.
 

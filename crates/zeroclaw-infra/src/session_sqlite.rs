@@ -1006,6 +1006,7 @@ impl SessionBackend for SqliteSessionBackend {
                 channel_id,
                 room_id,
                 sender_id,
+                principal_id: None,
             })
         }) {
             Ok(r) => r,
@@ -1199,6 +1200,7 @@ impl SessionBackend for SqliteSessionBackend {
                     channel_id,
                     room_id,
                     sender_id,
+                    principal_id: None,
                 })
             },
         )
@@ -1292,6 +1294,7 @@ impl SessionBackend for SqliteSessionBackend {
                 channel_id,
                 room_id,
                 sender_id,
+                principal_id: None,
             })
         }) {
             Ok(r) => r,
@@ -1342,6 +1345,7 @@ impl SessionBackend for SqliteSessionBackend {
                 channel_id,
                 room_id,
                 sender_id,
+                principal_id: None,
             })
         }) {
             Ok(r) => r,
@@ -1408,6 +1412,7 @@ impl SessionBackend for SqliteSessionBackend {
                             channel_id,
                             room_id,
                             sender_id,
+                            principal_id: None,
                         })
                     },
                 )
@@ -2993,6 +2998,7 @@ mod tests {
                     channel_id: None,
                     room_id: Some("1234567890"),
                     sender_id: None,
+                    principal_id: None,
                 },
             )
             .unwrap();
@@ -3224,6 +3230,7 @@ mod tests {
                     channel_id: Some("telegram.default"),
                     room_id: None,
                     sender_id: None,
+                    principal_id: None,
                 },
             )
             .unwrap();
