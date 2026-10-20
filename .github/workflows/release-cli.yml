@@ -160,11 +160,38 @@ jobs:
           merge-multiple: true
       - name: Show assets
         run: ls -lh assets/
-      - name: Create release
+      # `docs/releases/<version>.md`, when present, is the release body. Otherwise
+      # GitHub generates notes from the commit range.
+      - uses: actions/checkout@v4
+      - name: Resolve release notes
+        id: notes
+        shell: bash
+        env:
+          VERSION: ${{ needs.web.outputs.version }}
+        run: |
+          path="docs/releases/${VERSION}.md"
+          if [[ -f "$path" ]]; then
+            echo "path=$path" >> "$GITHUB_OUTPUT"
+            echo "Using $path"
+          else
+            echo "No release notes file; falling back to generated notes."
+          fi
+      - name: Create release (notes file)
+        if: steps.notes.outputs.path != ''
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.web.outputs.tag }}
-          name: "ZeroClaw CLI ${{ needs.web.outputs.tag }}"
+          name: "ZeroLite ${{ needs.web.outputs.version }}"
+          body_path: ${{ steps.notes.outputs.path }}
+          files: |
+            assets/*.zip
+            assets/*.tar.gz
+      - name: Create release (generated notes)
+        if: steps.notes.outputs.path == ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.web.outputs.tag }}
+          name: "ZeroLite ${{ needs.web.outputs.version }}"
           generate_release_notes: true
           files: |
             assets/*.zip
