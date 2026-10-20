@@ -43,30 +43,6 @@ enum Cmd {
         #[arg(value_name = "RENDERER")]
         renderer: Option<String>,
     },
-    /// Sync .po files and AI-fill translation delta
-    Sync {
-        #[arg(long)]
-        locale: Option<String>,
-        /// Re-translate all entries (quality pass, costs more)
-        #[arg(long)]
-        force: bool,
-        /// Provider alias from `[providers.models.<kind>.<alias>]` in config.toml
-        #[arg(long)]
-        model_provider: Option<String>,
-        /// Config directory holding config.toml and .secret-key (default:
-        /// ~/.zeroclaw). Mirrors `zeroclaw --config-dir`.
-        #[arg(long)]
-        config_dir: Option<String>,
-        /// Entries per API call (default: 50)
-        #[arg(long)]
-        batch: Option<usize>,
-    },
-    /// Show translation statistics per locale
-    Stats,
-    /// Validate .po file format for all locales
-    Check,
-    /// Print space-separated locale codes from locales.toml (for CI use)
-    Locales,
     /// Extract shared chrome layer into _shared directory
     ExtractChrome {
         version_dir: String,
@@ -128,25 +104,6 @@ fn main() -> anyhow::Result<()> {
                 cmd::mdbook::placeholders::supports();
             }
             cmd::mdbook::placeholders::run()
-        }
-        Cmd::Sync {
-            locale,
-            force,
-            model_provider,
-            config_dir,
-            batch,
-        } => cmd::mdbook::sync::run(
-            locale.as_deref(),
-            force,
-            model_provider.as_deref(),
-            config_dir.as_deref(),
-            batch,
-        ),
-        Cmd::Stats => cmd::mdbook::stats::run(),
-        Cmd::Check => cmd::mdbook::check::run(),
-        Cmd::Locales => {
-            cmd::mdbook::build::print_locales();
-            Ok(())
         }
         Cmd::ExtractChrome {
             version_dir,

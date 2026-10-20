@@ -13,8 +13,6 @@ pub fn run(locale: Option<&str>, tag: Option<&str>) -> anyhow::Result<()> {
     let root = repo_root();
     require_tool("cargo", "https://rustup.rs")?;
     ensure_cargo_tool("mdbook", "mdbook")?;
-    ensure_cargo_tool("mdbook-xgettext", "mdbook-i18n-helpers")?;
-    ensure_cargo_tool("mdbook-gettext", "mdbook-i18n-helpers")?;
     ensure_cargo_tool("mdbook-mermaid", "mdbook-mermaid")?;
 
     let entries = locale_entries();
@@ -47,8 +45,7 @@ pub fn run(locale: Option<&str>, tag: Option<&str>) -> anyhow::Result<()> {
 
     match locale {
         Some(code) => {
-            // Lang switcher advertises every locale even when serve builds one.
-            crate::cmd::mdbook::build::prepare_generated_book_inputs(&root, &entries)?;
+            crate::cmd::mdbook::build::prepare_generated_book_inputs(&root)?;
             println!("==> Building locale '{code}' for serve...");
             build_one_locale(&book, tag_dir, code)?;
         }

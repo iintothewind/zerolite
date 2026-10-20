@@ -1,6 +1,6 @@
 //! Cross-surface OIDC enrollment API.
 //!
-//! Design: `docs/security/oidc-browser-pkce-design-8289.md`. These routes
+//! Design: OIDC browser Authorization Code + PKCE enrollment. These routes
 //! are unauthenticated by necessity (enrollment precedes authentication),
 //! rate limited, and grant nothing: they relay what the IdP grants after
 //! the user approves. The gateway holds the `[oidc.<alias>]` client

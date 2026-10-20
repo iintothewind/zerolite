@@ -29,7 +29,7 @@
 #   dist/bin/<target>/zeroclaw          (via collect-dist.sh)
 # cargo's target/<target>/release/zeroclaw is removed on exit (success or fail).
 #
-# Docs: docs/maintainers/build-cli-local.md
+# Docs: see AGENTS.md rule 12
 #
 # Windows: always run under Git Bash (not WSL). WSL's `bash` does not see
 # Windows `cargo.exe` as `cargo`, and Docker volume mounts from WSL vs

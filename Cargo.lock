@@ -3289,20 +3289,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fill-translations"
-version = "1.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "serde_json",
- "tokio",
- "toml 0.8.23",
- "xtask",
- "zeroclaw-api",
- "zeroclaw-providers",
-]
-
-[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
