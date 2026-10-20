@@ -3,6 +3,7 @@
 use crate::agent::agent::{Agent, StreamedTurnError, StreamedTurnSuccess, TurnEvent};
 use crate::agent::cost::{TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext};
 use crate::agent::loop_::is_tool_loop_cancelled;
+use crate::rpc::types::{ProviderUsageTotals, TurnUsageTotals};
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -13,6 +14,9 @@ pub enum TurnOutcome {
         text: String,
         messages: Vec<ConversationMessage>,
         safeguard_fallback: Option<zeroclaw_providers::SafeguardFallbackNotice>,
+        /// Capacity and trim budget of the route that served the final call.
+        /// `None` when no call was served (for example a cache hit).
+        final_context_limits: Option<zeroclaw_config::schema::ResolvedContextLimits>,
     },
     Cancelled {
         partial_text: String,
@@ -28,7 +32,30 @@ pub enum TurnError {
         diagnostic: String,
         user_message: String,
     },
+    /// The turn's caller was refused on the Agent guard the turn would have
+    /// run under, so the turn never started.
+    Refused(TurnRefusal),
 }
+
+/// Why a turn's caller may not run it, as the JSON-RPC error it receives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnRefusal {
+    pub code: i32,
+    pub message: String,
+}
+
+impl std::fmt::Display for TurnRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for TurnRefusal {}
+
+/// Judges a turn's caller on the Agent guard the turn runs under, after the
+/// last wait before the turn, and applies the caller's tool posture to that
+/// Agent. A refusal stops the turn before it touches the Agent.
+pub type TurnAdmission = Box<dyn FnOnce(&mut Agent) -> Result<(), TurnRefusal> + Send>;
 
 impl std::fmt::Display for TurnError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -38,6 +65,7 @@ impl std::fmt::Display for TurnError {
             Self::TerminalCompletion { diagnostic, .. } => {
                 write!(f, "Agent turn failed: {diagnostic}")
             }
+            Self::Refused(refusal) => write!(f, "Turn refused: {refusal}"),
         }
     }
 }
@@ -50,7 +78,7 @@ impl TurnError {
     pub fn user_message(&self) -> Option<&str> {
         match self {
             Self::TerminalCompletion { user_message, .. } => Some(user_message),
-            Self::Panicked(_) | Self::AgentError(_) => None,
+            Self::Panicked(_) | Self::AgentError(_) | Self::Refused(_) => None,
         }
     }
 }
@@ -73,6 +101,8 @@ pub async fn execute_turn<F, Fut>(
     attribution: TurnAttribution,
     cost_context: Option<ToolLoopCostTrackingContext>,
     connection_activity: Option<crate::rpc::ConnectionActivity>,
+    steering_rx: Option<mpsc::Receiver<crate::agent::SteeringInput>>,
+    admission: Option<TurnAdmission>,
     on_event: F,
 ) -> Result<TurnOutcome, TurnError>
 where
@@ -89,7 +119,19 @@ where
         // only schedules that drop; provider and tool cleanup still runs after
         // it, and the reload drain must not read zero while it does.
         let _connection_activity = connection_activity;
+        let mut steering_rx = steering_rx;
         let mut guard = agent.lock().await;
+        // Judged on this guard, with no await before the turn starts under
+        // it: every earlier check predates at least this lock wait.
+        if let Some(admit) = admission
+            && let Err(refusal) = admit(&mut guard)
+        {
+            return Err(StreamedTurnError {
+                error: anyhow::Error::new(refusal),
+                committed_response: String::new(),
+                new_messages: Vec::new(),
+            });
+        }
         let sk = attribution.session_key.clone();
         crate::agent::loop_::scope_session_key(attribution.session_key, async move {
             use ::zeroclaw_log::Instrument as _;
@@ -110,7 +152,7 @@ where
                             &prompt,
                             event_tx,
                             Some(cancel_clone),
-                            None,
+                            steering_rx.as_mut(),
                         )
                         .instrument(span),
                 )
@@ -141,14 +183,21 @@ where
         DrainOutcome::ExplicitCancel => {
             let graced = {
                 let handle = turn_handle_guard.handle()?;
-                tokio::time::timeout(CANCEL_GRACE, &mut *handle).await
+                join_with_draining_grace(
+                    handle,
+                    &mut event_rx,
+                    &mut accumulated_text,
+                    &on_event,
+                    CANCEL_GRACE,
+                )
+                .await
             };
             match graced {
-                Ok(joined) => outcome_from_task_result(
+                Some(joined) => outcome_from_task_result(
                     joined.map_err(|e| TurnError::Panicked(format!("cancelled turn join: {e}")))?,
                     accumulated_text,
                 ),
-                Err(_) => {
+                None => {
                     let handle = turn_handle_guard.handle()?;
                     handle.abort();
                     // Joined through the guard rather than a moved-out handle:
@@ -199,6 +248,81 @@ impl Drop for TurnHandleGuard {
     }
 }
 
+/// After `drain_until_done_or_cancelled` returns `ExplicitCancel`, keep
+/// draining `event_rx` for up to `grace` while racing the turn task instead
+/// of only awaiting it: the cooperative unwind can synthesize one event per
+/// still-pending tool call, and a batch larger than the channel capacity
+/// blocks the task's send once nobody is reading. An un-drained queue
+/// therefore starves the task of the very grace period meant to let it
+/// commit its trimmed history, and every grace window times out into a hard
+/// abort that loses the writeback this repair depends on.
+///
+/// Returns the joined task result if it finishes within `grace`, or `None`
+/// if the grace period elapsed (the caller must abort the handle).
+///
+/// `on_event` delivery is bounded by the *remaining* grace, not left to run
+/// unbounded: `select!` only polls its `sleep` branch between chosen-branch
+/// polls, so an `on_event` call that itself awaits (e.g. an RPC callback
+/// blocked on a full outbound queue with no reader) would otherwise keep the
+/// timer from ever firing and defeat the grace deadline entirely.
+async fn join_with_draining_grace<T, F, Fut>(
+    turn_handle: &mut tokio::task::JoinHandle<T>,
+    event_rx: &mut mpsc::Receiver<TurnEvent>,
+    accumulated: &mut String,
+    on_event: &F,
+    grace: std::time::Duration,
+) -> Option<Result<T, tokio::task::JoinError>>
+where
+    F: Fn(TurnEvent) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let deadline = tokio::time::Instant::now() + grace;
+    let sleep = tokio::time::sleep_until(deadline);
+    tokio::pin!(sleep);
+    let mut event_rx_closed = false;
+    loop {
+        tokio::select! {
+            biased;
+            joined = &mut *turn_handle => {
+                // The task can finish while events it already sent are
+                // still sitting in the channel buffer (a bounded send only
+                // needs buffer space, not a live reader). `biased` gives the
+                // join priority over drain on a tied poll, so without this
+                // the last few buffered events would never reach `on_event`
+                // even though the task committed successfully. The task has
+                // already finished here, so a stuck callback must not block
+                // this return: bound each delivery and stop draining (but
+                // still report the join) once the deadline is reached.
+                while let Ok(event) = event_rx.try_recv() {
+                    if let TurnEvent::Chunk { ref delta } = event {
+                        accumulated.push_str(delta);
+                    }
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if tokio::time::timeout(remaining, on_event(event)).await.is_err() {
+                        break;
+                    }
+                }
+                return Some(joined);
+            }
+            maybe_event = event_rx.recv(), if !event_rx_closed => {
+                match maybe_event {
+                    Some(event) => {
+                        if let TurnEvent::Chunk { ref delta } = event {
+                            accumulated.push_str(delta);
+                        }
+                        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                        if tokio::time::timeout(remaining, on_event(event)).await.is_err() {
+                            return None;
+                        }
+                    }
+                    None => event_rx_closed = true,
+                }
+            }
+            () = &mut sleep => return None,
+        }
+    }
+}
+
 /// Grace window allowing a cancelled turn task to commit its cooperative
 /// unwind (synthesized tool results + `[interrupted]` message) into the agent
 /// history before the dispatch path falls back to a hard abort.
@@ -216,10 +340,13 @@ fn outcome_from_task_result(
             response,
             new_messages,
             safeguard_fallback,
+            final_context_limits,
+            ..
         }) => Ok(TurnOutcome::Completed {
             text: response,
             messages: new_messages,
             safeguard_fallback,
+            final_context_limits,
         }),
         Err(StreamedTurnError {
             error,
@@ -234,6 +361,10 @@ fn outcome_from_task_result(
             messages: new_messages,
         }),
         Err(StreamedTurnError { error, .. }) => {
+            let error = match error.downcast::<TurnRefusal>() {
+                Ok(refusal) => return Err(TurnError::Refused(refusal)),
+                Err(error) => error,
+            };
             if let Some(user_message) =
                 crate::agent::terminal_completion_error_message(&error, None)
             {
@@ -289,6 +420,132 @@ where
     }
 }
 
+/// Per-turn fold of `TurnEvent::Usage` into the totals carried on
+/// `TurnComplete`. It follows the `TurnEvent::Usage` contract: billing totals
+/// and the per-provider breakdown count every billable attempt, while the
+/// serving snapshot (`last_*`, context limits) advances on accepted events
+/// only, so a billed rejected attempt cannot re-point the terminal identity.
+#[derive(Debug, Default)]
+pub(crate) struct TurnUsageFold {
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    last_provider_ref: Option<String>,
+    last_model: Option<String>,
+    last_input_tokens: Option<u64>,
+    last_context_token_budget: Option<u64>,
+    last_model_context_window: Option<u64>,
+    by_provider: std::collections::HashMap<(String, String), ProviderUsageTotals>,
+    saw_usage: bool,
+}
+
+impl TurnUsageFold {
+    pub(crate) fn apply(&mut self, event: &TurnEvent) {
+        let TurnEvent::Usage {
+            input_tokens,
+            cached_input_tokens,
+            output_tokens,
+            cost_usd,
+            context_token_budget,
+            model_context_window,
+            provider_ref,
+            model,
+            accepted,
+            // Billing totals and the accepted-serving snapshot describe
+            // provider-measured usage only. The display estimate is a
+            // context-meter concern and is labelled on the RPC
+            // `context_usage` surface, not folded into TurnComplete.
+            estimated_input_tokens: _,
+        } = event
+        else {
+            return;
+        };
+        self.saw_usage = true;
+        if let Some(it) = input_tokens {
+            self.input_tokens = Some(self.input_tokens.unwrap_or(0).saturating_add(*it));
+        }
+        if let Some(ot) = output_tokens {
+            self.output_tokens = Some(self.output_tokens.unwrap_or(0).saturating_add(*ot));
+        }
+        if *accepted {
+            self.last_provider_ref = Some(provider_ref.clone());
+            self.last_model = Some(model.clone());
+            self.last_context_token_budget = *context_token_budget;
+            self.last_model_context_window = *model_context_window;
+            // An accepted call without usage clears the previous route's
+            // snapshot rather than rendering it against this route's window.
+            self.last_input_tokens = *input_tokens;
+        }
+        let entry = self
+            .by_provider
+            .entry((provider_ref.clone(), model.clone()))
+            .or_insert_with_key(|(provider_ref, model)| ProviderUsageTotals {
+                provider_ref: provider_ref.clone(),
+                model: model.clone(),
+                ..Default::default()
+            });
+        if let Some(it) = input_tokens {
+            entry.input_tokens = entry.input_tokens.saturating_add(*it);
+        }
+        if let Some(ot) = output_tokens {
+            entry.output_tokens = entry.output_tokens.saturating_add(*ot);
+        }
+        if let Some(ct) = cached_input_tokens {
+            entry.cached_input_tokens = entry.cached_input_tokens.saturating_add(*ct);
+        }
+        if let Some(cu) = cost_usd {
+            entry.cost_usd += cu;
+        }
+    }
+
+    /// Build the wire totals. `final_limits` is the serving route's resolved
+    /// limits and wins over the last accepted usage event's; `None` when no
+    /// usage event arrived and no route served the turn.
+    pub(crate) fn totals(
+        &self,
+        final_limits: Option<zeroclaw_config::schema::ResolvedContextLimits>,
+    ) -> Option<TurnUsageTotals> {
+        if !self.saw_usage && final_limits.is_none() {
+            return None;
+        }
+        // Sorted so the wire order, and the float sum below, are stable.
+        let mut usage_by_provider: Vec<ProviderUsageTotals> =
+            self.by_provider.values().cloned().collect();
+        usage_by_provider.sort_by(|a, b| {
+            (a.provider_ref.as_str(), a.model.as_str())
+                .cmp(&(b.provider_ref.as_str(), b.model.as_str()))
+        });
+        // Same rule as the gateway `done` frame: an unpriced turn has no cost.
+        let cost_sum: f64 = usage_by_provider.iter().map(|e| e.cost_usd).sum();
+        let cost_usd = (cost_sum > 0.0).then_some(cost_sum);
+        let tokens_used = match (self.input_tokens, self.output_tokens) {
+            (None, None) => None,
+            (i, o) => Some(i.unwrap_or(0).saturating_add(o.unwrap_or(0))),
+        };
+        let (max_context_tokens, model_context_window) = match final_limits {
+            Some(limits) => (
+                Some(limits.context_token_budget as u64),
+                limits.configured_model_context_window().map(|w| w as u64),
+            ),
+            None => (
+                self.last_context_token_budget,
+                self.last_model_context_window,
+            ),
+        };
+        Some(TurnUsageTotals {
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            tokens_used,
+            cost_usd,
+            provider_ref: self.last_provider_ref.clone(),
+            model: self.last_model.clone(),
+            last_input_tokens: self.last_input_tokens,
+            max_context_tokens,
+            model_context_window,
+            usage_by_provider,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,6 +553,113 @@ mod tests {
 
     fn noop(_e: TurnEvent) -> std::future::Ready<()> {
         std::future::ready(())
+    }
+
+    fn usage(
+        provider_ref: &str,
+        model: &str,
+        input: Option<u64>,
+        output: Option<u64>,
+        cost: Option<f64>,
+        accepted: bool,
+    ) -> TurnEvent {
+        TurnEvent::Usage {
+            input_tokens: input,
+            cached_input_tokens: None,
+            output_tokens: output,
+            cost_usd: cost,
+            context_token_budget: Some(1000),
+            model_context_window: Some(4000),
+            provider_ref: provider_ref.into(),
+            model: model.into(),
+            accepted,
+            estimated_input_tokens: None,
+        }
+    }
+
+    #[test]
+    fn usage_fold_bills_rejected_attempts_but_reports_the_accepted_route() {
+        let mut fold = TurnUsageFold::default();
+        fold.apply(&usage(
+            "b.fallback",
+            "m2",
+            Some(7),
+            Some(1),
+            Some(0.5),
+            false,
+        ));
+        fold.apply(&usage(
+            "a.primary",
+            "m1",
+            Some(10),
+            Some(3),
+            Some(0.25),
+            true,
+        ));
+        fold.apply(&TurnEvent::Chunk {
+            delta: "ignored".into(),
+        });
+
+        let totals = fold.totals(None).expect("usage arrived");
+        assert_eq!(totals.input_tokens, Some(17));
+        assert_eq!(totals.output_tokens, Some(4));
+        assert_eq!(totals.tokens_used, Some(21));
+        assert_eq!(totals.cost_usd, Some(0.75));
+        assert_eq!(totals.provider_ref.as_deref(), Some("a.primary"));
+        assert_eq!(totals.model.as_deref(), Some("m1"));
+        assert_eq!(totals.last_input_tokens, Some(10));
+        assert_eq!(totals.max_context_tokens, Some(1000));
+        assert_eq!(totals.model_context_window, Some(4000));
+        let order: Vec<_> = totals
+            .usage_by_provider
+            .iter()
+            .map(|e| e.provider_ref.as_str())
+            .collect();
+        assert_eq!(order, ["a.primary", "b.fallback"], "sorted wire order");
+    }
+
+    #[test]
+    fn usage_fold_prefers_the_serving_route_limits_and_is_absent_without_usage() {
+        assert!(TurnUsageFold::default().totals(None).is_none());
+
+        let limits = zeroclaw_config::schema::ResolvedContextLimits {
+            model_context_window: 200_000,
+            model_context_window_source:
+                zeroclaw_config::schema::ModelContextWindowSource::Configured,
+            context_token_budget: 150_000,
+        };
+        let mut fold = TurnUsageFold::default();
+        fold.apply(&usage("a.primary", "m1", None, None, None, true));
+        let totals = fold.totals(Some(limits)).expect("a route served the turn");
+        assert_eq!(totals.max_context_tokens, Some(150_000));
+        assert_eq!(totals.model_context_window, Some(200_000));
+        assert_eq!(totals.tokens_used, None, "no counts reported is not zero");
+        assert_eq!(totals.cost_usd, None, "an unpriced turn carries no cost");
+    }
+
+    #[test]
+    fn usage_fold_does_not_bill_estimated_input_tokens() {
+        let mut fold = TurnUsageFold::default();
+        fold.apply(&TurnEvent::Usage {
+            input_tokens: None,
+            cached_input_tokens: None,
+            output_tokens: None,
+            cost_usd: None,
+            context_token_budget: Some(180_000),
+            model_context_window: Some(200_000),
+            provider_ref: "llamacpp.default".into(),
+            model: "local-model".into(),
+            accepted: true,
+            estimated_input_tokens: Some(4_200),
+        });
+        let totals = fold.totals(None).expect("usage arrived");
+        assert_eq!(
+            totals.input_tokens, None,
+            "a display estimate must not become a billed input total"
+        );
+        assert_eq!(totals.last_input_tokens, None);
+        assert_eq!(totals.tokens_used, None);
+        assert_eq!(totals.cost_usd, None);
     }
 
     // ── Matrix test support items (module-level) ──────────────────────────
@@ -571,6 +935,112 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn grace_drain_lets_a_backlog_larger_than_the_channel_finish_within_grace() {
+        // A cooperative unwind synthesizing more events than the channel
+        // capacity blocks on the (capacity+1)th send once nobody is
+        // draining. If the grace window only awaits the task without also
+        // draining, the task can never finish and always times out into a
+        // hard abort. This reproduces that backlog against an 8-slot
+        // channel with 20 events and asserts the task still completes well
+        // inside a generous grace window.
+        const CAPACITY: usize = 8;
+        const EVENTS: usize = CAPACITY * 3;
+        let (tx, mut rx) = mpsc::channel::<TurnEvent>(CAPACITY);
+
+        let mut handle = zeroclaw_spawn::spawn!(async move {
+            for i in 0..EVENTS {
+                // Blocks once the channel fills, exactly like a real
+                // cooperative unwind synthesizing one event per pending
+                // tool call after cancellation is observed.
+                let _ = tx
+                    .send(TurnEvent::Chunk {
+                        delta: i.to_string(),
+                    })
+                    .await;
+            }
+            "task-finished"
+        });
+
+        let mut acc = String::new();
+        let joined = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            join_with_draining_grace(
+                &mut handle,
+                &mut rx,
+                &mut acc,
+                &noop,
+                std::time::Duration::from_secs(5),
+            ),
+        )
+        .await
+        .expect("the grace drain itself must not hang");
+
+        assert_eq!(
+            joined
+                .expect("the task must finish within the grace window")
+                .unwrap(),
+            "task-finished",
+            "an un-drained backlog must not starve the task of the grace \
+             period meant to let it commit its cooperative unwind"
+        );
+        assert_eq!(
+            acc.len(),
+            (0..EVENTS).map(|i| i.to_string().len()).sum::<usize>(),
+            "every backlogged event must still be drained and accumulated"
+        );
+    }
+
+    #[tokio::test]
+    async fn grace_drain_returns_within_grace_despite_a_callback_that_never_resolves() {
+        // A callback that permanently blocks (e.g. the outbound RPC queue
+        // is full and nobody is reading) must not be able to keep
+        // join_with_draining_grace parked past its deadline: without a
+        // per-delivery timeout, select! never gets to re-poll the sleep
+        // branch while the chosen branch's on_event().await is still
+        // running, so the grace bound would be defeated entirely.
+        let (tx, mut rx) = mpsc::channel::<TurnEvent>(8);
+
+        let mut handle = zeroclaw_spawn::spawn!(async move {
+            let _ = tx
+                .send(TurnEvent::Chunk {
+                    delta: "x".to_string(),
+                })
+                .await;
+            // Task itself never finishes on its own within the grace
+            // window; only the deadline should end this test.
+            std::future::pending::<()>().await;
+            "unreachable"
+        });
+
+        fn never_resolves(_e: TurnEvent) -> std::future::Pending<()> {
+            std::future::pending()
+        }
+
+        let mut acc = String::new();
+        let grace = std::time::Duration::from_millis(300);
+        let started = tokio::time::Instant::now();
+        let joined = tokio::time::timeout(
+            grace + std::time::Duration::from_secs(5),
+            join_with_draining_grace(&mut handle, &mut rx, &mut acc, &never_resolves, grace),
+        )
+        .await
+        .expect("a stuck callback must not hang join_with_draining_grace past its own timeout");
+
+        assert!(
+            joined.is_none(),
+            "the task never finishes on its own here, so the grace window \
+             elapsing must report timeout, not a spurious join"
+        );
+        assert!(
+            started.elapsed() < grace + std::time::Duration::from_secs(2),
+            "a callback stuck in on_event().await must not extend the grace \
+             deadline; the caller (execute_turn) depends on this bound to \
+             reach its persistence path"
+        );
+        handle.abort();
+    }
+
     #[test]
     fn cancel_outcome_carries_committed_messages_not_just_partial_text() {
         let msgs = vec![ConversationMessage::Chat(
@@ -622,6 +1092,9 @@ mod tests {
             Ok(StreamedTurnSuccess {
                 response: "accepted response".into(),
                 new_messages: messages.clone(),
+                provider_name: "requested-provider".into(),
+                model: "requested-model".into(),
+                final_context_limits: None,
                 safeguard_fallback: Some(safeguard),
             }),
             "accepted response".into(),
@@ -632,6 +1105,7 @@ mod tests {
             text,
             messages: outcome_messages,
             safeguard_fallback,
+            ..
         } = outcome
         else {
             panic!("successful turn must complete");
@@ -840,6 +1314,8 @@ mod tests {
             },
             Some(cost_context),
             None,
+            None,
+            None,
             noop,
         )
         .await
@@ -992,6 +1468,8 @@ mod tests {
                 model: "test-model".into(),
                 channel: "rpc",
             },
+            None,
+            None,
             None,
             None,
             move |event| {
@@ -1167,6 +1645,8 @@ mod tests {
                 },
                 None,
                 None,
+                None,
+                None,
                 move |event| {
                     let cfg = Arc::clone(&cfg_arc);
                     let dc = Arc::clone(&dc);
@@ -1323,7 +1803,7 @@ mod tests {
         use crate::rpc::dispatch::forward_turn_event;
         use tokio::sync::mpsc;
         use zeroclaw_api::jsonrpc::RpcOutbound;
-        use zeroclaw_config::schema::{Config, MemoryConfig};
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config, MemoryConfig};
 
         // Build a config with a known context_window for the provider.
         let mut config = Config::default();
@@ -1334,6 +1814,16 @@ mod tests {
             .expect("ensure provider entry");
         provider_entry.context_window = Some(128_000);
         provider_entry.model = Some("w1-model".to_string());
+        config.agents.insert(
+            "rpc-w1".to_string(),
+            AliasedAgentConfig {
+                model_provider: zeroclaw_config::providers::ModelProviderRef::new("openai.default"),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let agent_config = config
+            .resolved_agent_config("rpc-w1")
+            .expect("test agent config should resolve");
 
         let memory_cfg = MemoryConfig {
             backend: "none".into(),
@@ -1401,18 +1891,9 @@ mod tests {
             .model_name("w1-model".into())
             .model_provider_name("openai.default".into())
             .agent_alias("rpc-w1".into())
+            .config(agent_config)
             .build()
             .expect("agent builder should succeed");
-
-        // Use parking_lot::RwLock for config so that .read() returns the
-        // guard directly (no Result wrapping), matching the existing
-        // drain-callback pattern in the matrix test.
-        let cfg_arc: Arc<parking_lot::RwLock<Config>> = Arc::new(parking_lot::RwLock::new(config));
-        let cfg_for_cb = Arc::clone(&cfg_arc);
-
-        // Resolve max_context_tokens from the config using the public
-        // Config method (context_usage_max_tokens is private to dispatch).
-        let max_ctx = cfg_arc.read().effective_context_window("rpc-w1") as u64;
 
         // Drive the turn through execute_turn, forwarding each event
         // through the real RPC boundary using forward_turn_event.
@@ -1430,28 +1911,13 @@ mod tests {
             },
             None,
             None,
+            None,
+            None,
             move |event| {
                 let rpc = Arc::clone(&rpc);
-                let cfg = Arc::clone(&cfg_for_cb);
                 async move {
-                    // Resolve model_context_window per event from the embedded
-                    // provider_ref (only Usage events carry it).
-                    let model_ctx_window = if let TurnEvent::Usage {
-                        provider_ref,
-                        model,
-                        ..
-                    } = &event
-                    {
-                        let cfg = cfg.read();
-                        cfg.model_provider_context_window_opt(provider_ref, model)
-                            .map(|v| v as u64)
-                    } else {
-                        None
-                    };
-
                     // Forward through the real RPC boundary.
-                    forward_turn_event(&rpc, "w1-test", &event, Some(max_ctx), model_ctx_window)
-                        .await;
+                    forward_turn_event(&rpc, "w1-test", &event).await;
                 }
             },
         )
@@ -1724,6 +2190,8 @@ mod tests {
                 },
                 None,
                 Some(activity),
+                None,
+                None,
                 noop,
             )
             .await;

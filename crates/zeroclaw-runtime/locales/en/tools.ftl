@@ -5,7 +5,7 @@
 #
 # Literal { and } in values must be escaped as {"{"}  and  {"}"} respectively.
 
-tool-backup = Create, list, verify, and restore workspace backups
+tool-backup = Create, list, verify, and restore shared data directory backups
 
 tool-browser = Web/browser automation with pluggable backends (agent-browser, rust-native, computer_use). Supports DOM actions plus optional OS-level actions (mouse_move, mouse_click, mouse_drag, key_type, key_press, screen_capture) through a computer-use sidecar. Use 'snapshot' to map interactive elements to refs (@e1, @e2). Enforces browser.allowed_domains for open actions.
 
@@ -56,7 +56,7 @@ tool-cron-runs = List recent run history for a cron job
 
 tool-cron-update = Patch an existing cron job (schedule, command, prompt, enabled, delivery, model, etc.)
 
-tool-data-management = Workspace data retention, purge, and storage statistics
+tool-data-management = Shared data directory retention preview and storage statistics
 
 tool-delegate = Delegate a subtask to a specialized agent. Use when: a task benefits from a different model (e.g. fast summarization, deep reasoning, code generation). The sub-agent runs a single prompt by default; with agentic=true it can iterate with a filtered tool-call loop.
 
@@ -74,6 +74,11 @@ tool-file-download-error-missing-dest-path = Missing 'dest_path' parameter
 tool-file-download-error-invalid-file-name = Invalid dest_path '{ $dest_path }': must end in a concrete file name
 tool-file-download-error-no-parent = Invalid dest_path '{ $dest_path }': has no parent directory
 tool-file-download-error-resolve-dir = Cannot resolve destination directory for '{ $dest_path }': { $err }
+tool-file-download-error-bad-scheme = file_download endpoint URL scheme '{ $scheme }' is not supported; only http:// and https:// are allowed
+tool-file-download-error-invalid-url = file_download endpoint URL is invalid: { $err }
+tool-file-download-error-private-host = file_download endpoint host '{ $host }' is loopback / private / link-local. To allow this host, add it (or "*") to { $config_key } in config.toml
+tool-file-download-error-metadata-endpoint = file_download endpoint host '{ $host }' resolved to cloud metadata or credential-delivery address { $ip }, which cannot be enabled by file_download.allowed_private_hosts
+tool-file-download-error-invalid-nat64-prefix = file_download config '{ $config_key }' contains malformed entry '{ $prefix }': fix or remove it, then retry (a network-specific NAT64 prefix must be an IPv6 CIDR with length 32, 40, 48, 56, 64, or 96)
 tool-file-download-error-client-build = Failed to build download client: { $err }
 tool-file-download-error-request = Download request failed: { $err }
 tool-file-download-error-status = Download endpoint returned status { $status }
@@ -89,9 +94,41 @@ tool-file-download-success = Downloaded { $written } bytes to { $dest_path } ({ 
 tool-file-read = Read file contents with line numbers. Supports partial reading via offset and limit. Binary and image files are rejected (use the image_info tool for images). Set encoding="base64" to return raw bytes base64-encoded (for binary files such as .pdf/.xlsx/.docx); offset/limit are ignored in that mode.
 
 tool-file-write = Write contents to a file in the workspace
+tool-file-write-error-path-blocked = Path blocked by security policy: '{ $path }'
+tool-file-write-error-missing-parent = Invalid path: missing parent directory
+tool-file-write-error-no-existing-parent = Failed to resolve an existing parent directory
+tool-file-write-error-parent-binding = Failed to resolve the file-write parent path: '{ $path }'
+tool-file-write-error-missing-name = Invalid path: missing file name
+tool-file-write-error-runtime-config = Runtime configuration files cannot be changed with file_write: '{ $path }'
+tool-file-write-error-capability-binding = Failed to bind the file-write parent to an authorized directory
+tool-file-write-error-symlink = Refusing to write through a symlink: '{ $path }'
+tool-filesystem-boundary-error-symlink = Refusing to follow a symlink at '{ $path }'
+tool-filesystem-boundary-error-contained = Path must be relative and contained: '{ $path }'
+tool-filesystem-boundary-error-not-directory = Path component is not a directory: '{ $path }'
+tool-filesystem-boundary-error-not-regular = Refusing to open a non-regular file: '{ $path }'
+tool-data-management-error-purge-disabled = Confirmed purge is unavailable; use dry_run to preview eligible files
+tool-data-management-error-read-blocked = Shared data path is not readable under the security policy: '{ $path }'
+tool-backup-error-max-keep = Backup retention max_keep must be at least 1
+tool-backup-error-action-blocked = Backup mutation is blocked by the security policy
+tool-backup-error-source-overlap = Backup source cannot contain the backup output directory: '{ $path }'
+tool-backup-error-rotation-platform = Backup rotation is unavailable on this platform because recursive deletion cannot preserve the verified directory-handle boundary
+tool-backup-error-not-found = Backup not found: '{ $name }'
+tool-backup-error-integrity = Integrity check failed
+tool-backup-error-non-utf8 = Backup contains a non-UTF-8 entry name
+tool-backup-error-contained = Backup path must stay within the shared data directory: '{ $path }'
+tool-backup-error-invalid-name = Invalid backup name: '{ $name }'
+tool-backup-error-symlink = Refusing to traverse a symlink in backup data: '{ $path }'
+tool-backup-error-not-directory = Backup path is not a directory: '{ $path }'
+tool-backup-error-is-directory = Backup file destination is a directory: '{ $path }'
+tool-backup-error-special-file = Refusing to traverse a special file in backup data: '{ $path }'
+tool-backup-error-read-blocked = Shared data path is not readable under the security policy: '{ $path }'
+tool-backup-error-write-blocked = Backup destination is not writable under the security policy: '{ $path }'
 
-tool-git-operations = Perform structured Git operations (status, diff, log, branch, commit, add, checkout, stash). Provides parsed JSON output and integrates with security policy for autonomy controls.
+tool-git-operations = Perform structured Git operations (status, diff, log, branch, commit, add, checkout, stash, worktree). Provides parsed JSON output and integrates with security policy for autonomy controls.
 tool-git-operations-error-not-in-repo = Not in a Git repository at '{ $path }'. Choose a path inside a Git worktree, pass 'path' for a repository subdirectory, or initialize a repository before running git_operations.
+tool-git-operations-error-repository-outside-authorized-roots = No Git repository is reachable within the authorized roots for '{ $path }'. Choose a path inside a repository covered by the applicable allowed root, or initialize a repository before running git_operations.
+tool-git-operations-error-repository-not-authorized = Git repository metadata at '{ $path }' is not authorized for this operation. Choose a repository covered by the applicable allowed root.
+tool-git-operations-error-path-not-authorized = Git path '{ $path }' is not authorized for this operation. Choose a path covered by the applicable allowed root.
 
 tool-git-forge-error-requires-field = { $resource }.{ $action } requires '{ $field }'.
 tool-git-forge-error-requires-number = { $resource }.{ $action } requires 'number'.
@@ -136,6 +173,12 @@ tool-memory-store = Store a fact, preference, or note in long-term memory. Use c
 tool-microsoft365 = Microsoft 365 integration: manage Outlook mail, Teams messages, Calendar events, OneDrive files, and SharePoint search via Microsoft Graph API
 
 tool-model-routing-config = Manage default model settings, scenario-based provider/model routes, classification rules, and aliased agent profiles
+tool-model-routing-config-error-missing-risk-profile = agent `{$agent}` references missing risk profile `{$profile}`
+tool-model-routing-config-error-shared-risk-profile = risk profile `{$profile}` is shared by another agent; refusing an agent-scoped mutation
+tool-model-routing-config-error-risk-profile-collision = risk profile `{$profile}` already exists; refusing to overwrite it while isolating agent `{$agent}`
+tool-model-routing-config-error-missing-runtime-profile = agent `{$agent}` references missing runtime profile `{$profile}`
+tool-model-routing-config-error-shared-runtime-profile = runtime profile `{$profile}` is shared by another agent; refusing an agent-scoped mutation
+tool-model-routing-config-error-runtime-profile-collision = runtime profile `{$profile}` already exists; refusing to overwrite it while isolating agent `{$agent}`
 
 tool-notion = Interact with Notion: query databases, read/create/update pages, and search the workspace.
 
@@ -173,6 +216,7 @@ tool-browser-screenshot-error-sidecar-no-png-data = computer-use sidecar did not
 tool-browser-screenshot-error-sidecar-empty-png = computer-use sidecar returned an empty screenshot payload
 tool-browser-screenshot-error-sidecar-not-png = computer-use sidecar returned a non-PNG screenshot payload
 tool-browser-screenshot-error-sidecar-non-json-success = computer-use sidecar returned a non-JSON success response for a path-bearing screenshot; the requested file was not written
+tool-browser-screenshot-error-allocated-target-exists = Allocated screenshot target '{ $filename }' already exists; pass an explicit `path` instead of overwriting it
 
 tool-security-ops = Security operations tool for managed cybersecurity services. Actions: triage_alert (classify/prioritize alerts), run_playbook (execute incident response steps), parse_vulnerability (parse scan results), generate_report (create security posture reports), list_playbooks (list available playbooks), alert_stats (summarize alert metrics).
 

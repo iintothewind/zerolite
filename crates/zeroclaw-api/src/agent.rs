@@ -1,4 +1,6 @@
+use crate::model_provider::ConversationMessage;
 use crate::plan::PlanEntry;
+use std::fmt;
 
 /// Structured metadata for a tool that produced a file artifact (e.g.
 /// `deliver_file`). Carried on [`TurnEvent::ToolResult`] so a channel attaches
@@ -125,24 +127,35 @@ pub enum TurnEvent {
         timeout_secs: u64,
     },
     /// Older whole turns were dropped to fit either the context token budget or
-    /// the configured message limit. Surfaces a user-visible "context was cut
+    /// the configured turn limit. Surfaces a user-visible "context was cut
     /// here" marker so trimming is never silent. Emitted whenever a trim occurs.
-    ///
-    /// Emitted from inside the turn, before the session store is rewritten, so
-    /// consumers must cut their own transcript locally rather than re-reading
-    /// the store. `history_trimmed_ws_frame` in the gateway owns that contract.
     HistoryTrimmed {
         dropped_messages: usize,
+        dropped_turns: usize,
         kept_turns: usize,
         reason: String,
-        /// Estimated (or provider-aligned) prompt size after the trim action.
-        /// Clients use this to refresh the context meter when no further LLM
-        /// call will re-emit `Usage` in the same turn.
-        tokens_after: Option<usize>,
-        /// Prompt size used as the trim trigger baseline, when known.
-        tokens_before: Option<usize>,
-        /// Whole turns dropped by the trim action, when known.
-        dropped_turns: Option<usize>,
+        /// Configured context token budget in effect at trim time. `None` for
+        /// message-limit trims, which carry no token accounting.
+        token_budget: Option<u64>,
+        /// Token count before trimming.
+        tokens_before: Option<u64>,
+        /// Token count after trimming.
+        tokens_after: Option<u64>,
+        /// Provenance of `tokens_before`.
+        tokens_before_source: Option<TokenCountSource>,
+        /// Provenance of `tokens_after`.
+        tokens_after_source: Option<TokenCountSource>,
+        /// The retained provider-facing request cannot be brought under the
+        /// configured budget because only the protected newest turn (plus
+        /// tool schemas) remains. History MAY have been trimmed on the way to
+        /// that floor, so this flag — not `dropped_messages == 0` — is the
+        /// authoritative "unsatisfiable" signal. `None`/absent for ordinary
+        /// trims.
+        unsatisfiable_floor: Option<bool>,
+        /// Native RPC-only provider context captured by the owning turn before
+        /// the trim is announced. Wire and observer adapters deliberately
+        /// ignore this field; it is never serialized as a turn event.
+        retained_context: Option<RetainedContextSnapshot>,
     },
     /// Per-LLM-call token usage and cost; a turn may emit several, one per
     /// model call. `None` means "unavailable for this call", not zero.
@@ -158,15 +171,19 @@ pub enum TurnEvent {
     /// current provider trait.
     Usage {
         input_tokens: Option<u64>,
-        /// Prompt-cache hit count when the provider reports it (OpenAI/vLLM
-        /// `prompt_tokens_details.cached_tokens`, Anthropic
-        /// `cache_read_input_tokens`). For OpenAI-compatible backends this is a
-        /// **subset** of `input_tokens` — do **not** add it again for context
-        /// occupancy / trim / meter. Use for cache observability and cost only.
-        /// Absence is normal (flag off, provider silent, or buggy vLLM details).
+        /// Tokens served from the provider's prompt cache (e.g. Anthropic
+        /// `cache_read_input_tokens`, OpenAI `cached_tokens`). Subset of
+        /// `input_tokens` — adding would double-count.
         cached_input_tokens: Option<u64>,
         output_tokens: Option<u64>,
         cost_usd: Option<f64>,
+        /// Proactive trim threshold resolved for the provider/model route that
+        /// produced this usage sample. Zero means proactive trimming is disabled.
+        context_token_budget: Option<u64>,
+        /// Configured full context capacity for that same provider/model route.
+        /// `None` means the runtime used the compatibility fallback because no
+        /// authoritative capacity was configured.
+        model_context_window: Option<u64>,
         /// The `<type>.<alias>` config reference of the provider that served
         /// this call. Used for accurate context window resolution and cost
         /// attribution when vision routing or provider switches are active.
@@ -278,5 +295,25 @@ mod tool_artifact_tests {
         assert!(
             ToolArtifact::from_delivered_data(&json!({"delivered": true, "path": ""})).is_none()
         );
+    }
+}
+
+
+/// Provider-facing context captured at a trim boundary. This remains attached
+/// to the internal turn event so the serial RPC consumer can persist it before
+/// forwarding the public trim notice without borrowing the live agent again.
+#[derive(Clone)]
+pub struct RetainedContextSnapshot {
+    pub retained_messages: Vec<ConversationMessage>,
+    pub breadcrumb: bool,
+}
+
+impl fmt::Debug for RetainedContextSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RetainedContextSnapshot")
+            .field("retained_messages", &self.retained_messages.len())
+            .field("breadcrumb", &self.breadcrumb)
+            .finish()
     }
 }

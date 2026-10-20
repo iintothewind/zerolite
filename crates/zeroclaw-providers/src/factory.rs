@@ -235,6 +235,7 @@ impl<T: CompatFamilySpec> FamilyProviderFactory for T {
             api_url.or(Some(Self::DEFAULT_URL)),
             key,
             opts,
+            false,
         ) {
             return Ok(p);
         }
@@ -297,9 +298,6 @@ pub fn apply_compat_options(
     if let Some(t) = opts.provider_timeout_secs {
         b = b.timeout_secs(t);
     }
-    if let Some(idle) = opts.stream_app_idle_secs {
-        b = b.stream_app_idle_secs(idle);
-    }
     if let Some(ref effort) = opts.reasoning_effort {
         b = b.reasoning_effort(Some(effort.clone()));
     }
@@ -319,10 +317,16 @@ pub fn apply_compat_options(
         b = b.tls_ca_cert_path(cert_path);
     }
     b = b.tool_result_image_policy(opts.tool_result_image_policy);
-    b = b.multimodal(opts.multimodal.clone());
     if opts.replay_assistant_reasoning == Some(false) {
         b = b.without_assistant_reasoning_replay();
     }
+    if opts.thinking_passthrough {
+        b = b.with_thinking_passthrough();
+    }
+    // The configured `[multimodal]` policy. Without this the provider boundary
+    // would re-normalize already-prepared messages under defaults and could
+    // trim images the runtime had accepted under the operator's settings.
+    b = b.multimodal(opts.multimodal.clone());
     if opts.cache_passthrough {
         b = b.with_cache_passthrough();
     }
@@ -386,11 +390,14 @@ fn build_responses_provider_if_requested(
     base_url: Option<&str>,
     key: Option<&str>,
     opts: &ModelProviderRuntimeOptions,
+    single_tool_rounds_supported: bool,
 ) -> Option<Box<dyn ModelProvider>> {
     if wire_api != Some(zeroclaw_config::schema::WireApi::Responses) {
         return None;
     }
-    let mut builder = crate::openai::OpenAiResponsesModelProvider::builder(alias).credential(key);
+    let mut builder = crate::openai::OpenAiResponsesModelProvider::builder(alias)
+        .credential(key)
+        .single_tool_rounds_supported(single_tool_rounds_supported);
     if let Some(url) = base_url {
         builder = builder.api_url(url);
     }
@@ -1006,6 +1013,7 @@ impl FamilyProviderFactory for XaiModelProviderConfig {
             api_url.or(Some(fixed_family_endpoint::<Self>())),
             key,
             opts,
+            false,
         ) {
             return Ok(p);
         }
@@ -1212,6 +1220,9 @@ impl FamilyProviderFactory for AnthropicModelProviderConfig {
         let mut b = crate::anthropic::AnthropicModelProvider::builder(alias)
             .credential(key)
             .server_fallback_models(self.server_fallback_models.clone())
+            .single_tool_rounds_supported(
+                api_url.is_none_or(|url| url.trim_end_matches('/') == crate::anthropic::BASE_URL),
+            )
             .base_url(api_url.unwrap_or(fixed_family_endpoint::<Self>()));
         if let Some(mt) = opts.provider_max_tokens {
             b = b.max_tokens(mt);
@@ -1268,13 +1279,27 @@ impl FamilyProviderFactory for OpenAIModelProviderConfig {
         // OpenAIModelProviderConfig::default() (persisted-slot creation). Bare/
         // dangling dispatch uses openai_missing_entry_fallback_config() and stays
         // on the chat wire; unset/legacy configs also fall through below.
-        if let Some(p) =
-            build_responses_provider_if_requested(self.base.wire_api, alias, api_url, key, opts)
-        {
+        if let Some(p) = build_responses_provider_if_requested(
+            self.base.wire_api,
+            alias,
+            api_url,
+            key,
+            opts,
+            api_url.is_none_or(|url| {
+                matches!(
+                    url.trim_end_matches('/'),
+                    crate::openai::BASE_URL | crate::openai::RESPONSES_URL
+                )
+            }),
+        ) {
             return Ok(p);
         }
         // Fallback: chat_completions wire (explicit opt-in or legacy unset configs).
-        let mut b = crate::openai::OpenAiModelProvider::builder(alias).credential(key);
+        let mut b = crate::openai::OpenAiModelProvider::builder(alias)
+            .credential(key)
+            .single_tool_rounds_supported(
+                api_url.is_none_or(|url| url.trim_end_matches('/') == crate::openai::BASE_URL),
+            );
         if let Some(url) = api_url {
             b = b.base_url(url);
         }
@@ -1864,6 +1889,7 @@ impl FamilyProviderFactory for LlamacppModelProviderConfig {
             Some(base_url),
             Some(llama_cpp_key),
             opts,
+            false,
         ) {
             return Ok(p);
         }
@@ -1967,6 +1993,7 @@ impl FamilyProviderFactory for CustomModelProviderConfig {
             Some(base_url),
             key,
             opts,
+            false,
         ) {
             return Ok(p);
         }
@@ -2006,9 +2033,14 @@ impl FamilyProviderFactory for zeroclaw_config::schema::ModelProviderConfig {
                  `[providers.models.<family>.<alias>] uri = \"https://your-api.com\"` in config.toml.",
             )
         })?;
-        if let Some(p) =
-            build_responses_provider_if_requested(self.wire_api, alias, Some(base_url), key, opts)
-        {
+        if let Some(p) = build_responses_provider_if_requested(
+            self.wire_api,
+            alias,
+            Some(base_url),
+            key,
+            opts,
+            false,
+        ) {
             return Ok(p);
         }
         let mut b = OpenAiCompatibleModelProvider::builder(alias)
@@ -2418,6 +2450,12 @@ mod tests {
     fn grok_cli_factory_enables_explicit_vision_override() {
         let working_directory = tempfile::tempdir().expect("temporary working directory");
         let config = GrokCliModelProviderConfig {
+            binary_path: Some(
+                std::env::current_exe()
+                    .expect("current test executable")
+                    .display()
+                    .to_string(),
+            ),
             working_directory: working_directory.path().display().to_string(),
             ..Default::default()
         };
@@ -2647,6 +2685,89 @@ mod tests {
             .create_provider("test", None, None, &ModelProviderRuntimeOptions::default())
             .unwrap();
         assert!(!provider.capabilities().native_tool_calling);
+    }
+
+    #[test]
+    fn single_tool_round_support_is_limited_to_documented_factory_endpoints() {
+        let opts = ModelProviderRuntimeOptions::default();
+        for wire_api in [
+            None,
+            Some(WireApi::ChatCompletions),
+            Some(WireApi::Responses),
+        ] {
+            let config = OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    wire_api,
+                    ..Default::default()
+                },
+            };
+            assert!(
+                config
+                    .create_provider("test", Some("test-key"), None, &opts)
+                    .unwrap()
+                    .supports_single_tool_rounds("gpt-4o")
+            );
+            assert!(
+                !config
+                    .create_provider(
+                        "test",
+                        Some("test-key"),
+                        Some("https://custom.example/v1"),
+                        &opts
+                    )
+                    .unwrap()
+                    .supports_single_tool_rounds("gpt-4o")
+            );
+        }
+        let anthropic = AnthropicModelProviderConfig::default();
+        assert!(
+            anthropic
+                .create_provider("test", Some("test-key"), None, &opts)
+                .unwrap()
+                .supports_single_tool_rounds("claude-sonnet-4-6")
+        );
+        assert!(
+            !anthropic
+                .create_provider(
+                    "test",
+                    Some("test-key"),
+                    Some("https://custom.example"),
+                    &opts
+                )
+                .unwrap()
+                .supports_single_tool_rounds("claude-sonnet-4-6")
+        );
+        assert!(
+            !OvhModelProviderConfig::default()
+                .create_provider("test", Some("test-key"), None, &opts)
+                .unwrap()
+                .supports_single_tool_rounds("model")
+        );
+        let custom = CustomModelProviderConfig {
+            base: ModelProviderConfig {
+                wire_api: Some(WireApi::Responses),
+                ..Default::default()
+            },
+        };
+        assert!(
+            !custom
+                .create_provider(
+                    "test",
+                    Some("test-key"),
+                    Some(crate::openai::BASE_URL),
+                    &opts
+                )
+                .unwrap()
+                .supports_single_tool_rounds("gpt-4o")
+        );
+        assert!(
+            !OpenAiCompatibleModelProvider::builder("test")
+                .display_name("custom")
+                .base_url(crate::openai::BASE_URL)
+                .auth_style(AuthStyle::Bearer)
+                .build()
+                .supports_single_tool_rounds("gpt-4o")
+        );
     }
 
     #[test]

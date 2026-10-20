@@ -277,6 +277,40 @@ impl Default for AutoClassifyConfig {
     }
 }
 
+/// Whether an effort-routed turn may leave the configured local route.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum CloudEscalationPolicy {
+    /// Keep every automatically classified turn on the local route.
+    #[default]
+    Never,
+    /// Send complex turns to the configured cloud route.
+    Auto,
+}
+
+impl HasPropKind for CloudEscalationPolicy {
+    const PROP_KIND: PropKind = PropKind::Enum;
+}
+
+/// Opt-in deterministic local/cloud routing for one runtime profile.
+///
+/// The hints reference existing `[[model_routes]]` entries; provider
+/// credentials, models, and reliability remain owned by those entries and
+/// their provider profiles.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "agent.effort_routing"]
+pub struct EffortRoutingConfig {
+    /// Exact `[[model_routes]].hint` used for simple and standard turns.
+    pub local_hint: String,
+    /// Exact `[[model_routes]].hint` eligible for complex turns.
+    pub cloud_hint: String,
+    /// Whether complex turns may select `cloud_hint`; defaults to `never`.
+    #[serde(default)]
+    pub cloud_escalation: CloudEscalationPolicy,
+}
+
 fn default_min_quality_score() -> f64 {
     0.5
 }
@@ -980,4 +1014,129 @@ mod tests {
     fn thinking_level_default_is_medium() {
         assert_eq!(ThinkingLevel::default(), ThinkingLevel::Medium);
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "agent.context_compression"]
+pub struct ContextCompressionConfig {
+    /// The runtime context compressor was removed; no runtime execution path
+    /// consumes this flag, so setting it to `true` currently has no effect.
+    /// Defaults to `false` to match actual runtime behavior;
+    /// `Config::collect_warnings` reads an explicit `true` only to report
+    /// `context_compression_unsupported`.
+    #[serde(default = "default_cc_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_threshold_ratio")]
+    pub threshold_ratio: f64,
+    #[serde(default = "default_protect_first_n")]
+    pub protect_first_n: usize,
+    #[serde(default = "default_protect_last_n")]
+    pub protect_last_n: usize,
+    #[serde(default = "default_cc_max_passes")]
+    pub max_passes: u32,
+    #[serde(default = "default_summary_max_chars")]
+    pub summary_max_chars: usize,
+    #[serde(default = "default_source_max_chars")]
+    pub source_max_chars: usize,
+    #[serde(default = "default_cc_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Summarizer provider as a `<type>.<alias>` reference into `providers.models`.
+    #[serde(default)]
+    pub summary_provider: crate::providers::ModelProviderRef,
+    /// DEPRECATED bare model id retained as a compatibility fallback.
+    #[serde(default)]
+    pub summary_model: Option<String>,
+    #[serde(default = "default_identifier_policy")]
+    pub identifier_policy: String,
+    #[serde(default = "default_tool_result_retrim_chars")]
+    pub tool_result_retrim_chars: usize,
+    #[serde(default)]
+    pub tool_result_trim_exempt: Vec<String>,
+}
+
+impl Default for ContextCompressionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_cc_enabled(),
+            threshold_ratio: default_threshold_ratio(),
+            protect_first_n: default_protect_first_n(),
+            protect_last_n: default_protect_last_n(),
+            max_passes: default_cc_max_passes(),
+            summary_max_chars: default_summary_max_chars(),
+            source_max_chars: default_source_max_chars(),
+            timeout_secs: default_cc_timeout_secs(),
+            summary_provider: crate::providers::ModelProviderRef::default(),
+            summary_model: None,
+            identifier_policy: default_identifier_policy(),
+            tool_result_retrim_chars: default_tool_result_retrim_chars(),
+            tool_result_trim_exempt: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "agent.history_pruning"]
+pub struct HistoryPrunerConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_max_tokens")]
+    pub max_tokens: usize,
+    #[serde(default = "default_keep_recent")]
+    pub keep_recent: usize,
+    #[serde(default = "default_collapse")]
+    pub collapse_tool_results: bool,
+}
+
+impl Default for HistoryPrunerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_tokens: 8192,
+            keep_recent: 4,
+            collapse_tool_results: true,
+        }
+    }
+}
+
+fn default_cc_enabled() -> bool {
+    false
+}
+fn default_threshold_ratio() -> f64 {
+    0.50
+}
+fn default_protect_first_n() -> usize {
+    3
+}
+fn default_protect_last_n() -> usize {
+    4
+}
+fn default_cc_max_passes() -> u32 {
+    3
+}
+fn default_summary_max_chars() -> usize {
+    4000
+}
+fn default_source_max_chars() -> usize {
+    50_000
+}
+fn default_cc_timeout_secs() -> u64 {
+    60
+}
+fn default_identifier_policy() -> String {
+    "strict".to_string()
+}
+fn default_tool_result_retrim_chars() -> usize {
+    2_000
+}
+
+fn default_max_tokens() -> usize {
+    8192
+}
+fn default_keep_recent() -> usize {
+    4
+}
+fn default_collapse() -> bool {
+    true
 }
