@@ -390,7 +390,7 @@ fn plugin_enabled_container_variants_stage_wit_and_have_source_build_coverage() 
         );
         assert_eq!(
             cleanup_instructions,
-            ["RUN rm -rf src benches crates xtask tools/fill-translations"],
+            ["RUN rm -rf src benches crates xtask "],
             "{name} must keep the staged WIT contract through its source cleanup"
         );
     }
@@ -699,7 +699,7 @@ fn source_containerfiles_stage_sign_manifest_example_during_prefetch() {
                 "{name} must stage declared signer target {target} before its dependency build"
             );
             let cleanup = builder
-                .find("RUN rm -rf src benches crates xtask tools/fill-translations\n")
+                .find("RUN rm -rf src benches crates xtask \n")
                 .unwrap_or_else(|| panic!("{name} must remove its dummy crate sources"));
             let real_copy = builder[cleanup..]
                 .find("\nCOPY crates/ crates/\n")

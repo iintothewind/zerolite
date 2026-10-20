@@ -1,5 +1,4 @@
 pub mod build;
-pub mod check;
 pub mod feature_matrix;
 pub mod hardware;
 pub mod keymap;
@@ -8,11 +7,8 @@ pub mod llms;
 pub mod peer_groups;
 pub mod placeholders;
 pub mod plugins;
-pub mod protected;
 pub mod refs;
 pub mod seo;
 pub mod serve;
-pub mod stats;
-pub mod sync;
 pub mod themes;
 pub mod versions;

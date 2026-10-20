@@ -35,7 +35,7 @@ keep_recent_turns = 5           # default, clamped 1–10
 - Sends keep the longest byte-stable prefix. Cache hits are `zeroclaw_tokens_cached_input_total` and the composer's cache-hit percent. A child's context budget cannot exceed its parent's.
 - Stable prefix: no dates or clocks in the system prompt, channel turn context, or history. `HEARTBEAT.md` loads only for heartbeat. Skill and deferred catalogs are frozen for the session and sorted by name.
 
-[Context management](docs/book/src/agents/context-management.md) · [History management](docs/book/src/agents/history-management.md).
+[Context management](docs/book/src/agents/context-management.md).
 
 ### Web chat
 
@@ -47,7 +47,7 @@ keep_recent_turns = 5           # default, clamped 1–10
 ### Sessions, pairing, delegates
 
 - `session_search` finds this agent's messages. `sessions_history` can read around a hit (`around_message_id`).
-- `gateway.master_pair_code` mints a device token without using up the one-time pairing code. It is a secret, and it does nothing while pairing is off. [Details](docs/book/src/gateway/web-dashboard.md#pairing-recovery-code-gatewaymaster_pair_code).
+- `gateway.master_pair_code` mints a device token without using up the one-time pairing code. It is a secret, and it does nothing while pairing is off. Details live in the `gateway.master_pair_code` config key.
 - Nested background delegates stay visible to their caller.
 
 ## Install
@@ -89,28 +89,28 @@ zeroclaw service install          # register as systemd/launchctl/Windows Servic
 zeroclaw service start            # run it always-on in the background
 ```
 
-Full walkthrough: [Quick start](docs/book/src/getting-started/quickstart.md) — or skip the safety gates with [YOLO mode](docs/book/src/getting-started/yolo.md) for dev boxes.
+Full walkthrough: `zeroclaw quickstart` — or pass `--yolo` to skip the safety gates on dev boxes.
 
 ## What the runtime does
 
-- **Multi-channel** — one agent answering you across [every channel you configure](docs/book/src/channels/overview.md). Inbound messages from Discord, Telegram, Matrix, email, webhooks, CLI — all delivered to the same agent loop.
-- **Provider-agnostic** — [model providers](docs/book/src/providers/overview.md) are pluggable. Configure Anthropic, OpenAI, local Ollama, or any OpenAI-compatible endpoint. [Fallback chains and routing](docs/book/src/providers/routing.md) keep the agent running when a provider flakes.
-- **Security-first, with escape hatches** — default autonomy is `supervised`: medium-risk ops require approval, high-risk blocked. Workspace boundaries, command policy, OS-level sandboxes (Landlock / Bubblewrap / Seatbelt / Docker), and cryptographic [tool receipts](docs/book/src/security/tool-receipts.md) on every action. [YOLO mode](docs/book/src/getting-started/yolo.md) exists for trusted dev environments.
-- **Hardware-capable** — GPIO / I2C / SPI / USB on Raspberry Pi, STM32, Arduino, and ESP32 via the `Peripheral` trait. See [Hardware](docs/book/src/hardware/index.md).
+- **Multi-channel** — one agent answering you across every channel you configure (Discord, Telegram, Matrix, email, webhooks, CLI). All delivered to the same agent loop.
+- **Provider-agnostic** — model providers are pluggable. Configure Anthropic, OpenAI, local Ollama, or any OpenAI-compatible endpoint. Fallback chains and routing keep the agent running when a provider flakes.
+- **Security-first, with escape hatches** — default autonomy is `supervised`: medium-risk ops require approval, high-risk blocked. Workspace boundaries, command policy, OS-level sandboxes (Landlock / Bubblewrap / Seatbelt / Docker), and cryptographic tool receipts on every action. `--yolo` exists for trusted dev environments.
+- **Hardware-capable** — GPIO / I2C / SPI / USB on Raspberry Pi, STM32, Arduino, and ESP32 via the `Peripheral` trait.
 - **Gateway + dashboard** — HTTP / WebSocket gateway for clients, with a web dashboard for chat, memory browsing, config editing, cron management, and tool inspection.
-- **SOP engine** — event-triggered [Standard Operating Procedures](docs/book/src/sop/index.md) (MQTT / webhook / cron / peripheral) with approval gates and resumable runs.
-- **ACP** — IDE / editor integration via [Agent Client Protocol](docs/book/src/channels/acp.md) (JSON-RPC 2.0 over stdio).
+- **SOP engine** — event-triggered Standard Operating Procedures (MQTT / webhook / cron / peripheral) with approval gates and resumable runs.
+- **ACP** — IDE / editor integration via Agent Client Protocol (JSON-RPC 2.0 over stdio).
 
 ## Configuration
 
 One TOML file at `~/.zeroclaw/config.toml`. Pointers:
 
-- [Provider configuration](docs/book/src/providers/configuration.md) — the universal `[providers.models.<type>.<alias>]` schema
-- [Channels overview](docs/book/src/channels/overview.md) — per-channel `[channels.<type>.<alias>]` blocks
-- [Security overview](docs/book/src/security/overview.md) — autonomy, sandboxing, tool receipts
+- `providers.models.<type>.<alias>` — the universal provider schema
+- `channels.<type>.<alias>` blocks — per-channel settings
+- `permission_profiles` / sandboxing / tool receipts — the security surface
 - [Full config reference](https://docs.zeroclaw.com/master/en/reference/config.html) — generated from the live schema; every key documented
 
-A V3 config has at minimum four section headers (`<type>.<alias>` shaped) — a provider entry, an agent that references it, and a risk profile the agent gates against. See [Provider Configuration → Minimal working example](docs/book/src/providers/configuration.md#minimal-working-example) for the canonical four-section form with inline type/alias commentary.
+A V3 config has at minimum four section headers (`<type>.<alias>` shaped) — a provider entry, an agent that references it, and a risk profile the agent gates against.
 
 For standard OpenAI Codex subscription auth, Quickstart can write the provider
 entry for you:
@@ -159,8 +159,6 @@ Notes:
 │          ~20 more)   hardware)                               │
 └──────────────────────────────────────────────────────────────┘
 ```
-
-Full detail with Mermaid diagrams: [Architecture overview](docs/book/src/architecture/overview.md) · [Request lifecycle](docs/book/src/architecture/request-lifecycle.md) · [Crates](docs/book/src/architecture/crates.md).
 
 ## License
 

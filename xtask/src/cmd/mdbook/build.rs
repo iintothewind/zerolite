@@ -10,8 +10,6 @@ pub fn run(tag: Option<&str>) -> anyhow::Result<()> {
     let root = repo_root();
     require_tool("cargo", "https://rustup.rs")?;
     ensure_cargo_tool("mdbook", "mdbook")?;
-    ensure_cargo_tool("mdbook-xgettext", "mdbook-i18n-helpers")?;
-    ensure_cargo_tool("mdbook-gettext", "mdbook-i18n-helpers")?;
     ensure_cargo_tool("mdbook-mermaid", "mdbook-mermaid")?;
 
     build_api(&root)?;
@@ -31,37 +29,21 @@ pub fn run(tag: Option<&str>) -> anyhow::Result<()> {
 
 pub fn build_locales(root: &std::path::Path, tag: Option<&str>) -> anyhow::Result<()> {
     let book = book_dir(root);
-    let entries = locale_entries();
-    println!(
-        "==> Building mdBook for locales: {}",
-        entries
-            .iter()
-            .map(|e| e.code.as_str())
-            .collect::<Vec<_>>()
-            .join(" ")
-    );
-    prepare_generated_book_inputs(root, &entries)?;
+    println!("==> Building mdBook (English only)");
+    prepare_generated_book_inputs(root)?;
     let mdbook = mdbook_program()?;
     let preprocessor_env = mdbook_xtask_preprocessor_env();
     let tag_dir = tag.unwrap_or(DEFAULT_TAG);
-    let primary_locale = entries.first().map(|e| e.code.clone());
-    for entry in &entries {
-        let dest = format!("book/{}/{}", tag_dir, entry.code);
-        let mut cmd = Command::new(&mdbook);
-        cmd.args(["build", "-d", &dest])
-            .env("MDBOOK_BOOK__LANGUAGE", &entry.code)
-            .current_dir(&book);
-        if Some(&entry.code) != primary_locale.as_ref() {
-            cmd.env("MDBOOK_OUTPUT__HTML__SEARCH__ENABLE", "false");
-        }
-        if let Some(env) = &preprocessor_env {
-            cmd.envs(env.iter().map(|(key, value)| (key, value)));
-        }
-        run_cmd(&mut cmd)?;
+    let dest = format!("book/{}/en", tag_dir);
+    let mut cmd = Command::new(&mdbook);
+    cmd.args(["build", "-d", &dest])
+        .env("MDBOOK_BOOK__LANGUAGE", "en")
+        .current_dir(&book);
+    if let Some(env) = &preprocessor_env {
+        cmd.envs(env.iter().map(|(key, value)| (key, value)));
     }
-    if let Some(primary) = primary_locale.as_deref() {
-        build_llms(root, tag, primary)?;
-    }
+    run_cmd(&mut cmd)?;
+    build_llms(root, tag, "en")?;
     Ok(())
 }
 
@@ -106,54 +88,14 @@ fn llms_output_table(helper_path: &str) -> String {
 /// Generate every gitignored input that mdBook sources or hashes while
 /// rendering. Keep all entrypoints on this helper so a warm working tree cannot
 /// hide a missing generator from clean-checkout builds.
-pub fn prepare_generated_book_inputs(root: &Path, entries: &[LocaleEntry]) -> anyhow::Result<()> {
+pub fn prepare_generated_book_inputs(root: &Path) -> anyhow::Result<()> {
     build_refs(root)?;
-    inject_lang_switcher_locales(&book_dir(root), entries)?;
     crate::cmd::mdbook::themes::run(root)?;
     crate::cmd::mdbook::keymap::run(root)?;
     crate::cmd::mdbook::hardware::run(root)?;
     crate::cmd::mdbook::feature_matrix::run(root)?;
     crate::cmd::mdbook::plugins::run(root)?;
     Ok(())
-}
-
-/// Render `theme/lang-switcher.js.tpl` into `theme/lang-switcher.js` with the
-/// `LOCALES` array filled from `locales.toml`. The `.js` output is gitignored
-/// (every locale add/remove rewrites it); the `.tpl` source is the tracked
-/// truth. Errors loudly when the template is missing — silently skipping
-/// would let mdBook fail later with a confusing "missing additional-js"
-/// message.
-pub fn inject_lang_switcher_locales(book: &Path, entries: &[LocaleEntry]) -> anyhow::Result<()> {
-    let tpl_path = book.join("theme/lang-switcher.js.tpl");
-    let js_path = book.join("theme/lang-switcher.js");
-    let src = std::fs::read_to_string(&tpl_path).map_err(|e| {
-        anyhow::Error::msg(format!(
-            "lang-switcher.js.tpl missing at {}: {e}. The template is the tracked source of \
-             truth for the locale switcher; do not delete it.",
-            tpl_path.display(),
-        ))
-    })?;
-    let locale_lines: String = entries
-        .iter()
-        .map(|e| format!("    {{ code: {:?}, label: {:?} }},", e.code, e.label))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let new_block = format!("const LOCALES = [\n{locale_lines}\n  ];");
-
-    let start = src
-        .find("const LOCALES = [")
-        .ok_or_else(|| anyhow::Error::msg("lang-switcher.js.tpl: LOCALES array not found"))?;
-    let end = src[start..]
-        .find("];")
-        .ok_or_else(|| anyhow::Error::msg("lang-switcher.js.tpl: LOCALES closing ]; not found"))?;
-    let updated = format!("{}{}{}", &src[..start], new_block, &src[start + end + 2..]);
-    std::fs::write(&js_path, updated)?;
-    Ok(())
-}
-
-pub fn print_locales() {
-    let codes: Vec<String> = locale_entries().into_iter().map(|e| e.code).collect();
-    println!("{}", codes.join(" "));
 }
 
 pub fn assemble(root: &std::path::Path, tag: Option<&str>) -> anyhow::Result<()> {
@@ -243,12 +185,7 @@ pub fn strip_chrome_hash(file_name: &str) -> Option<String> {
 pub fn extract_shared_chrome(version_dir: &Path, shared_dir: &Path) -> anyhow::Result<()> {
     println!("==> Extracting shared chrome layer");
 
-    let first_locale = locale_entries()
-        .into_iter()
-        .next()
-        .map(|e| e.code)
-        .unwrap_or_else(|| "en".to_string());
-    let src_dir = version_dir.join(&first_locale);
+    let src_dir = version_dir.join("en");
     if !src_dir.exists() {
         return Ok(());
     }
@@ -312,8 +249,8 @@ pub fn extract_shared_chrome(version_dir: &Path, shared_dir: &Path) -> anyhow::R
         }
     }
 
-    for entry in locale_entries() {
-        let loc_dir = version_dir.join(&entry.code);
+    for entry in ["en"] {
+        let loc_dir = version_dir.join(entry);
         for file in walk_dir(&loc_dir) {
             let page_depth = file
                 .strip_prefix(&loc_dir)

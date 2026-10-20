@@ -178,9 +178,8 @@ fn literal_tool_names_are_inventoried_or_excluded() {
     assert!(
         unlisted.is_empty(),
         "production tools with a literal name are missing from BUILTIN_TOOLS: {}. Add each one \
-         to BUILTIN_TOOLS in crates/zeroclaw-tools/src/inventory.rs and to the tier tables in \
-         docs/book/src/developing/tool-inventory.md, or to OUTSIDE_INVENTORY in this test with \
-         the reason it stays out",
+         to BUILTIN_TOOLS in crates/zeroclaw-tools/src/inventory.rs, or to OUTSIDE_INVENTORY in \
+         this test with the reason it stays out",
         unlisted.join("; ")
     );
 }
