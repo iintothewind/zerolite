@@ -3082,6 +3082,7 @@ pub async fn handle_migrate(
             // dropped request cannot leave a replaced file without its
             // publication.
             let replace_config_path = config_path.clone();
+            #[cfg(unix)]
             let replace_parent = parent.clone();
             let response_backup_path = backup_path.display().to_string();
             let pending_reload = Arc::clone(&state.pending_reload);

@@ -277,9 +277,6 @@ export interface WsMessage {
   dropped_turns?: number;
   kept_turns?: number;
   reason?: string;
-  tokens_after?: number;
-  tokens_before?: number;
-  dropped_turns?: number;
   // Safety-safeguard fallback notice (server → client), present only on
   // "safeguard_fallback" frames. Display-only: the gateway sends just the
   // model names and which layer switched (`server`/`client`) — never the
