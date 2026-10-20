@@ -137,7 +137,7 @@ tar = "0.4"
 tempfile = "3.26"
 
 # Zip extraction (plugin registry, self-update archives)
-zip = { version = "8.1", default-features = false, features = ["deflate-flate2"] }
+zip = { version = "9.0.3", default-features = false, features = ["deflate-flate2"] }
 
 # Error handling
 anyhow = "1.0"
@@ -183,6 +183,15 @@ tower = { version = "0.5", default-features = false, features = ["util"], option
 # it draws on (TIOCGWINSZ). Linux additionally uses it for `desktop --install`,
 # which opens candidate `.desktop` entries with O_NONBLOCK|O_NOFOLLOW so a FIFO
 # or symlink planted in an XDG data dir cannot block or redirect the read.
+# Capability-scoped directory handles (beneath/no-follow). Used by the agent-bundle
+# export to walk a live, agent-writable workspace without re-opening paths by name.
+cap-std = "4"
+# `follow(FollowSymlinks::No)` and `open_dir_nofollow`, which cap-std itself does not
+# expose. Thin trait layer over the cap-std/cap-primitives already compiled above.
+cap-fs-ext = "4"
+
+base64 = { version = "0.22", optional = true }
+ring = { version = "0.17", optional = true }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
@@ -250,6 +259,8 @@ agent-runtime = [
     "dep:crossterm",
     "dep:tokio-tungstenite",
     "dep:rustls",
+    "dep:base64",
+    "dep:ring",
 ]
 
 # Lean channel bundle included in `default`. These channels cover local/editor
