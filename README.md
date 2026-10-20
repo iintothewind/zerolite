@@ -2,7 +2,7 @@
   <img src="web/public/logo.png" alt="ZeroLite" width="360" />
 </p>
 
-<h1 align="center">ZeroLite 1.0.0 — Personal AI Assistant</h1>
+<h1 align="center">ZeroLite 1.1.0 — Personal AI Assistant</h1>
 
 <p align="center">
   <strong>A ZeroClaw fork. You own the agent, the data, and the machine it runs on.</strong>
@@ -14,7 +14,7 @@ ZeroLite is a fork of [ZeroClaw](https://github.com/zeroclaw-labs/zeroclaw). The
 
 It is still one Rust binary: LLM providers (Anthropic, OpenAI, Ollama, and ~20 others), 30+ channels (Discord, Telegram, Matrix, email, voice, webhooks, CLI), and tools (shell, browser, HTTP, hardware, custom MCP servers). Everything runs on your machine, with your keys, in your workspace.
 
-What this fork adds on top of upstream ZeroClaw 0.8.5. Inherited runtime behavior is under [What the runtime does](#what-the-runtime-does).
+What this fork adds on top of upstream ZeroClaw 0.8.6. Inherited runtime behavior is under [What the runtime does](#what-the-runtime-does).
 
 ## What ZeroLite adds
 
@@ -52,31 +52,31 @@ keep_recent_turns = 5           # default, clamped 1–10
 
 ## Install
 
-Install from the [ZeroLite 1.0.0 release](https://github.com/iintothewind/zeroclaw/releases/tag/v1.0.0). Each binary has the web dashboard embedded. There is no macOS build.
+Install from the [ZeroLite 1.1.0 release](https://github.com/iintothewind/zeroclaw/releases/tag/v1.1.0). Each binary has the web dashboard embedded. There is no macOS build.
 
 | Platform | Asset |
 |---|---|
-| Windows x64 | `zerolite-1.0.0-x86_64-pc-windows-msvc.zip` |
-| Linux x64 | `zerolite-1.0.0-x86_64-unknown-linux-gnu.tar.gz` |
-| Linux arm64 | `zerolite-1.0.0-aarch64-unknown-linux-gnu.tar.gz` |
+| Windows x64 | `zerolite-1.1.0-x86_64-pc-windows-msvc.zip` |
+| Linux x64 | `zerolite-1.1.0-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux arm64 | `zerolite-1.1.0-aarch64-unknown-linux-gnu.tar.gz` |
 
 Linux x64:
 
 ```sh
-gh release download v1.0.0 -R iintothewind/zeroclaw -p 'zerolite-1.0.0-x86_64-unknown-linux-gnu.tar.gz'
-tar -xzf zerolite-1.0.0-x86_64-unknown-linux-gnu.tar.gz
+gh release download v1.1.0 -R iintothewind/zeroclaw -p 'zerolite-1.1.0-x86_64-unknown-linux-gnu.tar.gz'
+tar -xzf zerolite-1.1.0-x86_64-unknown-linux-gnu.tar.gz
 install -m 755 zeroclaw "${CARGO_HOME:-$HOME/.cargo}/bin/zeroclaw"
 zeroclaw quickstart
 ```
 
-Linux arm64: same steps, with `zerolite-1.0.0-aarch64-unknown-linux-gnu.tar.gz`.
+Linux arm64: same steps, with `zerolite-1.1.0-aarch64-unknown-linux-gnu.tar.gz`.
 
 Windows (PowerShell):
 
 ```powershell
-gh release download v1.0.0 -R iintothewind/zeroclaw -p 'zerolite-1.0.0-x86_64-pc-windows-msvc.zip'
-Expand-Archive .\zerolite-1.0.0-x86_64-pc-windows-msvc.zip -DestinationPath "$env:USERPROFILE\.cargo\bin"
-Rename-Item "$env:USERPROFILE\.cargo\bin\zerolite-1.0.0-x86_64-pc-windows-msvc.exe" zeroclaw.exe
+gh release download v1.1.0 -R iintothewind/zeroclaw -p 'zerolite-1.1.0-x86_64-pc-windows-msvc.zip'
+Expand-Archive .\zerolite-1.1.0-x86_64-pc-windows-msvc.zip -DestinationPath "$env:USERPROFILE\.cargo\bin"
+Rename-Item "$env:USERPROFILE\.cargo\bin\zerolite-1.1.0-x86_64-pc-windows-msvc.exe" zeroclaw.exe
 zeroclaw quickstart
 ```
 
