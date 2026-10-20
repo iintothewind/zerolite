@@ -290,6 +290,9 @@ pub struct NativeRuntime {
     shell: String,
     /// Absolute launcher resolved by the TUI-aware runtime factory, when one
     /// was supplied. Ambient callers continue resolving at command build time.
+    /// Only the Unix command builder reads it; Windows always goes through
+    /// `cmd.exe`/PowerShell, so the field is write-only there.
+    #[cfg_attr(not(unix), allow(dead_code))]
     resolved_shell: Option<PathBuf>,
 }
 

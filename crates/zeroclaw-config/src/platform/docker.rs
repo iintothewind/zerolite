@@ -29,6 +29,9 @@ pub struct DockerRuntime {
     config: DockerRuntimeConfig,
     /// Absolute launcher resolved by the TUI-aware runtime factory, when one
     /// was supplied. Ambient callers continue resolving at command build time.
+    /// Only the Unix command builder reads it; Windows resolves `docker` at
+    /// spawn time, so the field is write-only there.
+    #[cfg_attr(not(unix), allow(dead_code))]
     resolved_launcher: Option<PathBuf>,
 }
 
