@@ -135,6 +135,15 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+      # The aarch64 leg runs the plugin smoke inside a `linux/arm64`
+      # container on an x86_64 runner, so the kernel needs a binfmt handler to
+      # exec the foreign-architecture image. Without this the container starts
+      # and dies with "exec /usr/bin/bash: exec format error".
+      - uses: docker/setup-qemu-action@v3
+        if: matrix.cross_compiler
+        with:
+          platforms: arm64
+
       - name: Build plugin smoke packages
         shell: bash
         run: |
