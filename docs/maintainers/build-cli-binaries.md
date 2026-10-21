@@ -32,8 +32,16 @@ Recommended for verification runs and for pre-release builds.
 | Linux arm64 | `aarch64-unknown-linux-gnu` | `ubuntu-22.04` | `zerolite-<version>-aarch64-unknown-linux-gnu.tar.gz` |
 
 Job order: `web` (dashboard assets) → `build` (three-way matrix with
-`--features embedded-web`, so `web/dist` is compiled into the binary via
-`include_dir!`) → `release` (attach assets).
+`--features embedded-web,plugins-wasm-cranelift`, so `web/dist` is compiled
+into the binary via `include_dir!` and the WASM plugin host is included) →
+`release` (attach assets).
+Each `build` leg runs a **plugin host smoke test** before packaging:
+`scripts/ci/build_plugin_smoke_packages.sh` builds the `wasm32-wasip2` fixture
+packages, and `scripts/ci/plugin_artifact_smoke.sh` installs and exercises
+them against the freshly built binary. A binary whose plugin host does not
+load a real package fails the leg and is never published. The aarch64 leg
+runs the smoke inside a `linux/arm64` container because the archive targets a
+foreign architecture.
 
 The `release` job checks out the repo **before** downloading artifacts:
 `actions/checkout` defaults to `clean: true` and deletes the workspace, which
@@ -56,11 +64,9 @@ publish.
 > binary on a Pi will not update the WebUI. Local builds must use
 > `scripts/dev/build-cli-local.sh` (see [`build-cli-local.md`](./build-cli-local.md)).
 
-> **Pit:** these archives carry `embedded-web` only. `plugins-wasm` is not a
-> default feature either, so `zeroclaw plugin` is absent and upstream v0.8.6's
-> WASM plugin host is not shipped. Build with
-> `--features embedded-web,plugins-wasm-cranelift` to get it; Cranelift is not
-> available on ARM32, which these three targets do not cover.
+> **Pit:** these archives carry `embedded-web,plugins-wasm-cranelift`. `plugins-wasm` alone is not a default feature, so a plain `cargo build --bin zeroclaw` has no `zeroclaw plugin`. With Cranelift enabled, registry `.wasm` packages are JIT-compiled on load; without it the host can only deserialize host-native `.cwasm`. Cranelift costs roughly +23% binary size and is unavailable on ARM32, which these three targets do not cover.
+
+> **Pit:** `crates/zeroclaw-plugins/wit` is a git symlink to the repo-root `wit/`. On Windows with `core.symlinks=false` it is checked out as a 9-byte text file, and every `plugins-wasm` build then fails with `failed to read path for wit/v0`. Resolve it locally with `cp -r wit crates/zeroclaw-plugins/wit`; GitHub runners check out symlinks correctly.
 
 ### glibc compatibility of the arm64 build
 

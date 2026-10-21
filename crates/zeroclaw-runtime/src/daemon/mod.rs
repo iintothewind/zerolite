@@ -4563,58 +4563,6 @@ mod tests {
         assert!(has_tui_registry);
     }
 
-    #[tokio::test]
-    async fn daemon_exit_signals_the_gateway_instead_of_aborting_it() {
-        // Exit without the RPC reload helper, which signals the gateway itself:
-        // the same teardown a SIGTERM takes. The gateway must be told to stop
-        // so it can withdraw what it published (its tunnel) before returning,
-        // rather than being aborted when the component grace window ends.
-        // Upstream also holds `hold_broadcast_hooks()` here; that helper comes
-        // from the pre-window observer-firehose commit (#11131), which this
-        // fork has not taken.
-        let tmp = TempDir::new().unwrap();
-        let config = test_config(&tmp);
-        let (signalled_tx, mut signalled_rx) = tokio::sync::mpsc::unbounded_channel();
-
-        let mut registry = DaemonRegistry::new();
-        registry.register_gateway(Box::new(
-            move |_host, _port, _config, _event_tx, reload_controls, _tui_registry, _ready_tx| {
-                let signalled_tx = signalled_tx.clone();
-                Box::pin(async move {
-                    let controls =
-                        reload_controls.expect("daemon should pass reload controls to gateway");
-                    let mut shutdown_rx = controls.shutdown_tx.subscribe();
-                    controls.reload_tx.send(true).expect("send reload signal");
-                    if shutdown_rx.wait_for(|stop| *stop).await.is_ok() {
-                        signalled_tx.send(()).ok();
-                    }
-                    Ok(())
-                })
-            },
-        ));
-
-        let exit = tokio::time::timeout(
-            DAEMON_DEADLOCK_GUARD,
-            run(
-                config,
-                "127.0.0.1".to_string(),
-                4243,
-                registry,
-                false,
-                false,
-            ),
-        )
-        .await
-        .expect("daemon must not deadlock on exit")
-        .expect("daemon run should succeed");
-
-        assert_eq!(exit, DaemonExit::Reload);
-        assert!(
-            signalled_rx.try_recv().is_ok(),
-            "the daemon aborted the gateway without signalling its shutdown"
-        );
-    }
-
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn daemon_exit_signals_the_gateway_instead_of_aborting_it() {

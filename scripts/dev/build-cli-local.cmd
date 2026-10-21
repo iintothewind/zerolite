@@ -1,6 +1,6 @@
 @echo off
 REM Windows entrypoint for build-cli-local.sh - always uses Git Bash, never WSL.
-REM Usage: scripts\dev\build-cli-local.cmd [--skip-web] [other args...]
+REM Usage: scripts\dev\build-cli-local.cmd [--skip-web] [--plugins-wasm] [other args...]
 setlocal EnableExtensions
 
 set "GIT_BASH=%ProgramFiles%\Git\bin\bash.exe"

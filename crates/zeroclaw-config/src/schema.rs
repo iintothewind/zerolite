@@ -3855,21 +3855,11 @@ pub struct ResolvedRuntime {
     /// History retention limit. Structured Agent and legacy loop sessions
     /// interpret this as complete turns; channel caches retain message rows.
     pub max_history_messages: usize,
-    /// Optional operator context budget from `runtime_profiles.<name>.max_context_tokens`.
-    /// Without an opt-in ratio, `None` preserves the legacy 32,000-token budget.
-    /// With a ratio, `Some(n)` clamps the model-relative threshold down to `n`.
-    /// Every positive result is also capped by the selected model capacity.
-    /// `Some(0)` disables proactive token-budget trimming.
-    /// NOT the provider `max_tokens` output limit.
-    pub max_context_tokens: Option<usize>,
     /// Model's context window (max input tokens) — from provider config.
     pub model_context_window: usize,
     /// Whether `model_context_window` came from the selected provider profile
     /// or from the compatibility fallback for unknown/unconfigured capacity.
     pub model_context_window_source: ModelContextWindowSource,
-    /// Opt-in fraction of `model_context_window` at which proactive trimming
-    /// triggers. `None` preserves the legacy absolute-budget behavior.
-    pub context_compact_ratio: Option<f64>,
     pub parallel_tools: bool,
     pub tool_dispatcher: String,
     pub strict_tool_parsing: bool,
@@ -3877,11 +3867,10 @@ pub struct ResolvedRuntime {
     pub tool_filter_groups: Vec<ToolFilterGroup>,
     pub max_system_prompt_chars: usize,
     pub thinking: crate::scattered_types::ThinkingConfig,
-    pub history_pruning: crate::scattered_types::HistoryPrunerConfig,
+    pub context: crate::scattered_types::ContextConfig,
     pub eval: crate::scattered_types::EvalConfig,
     pub auto_classify: Option<crate::scattered_types::AutoClassifyConfig>,
     pub effort_routing: Option<crate::scattered_types::EffortRoutingConfig>,
-    pub context_compression: crate::scattered_types::ContextCompressionConfig,
     pub max_tool_result_chars: usize,
     pub keep_tool_context_turns: usize,
     pub tool_receipts: ToolReceiptsConfig,
@@ -3922,7 +3911,27 @@ pub struct ResolvedModelContextWindow {
 pub struct ResolvedContextLimits {
     pub model_context_window: usize,
     pub model_context_window_source: ModelContextWindowSource,
+    /// The water-line: the token count at which proactive trimming engages.
+    /// Never a fit target — that is [`Self::context_send_budget`].
     pub context_token_budget: usize,
+    /// The send / fit budget: the largest retained population that still
+    /// fits the effective window. `0` means "unset" — callers resolve it to
+    /// the water-line via [`crate::agent::history_trim::resolve_send_budget`].
+    pub context_send_budget: usize,
+    /// Preferred whole-turn retention when a trim fires.
+    pub keep_recent_turns: usize,
+}
+
+impl Default for ResolvedContextLimits {
+    fn default() -> Self {
+        Self {
+            model_context_window: UNCONFIGURED_CONTEXT_WINDOW_FALLBACK,
+            model_context_window_source: ModelContextWindowSource::CompatibilityFallback,
+            context_token_budget: 0,
+            context_send_budget: 0,
+            keep_recent_turns: crate::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
+        }
+    }
 }
 
 impl ResolvedContextLimits {
@@ -3962,6 +3971,8 @@ impl ResolvedContextLimits {
             model_context_window,
             model_context_window_source: capacity.source,
             context_token_budget: budget.min(model_context_window),
+            context_send_budget: 0,
+            keep_recent_turns: crate::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
         }
     }
 
@@ -3993,63 +4004,98 @@ impl ResolvedRuntime {
         } else {
             UNCONFIGURED_CONTEXT_WINDOW_FALLBACK
         };
-        // An unconfigured capacity is only the compatibility stub, not model
-        // truth. An explicit absolute budget above it is the operator telling
-        // us the window is at least that large, so it becomes the window
-        // operand instead of being clamped down to the stub. The source is
-        // left untouched so wire/UI consumers still report the
-        // capacity as unconfigured.
-        let model_context_window = match (self.model_context_window_source, self.max_context_tokens)
-        {
-            (ModelContextWindowSource::CompatibilityFallback, Some(budget)) if budget > 0 => {
-                model_context_window.max(budget)
+
+        let effective_window = model_context_window
+            .min(self.context.max_input_tokens.unwrap_or(usize::MAX));
+        let percent = self.context.trim_threshold_percent.clamp(1, 100);
+        let percent_threshold = ((effective_window as u64) * (percent as u64) / 100) as usize;
+        let context_token_budget = match self.context.reserve_tokens {
+            Some(reserve) if reserve < effective_window => {
+                percent_threshold.min(effective_window - reserve)
             }
-            _ => model_context_window,
+            _ => percent_threshold,
+        }
+        .max(1);
+
+        let context_token_budget = context_token_budget.min(model_context_window);
+        // The send budget is the effective window minus the output reserve:
+        // the largest retained population that still leaves room for the
+        // model's own reply.
+        let context_send_budget = match self.context.reserve_tokens {
+            Some(reserve) if reserve < effective_window => effective_window - reserve,
+            _ => effective_window,
         };
-
-        // Preserve the established disable sentinel before applying any
-        // ratio, pruning floor, or positive-value normalization.
-        if self.max_context_tokens == Some(0) {
-            return ResolvedContextLimits {
-                model_context_window,
-                model_context_window_source: self.model_context_window_source,
-                context_token_budget: 0,
-            };
-        }
-
-        let ratio = self
-            .context_compact_ratio
-            .filter(|ratio| *ratio > 0.0 && *ratio <= 1.0);
-        let mut context_token_budget = ratio.map_or_else(
-            || {
-                self.max_context_tokens
-                    .unwrap_or(LEGACY_DEFAULT_CONTEXT_BUDGET)
-            },
-            |ratio| ((model_context_window as f64 * ratio) as usize).max(1),
-        );
-
-        // In ratio mode an explicit absolute budget remains an operator cap.
-        if ratio.is_some()
-            && let Some(ceiling) = self.max_context_tokens
-        {
-            context_token_budget = context_token_budget.min(ceiling);
-        }
-        if self.history_pruning.enabled && self.history_pruning.max_tokens > 0 {
-            context_token_budget = context_token_budget.min(self.history_pruning.max_tokens);
-        }
-        // Capacity is a hard invariant for every positive effective budget.
-        // Preserve zero as the explicit proactive-trimming disable sentinel.
-        context_token_budget = context_token_budget.min(model_context_window);
         ResolvedContextLimits {
             model_context_window,
             model_context_window_source: self.model_context_window_source,
             context_token_budget,
+            context_send_budget,
+            keep_recent_turns: self.keep_recent_turns(),
         }
     }
 
     /// Effective token budget for preemptive whole-turn history trimming.
     pub fn effective_context_budget(&self) -> usize {
         self.context_limits().context_token_budget
+    }
+
+    /// The effective context window: the resolved model window, clamped down
+    /// by an explicit `context.max_input_tokens` ceiling when configured.
+    /// This is the denominator for utilization display and the base for the
+    /// trim threshold — never a trim trigger on its own.
+    #[must_use]
+    pub fn effective_context_window(&self) -> usize {
+        self.model_context_window
+            .min(self.context.max_input_tokens.unwrap_or(usize::MAX))
+    }
+
+    /// Token threshold at which history trimming engages. Derived from the
+    /// effective context window: `min(window − reserve, window × percent)` so
+    /// output headroom and the operator-chosen percentage both bound it.
+    /// Validation guarantees `percent ∈ 1..=100`; the reserve ratio is
+    /// validated against the window, so this arithmetic never clamps silently.
+    #[must_use]
+    pub fn trim_threshold_tokens(&self) -> usize {
+        let window = self.effective_context_window();
+        let percent = self.context.trim_threshold_percent.clamp(1, 100);
+        let pct_threshold = ((window as u64) * (percent as u64) / 100) as usize;
+        match self.context.reserve_tokens {
+            Some(reserve) if reserve < window => pct_threshold.min(window - reserve),
+            _ => pct_threshold,
+        }
+    }
+
+    /// Compatibility accessor for call sites that consume a single trim
+    /// budget. The former `effective_context_budget` conflated the hard
+    /// ceiling with the trim trigger; this returns the trim **water-line**
+    /// (trigger) only — not the cascade fit target.
+    #[must_use]
+    pub fn context_trim_budget(&self) -> usize {
+        self.trim_threshold_tokens().max(1)
+    }
+
+    /// Post-trim send / fit budget: `effective_context_window − reserve_tokens`
+    /// when a reserve is set and below the window; otherwise the full effective
+    /// window. Cascade (`history_trim::trim_to_budget`) and hard-fail checks use
+    /// this number; the water-line ([`Self::context_trim_budget`]) only decides
+    /// *when* trimming engages.
+    #[must_use]
+    pub fn context_send_budget(&self) -> usize {
+        let window = self.effective_context_window();
+        match self.context.reserve_tokens {
+            Some(reserve) if reserve < window => window - reserve,
+            _ => window,
+        }
+    }
+
+    /// Number of recent whole turns preferred when a trim fires. Clamped to
+    /// `MIN_KEEP_RECENT_TURNS..=MAX_KEEP_RECENT_TURNS`; `None` resolves to
+    /// `DEFAULT_KEEP_RECENT_TURNS`. The trim *trigger* is the token
+    /// water-line; the *action* prefers this many newest turns, then cascades
+    /// down to `kept_turns == 1` until under the **send** budget.
+    #[must_use]
+    pub fn keep_recent_turns(&self) -> usize {
+        self.context.resolved_keep_recent_turns()
     }
 }
 
@@ -4059,11 +4105,9 @@ impl Default for ResolvedRuntime {
             compact_context: true,
             max_tool_iterations: 10,
             max_execution_tree_iterations: None,
-            max_history_messages: 50,
-            max_context_tokens: None,
+            max_history_messages: crate::scattered_types::ContextConfig::default().resolved_keep_recent_turns(),
             model_context_window: 32_000,
             model_context_window_source: ModelContextWindowSource::CompatibilityFallback,
-            context_compact_ratio: None,
             parallel_tools: false,
             tool_dispatcher: default_agent_tool_dispatcher(),
             strict_tool_parsing: false,
@@ -4071,11 +4115,10 @@ impl Default for ResolvedRuntime {
             tool_filter_groups: Vec::new(),
             max_system_prompt_chars: default_max_system_prompt_chars(),
             thinking: crate::scattered_types::ThinkingConfig::default(),
-            history_pruning: crate::scattered_types::HistoryPrunerConfig::default(),
+            context: crate::scattered_types::ContextConfig::default(),
             eval: crate::scattered_types::EvalConfig::default(),
             auto_classify: None,
             effort_routing: None,
-            context_compression: crate::scattered_types::ContextCompressionConfig::default(),
             max_tool_result_chars: default_max_tool_result_chars(),
             keep_tool_context_turns: default_keep_tool_context_turns(),
             tool_receipts: ToolReceiptsConfig::default(),
@@ -4330,16 +4373,6 @@ pub struct AliasedAgentConfig {
     #[nested]
     pub precheck: crate::scattered_types::ChannelPrecheckConfig,
 
-    /// Per-agent override for the context-compression summarizer provider, as
-    /// a `providers.models.<type>.<alias>` reference. Empty (Default) = inherit
-    /// the runtime profile's `context_compression.summary_provider`, else the
-    /// agent's own resolved provider+model. Reference only, never a copy;
-    /// resolved by [`Config::effective_summary_provider`]. Validated in
-    /// `Config::validate()`.
-    #[tab(Providers)]
-    #[serde(default)]
-    pub summary_provider: crate::providers::ModelProviderRef,
-
     /// Auto-allow delegation to every agent sharing this agent's risk
     /// profile. Default `true` preserves the historical reach where any
     /// same-profile peer is a delegation target. Set `false` to opt this
@@ -4422,7 +4455,6 @@ impl Default for AliasedAgentConfig {
             transcription_provider: crate::providers::TranscriptionProviderRef::default(),
             classifier_provider: crate::providers::ModelProviderRef::default(),
             precheck: crate::scattered_types::ChannelPrecheckConfig::default(),
-            summary_provider: crate::providers::ModelProviderRef::default(),
             delegate_same_risk_profile: true,
             delegates: Vec::new(),
             resolved: ResolvedRuntime::default(),
@@ -4635,29 +4667,6 @@ impl Config {
         self.runtime_profiles.get(profile_alias)
     }
 
-    /// Effective context-compression summarizer provider for an agent:
-    /// agent-level `summary_provider` override → the runtime profile's
-    /// `context_compression.summary_provider` → `None` (the caller then reuses
-    /// the agent's own provider+model, optionally via the deprecated
-    /// `summary_model` swap). Unlike the inert agent-inline tunables below, the
-    /// agent-level override IS consulted — it's an explicit per-agent choice,
-    /// mirroring `classifier_provider`'s "empty = inherit" semantics.
-    #[must_use]
-    pub fn effective_summary_provider(
-        &self,
-        agent_alias: &str,
-    ) -> Option<crate::providers::ModelProviderRef> {
-        if let Some(a) = self.agents.get(agent_alias)
-            && !a.summary_provider.trim().is_empty()
-        {
-            return Some(a.summary_provider.clone());
-        }
-        self.runtime_profile_for_agent(agent_alias)
-            .map(|p| &p.context_compression.summary_provider)
-            .filter(|r| !r.trim().is_empty())
-            .cloned()
-    }
-
     // ── Effective per-agent runtime tunables ──────────────────────────
     //
     // Runtime tunables live on `[runtime_profiles.<profile>]`, referenced by an
@@ -4689,39 +4698,36 @@ impl Config {
             .and_then(|p| p.max_execution_tree_iterations)
     }
 
-    #[must_use]
-    pub fn effective_max_history_messages(&self, agent_alias: &str) -> usize {
-        self.runtime_profile_for_agent(agent_alias)
-            .and_then(|p| p.max_history_messages)
-            .unwrap_or(50)
-    }
-
     /// Resolve the whole-turn history cap used by structured `Agent` sessions.
     ///
-    /// The legacy config key is named `max_history_messages`, but structured
-    /// Agent sessions enforce it at complete user-turn boundaries. Tool-call
-    /// and tool-result rows therefore do not consume independent slots there.
+    /// The single source is `[runtime_profiles.<alias>.context].keep_recent_turns`:
+    /// the preferred number of newest whole turns a trim retains. Tool-call and
+    /// tool-result rows do not consume independent slots.
     #[must_use]
     pub fn effective_structured_max_history_messages(&self, agent_alias: &str) -> usize {
-        self.effective_max_history_messages(agent_alias)
+        self.effective_context_config(agent_alias).resolved_keep_recent_turns()
     }
 
+    /// Context management policy for an agent: the `[context]` table on its
+    /// runtime profile. Consumed by the context pipeline for the trim
+    /// threshold, the input ceiling, and the output reserve.
     #[must_use]
-    pub fn effective_max_context_tokens(&self, agent_alias: &str) -> Option<usize> {
-        // Optional operator budget from the runtime profile. `None` retains the
-        // legacy 32k default unless the model-relative ratio is explicitly set.
+    pub fn effective_context_config(
+        &self,
+        agent_alias: &str,
+    ) -> crate::scattered_types::ContextConfig {
         self.runtime_profile_for_agent(agent_alias)
-            .and_then(|p| p.max_context_tokens)
+            .map(|p| p.context.clone())
+            .unwrap_or_default()
     }
 
-    /// Optional fraction of the selected model's context window at which
-    /// proactive trimming fires. Invalid values are treated as unset so they
-    /// cannot silently opt an existing profile into model-relative budgeting.
+    /// Hard ceiling on total request input tokens, from
+    /// `runtime_profiles.<alias>.context.max_input_tokens`. `None` means the
+    /// effective context window is the sole limit. This is a ceiling only —
+    /// it does not trigger trimming by itself.
     #[must_use]
-    pub fn effective_context_compact_ratio(&self, agent_alias: &str) -> Option<f64> {
-        self.runtime_profile_for_agent(agent_alias)
-            .and_then(|p| p.context_compact_ratio)
-            .filter(|r| *r > 0.0 && *r <= 1.0)
+    pub fn effective_max_input_tokens(&self, agent_alias: &str) -> Option<usize> {
+        self.effective_context_config(agent_alias).max_input_tokens
     }
 
     /// The model's context window exactly as configured, or `None` when no
@@ -4834,14 +4840,12 @@ impl Config {
         let model_context_window =
             self.resolved_model_context_window_for_route(model_provider_ref, selected_model);
         let mut runtime = ResolvedRuntime {
-            max_context_tokens: self.effective_max_context_tokens(agent_alias),
             model_context_window: model_context_window.tokens,
             model_context_window_source: model_context_window.source,
-            context_compact_ratio: self.effective_context_compact_ratio(agent_alias),
             ..ResolvedRuntime::default()
         };
         if let Some(profile) = self.runtime_profile_for_agent(agent_alias) {
-            runtime.history_pruning = profile.history_pruning.clone();
+            runtime.context = profile.context.clone();
         }
         runtime.context_limits()
     }
@@ -4962,14 +4966,11 @@ impl Config {
             max_tool_iterations: self.effective_max_tool_iterations(agent_alias),
             max_execution_tree_iterations: self
                 .effective_max_execution_tree_iterations(agent_alias),
-            max_history_messages: self.effective_max_history_messages(agent_alias),
-            // Absolute operator budget. In opt-in ratio mode it also caps the
-            // model-derived threshold (see `effective_context_budget`).
-            max_context_tokens: self.effective_max_context_tokens(agent_alias),
-            // Model's context window (max input tokens) — from provider config
+            max_history_messages: self
+                .effective_context_config(agent_alias)
+                .resolved_keep_recent_turns(),
             model_context_window: model_context_window.tokens,
             model_context_window_source: model_context_window.source,
-            context_compact_ratio: self.effective_context_compact_ratio(agent_alias),
             compact_context: self.effective_compact_context(agent_alias),
             parallel_tools: self.effective_parallel_tools(agent_alias),
             tool_dispatcher: self.effective_tool_dispatcher(agent_alias),
@@ -4983,17 +4984,19 @@ impl Config {
         if let Some(profile) = self.runtime_profile_for_agent(agent_alias) {
             resolved.strict_tool_parsing = profile.strict_tool_parsing;
             resolved.thinking = profile.thinking.clone();
-            resolved.history_pruning = profile.history_pruning.clone();
+            resolved.context = profile.context.clone();
             resolved.eval = profile.eval.clone();
             resolved.auto_classify = profile.auto_classify.clone();
             resolved.effort_routing = profile.effort_routing.clone();
-            resolved.context_compression = profile.context_compression.clone();
             resolved.tool_receipts = profile.tool_receipts.clone();
             resolved.tool_filter_groups = profile.tool_filter_groups.clone();
+        } else {
+            resolved.context = crate::scattered_types::ContextConfig::default();
         }
         out.resolved = resolved;
         Some(out)
     }
+
 
     /// Resolve the effective skills prompt-injection mode for an agent: use an
     /// explicit runtime-profile override when set, otherwise inherit the global
@@ -7604,6 +7607,7 @@ impl CostRatesConfig {
     /// Deliberate zero-cost entries remain valid and distinguish a configured
     /// free resource from one whose pricing is unavailable.
     pub fn validate(&self) -> Result<()> {
+
         fn validate_rate(path: String, value: Option<f64>) -> Result<()> {
             if let Some(value) = value
                 && !crate::cost::is_sane_usd_rate(value)
@@ -14778,21 +14782,13 @@ pub struct RuntimeProfileConfig {
     /// Agentic delegate run timeout in seconds. `None` inherits global.
     pub agentic_timeout_secs: Option<u64>,
     // ── Per-agent runtime tunables (also live on AliasedAgentConfig) ─
-    /// History retention limit per session. Structured Agent and legacy loop
-    /// sessions count complete turns; channel caches count message rows. `None`
-    /// inherits the default of 50.
-    pub max_history_messages: Option<usize>,
-    /// Maximum estimated tokens before proactive history trimming. `None`
-    /// preserves the legacy 32,000-token default when `context_compact_ratio`
-    /// is unset. In ratio mode this remains an optional downward cap. Every
-    /// positive effective value is capped by the selected model capacity. `0`
-    /// disables proactive token-budget trimming.
-    pub max_context_tokens: Option<usize>,
-    /// Opt-in fraction of the selected model's context window at which
-    /// proactive history trimming triggers (e.g. `0.9` = trim at 90%). `None`
-    /// preserves the legacy absolute-budget behavior. Values outside `(0, 1]`
-    /// are treated as unset.
-    pub context_compact_ratio: Option<f64>,
+    /// Context management policy (`[runtime_profiles.<alias>.context]`):
+    /// input ceiling, trim threshold percentage, output reserve, and the
+    /// preferred whole-turn retention. Replaces the legacy `max_context_tokens`
+    /// / `context_compact_ratio` / `max_history_messages` knobs and the
+    /// `[history_pruning]` / `[context_compression]` tables.
+    #[nested]
+    pub context: crate::scattered_types::ContextConfig,
     /// Use compact bootstrap (6000 chars / 2 RAG chunks). `None` inherits.
     pub compact_context: Option<bool>,
     /// Enable parallel tool execution per iteration. `None` inherits.
@@ -14829,15 +14825,11 @@ pub struct RuntimeProfileConfig {
     #[nested]
     pub thinking: crate::scattered_types::ThinkingConfig,
     #[nested]
-    pub history_pruning: crate::scattered_types::HistoryPrunerConfig,
-    #[nested]
     pub eval: crate::scattered_types::EvalConfig,
     #[nested]
     pub auto_classify: Option<crate::scattered_types::AutoClassifyConfig>,
     #[nested]
     pub effort_routing: Option<crate::scattered_types::EffortRoutingConfig>,
-    #[nested]
-    pub context_compression: crate::scattered_types::ContextCompressionConfig,
     #[nested]
     pub tool_receipts: ToolReceiptsConfig,
     pub tool_filter_groups: Vec<ToolFilterGroup>,
@@ -14855,9 +14847,7 @@ impl Default for RuntimeProfileConfig {
             max_delegation_depth: 0,
             delegation_timeout_secs: None,
             agentic_timeout_secs: None,
-            max_history_messages: None,
-            max_context_tokens: None,
-            context_compact_ratio: None,
+            context: crate::scattered_types::ContextConfig::default(),
             compact_context: None,
             parallel_tools: None,
             single_tool_rounds: None,
@@ -14871,11 +14861,9 @@ impl Default for RuntimeProfileConfig {
             prompt_injection_mode: None,
             strict_tool_parsing: false,
             thinking: crate::scattered_types::ThinkingConfig::default(),
-            history_pruning: crate::scattered_types::HistoryPrunerConfig::default(),
             eval: crate::scattered_types::EvalConfig::default(),
             auto_classify: None,
             effort_routing: None,
-            context_compression: crate::scattered_types::ContextCompressionConfig::default(),
             tool_receipts: ToolReceiptsConfig::default(),
             tool_filter_groups: Vec::new(),
         }
@@ -23401,16 +23389,10 @@ impl Config {
         self.collect_codex_cli_extra_arg_warnings(&mut warnings);
         self.collect_fallback_warnings(&mut warnings);
         self.collect_server_fallback_model_warnings(&mut warnings);
-        self.collect_cross_provider_summary_model_warnings(&mut warnings);
         self.collect_a2a_exposed_skills_warnings(&mut warnings);
         self.collect_memory_semantic_search_warnings(&mut warnings);
         self.collect_dns_pinned_proxy_warnings(&mut warnings);
         self.collect_peer_groups_warnings(&mut warnings);
-        // Must run after `collect_cross_provider_summary_model_warnings`: it
-        // scans `warnings` to suppress its generic inert `summary_model`
-        // warning when the more specific cross-provider diagnostic already
-        // covers the same path.
-        self.collect_context_compression_ignored_warnings(&mut warnings);
         self.collect_verifiable_intent_warnings(&mut warnings);
         self.collect_cron_claim_warnings(&mut warnings);
         self.collect_compiled_out_tool_warnings(&mut warnings);
@@ -23717,228 +23699,6 @@ impl Config {
         }
     }
 
-    /// Surface cross-provider ambiguity in a legacy config while reporting
-    /// the current contract: context compression has no runtime consumer, so
-    /// this knob is inert like every other `context_compression` field (see
-    /// `collect_context_compression_ignored_warnings`). This diagnostic adds
-    /// config-shape detail as a more specific companion for the same line. The
-    /// deprecated
-    /// `runtime_profiles.<p>.context_compression.summary_model` is a bare
-    /// model id that names no provider of its own — it would need to be
-    /// resolved onto each consuming agent's OWN provider were the field ever
-    /// read again — so when a single profile is shared by agents resolving
-    /// to MORE THAN ONE distinct provider, that one bare id is ambiguous for
-    /// at least one of them. A `summary_provider` supplies provider identity
-    /// for this narrower diagnostic and excludes the corresponding value from
-    /// the ambiguity count; it does not make context compression functional.
-    ///
-    /// The diagnostic is offline and deterministic: no schema bump, no
-    /// network, and no model catalog. It names the profile, the affected
-    /// agents, and their differing providers, then recommends removing the
-    /// unsupported setting or waiting for an accepted compression design.
-    fn collect_cross_provider_summary_model_warnings(
-        &self,
-        warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
-    ) {
-        for (profile_alias, profile) in &self.runtime_profiles {
-            // Only the deprecated bare summary_model lacks provider identity.
-            // A profile-level summary_provider excludes this narrower
-            // ambiguity shape, but context compression remains inert.
-            if !profile
-                .context_compression
-                .summary_provider
-                .trim()
-                .is_empty()
-            {
-                continue;
-            }
-            let Some(summary_model) = profile.context_compression.summary_model.as_deref() else {
-                continue;
-            };
-            if summary_model.trim().is_empty() {
-                continue;
-            }
-
-            // Gather agents that reference this profile and have no agent-level
-            // summary_provider identity. An override excludes that agent from
-            // this ambiguity diagnostic but does not make compression
-            // functional. Resolve the provider that would be paired with the
-            // bare model if a future implementation consumed this config.
-            let mut affected: Vec<(String, String)> = Vec::new();
-            for (agent_alias, agent) in &self.agents {
-                if agent.runtime_profile.trim() != profile_alias {
-                    continue;
-                }
-                if !agent.summary_provider.trim().is_empty() {
-                    continue;
-                }
-                let provider_label = self.canonical_provider_label(agent.model_provider.trim());
-                affected.push((agent_alias.clone(), provider_label));
-            }
-
-            // Cross-provider ambiguity requires distinct providers. A
-            // same-provider bare id is still inert, but the generic
-            // context-compression warning reports that fact without this
-            // additional ambiguity detail.
-            let distinct: std::collections::BTreeSet<&str> =
-                affected.iter().map(|(_, p)| p.as_str()).collect();
-            if distinct.len() < 2 {
-                continue;
-            }
-
-            let mut agents_sorted: Vec<&(String, String)> = affected.iter().collect();
-            agents_sorted.sort_by(|a, b| a.0.cmp(&b.0));
-            let detail = agents_sorted
-                .iter()
-                .map(|(name, provider)| format!("{name} -> {provider}"))
-                .collect::<Vec<_>>()
-                .join(", ");
-
-            warnings.push(crate::validation_warnings::ValidationWarning::new(
-                "cross_provider_summary_model",
-                format!(
-                    "runtime_profiles.{profile_alias}.context_compression.summary_model \
-                     ({summary_model:?}) is set, but context compression is not currently \
-                     implemented in the runtime; this setting has no effect. It is also a \
-                     bare model id reused by agents resolving to different providers \
-                     ({detail}), which names no provider of its own and would be ambiguous \
-                     for at least one of them if compression were read again. Remove the \
-                     unsupported context_compression setting (every context_compression \
-                     field, including summary_provider, is currently inert), or wait for a \
-                     separately accepted compression design before configuring it."
-                ),
-                format!("runtime_profiles.{profile_alias}.context_compression.summary_model"),
-            ));
-        }
-    }
-
-    /// Surface every non-default `context_compression` knob as inert: the
-    /// runtime context compressor was removed and nothing in the
-    /// workspace reads `context_compression` at runtime anymore, so the whole
-    /// struct — `enabled`, thresholds, protected counts, summarizer limits,
-    /// provider selection, tool-result retrimming — has no effect. Mirrors
-    /// `validate_memory_semantics`: one warning per non-default field, so a
-    /// user sees exactly which of their authored knobs are dead. A field
-    /// explicitly written at its default value is indistinguishable from an
-    /// omitted one post-deserialization and stays silent (same limitation as
-    /// `validate_memory_semantics`).
-    ///
-    /// Only `[runtime_profiles.<alias>.context_compression]` is checked —
-    /// `AliasedAgentConfig` (`[agents.<alias>]`) has no `context_compression`
-    /// field of its own, and the legacy pre-V3 `[agent.context_compression]`
-    /// top-level table (folded into `[runtime_profiles.default]` by the V2→V3
-    /// migration, see `schema/v2.rs`) has already collapsed into this same
-    /// surface by the time `Config` exists, so a single pass over
-    /// `runtime_profiles` covers both the historical and current authored
-    /// forms without double-warning.
-    fn collect_context_compression_ignored_warnings(
-        &self,
-        warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
-    ) {
-        let defaults = crate::scattered_types::ContextCompressionConfig::default();
-        for (alias, profile) in &self.runtime_profiles {
-            let cc = &profile.context_compression;
-
-            // `enabled = true` gets its own message: it is the master switch
-            // users flip expecting compression to happen at all.
-            if cc.enabled {
-                warnings.push(crate::validation_warnings::ValidationWarning::new(
-                    "context_compression_unsupported",
-                    format!(
-                        "runtime_profiles.{alias}.context_compression.enabled is set but context \
-                         compression is not currently implemented in the runtime (the compressor \
-                         was removed in #8196); this setting has no effect."
-                    ),
-                    format!("runtime_profiles.{alias}.context_compression.enabled"),
-                ));
-            }
-
-            // Every other knob: flag any value that differs from the default.
-            let mut inert: Vec<&'static str> = Vec::new();
-            if (cc.threshold_ratio - defaults.threshold_ratio).abs() > f64::EPSILON {
-                inert.push("threshold_ratio");
-            }
-            if cc.protect_first_n != defaults.protect_first_n {
-                inert.push("protect_first_n");
-            }
-            if cc.protect_last_n != defaults.protect_last_n {
-                inert.push("protect_last_n");
-            }
-            if cc.max_passes != defaults.max_passes {
-                inert.push("max_passes");
-            }
-            if cc.summary_max_chars != defaults.summary_max_chars {
-                inert.push("summary_max_chars");
-            }
-            if cc.source_max_chars != defaults.source_max_chars {
-                inert.push("source_max_chars");
-            }
-            if cc.timeout_secs != defaults.timeout_secs {
-                inert.push("timeout_secs");
-            }
-            if cc.summary_provider != defaults.summary_provider {
-                inert.push("summary_provider");
-            }
-            if cc.summary_model != defaults.summary_model {
-                // Ordering dependency: `collect_warnings()` runs
-                // `collect_cross_provider_summary_model_warnings` before this
-                // helper, so a cross-provider `summary_model` diagnostic for
-                // this same path is already in `warnings`. That diagnostic
-                // reports the same "has no effect" fact plus the specific
-                // cross-provider agents affected, so it wins and the generic
-                // inert warning is skipped to avoid printing two warnings
-                // for the same config line. All other `summary_model`
-                // shapes (single-provider, unshared) still get the inert
-                // warning; no other diagnostic covers them.
-                let summary_model_path =
-                    format!("runtime_profiles.{alias}.context_compression.summary_model");
-                if !warnings.iter().any(|w| {
-                    w.code == "cross_provider_summary_model" && w.path == summary_model_path
-                }) {
-                    inert.push("summary_model");
-                }
-            }
-            if cc.identifier_policy != defaults.identifier_policy {
-                inert.push("identifier_policy");
-            }
-            if cc.tool_result_retrim_chars != defaults.tool_result_retrim_chars {
-                inert.push("tool_result_retrim_chars");
-            }
-            if cc.tool_result_trim_exempt != defaults.tool_result_trim_exempt {
-                inert.push("tool_result_trim_exempt");
-            }
-
-            for field in inert {
-                warnings.push(crate::validation_warnings::ValidationWarning::new(
-                    "context_compression_unsupported",
-                    format!(
-                        "runtime_profiles.{alias}.context_compression.{field} is set to a \
-                         non-default value but context compression is not currently implemented \
-                         in the runtime (the compressor was removed in #8196); this setting has \
-                         no effect."
-                    ),
-                    format!("runtime_profiles.{alias}.context_compression.{field}"),
-                ));
-            }
-        }
-    }
-
-    /// Canonical label for an agent's resolved model provider, used to decide
-    /// whether two agents sit on distinct providers. A non-empty ref that
-    /// resolves through `[providers.models]` collapses to its canonical
-    /// `<family>.<alias>` so equivalent spellings (bare vs dotted) compare
-    /// equal; an empty or unresolved ref keeps its raw form (empty becomes a
-    /// stable sentinel) so it still participates as a distinct bucket.
-    fn canonical_provider_label(&self, provider_ref: &str) -> String {
-        if provider_ref.is_empty() {
-            return "<agent default provider>".to_string();
-        }
-        match self.providers.models.find_by_name(provider_ref) {
-            Some((family, alias, _)) => format!("{family}.{alias}"),
-            None => provider_ref.to_string(),
-        }
-    }
-
     /// Surface non-fatal issues in per-alias `fallback` chains: dangling refs
     /// (a fallback naming an alias that is not configured) and cycles (a
     /// fallback path that loops back onto itself). Both are warn-and-skip — the
@@ -24232,6 +23992,37 @@ impl Config {
     /// Called after TOML deserialization and env-override application to catch
     /// obviously invalid values early instead of failing at arbitrary runtime points.
     pub fn validate(&self) -> Result<()> {
+        // Per-agent `[context]` validation. Out-of-range knobs are hard
+        // errors here — never silent clamps. Sorted iteration keeps ordering
+        // deterministic.
+        let mut context_agent_aliases: Vec<&String> = self.agents.keys().collect();
+        context_agent_aliases.sort();
+        for alias in context_agent_aliases {
+            let Some(profile) = self.runtime_profile_for_agent(alias) else {
+                continue;
+            };
+            let ctx = &profile.context;
+            if let Some(field) = ctx.out_of_range_fields().into_iter().next() {
+                validation_bail!(
+                    InvalidNumericRange,
+                    format!("runtime_profiles.{alias}.context.{field}"),
+                    "runtime_profiles.{alias}.context.{field} = {} but the accepted range is 1..=100",
+                    ctx.trim_threshold_percent
+                );
+            }
+            if let Some(reserve) = ctx.reserve_tokens {
+                let window = self.effective_model_context_window(alias);
+                if reserve > window * crate::scattered_types::MAX_CONTEXT_RESERVE_PERCENT / 100 {
+                    validation_bail!(
+                        InvalidNumericRange,
+                        format!("runtime_profiles.{alias}.context.reserve_tokens"),
+                        "runtime_profiles.{alias}.context.reserve_tokens = {reserve} exceeds {}% of the model context window ({window}); the reserve would strand most of the window",
+                        crate::scattered_types::MAX_CONTEXT_RESERVE_PERCENT
+                    );
+                }
+            }
+        }
+
         validate_memory_rerank_config(&self.memory)?;
         self.cost.rates.validate()?;
 
@@ -25545,42 +25336,6 @@ impl Config {
             );
         }
 
-        // Per-profile validation: the context-compression summarizer provider
-        // ref must resolve to a configured `[providers.models.*]` alias.
-        // Empty = inherit (valid). A shared profile fails loud at config time
-        // instead of only when some agent using it compresses.
-        let mut profile_aliases: Vec<&String> = self.runtime_profiles.keys().collect();
-        profile_aliases.sort();
-        for palias in profile_aliases {
-            let value = self.runtime_profiles[palias]
-                .context_compression
-                .summary_provider
-                .trim();
-            if value.is_empty() {
-                continue;
-            }
-            match value.split_once('.') {
-                Some((ty, inner)) if !ty.is_empty() && !inner.is_empty() => {
-                    let exists = self
-                        .get_map_keys(&format!("providers.models.{ty}"))
-                        .is_some_and(|keys| keys.iter().any(|k| k == inner));
-                    if !exists {
-                        validation_bail!(
-                            DanglingReference,
-                            format!(
-                                "runtime_profiles.{palias}.context_compression.summary_provider"
-                            ),
-                            "runtime_profiles.{palias}.context_compression.summary_provider = {value:?} but providers.models.{ty}.{inner} is not configured",
-                        );
-                    }
-                }
-                _ => validation_bail!(
-                    InvalidFormat,
-                    format!("runtime_profiles.{palias}.context_compression.summary_provider"),
-                    "runtime_profiles.{palias}.context_compression.summary_provider must be dotted form `<type>.<alias>` (got {value:?})",
-                ),
-            }
-        }
 
         // Per-agent validation. Mandatory + alias-existence checks live
         // here so the gateway PATCH path returns structured per-field
@@ -25678,12 +25433,6 @@ impl Config {
                     "providers.models",
                     "classifier_provider",
                     agent.classifier_provider.trim(),
-                ),
-                // Agent-level context-compression summarizer override.
-                (
-                    "providers.models",
-                    "summary_provider",
-                    agent.summary_provider.trim(),
                 ),
             ];
             for (section_prefix, field, value) in typed_provider_refs {
@@ -29373,128 +29122,90 @@ mod tests {
     }
 
     #[::core::prelude::v1::test]
-    fn effective_context_budget_preserves_legacy_default_and_zero_sentinel() {
+    fn effective_context_budget_derives_the_water_line_from_the_context_table() {
         use super::{ModelContextWindowSource, ResolvedRuntime};
 
-        // Ratio is opt-in: a large model keeps the established 32k default.
+        // Default policy: 80% of the selected model window.
         let r = ResolvedRuntime {
             model_context_window: 200_000,
-            ..ResolvedRuntime::default()
-        };
-        assert_eq!(r.effective_context_budget(), 32_000);
-
-        // Opting in to a ratio scales against the selected model window.
-        let r = ResolvedRuntime {
-            model_context_window: 200_000,
-            context_compact_ratio: Some(0.8),
+            model_context_window_source: ModelContextWindowSource::Configured,
             ..ResolvedRuntime::default()
         };
         assert_eq!(r.effective_context_budget(), 160_000);
 
-        // An explicit ceiling clamps ratio mode down.
+        // The trim percentage is the only knob on the water-line.
         let r = ResolvedRuntime {
             model_context_window: 200_000,
-            max_context_tokens: Some(50_000),
-            context_compact_ratio: Some(0.8),
+            model_context_window_source: ModelContextWindowSource::Configured,
+            context: crate::scattered_types::ContextConfig {
+                trim_threshold_percent: 50,
+                ..Default::default()
+            },
+            ..ResolvedRuntime::default()
+        };
+        assert_eq!(r.effective_context_budget(), 100_000);
+
+        // The input ceiling clamps the effective window, so the water-line
+        // follows it.
+        let r = ResolvedRuntime {
+            model_context_window: 200_000,
+            model_context_window_source: ModelContextWindowSource::Configured,
+            context: crate::scattered_types::ContextConfig {
+                max_input_tokens: Some(50_000),
+                ..Default::default()
+            },
+            ..ResolvedRuntime::default()
+        };
+        assert_eq!(r.effective_context_budget(), 40_000);
+
+        // The output reserve bounds the water-line from above.
+        let r = ResolvedRuntime {
+            model_context_window: 200_000,
+            model_context_window_source: ModelContextWindowSource::Configured,
+            context: crate::scattered_types::ContextConfig {
+                reserve_tokens: Some(150_000),
+                ..Default::default()
+            },
             ..ResolvedRuntime::default()
         };
         assert_eq!(r.effective_context_budget(), 50_000);
 
-        // Invalid ratio behaves as unset and therefore preserves 32k.
-        let r = ResolvedRuntime {
-            model_context_window: 200_000,
-            context_compact_ratio: Some(0.0),
-            ..ResolvedRuntime::default()
-        };
-        assert_eq!(r.effective_context_budget(), 32_000);
-
-        // Explicit zero remains the proactive-trimming disable sentinel.
-        let r = ResolvedRuntime {
-            model_context_window: 200_000,
-            max_context_tokens: Some(0),
-            context_compact_ratio: Some(0.9),
-            ..ResolvedRuntime::default()
-        };
-        assert_eq!(r.effective_context_budget(), 0);
-
-        // The historical 32k input budget is clamped to the selected model's
-        // smaller capacity.
+        // Trimming can never be disabled: no configuration yields a zero
+        // water-line.
         let r = ResolvedRuntime {
             model_context_window: 8_000,
             model_context_window_source: ModelContextWindowSource::Configured,
-            ..ResolvedRuntime::default()
-        };
-        assert_eq!(r.effective_context_budget(), 8_000);
-
-        // An explicit absolute budget is also bounded by capacity when ratio
-        // mode is off.
-        let r = ResolvedRuntime {
-            model_context_window: 8_000,
-            model_context_window_source: ModelContextWindowSource::Configured,
-            max_context_tokens: Some(128_000),
-            ..ResolvedRuntime::default()
-        };
-        assert_eq!(r.effective_context_budget(), 8_000);
-
-        // A pruning threshold remains a downward cap and can never raise the
-        // effective budget above model capacity.
-        let r = ResolvedRuntime {
-            model_context_window: 8_000,
-            model_context_window_source: ModelContextWindowSource::Configured,
-            history_pruning: crate::scattered_types::HistoryPrunerConfig {
-                enabled: true,
-                max_tokens: 12_000,
-                ..crate::scattered_types::HistoryPrunerConfig::default()
+            context: crate::scattered_types::ContextConfig {
+                trim_threshold_percent: 1,
+                ..Default::default()
             },
             ..ResolvedRuntime::default()
         };
-        assert_eq!(r.effective_context_budget(), 8_000);
-
-        // An unconfigured capacity is a compatibility stub, not model truth.
-        // An explicit absolute budget above the stub is honored, and the
-        // window operand is raised to it so capacity stays a hard invariant
-        // while its provenance still reports "not configured".
+        assert!(r.effective_context_budget() > 0);
         let r = ResolvedRuntime {
-            max_context_tokens: Some(1_000_000),
-            ..ResolvedRuntime::default()
-        };
-        let limits = r.context_limits();
-        assert_eq!(limits.context_token_budget, 1_000_000);
-        assert_eq!(limits.model_context_window, 1_000_000);
-        assert_eq!(
-            limits.model_context_window_source,
-            ModelContextWindowSource::CompatibilityFallback
-        );
-        assert_eq!(limits.configured_model_context_window(), None);
-
-        // In ratio mode the explicit budget stands in for the unknown window.
-        let r = ResolvedRuntime {
-            max_context_tokens: Some(1_000_000),
-            context_compact_ratio: Some(0.8),
-            ..ResolvedRuntime::default()
-        };
-        assert_eq!(r.effective_context_budget(), 800_000);
-
-        // A pruning threshold still pulls the honored budget down.
-        let r = ResolvedRuntime {
-            max_context_tokens: Some(1_000_000),
-            history_pruning: crate::scattered_types::HistoryPrunerConfig {
-                enabled: true,
-                max_tokens: 12_000,
-                ..crate::scattered_types::HistoryPrunerConfig::default()
+            model_context_window: 8_000,
+            model_context_window_source: ModelContextWindowSource::Configured,
+            context: crate::scattered_types::ContextConfig {
+                max_input_tokens: Some(0),
+                trim_threshold_percent: 1,
+                ..Default::default()
             },
             ..ResolvedRuntime::default()
         };
-        assert_eq!(r.effective_context_budget(), 12_000);
+        assert!(r.effective_context_budget() > 0);
 
-        // An explicit budget at or below the stub leaves the stub untouched.
+        // The water-line never exceeds the send budget: the reserve bounds it.
         let r = ResolvedRuntime {
-            max_context_tokens: Some(16_000),
+            model_context_window: 200_000,
+            model_context_window_source: ModelContextWindowSource::Configured,
+            context: crate::scattered_types::ContextConfig {
+                reserve_tokens: Some(16_384),
+                ..Default::default()
+            },
             ..ResolvedRuntime::default()
         };
-        let limits = r.context_limits();
-        assert_eq!(limits.context_token_budget, 16_000);
-        assert_eq!(limits.model_context_window, 32_000);
+        assert!(r.context_trim_budget() <= r.context_send_budget());
+        assert_eq!(r.context_send_budget(), 200_000 - 16_384);
     }
 
     #[::core::prelude::v1::test]
@@ -29555,12 +29266,11 @@ mod tests {
         assert_eq!(limits.model_context_window, 1_000_000);
     }
 
-    /// Mirrors the reported operator setup: a provider profile that declares `model`
-    /// and `max_tokens` but no `context_window`, bound to a runtime profile
-    /// with a large explicit `max_context_tokens`. The profile budget must
-    /// win over the 32,000 compatibility stub.
+    /// An input ceiling only ever clamps the window *down*: an unknown
+    /// capacity stays the 32,000 compatibility stub, and the water-line is
+    /// that stub scaled by the trim percentage.
     #[::core::prelude::v1::test]
-    fn unconfigured_provider_capacity_honors_explicit_profile_budget() {
+    fn unconfigured_provider_capacity_is_bounded_by_the_input_ceiling() {
         use super::{AliasedAgentConfig, Config, RuntimeProfileConfig};
 
         let mut cfg = Config::default();
@@ -29574,7 +29284,10 @@ mod tests {
         cfg.runtime_profiles.insert(
             "normal".to_string(),
             RuntimeProfileConfig {
-                max_context_tokens: Some(1_000_000),
+                context: crate::scattered_types::ContextConfig {
+                    max_input_tokens: Some(1_000_000),
+                    ..Default::default()
+                },
                 ..RuntimeProfileConfig::default()
             },
         );
@@ -29590,8 +29303,10 @@ mod tests {
 
         let limits =
             cfg.resolved_context_limits_for_route("zerocode", "anthropic.clod", "claude-opus-5-5");
-        assert_eq!(limits.context_token_budget, 1_000_000);
-        assert_eq!(limits.model_context_window, 1_000_000);
+        // The ceiling never raises an unknown capacity: the stub stays the
+        // window, and the water-line is 80% of it.
+        assert_eq!(limits.model_context_window, 32_000);
+        assert_eq!(limits.context_token_budget, 25_600);
         assert_eq!(
             limits.model_context_window_source,
             super::ModelContextWindowSource::CompatibilityFallback
@@ -29602,18 +29317,19 @@ mod tests {
                 .expect("agent resolves")
                 .resolved
                 .effective_context_budget(),
-            1_000_000
+            25_600
         );
 
-        // With the ratio also set, the explicit budget is the window operand.
+        // A ceiling below the stub clamps the window down further.
         cfg.runtime_profiles
             .get_mut("normal")
             .expect("profile exists")
-            .context_compact_ratio = Some(0.8);
+            .context
+            .max_input_tokens = Some(10_000);
         let limits =
             cfg.resolved_context_limits_for_route("zerocode", "anthropic.clod", "claude-opus-5-5");
-        assert_eq!(limits.context_token_budget, 800_000);
-        assert_eq!(limits.model_context_window, 1_000_000);
+        assert_eq!(limits.context_token_budget, 8_000);
+        assert_eq!(limits.model_context_window, 32_000);
     }
 
     #[::core::prelude::v1::test]
@@ -29647,7 +29363,10 @@ mod tests {
         cfg.runtime_profiles.insert(
             "ratio".to_string(),
             RuntimeProfileConfig {
-                context_compact_ratio: Some(0.9),
+                context: crate::scattered_types::ContextConfig {
+                    trim_threshold_percent: 90,
+                    ..Default::default()
+                },
                 ..RuntimeProfileConfig::default()
             },
         );
@@ -34452,7 +34171,7 @@ reasoning_effort = "turbo"
         assert!(cfg.resolved.compact_context);
         assert_eq!(cfg.resolved.max_tool_iterations, 10);
         assert_eq!(cfg.resolved.max_execution_tree_iterations, None);
-        assert_eq!(cfg.resolved.max_history_messages, 50);
+        assert_eq!(cfg.resolved.max_history_messages, 5);
         assert!(!cfg.resolved.parallel_tools);
         assert_eq!(cfg.resolved.tool_dispatcher, "auto");
         assert!(!cfg.resolved.strict_tool_parsing);
@@ -34657,13 +34376,12 @@ max_tool_iterations = 100
 runtime_profile = "long_turn"
 "#;
         let parsed = parse_test_config(raw);
-        assert_eq!(parsed.effective_max_history_messages("default"), 50);
         assert_eq!(
             parsed.effective_structured_max_history_messages("default"),
-            50
+            5
         );
         let agent = parsed.resolved_agent_config("default").unwrap();
-        assert_eq!(agent.resolved.max_history_messages, 50);
+        assert_eq!(agent.resolved.max_history_messages, 5);
     }
 
     #[test]
@@ -34671,39 +34389,39 @@ runtime_profile = "long_turn"
         let raw = r#"
 [runtime_profiles.long_turn]
 max_tool_iterations = 100
-max_history_messages = 80
+
+[runtime_profiles.long_turn.context]
+keep_recent_turns = 8
 
 [agents.default]
 runtime_profile = "long_turn"
 "#;
         let parsed = parse_test_config(raw);
-        assert_eq!(parsed.effective_max_history_messages("default"), 80);
         assert_eq!(
             parsed.effective_structured_max_history_messages("default"),
-            80
+            8
         );
         let agent = parsed.resolved_agent_config("default").unwrap();
-        assert_eq!(agent.resolved.max_history_messages, 80);
+        assert_eq!(agent.resolved.max_history_messages, 8);
     }
 
     #[test]
-    async fn runtime_profile_history_cap_explicit_zero_remains_authoritative() {
+    async fn runtime_profile_history_cap_is_clamped_not_rejected() {
         let raw = r#"
 [runtime_profiles.long_turn]
-max_tool_iterations = 100
-max_history_messages = 0
+
+[runtime_profiles.long_turn.context]
+keep_recent_turns = 0
 
 [agents.default]
 runtime_profile = "long_turn"
 "#;
         let parsed = parse_test_config(raw);
-        assert_eq!(parsed.effective_max_history_messages("default"), 0);
         assert_eq!(
             parsed.effective_structured_max_history_messages("default"),
-            0
+            1,
+            "keep_recent_turns clamps up to 1 rather than failing validation"
         );
-        let agent = parsed.resolved_agent_config("default").unwrap();
-        assert_eq!(agent.resolved.max_history_messages, 0);
     }
 
     #[test]
@@ -34726,19 +34444,18 @@ runtime_profile = "long_turn"
 
         assert_eq!(
             config.effective_structured_max_history_messages("default"),
-            50
+            5
         );
-        assert_eq!(config.effective_max_history_messages("default"), 50);
     }
 
     #[test]
-    async fn default_runtime_profile_history_cap_remains_50() {
+    async fn default_runtime_profile_history_cap_is_the_documented_default() {
         let parsed = parse_test_config("");
         assert_eq!(parsed.effective_max_tool_iterations("default"), 10);
-        assert_eq!(parsed.effective_max_history_messages("default"), 50);
         assert_eq!(
             parsed.effective_structured_max_history_messages("default"),
-            50
+            5,
+            "keep_recent_turns defaults to 5 whole turns"
         );
     }
     #[test]
@@ -44348,9 +44065,11 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         let thinking = crate::scattered_types::ThinkingConfig::default().prop_fields();
         assert_description(&thinking, ".native_thinking", "selected level has a budget");
 
-        let compression = crate::scattered_types::ContextCompressionConfig::default().prop_fields();
-        assert_description(&compression, ".summary_provider", "<type>.<alias>");
-        assert_description(&compression, ".summary_model", "DEPRECATED bare model id");
+        let context = crate::scattered_types::ContextConfig::default().prop_fields();
+        assert_description(&context, ".max_input_tokens", "ceiling");
+        assert_description(&context, ".trim_threshold_percent", "history trimming");
+        assert_description(&context, ".reserve_tokens", "Output headroom");
+        assert_description(&context, ".keep_recent_turns", "recent whole turns");
 
         let email = crate::scattered_types::EmailConfig::default().prop_fields();
         assert_description(&email, ".observer_mode", "never modifies any IMAP flag");
@@ -47462,24 +47181,24 @@ allowed_users = []
         assert!(
             fields
                 .iter()
-                .any(|field| field.name == "runtime_profiles.fast.history_pruning.enabled"),
-            "history-pruning is a runtime-profile field, emitted under the profile alias"
+                .any(|field| field.name == "runtime_profiles.fast.context.max_input_tokens"),
+            "the context table is a runtime-profile field, emitted under the profile alias"
         );
         assert!(
             !fields
                 .iter()
-                .any(|field| field.name.starts_with("agents.bob.history_pruning")),
-            "history-pruning must no longer be settable on the agent"
+                .any(|field| field.name.starts_with("agents.bob.context")),
+            "the context table must no longer be settable on the agent"
         );
 
         config
-            .set_prop("runtime_profiles.fast.history_pruning.enabled", "true")
+            .set_prop("runtime_profiles.fast.context.max_input_tokens", "100000")
             .expect("set_prop should accept the runtime-profile nested path");
         assert_eq!(
             config
-                .get_prop("runtime_profiles.fast.history_pruning.enabled")
+                .get_prop("runtime_profiles.fast.context.max_input_tokens")
                 .expect("get_prop should accept the runtime-profile nested path"),
-            "true"
+            "100000"
         );
     }
 
@@ -48888,534 +48607,6 @@ allowed_users = []
                 && msg.contains("does-not-exist")
                 && msg.contains("providers.models.custom.does-not-exist is not configured"),
             "expected DanglingReference error mentioning field + alias + section, got: {msg}"
-        );
-    }
-
-    // agent-level summary_provider validated like classifier_provider.
-    #[tokio::test]
-    async fn config_validate_rejects_agent_summary_provider_missing_alias() {
-        let toml = r#"
-            [providers.models.custom.default]
-            api_key = "k"
-            model = "qwen3.6-plus"
-            uri = "https://example.com/v1"
-            wire_api = "chat_completions"
-
-            [risk_profiles.default]
-            level = "supervised"
-
-            [agents.default]
-            enabled = true
-            model_provider = "custom.default"
-            risk_profile = "default"
-            summary_provider = "custom.does-not-exist"
-        "#;
-        let cfg: Config = toml::from_str(toml).unwrap();
-        let msg = format!("{:#}", cfg.validate().expect_err("missing alias must fail"));
-        assert!(
-            msg.contains("summary_provider")
-                && msg.contains("providers.models.custom.does-not-exist is not configured"),
-            "expected DanglingReference for agent summary_provider, got: {msg}"
-        );
-    }
-
-    // profile-level summary_provider validated by the new profile loop.
-    #[tokio::test]
-    async fn config_validate_rejects_profile_summary_provider_missing_alias() {
-        let toml = r#"
-            [providers.models.custom.default]
-            api_key = "k"
-            model = "qwen3.6-plus"
-            uri = "https://example.com/v1"
-            wire_api = "chat_completions"
-
-            [risk_profiles.default]
-            level = "supervised"
-
-            [runtime_profiles.fast.context_compression]
-            summary_provider = "custom.nope"
-
-            [agents.default]
-            enabled = true
-            model_provider = "custom.default"
-            risk_profile = "default"
-            runtime_profile = "fast"
-        "#;
-        let cfg: Config = toml::from_str(toml).unwrap();
-        let msg = format!(
-            "{:#}",
-            cfg.validate().expect_err("missing profile alias must fail")
-        );
-        assert!(
-            msg.contains("runtime_profiles.fast.context_compression.summary_provider")
-                && msg.contains("providers.models.custom.nope is not configured"),
-            "expected DanglingReference for profile summary_provider, got: {msg}"
-        );
-    }
-
-    // effective_summary_provider precedence — agent → profile → None.
-    #[tokio::test]
-    async fn effective_summary_provider_precedence() {
-        let toml = r#"
-            [providers.models.custom.main]
-            api_key = "k"
-            model = "m-main"
-            uri = "https://example.com/v1"
-            wire_api = "chat_completions"
-            [providers.models.custom.cheap]
-            api_key = "k"
-            model = "m-cheap"
-            uri = "https://example.com/v1"
-            wire_api = "chat_completions"
-            [providers.models.custom.profilesum]
-            api_key = "k"
-            model = "m-profile"
-            uri = "https://example.com/v1"
-            wire_api = "chat_completions"
-
-            [risk_profiles.default]
-            level = "supervised"
-
-            [runtime_profiles.fast.context_compression]
-            summary_provider = "custom.profilesum"
-
-            [agents.a]
-            enabled = true
-            model_provider = "custom.main"
-            risk_profile = "default"
-            runtime_profile = "fast"
-            summary_provider = "custom.cheap"
-
-            [agents.b]
-            enabled = true
-            model_provider = "custom.main"
-            risk_profile = "default"
-            runtime_profile = "fast"
-
-            [agents.c]
-            enabled = true
-            model_provider = "custom.main"
-            risk_profile = "default"
-        "#;
-        let cfg: Config = toml::from_str(toml).unwrap();
-        // agent override wins over the profile
-        assert_eq!(
-            cfg.effective_summary_provider("a").as_deref(),
-            Some("custom.cheap")
-        );
-        // agent empty → profile value
-        assert_eq!(
-            cfg.effective_summary_provider("b").as_deref(),
-            Some("custom.profilesum")
-        );
-        // no agent override + no runtime profile → None (caller uses agent's own)
-        assert_eq!(cfg.effective_summary_provider("c"), None);
-    }
-
-    // config-time diagnostic for the legacy cross-provider summary_model
-    // shape. A profile sets the deprecated bare summary_model and is shared by
-    // two agents on DIFFERENT providers with no summary_provider override -> the
-    // diagnostic fires and names the profile + the affected agents + providers.
-    #[tokio::test]
-    async fn collect_warnings_flags_cross_provider_summary_model() {
-        let toml = r#"
-            [providers.models.custom.p1]
-            api_key = "k"
-            model = "m1"
-            uri = "https://example.com/v1"
-            wire_api = "chat_completions"
-            [providers.models.custom.p2]
-            api_key = "k"
-            model = "m2"
-            uri = "https://example.com/v1"
-            wire_api = "chat_completions"
-
-            [risk_profiles.default]
-            level = "supervised"
-
-            [runtime_profiles.shared.context_compression]
-            summary_model = "haiku"
-
-            [agents.alpha]
-            enabled = true
-            model_provider = "custom.p1"
-            risk_profile = "default"
-            runtime_profile = "shared"
-
-            [agents.beta]
-            enabled = true
-            model_provider = "custom.p2"
-            risk_profile = "default"
-            runtime_profile = "shared"
-        "#;
-        let cfg: Config = toml::from_str(toml).unwrap();
-        let warnings = cfg.collect_warnings();
-        let w = warnings
-            .iter()
-            .find(|w| w.code == "cross_provider_summary_model")
-            .expect("expected cross_provider_summary_model warning");
-        assert_eq!(
-            w.path,
-            "runtime_profiles.shared.context_compression.summary_model"
-        );
-        assert!(
-            w.message.contains("haiku"),
-            "message names the model: {}",
-            w.message
-        );
-        assert!(
-            w.message.contains("alpha -> custom.p1"),
-            "message names alpha + provider: {}",
-            w.message
-        );
-        assert!(
-            w.message.contains("beta -> custom.p2"),
-            "message names beta + provider: {}",
-            w.message
-        );
-    }
-
-    // The `cross_provider_summary_model` diagnostic must report the setting
-    // as unsupported/inert like every other `context_compression` knob, not
-    // as something that is actively dispatched onto per-agent providers and
-    // fails at runtime — there is no runtime consumer left to dispatch
-    // anything. The cross-provider detail (which agents, which providers)
-    // must still be present since it is useful context for the fix, but the
-    // message must not claim any runtime behavior.
-    #[tokio::test]
-    async fn collect_warnings_cross_provider_summary_model_reports_inert_not_dispatch() {
-        let toml = r#"
-            [providers.models.custom.p1]
-            api_key = "k"
-            model = "m1"
-            uri = "https://example.com/v1"
-            wire_api = "chat_completions"
-            [providers.models.custom.p2]
-            api_key = "k"
-            model = "m2"
-            uri = "https://example.com/v1"
-            wire_api = "chat_completions"
-
-            [risk_profiles.default]
-            level = "supervised"
-
-            [runtime_profiles.shared.context_compression]
-            summary_model = "haiku"
-
-            [agents.alpha]
-            enabled = true
-            model_provider = "custom.p1"
-            risk_profile = "default"
-            runtime_profile = "shared"
-
-            [agents.beta]
-            enabled = true
-            model_provider = "custom.p2"
-            risk_profile = "default"
-            runtime_profile = "shared"
-        "#;
-        let cfg: Config = toml::from_str(toml).unwrap();
-        let warnings = cfg.collect_warnings();
-        let w = warnings
-            .iter()
-            .find(|w| w.code == "cross_provider_summary_model")
-            .expect("expected cross_provider_summary_model warning");
-        assert!(
-            w.message.contains("not currently implemented") && w.message.contains("no effect"),
-            "message must truthfully report the setting as unsupported/inert: {}",
-            w.message
-        );
-        assert!(
-            !w.message.contains("silently fails"),
-            "message must not claim the setting silently fails at runtime: {}",
-            w.message
-        );
-        assert!(
-            !w.message.contains("dispatched"),
-            "message must not claim the setting is dispatched to a provider at runtime: {}",
-            w.message
-        );
-        // Cross-provider specificity must survive the rewrite — it is still
-        // useful detail even though the setting is inert.
-        assert!(
-            w.message.contains("alpha -> custom.p1") && w.message.contains("beta -> custom.p2"),
-            "message must keep naming the affected agents and providers: {}",
-            w.message
-        );
-        // The remediation must NOT send the operator to another inert
-        // context_compression field: this PR's per-field pass classifies a
-        // non-default `summary_provider` as unsupported/inert too, so
-        // "migrate to context_compression.summary_provider" would just produce
-        // another no-effect setting and another warning.
-        assert!(
-            !w.message
-                .contains("Migrate to context_compression.summary_provider"),
-            "remediation must not recommend migrating to the inert summary_provider: {}",
-            w.message
-        );
-        assert!(
-            w.message
-                .contains("Remove the unsupported context_compression setting"),
-            "remediation should tell the operator to remove the inert setting: {}",
-            w.message
-        );
-    }
-
-    // The runtime context compressor was removed; nothing reads
-    // `context_compression` at runtime anymore, so an explicit
-    // `enabled = true` on a named runtime profile is inert and must be
-    // flagged.
-    #[tokio::test]
-    async fn collect_warnings_flags_context_compression_enabled_on_runtime_profile() {
-        let toml = r#"
-            [risk_profiles.default]
-            level = "supervised"
-
-            [runtime_profiles.fast.context_compression]
-            enabled = true
-
-            [agents.alpha]
-            enabled = true
-            risk_profile = "default"
-            runtime_profile = "fast"
-        "#;
-        let cfg: Config = toml::from_str(toml).unwrap();
-        let warnings = cfg.collect_warnings();
-        let w = warnings
-            .iter()
-            .find(|w| w.code == "context_compression_unsupported")
-            .expect("expected context_compression_unsupported warning");
-        assert_eq!(w.path, "runtime_profiles.fast.context_compression.enabled");
-        assert!(
-            w.message.contains("not currently implemented"),
-            "message explains the flag is inert: {}",
-            w.message
-        );
-    }
-
-    // The legacy pre-V3 `[agent.context_compression]` top-level table is
-    // folded into `[runtime_profiles.default]` by the V1/V2→V3 migration
-    // (see `schema/v2.rs`), so it must surface the same diagnostic once
-    // migrated — this is the historical form of the surface commonly
-    // called "agent-level" configuration.
-    #[::core::prelude::v1::test]
-    fn collect_warnings_flags_context_compression_enabled_via_legacy_agent_table() {
-        let raw = r#"
-            default_temperature = 0.7
-
-            [agent.context_compression]
-            enabled = true
-        "#;
-        let parsed = crate::migration::migrate_to_current(raw).expect("migration succeeds");
-        let warnings = parsed.collect_warnings();
-        let w = warnings
-            .iter()
-            .find(|w| w.code == "context_compression_unsupported")
-            .expect("expected context_compression_unsupported warning after migration");
-        assert_eq!(
-            w.path,
-            "runtime_profiles.default.context_compression.enabled"
-        );
-    }
-
-    // A default config (no explicit `context_compression.enabled`) must stay
-    // silent — the flag now defaults to `false`, matching the runtime, which
-    // does not consult it at all.
-    #[tokio::test]
-    async fn collect_warnings_silent_for_context_compression_default() {
-        let toml = r#"
-            [risk_profiles.default]
-            level = "supervised"
-
-            [agents.alpha]
-            enabled = true
-            risk_profile = "default"
-        "#;
-        let cfg: Config = toml::from_str(toml).unwrap();
-        let warnings = cfg.collect_warnings();
-        assert!(
-            !warnings
-                .iter()
-                .any(|w| w.code == "context_compression_unsupported"),
-            "default config must not flag context_compression_unsupported: {warnings:?}"
-        );
-    }
-
-    // Every `context_compression` knob is inert, not just `enabled` — tuning
-    // fields set to non-default values must each surface their own warning
-    // with a per-field path, even with `enabled` left off, since the whole
-    // struct is covered.
-    #[tokio::test]
-    async fn collect_warnings_flags_context_compression_tuning_fields() {
-        let toml = r#"
-            [risk_profiles.default]
-            level = "supervised"
-
-            [runtime_profiles.fast.context_compression]
-            threshold_ratio = 0.9
-            protect_first_n = 500
-
-            [agents.alpha]
-            enabled = true
-            risk_profile = "default"
-            runtime_profile = "fast"
-        "#;
-        let cfg: Config = toml::from_str(toml).unwrap();
-        let warnings = cfg.collect_warnings();
-        let paths: Vec<&str> = warnings
-            .iter()
-            .filter(|w| w.code == "context_compression_unsupported")
-            .map(|w| w.path.as_str())
-            .collect();
-        assert!(
-            paths.contains(&"runtime_profiles.fast.context_compression.threshold_ratio"),
-            "threshold_ratio must be flagged: {paths:?}"
-        );
-        assert!(
-            paths.contains(&"runtime_profiles.fast.context_compression.protect_first_n"),
-            "protect_first_n must be flagged: {paths:?}"
-        );
-        // `enabled` was not set (defaults to false) — no warning for it.
-        assert!(
-            !paths.contains(&"runtime_profiles.fast.context_compression.enabled"),
-            "unset enabled must not be flagged: {paths:?}"
-        );
-        let w = warnings
-            .iter()
-            .find(|w| w.path == "runtime_profiles.fast.context_compression.threshold_ratio")
-            .expect("threshold_ratio warning present");
-        assert!(
-            w.message.contains("non-default value"),
-            "message says the value is non-default: {}",
-            w.message
-        );
-    }
-
-    // A knob explicitly written at its default value is indistinguishable
-    // from an omitted one post-deserialization and must stay silent — the
-    // same accepted limitation as `validate_memory_semantics`.
-    #[tokio::test]
-    async fn collect_warnings_silent_for_context_compression_default_values_written_explicitly() {
-        let toml = r#"
-            [risk_profiles.default]
-            level = "supervised"
-
-            [runtime_profiles.fast.context_compression]
-            enabled = false
-            threshold_ratio = 0.50
-            protect_first_n = 3
-            tool_result_retrim_chars = 2000
-
-            [agents.alpha]
-            enabled = true
-            risk_profile = "default"
-            runtime_profile = "fast"
-        "#;
-        let cfg: Config = toml::from_str(toml).unwrap();
-        let warnings = cfg.collect_warnings();
-        assert!(
-            !warnings
-                .iter()
-                .any(|w| w.code == "context_compression_unsupported"),
-            "explicit default values must not flag context_compression_unsupported: {warnings:?}"
-        );
-    }
-
-    // Specific-warning-wins dedup: a bare cross-provider `summary_model`
-    // already draws the more specific `cross_provider_summary_model`
-    // diagnostic, which itself reports the setting as inert (same fact as
-    // `context_compression_unsupported`) plus the cross-provider detail, so
-    // the generic inert warning must NOT also fire for the identical path —
-    // doctor/gateway print both with no dedup, and it would just be the same
-    // statement twice.
-    #[tokio::test]
-    async fn collect_warnings_context_compression_defers_to_cross_provider_summary_model() {
-        let toml = r#"
-            [providers.models.custom.p1]
-            api_key = "k"
-            model = "m1"
-            uri = "https://example.com/v1"
-            wire_api = "chat_completions"
-            [providers.models.custom.p2]
-            api_key = "k"
-            model = "m2"
-            uri = "https://example.com/v1"
-            wire_api = "chat_completions"
-
-            [risk_profiles.default]
-            level = "supervised"
-
-            [runtime_profiles.shared.context_compression]
-            summary_model = "haiku"
-
-            [agents.alpha]
-            enabled = true
-            model_provider = "custom.p1"
-            risk_profile = "default"
-            runtime_profile = "shared"
-
-            [agents.beta]
-            enabled = true
-            model_provider = "custom.p2"
-            risk_profile = "default"
-            runtime_profile = "shared"
-        "#;
-        let cfg: Config = toml::from_str(toml).unwrap();
-        let warnings = cfg.collect_warnings();
-        let summary_model_warnings: Vec<_> = warnings
-            .iter()
-            .filter(|w| w.path == "runtime_profiles.shared.context_compression.summary_model")
-            .collect();
-        assert_eq!(
-            summary_model_warnings.len(),
-            1,
-            "exactly one warning for the summary_model path: {summary_model_warnings:?}"
-        );
-        assert_eq!(
-            summary_model_warnings[0].code, "cross_provider_summary_model",
-            "the specific cross-provider diagnostic wins for the shared path"
-        );
-    }
-
-    // Same-provider control: without a cross-provider diagnostic covering
-    // the path, the inert warning must still fire for `summary_model` — no
-    // other diagnostic covers the single-provider shape.
-    #[tokio::test]
-    async fn collect_warnings_context_compression_flags_same_provider_summary_model() {
-        let toml = r#"
-            [providers.models.custom.p1]
-            api_key = "k"
-            model = "m1"
-            uri = "https://example.com/v1"
-            wire_api = "chat_completions"
-
-            [risk_profiles.default]
-            level = "supervised"
-
-            [runtime_profiles.shared.context_compression]
-            summary_model = "haiku"
-
-            [agents.alpha]
-            enabled = true
-            model_provider = "custom.p1"
-            risk_profile = "default"
-            runtime_profile = "shared"
-
-            [agents.beta]
-            enabled = true
-            model_provider = "custom.p1"
-            risk_profile = "default"
-            runtime_profile = "shared"
-        "#;
-        let cfg: Config = toml::from_str(toml).unwrap();
-        let warnings = cfg.collect_warnings();
-        let w = warnings
-            .iter()
-            .find(|w| w.path == "runtime_profiles.shared.context_compression.summary_model")
-            .expect("expected a warning for the summary_model path");
-        assert_eq!(
-            w.code, "context_compression_unsupported",
-            "single-provider summary_model gets the inert warning"
         );
     }
 

@@ -7251,7 +7251,7 @@ mod tests {
             .runtime_profiles
             .get_mut("default")
             .unwrap()
-            .max_history_messages = Some(1);
+            .context.keep_recent_turns = Some(1);
         let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel::<String>(64);
         let server = Arc::new(AcpServer::new_with_writer_and_store(
             config,
@@ -7346,7 +7346,7 @@ mod tests {
             .runtime_profiles
             .get_mut("default")
             .unwrap()
-            .max_history_messages = Some(1);
+            .context.keep_recent_turns = Some(1);
         let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel::<String>(64);
         let server = Arc::new(AcpServer::new_with_writer_and_store(
             config,
@@ -7856,7 +7856,7 @@ mod tests {
             .runtime_profiles
             .get_mut("default")
             .unwrap()
-            .max_history_messages = Some(1);
+            .context.keep_recent_turns = Some(1);
         let server = Arc::new(AcpServer::new_with_store(
             config,
             AcpServerConfig::default(),
@@ -7935,7 +7935,7 @@ mod tests {
             .runtime_profiles
             .get_mut("default")
             .unwrap()
-            .max_history_messages = Some(2);
+            .context.keep_recent_turns = Some(2);
         let server = Arc::new(AcpServer::new_with_store(
             config,
             AcpServerConfig::default(),
@@ -8005,7 +8005,7 @@ mod tests {
             .runtime_profiles
             .get_mut("default")
             .unwrap()
-            .max_history_messages = Some(2);
+            .context.keep_recent_turns = Some(2);
         let server = Arc::new(AcpServer::new_with_store(
             config,
             AcpServerConfig::default(),
@@ -9269,7 +9269,7 @@ mod tests {
             .runtime_profiles
             .get_mut("default")
             .unwrap()
-            .max_history_messages = Some(1);
+            .context.keep_recent_turns = Some(1);
         let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel::<String>(64);
         let server = Arc::new(AcpServer::new_with_writer_and_store(
             config,

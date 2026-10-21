@@ -8,14 +8,6 @@ pub fn repo_root() -> PathBuf {
         .to_owned()
 }
 
-pub fn book_dir(root: &Path) -> PathBuf {
-    root.join("docs/book")
-}
-
-pub fn ref_dir(root: &Path) -> PathBuf {
-    root.join("docs/book/src/reference")
-}
-
 pub fn target_dir(root: &Path) -> PathBuf {
     target_dir_with_override(root, None)
 }
@@ -86,28 +78,6 @@ pub fn require_tool(cmd: &str, install_hint: &str) -> anyhow::Result<()> {
     anyhow::bail!("'{}' not found on PATH\n  install: {}", cmd, install_hint);
 }
 
-/// Like `require_tool`, but if the binary is a cargo-installable crate that's missing,
-/// auto-install it. Idempotent — a no-op when present.
-///
-/// `mdbook-mermaid` is pinned separately because its published lockfile still
-/// compiles against mdBook 0.5.0. Resolving its 0.5.x preprocessor dependency
-/// against the pinned mdBook release avoids a protocol-version warning during
-/// the docs build.
-pub fn ensure_cargo_tool(cmd: &str, crate_name: &str) -> anyhow::Result<()> {
-    if tool_on_path(cmd) {
-        return Ok(());
-    }
-    println!("==> installing '{crate_name}' (missing '{cmd}')");
-    let mut install = Command::new("cargo");
-    install.args(["install"]);
-    if cmd == "mdbook-mermaid" {
-        install.args(["--version", "0.17.1", crate_name]);
-    } else {
-        install.args(["--locked", crate_name]);
-    }
-    run_cmd(&mut install)
-}
-
 fn tool_on_path(cmd: &str) -> bool {
     std::env::var_os("PATH")
         .map(|paths| {
@@ -115,56 +85,6 @@ fn tool_on_path(cmd: &str) -> bool {
                 .any(|dir| dir.join(cmd).is_file() || dir.join(format!("{cmd}.exe")).is_file())
         })
         .unwrap_or(false)
-}
-
-pub fn mdbook_program() -> anyhow::Result<PathBuf> {
-    let exclude = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(Path::to_owned))
-        .and_then(|p| std::fs::canonicalize(&p).ok());
-    let paths = std::env::var_os("PATH")
-        .ok_or_else(|| anyhow::Error::msg("PATH environment variable is unset"))?;
-    for dir in std::env::split_paths(&paths) {
-        if let (Some(ex), Ok(canon)) = (exclude.as_deref(), std::fs::canonicalize(&dir))
-            && canon.starts_with(ex)
-        {
-            continue;
-        }
-        for name in ["mdbook", "mdbook.exe"] {
-            let candidate = dir.join(name);
-            if candidate.is_file() {
-                return Ok(candidate);
-            }
-        }
-    }
-    anyhow::bail!(
-        "'mdbook' not found on PATH\n  install: cargo install mdbook --version 0.5.4 --locked"
-    )
-}
-
-pub fn mdbook_xtask_preprocessor_env() -> Option<[(String, String); 2]> {
-    let exe = std::env::current_exe().ok()?;
-    let exe_str = exe.to_string_lossy();
-    Some(mdbook_xtask_preprocessor_env_for(&exe_str))
-}
-
-/// Pure form of [`mdbook_xtask_preprocessor_env`] over an explicit helper path,
-/// so mdBook's env-key mapping and shlex quoting are unit-testable without
-/// resolving `current_exe`. Both in-tree preprocessors must follow the routed
-/// Cargo target rather than the relative fallback paths in `book.toml`.
-fn mdbook_xtask_preprocessor_env_for(helper_path: &str) -> [(String, String); 2] {
-    let quoted =
-        shlex::try_quote(helper_path).map_or_else(|_| helper_path.to_string(), |q| q.into_owned());
-    [
-        (
-            "MDBOOK_PREPROCESSOR__PEER_GROUPS__COMMAND".to_string(),
-            format!("{quoted} preprocess"),
-        ),
-        (
-            "MDBOOK_PREPROCESSOR__PLACEHOLDERS__COMMAND".to_string(),
-            format!("{quoted} placeholders"),
-        ),
-    ]
 }
 
 pub fn run_cmd(cmd: &mut Command) -> anyhow::Result<()> {
@@ -326,41 +246,6 @@ pub fn copy_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> anyhow::Res
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn preprocessor_env_keys_match_mdbook_mapping() {
-        let env = mdbook_xtask_preprocessor_env_for("/some/dir/mdbook");
-        // mdBook lowercases, maps `__` -> `.` and `_` -> `-`, so this key must
-        // resolve to `preprocessor.peer-groups.command`.
-        assert_eq!(
-            env[0]
-                .0
-                .strip_prefix("MDBOOK_")
-                .map(|k| k.to_lowercase().replace("__", ".").replace('_', "-")),
-            Some("preprocessor.peer-groups.command".to_string())
-        );
-        assert_eq!(env[0].1, "/some/dir/mdbook preprocess");
-        assert_eq!(
-            env[1]
-                .0
-                .strip_prefix("MDBOOK_")
-                .map(|k| k.to_lowercase().replace("__", ".").replace('_', "-")),
-            Some("preprocessor.placeholders.command".to_string())
-        );
-        assert_eq!(env[1].1, "/some/dir/mdbook placeholders");
-    }
-
-    #[test]
-    fn preprocessor_env_quotes_paths_with_spaces() {
-        let env = mdbook_xtask_preprocessor_env_for("/tmp/my target/release/mdbook");
-        let peer_groups: Vec<String> = shlex::Shlex::new(&env[0].1).collect();
-        let placeholders: Vec<String> = shlex::Shlex::new(&env[1].1).collect();
-        assert_eq!(peer_groups, ["/tmp/my target/release/mdbook", "preprocess"]);
-        assert_eq!(
-            placeholders,
-            ["/tmp/my target/release/mdbook", "placeholders"]
-        );
-    }
 
     #[test]
     fn doc_dir_follows_cargo_target_dir_override() {

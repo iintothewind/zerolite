@@ -15,6 +15,8 @@ use crate::wire::{PlanEntry, PlanStatus};
 // Re-export the config-owned runtime types so existing `crate::todo_tracker::*`
 // call sites keep resolving after these moved to `crate::config` (their single
 // owner). The widget below is built from them.
+#[cfg(test)]
+pub(crate) use crate::config::TodoLocation;
 pub(crate) use crate::config::TodoTrackerSettings;
 
 #[derive(Debug)]

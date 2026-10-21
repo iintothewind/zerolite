@@ -322,7 +322,12 @@ const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
 fn interactive_context_recovery_budget(
     context_limits: zeroclaw_config::schema::ResolvedContextLimits,
 ) -> usize {
-    context_limits.model_context_window.saturating_mul(9) / 10
+    // The fit target is the send budget (window − reserve), never a
+    // hardcoded fraction of the window.
+    crate::agent::history_trim::resolve_send_budget(
+        context_limits.context_send_budget,
+        context_limits.context_token_budget,
+    )
 }
 
 /// The single autosave decision for a turn's user-side text, shared by both
@@ -3196,13 +3201,22 @@ pub async fn run(
                                 let taken = std::mem::take(&mut history);
                                 let recovery_budget = interactive_context_recovery_budget(context_limits);
                                 let crumb_present_before_recovery = history_has_trim_breadcrumb;
-                                let result =
-                                    crate::agent::history_trim::trim_to_recent_turns_with_crumb(
-                                        taken,
+                                // The synthetic crumb is not a turn: it never
+                                // consumes a keep-N slot nor gets dropped.
+                                let result = crate::agent::history_trim::trim_to_budget_with_crumb(
+                                    taken,
+                                    context_limits.keep_recent_turns,
+                                    recovery_budget,
+                                    crumb_present_before_recovery,
+                                );
+                                if result.below_preferred_keep {
+                                    crate::agent::history_trim::warn_if_below_preferred_keep(
+                                        context_limits.keep_recent_turns,
                                         recovery_budget,
-                                        crumb_present_before_recovery,
+                                        &result,
                                     );
-                                if result.trimmed {
+                                }
+                                if result.trimmed && !result.exceeds_budget {
                                     let mut trimmed = result.history;
                                     // Owner-aware insertion: does not stack a
                                     // second marker when the existing
@@ -4463,6 +4477,8 @@ mod tests {
             context_token_budget,
             model_context_window_source:
                 zeroclaw_config::schema::ModelContextWindowSource::CompatibilityFallback,
+            context_send_budget: 0,
+            keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
         }
     }
 
@@ -18261,7 +18277,7 @@ Let me check the result."#;
     }
 
     #[test]
-    fn cli_outer_recovery_uses_capacity_headroom_not_proactive_budget() {
+    fn cli_outer_recovery_uses_the_send_budget() {
         use crate::agent::history_trim::trim_to_recent_turns;
 
         let context_limits = zeroclaw_config::schema::ResolvedContextLimits {
@@ -18269,12 +18285,17 @@ Let me check the result."#;
             model_context_window_source:
                 zeroclaw_config::schema::ModelContextWindowSource::Configured,
             context_token_budget: 7_200,
+            context_send_budget: 28_800,
+            keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
         };
         let recovery_budget = interactive_context_recovery_budget(context_limits);
-        assert_eq!(recovery_budget, 28_800);
+        assert_eq!(
+            recovery_budget, 28_800,
+            "recovery fits against the send budget, never a hardcoded fraction of the window"
+        );
         assert_ne!(
             recovery_budget, context_limits.context_token_budget,
-            "reactive recovery must not reuse the positive proactive trim budget"
+            "the send budget is distinct from the proactive water-line"
         );
 
         let big = "x".repeat(4000);
@@ -18906,6 +18927,8 @@ Let me check the result."#;
                             context_token_budget: 100,
                             model_context_window_source:
                                 zeroclaw_config::schema::ModelContextWindowSource::Configured,
+                            context_send_budget: 0,
+                            keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
                         },
                         context_limits_resolver: None,
                         receipt_generator: None,
@@ -21305,234 +21328,6 @@ Let me check the result."#;
         assert_correlations(&persisted_records, &traces);
     }
 
-    #[tokio::test]
-    async fn reported_budget_calibrates_against_the_post_hook_request_population() {
-        // Regression for the request-seam contract: `reported_population_estimated`
-        // must be snapshotted from the POST-hook `provider_request_messages` (the
-        // request actually passed to the provider), not the pre-hook
-        // `prepared_messages`. A `before_llm_call` hook that grows the request
-        // changes the population the provider reports `input_tokens` for; if the
-        // calibration denominator came from the smaller pre-hook population, the
-        // ratio (and therefore the emitted calibrated `tokens_after`) would be
-        // inflated. The provider below reports `input_tokens` proportional to the
-        // messages it actually received, so the emitted accounting must be tied to
-        // that post-hook population.
-        use crate::hooks::{HookHandler, HookResult, HookRunner};
-
-        struct GrowingRequestHook;
-
-        #[async_trait]
-        impl HookHandler for GrowingRequestHook {
-            fn name(&self) -> &str {
-                "grow-request"
-            }
-
-            async fn before_llm_call(
-                &self,
-                messages: &mut Vec<ChatMessage>,
-                _model: &mut String,
-            ) -> HookResult<()> {
-                messages.push(ChatMessage::assistant("z".repeat(3000)));
-                HookResult::Continue(())
-            }
-        }
-
-        struct PostHookReportingProvider {
-            received: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
-        }
-
-        #[async_trait]
-        impl ModelProvider for PostHookReportingProvider {
-            async fn chat_with_system(
-                &self,
-                _system_prompt: Option<&str>,
-                _message: &str,
-                _model: &str,
-                _temperature: Option<f64>,
-            ) -> anyhow::Result<String> {
-                anyhow::bail!("chat_with_system should not be used in this test");
-            }
-
-            async fn chat(
-                &self,
-                request: ChatRequest<'_>,
-                _model: &str,
-                _temperature: Option<f64>,
-            ) -> anyhow::Result<ChatResponse> {
-                let post_hook_estimate = estimate_history_tokens(request.messages);
-                self.received
-                    .lock()
-                    .expect("received lock should be valid")
-                    .push(request.messages.to_vec());
-                Ok(ChatResponse {
-                    text: Some("done".to_string()),
-                    tool_calls: Vec::new(),
-                    usage: Some(zeroclaw_providers::traits::TokenUsage {
-                        input_tokens: Some(post_hook_estimate as u64 * 4),
-                        output_tokens: Some(10),
-                        cached_input_tokens: None,
-                        cache_creation_input_tokens: None,
-                    }),
-                    reasoning_content: None,
-                })
-            }
-        }
-        impl ::zeroclaw_api::attribution::Attributable for PostHookReportingProvider {
-            fn role(&self) -> ::zeroclaw_api::attribution::Role {
-                ::zeroclaw_api::attribution::Role::Provider(
-                    ::zeroclaw_api::attribution::ProviderKind::Model(
-                        ::zeroclaw_api::attribution::ModelProviderKind::Custom,
-                    ),
-                )
-            }
-            fn alias(&self) -> &str {
-                "PostHookReportingProvider"
-            }
-        }
-
-        let mut hooks = HookRunner::new();
-        hooks.register(Box::new(GrowingRequestHook));
-
-        let provider = PostHookReportingProvider {
-            received: Arc::new(Mutex::new(Vec::new())),
-        };
-        let received = Arc::clone(&provider.received);
-        let observer = NoopObserver;
-        // The OLDEST turn carries deliberately large content so the durable
-        // history's own raw size dominates the reported-budget trim target
-        // below; a droppable turn must exist and dropping it must matter,
-        // or the post-response enforcement seam under test never fires (see
-        // budget derivation below).
-        let big_first_turn = "x".repeat(4000);
-        let mut history = vec![
-            ChatMessage::system("system"),
-            ChatMessage::user(format!("first request {big_first_turn}").as_str()),
-            ChatMessage::assistant("first answer"),
-            ChatMessage::user("second request"),
-            ChatMessage::assistant("second answer"),
-        ];
-        // The preflight iteration-0 trim AND the pre-dispatch gate both run
-        // against `context_token_budget` before the reported-budget seam
-        // under test ever fires, so the budget must cover the FULL post-hook
-        // population (durable history plus the hook's growth) — otherwise
-        // the pre-dispatch gate fails the turn on a genuine floor before any
-        // request is dispatched. The provider then reports `input_tokens` at
-        // 4x that same post-hook population (`ratio == 4`), so the
-        // reported-budget trim target scales down to `budget / 4`. That
-        // target must still land BELOW the durable history's own raw size
-        // (dominated by `big_first_turn`) after the response, or nothing is
-        // left to trim and the seam under test never fires; the oldest turn
-        // is large enough that this holds with a comfortable margin.
-        let retained_estimate = estimate_history_tokens(&history);
-        let hook_growth_estimate =
-            estimate_history_tokens(&[ChatMessage::assistant("z".repeat(3000).as_str())]);
-        let budget = retained_estimate + hook_growth_estimate + 20;
-        let (event_tx, mut event_rx) =
-            tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(64);
-        let turn_id = uuid::Uuid::new_v4().to_string();
-
-        run_tool_call_loop(ToolLoop {
-            parent_agent_alias: None,
-            sop_reassembly: None,
-            exec: ResolvedAgentExecution {
-                model_access: ResolvedModelAccess {
-                    model_provider: &provider,
-                    provider_name: "mock-provider",
-                    model: "mock-model",
-                    dispatch_model: "mock-model",
-                    temperature: Some(0.0),
-                },
-                tools_registry: &crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
-                    Vec::new(),
-                ),
-                observer: &observer,
-                silent: true,
-                approval: None,
-                security: None,
-                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
-                config: None,
-                max_tool_iterations: 2,
-                hooks: Some(&hooks),
-                excluded_tools: &[],
-                dedup_exempt_tools: &[],
-                activated_tools: None,
-                model_switch_callback: None,
-                pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
-                parallel_tools: false,
-                max_tool_result_chars: 0,
-                context_limits: test_context_limits(budget),
-                context_limits_resolver: None,
-                receipt_generator: None,
-                knobs: &LoopKnobs::default(),
-            },
-            history: &mut history,
-            // Test transcripts start fresh: no prior trim, no crumb.
-            history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
-            channel_name: "test",
-            channel_reply_target: None,
-            cancellation_token: None,
-            on_delta: None,
-            shared_budget: None,
-            channel: None,
-            collected_receipts: None,
-            event_tx: Some(event_tx),
-            steering: None,
-            new_messages_out: None,
-            image_cache: None,
-            memory: None,
-            ingress: IngressContext::sub_turn(),
-            agent_alias: None,
-            turn_id: &turn_id,
-            served_route_sink: None,
-        })
-        .await
-        .expect("tool loop should succeed");
-
-        // The hook grew the request, so the provider must have seen a materially
-        // larger population than the durable history alone.
-        let post_hook_estimate = received
-            .lock()
-            .expect("received lock should be valid")
-            .first()
-            .map(|messages| estimate_history_tokens(messages))
-            .expect("the provider must have received at least one request");
-        assert!(
-            post_hook_estimate > estimate_history_tokens(&history),
-            "the hook must have grown the request population for this regression \
-             (post-hook {post_hook_estimate} vs retained {})",
-            estimate_history_tokens(&history)
-        );
-
-        // The reported-budget trim must be tied to the post-hook population: the
-        // provider reported `4 * post_hook_estimate`, and the runtime's
-        // calibration denominator is the same post-hook population, so the emitted
-        // `tokens_after` is `estimate_history_tokens(retained) * 4`. If the
-        // denominator were the smaller pre-hook population, the ratio would be
-        // inflated and `tokens_after` would not match.
-        let mut trimmed_event = None;
-        while let Ok(event) = event_rx.try_recv() {
-            if let zeroclaw_api::agent::TurnEvent::HistoryTrimmed { .. } = event {
-                trimmed_event = Some(event);
-            }
-        }
-        let trimmed = trimmed_event
-            .expect("the reported-budget enforcement must emit a HistoryTrimmed event");
-        let tokens_after = match trimmed {
-            zeroclaw_api::agent::TurnEvent::HistoryTrimmed { tokens_after, .. } => {
-                tokens_after.expect("reported-budget trim must carry token accounting")
-            }
-            other => panic!("expected HistoryTrimmed, got {other:?}"),
-        };
-        let expected = (estimate_history_tokens(&history) as f64 * 4.0).round() as u64;
-        assert_eq!(
-            tokens_after, expected,
-            "tokens_after must be calibrated against the post-hook request population \
-             (expected estimate(retained) * 4 = {expected})"
-        );
-    }
-
     /// A provider that records every dispatched request and answers with a
     /// scripted XML tool call on the first dispatch (when `script_tool_call`)
     /// and plain text after.
@@ -22107,6 +21902,8 @@ Let me check the result."#;
                             } else {
                                 32_768
                             },
+                            context_send_budget: 0,
+                            keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
                             ..test_context_limits(budget)
                         }
                     })),
@@ -22492,6 +22289,8 @@ Let me check the result."#;
                     // population exceeds it, but comfortable for the first.
                     context_limits: zeroclaw_config::schema::ResolvedContextLimits {
                         model_context_window: 2_000,
+                        context_send_budget: 0,
+                        keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
                         ..test_context_limits(2_000)
                     },
                     context_limits_resolver: None,
@@ -22618,6 +22417,8 @@ Let me check the result."#;
                     max_tool_result_chars: 0,
                     context_limits: zeroclaw_config::schema::ResolvedContextLimits {
                         model_context_window,
+                        context_send_budget: 0,
+                        keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
                         ..test_context_limits(context_token_budget)
                     },
                     context_limits_resolver: None,
@@ -22892,6 +22693,8 @@ Let me check the result."#;
                     // (well under 100 tokens for two short text messages).
                     context_limits: zeroclaw_config::schema::ResolvedContextLimits {
                         model_context_window: 500,
+                        context_send_budget: 0,
+                        keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
                         ..test_context_limits(0)
                     },
                     context_limits_resolver: None,

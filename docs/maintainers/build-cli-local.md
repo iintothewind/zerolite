@@ -11,10 +11,17 @@ Actions), primarily to produce a Linux arm64 executable for on-device testing
 bash scripts/dev/build-cli-local.sh
 # optional:
 # bash scripts/dev/build-cli-local.sh --target x86_64-unknown-linux-gnu
+# bash scripts/dev/build-cli-local.sh --plugins-wasm   # also embed the WASM plugin host
 
 # Windows (PowerShell / cmd) — always Git Bash, never WSL:
 scripts\dev\build-cli-local.cmd
 ```
+
+`--plugins-wasm` adds `plugins-wasm-cranelift` to the build, which gives the
+binary `zeroclaw plugin` (search / install / update / …) and lets it JIT-compile
+registry `.wasm` packages. Without it the binary only loads host-native
+`.cwasm` packages. Cranelift is unavailable on ARM32, so a hypothetical 32-bit
+target would build without the flag.
 
 Output (durable — deploy this path only):
 
@@ -67,7 +74,8 @@ dashboard still looks like yesterday (ctx bar, Progress, …).
 1. Wipe `web/dist` (keeps `.gitkeep`)
 2. `cargo web build` → fresh OpenAPI + Vite bundle
 3. `cargo clean -p zeroclaw-gateway` → force `include_dir!` to re-read dist
-4. Docker cross-compile with **`--features embedded-web`**
+4. Docker cross-compile with **`--features embedded-web`** (add
+   `plugins-wasm-cranelift` when `--plugins-wasm` is passed)
 5. **Assert** the ELF contains the current `assets/index-*.js` fingerprint
    from `web/dist/index.html` (refuse to collect if missing)
 6. Copy into `dist/bin/<triple>/` via `scripts/dev/collect-dist.sh`
@@ -158,6 +166,8 @@ docker run --rm -v "$PWD":/build -w /build \
 bash scripts/dev/collect-dist.sh --target aarch64-unknown-linux-gnu --bin zeroclaw
 rm -rf target
 ```
+
+`--plugins-wasm` adds `plugins-wasm-cranelift` to that `--features` list.
 
 First full run ~10+ minutes. Because the script wipes `target/` after success,
 later runs are also cold (no cross-compile crate cache reuse).

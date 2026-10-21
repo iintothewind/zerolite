@@ -1456,6 +1456,111 @@ impl Agent {
         format!("[CURRENT DATE & TIME: {date_str}]\n\n{user_message}")
     }
 
+    /// Compact durable `ConversationMessage` history when the water-line is
+    /// exceeded. Cascades keep-N → keep≥1 until under the **send** budget; returns
+    /// `Err` when the floor still exceeds (turn must abort). Emits
+    /// `HistoryTrimmed` only when turns are dropped **and** the floor fits.
+    fn maybe_compact_durable_history(
+        &mut self,
+        dispatcher: &dyn crate::agent::dispatcher::ToolDispatcher,
+        event_tx: Option<&tokio::sync::mpsc::Sender<TurnEvent>>,
+    ) -> Result<(), anyhow::Error> {
+        let water_line = self.config.resolved.context_trim_budget();
+        let send_budget = self.config.resolved.context_send_budget();
+        if water_line == 0 {
+            return Ok(());
+        }
+        let estimate = |h: &[zeroclaw_providers::ConversationMessage]| {
+            crate::agent::history::estimate_history_tokens(&dispatcher.to_provider_messages(h))
+        };
+        let tokens_now = estimate(&self.history);
+        let decision =
+            crate::agent::turn::context_pipeline::plan_pre_send_trim(tokens_now, water_line, false);
+        if !decision.should_trim {
+            return Ok(());
+        }
+        let keep = self.config.resolved.keep_recent_turns();
+        let taken = std::mem::take(&mut self.history);
+        let mut result = crate::agent::history_trim::trim_conversation_to_budget_with(
+            taken,
+            keep,
+            send_budget,
+            estimate,
+        );
+        if result.trimmed && !result.exceeds_budget {
+            crate::agent::history_trim::insert_conversation_breadcrumb_deduped(&mut result.history);
+            result.tokens_after = estimate(&result.history);
+            crate::agent::history_trim::warn_if_conversation_below_preferred_keep(
+                keep,
+                send_budget,
+                &result,
+            );
+            let reason = crate::i18n::get_required_cli_string("history-trim-reason-budget");
+            if let Some(tx) = event_tx {
+                if let Err(error) =
+                    tx.try_send(crate::agent::history_trim::history_trimmed_turn_event(
+                        result.dropped_messages,
+                        result.kept_turns,
+                        reason.clone(),
+                        Some(result.tokens_after),
+                        Some(result.tokens_before),
+                        Some(result.dropped_turns),
+                    ))
+                {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_category(::zeroclaw_log::EventCategory::Agent)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "error": format!("{error}"),
+                                "error_key": "history_trimmed_event_dropped",
+                                "tokens_after": result.tokens_after,
+                            })),
+                        "Dropped HistoryTrimmed turn event: channel full or closed"
+                    );
+                }
+            }
+            self.observer.record_event(
+                &crate::agent::history_trim::history_trimmed_observer_event(
+                    result.dropped_messages,
+                    result.kept_turns,
+                    reason,
+                    Some(result.tokens_after),
+                    Some(result.tokens_before),
+                    Some(result.dropped_turns),
+                ),
+            );
+        }
+        self.history = result.history;
+        if result.exceeds_budget {
+            let system_floor = crate::agent::history::estimate_system_floor_tokens(
+                &dispatcher.to_provider_messages(&self.history),
+            );
+            let msg = if system_floor >= send_budget {
+                crate::agent::history::context_floor_remediation(system_floor, send_budget)
+            } else {
+                "Context overflow unrecoverable: only one turn left, cannot trim further"
+                    .to_string()
+            };
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "tokens_after": result.tokens_after,
+                        "budget": send_budget,
+                        "kept_turns": result.kept_turns,
+                        "error_key": "context_floor_exceeds_budget",
+                    })),
+                &msg
+            );
+            return Err(anyhow::anyhow!(msg));
+        }
+        Ok(())
+    }
+
     pub fn set_channel_name(&mut self, name: String) {
         self.channel_name = name;
     }
@@ -3244,29 +3349,45 @@ impl Agent {
     }
 
     fn trim_history(&mut self, turn_id: Option<&str>) -> Option<HistoryTrimNotice> {
-        let max_turns = self
+        let keep_recent = self.config.resolved.keep_recent_turns();
+        let resolver_max = self
             .structured_history_turn_limit_resolver
             .as_ref()
-            .map_or(self.config.resolved.max_history_messages, |resolve| {
-                resolve()
-            });
-        let result = crate::agent::history_trim::trim_conversation_to_recent_turns(
-            std::mem::take(&mut self.history),
+            .map(|resolve| resolve());
+        let max_turns = match resolver_max {
+            Some(r) if r == 0 => keep_recent,
+            Some(r) => r.min(keep_recent),
+            None => keep_recent,
+        };
+        let send_budget = self.config.resolved.context_send_budget();
+        let taken = std::mem::take(&mut self.history);
+        let estimate = |h: &[zeroclaw_providers::ConversationMessage]| {
+            crate::agent::history::estimate_history_tokens(&self.tool_dispatcher.to_provider_messages(h))
+        };
+        let mut result = crate::agent::history_trim::trim_conversation_to_budget_with(
+            taken,
             max_turns,
-            self.history_has_trim_breadcrumb,
+            send_budget,
+            estimate,
         );
-        self.history = result.history;
         if !result.trimmed {
+        self.history = result.history;
             return None;
         }
 
-        crate::agent::history_trim::insert_conversation_breadcrumb(&mut self.history);
+        crate::agent::history_trim::insert_conversation_breadcrumb_deduped(&mut result.history);
         self.history_has_trim_breadcrumb = true;
         self.history_trim_generation = self.history_trim_generation.wrapping_add(1);
+        result.tokens_after = estimate(&result.history);
+        crate::agent::history_trim::warn_if_conversation_below_preferred_keep(
+            max_turns,
+            send_budget,
+            &result,
+        );
         let reason = crate::i18n::get_required_cli_string("history-trim-reason-message-cap");
         let channel = self.channel_name.clone();
         let agent_alias = self.observer_agent_alias();
-        let turn_id = turn_id.map(str::to_owned);
+        let turn_id_owned = turn_id.map(str::to_owned);
 
         {
             let scope_span = ::zeroclaw_log::info_span!(
@@ -3279,8 +3400,8 @@ impl Agent {
             if let Some(agent_alias) = agent_alias.as_deref() {
                 scope_span.record("agent_alias", agent_alias);
             }
-            if let Some(turn_id) = turn_id.as_deref() {
-                scope_span.record("trace_id", turn_id);
+            if let Some(tid) = turn_id_owned.as_deref() {
+                scope_span.record("trace_id", tid);
             }
             let _scope_guard = scope_span.enter();
             ::zeroclaw_log::record!(
@@ -3293,26 +3414,26 @@ impl Agent {
                         "dropped_messages": result.dropped_messages,
                         "dropped_turns": result.dropped_turns,
                         "kept_turns": result.kept_turns,
-                        "remaining_messages": self.history.len(),
+                        "remaining_messages": result.history.len(),
                     })),
                 "trim_history: dropped oldest whole turns"
             );
         }
 
+        self.history = result.history;
         self.observer.record_event(&ObserverEvent::HistoryTrimmed {
             dropped_messages: result.dropped_messages,
             kept_turns: result.kept_turns,
             reason: reason.clone(),
             channel: Some(channel),
             agent_alias,
-            turn_id,
-            // Message-limit trims carry no token accounting.
-            token_budget: None,
-            tokens_before: None,
-            tokens_after: None,
-            tokens_before_source: None,
-            tokens_after_source: None,
-            unsatisfiable_floor: None,
+            turn_id: turn_id_owned,
+            token_budget: Some(send_budget as u64),
+            tokens_before: Some(result.tokens_before as u64),
+            tokens_after: Some(result.tokens_after as u64),
+            tokens_before_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
+            tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
+            unsatisfiable_floor: Some(result.exceeds_budget),
         });
 
         Some(HistoryTrimNotice {
@@ -4053,6 +4174,13 @@ impl Agent {
             }
         };
 
+        // Durable water-line compaction: shrink Agent.history before building
+        // the provider view so session/UI and the model share one transcript.
+        if let Err(error) = self.maybe_compact_durable_history(active_dispatcher.as_ref(), None) {
+            let _ = self.trim_history(Some(&turn_id));
+            return Err(error);
+        }
+
         let provider_messages = active_dispatcher.to_provider_messages(&self.history);
         let cache_key = self.response_cache_key_for_messages(&provider_messages, &effective_model);
 
@@ -4596,6 +4724,18 @@ impl Agent {
                 });
             }
         };
+
+        if let Err(error) =
+            self.maybe_compact_durable_history(active_dispatcher.as_ref(), Some(&event_tx))
+        {
+            let notice = self.trim_history(Some(&turn_id));
+            forward_history_trim_notice(&event_tx, notice).await;
+            return Err(StreamedTurnError {
+                error,
+                committed_response: String::new(),
+                new_messages: new_msgs,
+            });
+        }
 
         let provider_messages = active_dispatcher.to_provider_messages(&self.history);
         let cache_key = self.response_cache_key_for_messages(&provider_messages, &effective_model);
@@ -10679,6 +10819,8 @@ mod tests {
                 context_token_budget: 160_000,
                 model_context_window_source:
                     zeroclaw_config::schema::ModelContextWindowSource::Configured,
+                context_send_budget: 0,
+                keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
             }
         }));
 
@@ -18005,12 +18147,10 @@ mod tests {
         }
         let (budget, window) = terminal_usage
             .expect("a terminal Usage snapshot must fire even without provider usage");
-        // Default builder has no configured capacity -> 32k compatibility
-        // fallback budget, and the window is omitted (not configured truth).
-        assert_eq!(
-            budget,
-            Some(zeroclaw_config::schema::LEGACY_DEFAULT_CONTEXT_BUDGET as u64)
-        );
+        // Default builder has no configured capacity -> the 32k compatibility
+        // stub, whose water-line is 80% of it. The window is omitted from the
+        // wire (not configured truth).
+        assert_eq!(budget, Some(25_600));
         assert_eq!(
             window, None,
             "compatibility-fallback capacity is omitted from the wire snapshot"
@@ -18134,6 +18274,8 @@ mod tests {
                 context_token_budget: 180_000,
                 model_context_window_source:
                     zeroclaw_config::schema::ModelContextWindowSource::Configured,
+                context_send_budget: 0,
+                keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
             }
         }));
 
@@ -18434,13 +18576,13 @@ vision_model_provider = "custom.vision"
             Some(200_000),
             "the first usage frame must carry the 200k text route it was served on"
         );
-        // No runtime profile in this config, so the budget is the legacy 32k
-        // default: under the text route's 200k capacity it survives unclamped,
-        // which is what distinguishes it from the vision frame below.
+        // No runtime profile in this config, so the water-line is 80% of the
+        // text route's 200k capacity, which is what distinguishes it from the
+        // vision frame below.
         assert_eq!(
             first_budget,
-            Some(32_000),
-            "the legacy default budget fits under the text route's 200k capacity unclamped"
+            Some(160_000),
+            "the water-line follows the text route's 200k capacity"
         );
 
         let terminal_index = usage_frames
@@ -18464,8 +18606,8 @@ vision_model_provider = "custom.vision"
         );
         assert_eq!(
             budget,
-            Some(8_000),
-            "the 8k vision capacity clamps the effective budget the terminal snapshot reports"
+            Some(6_400),
+            "the 8k vision capacity clamps the water-line to 80% of it"
         );
 
         // Route IDENTITY on the outcome, not just the numbers: a window that
@@ -18487,8 +18629,8 @@ vision_model_provider = "custom.vision"
             "the outcome's limits must agree with the terminal snapshot's window"
         );
         assert_eq!(
-            final_limits.context_token_budget, 8_000,
-            "the outcome's limits must agree with the terminal snapshot's budget"
+            final_limits.context_token_budget, 6_400,
+            "the outcome's limits must agree with the terminal snapshot's water-line"
         );
     }
 
@@ -18732,8 +18874,8 @@ model_provider = "custom.primary"
             "capacity must come from the accepted fallback's alias, not the requested primary's"
         );
         assert_eq!(
-            final_limits.context_token_budget, 8_000,
-            "the fallback's 8k capacity must clamp the effective trim budget"
+            final_limits.context_token_budget, 6_400,
+            "the fallback's 8k capacity must clamp the water-line to 80% of it"
         );
 
         // The wire frame consumers actually read must agree with the outcome.
@@ -18750,8 +18892,9 @@ model_provider = "custom.primary"
         }
         assert_eq!(
             terminal,
-            Some((Some(8_000), Some(8_000))),
-            "the usage-less fallback must publish a terminal snapshot carrying ITS window"
+            Some((Some(6_400), Some(8_000))),
+            "the usage-less fallback must publish a terminal snapshot carrying ITS window \
+             and the 80% water-line derived from it"
         );
     }
 
@@ -19082,8 +19225,10 @@ model_provider = "custom.only"
         cfg.runtime_profiles.insert(
             "default".to_string(),
             zeroclaw_config::schema::RuntimeProfileConfig {
-                context_compact_ratio: Some(0.5),
-                max_history_messages: Some(history_cap),
+                context: zeroclaw_config::scattered_types::ContextConfig {
+                    keep_recent_turns: Some(history_cap),
+                    ..Default::default()
+                },
                 ..Default::default()
             },
         );
@@ -19229,7 +19374,7 @@ model_provider = "custom.only"
                 retained_limits.model_context_window,
                 retained_limits.context_token_budget
             ),
-            (200_000, 100_000)
+            (200_000, 160_000)
         );
         assert_eq!(
             retained
@@ -19282,7 +19427,7 @@ model_provider = "custom.only"
                 rebuilt_limits.model_context_window,
                 rebuilt_limits.context_token_budget
             ),
-            (8_000, 4_000)
+            (8_000, 6_400)
         );
     }
 
@@ -19358,8 +19503,8 @@ model_provider = "custom.only"
             "limits must report the SAME generation the provider was rebuilt from"
         );
         assert_eq!(
-            limits.context_token_budget, 8_000,
-            "the legacy 32k default clamps to the refreshed 8k capacity"
+            limits.context_token_budget, 6_400,
+            "the water-line is 80% of the refreshed 8k capacity"
         );
         assert_eq!(
             agent
@@ -19790,18 +19935,24 @@ model_provider = "custom.only"
                     context_token_budget: 180_000,
                     model_context_window_source:
                         zeroclaw_config::schema::ModelContextWindowSource::Configured,
+                    context_send_budget: 0,
+                    keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
                 },
                 ("ollama.small", "small") => zeroclaw_config::schema::ResolvedContextLimits {
                     model_context_window: 8_000,
                     context_token_budget: 7_200,
                     model_context_window_source:
                         zeroclaw_config::schema::ModelContextWindowSource::Configured,
+                    context_send_budget: 0,
+                    keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
                 },
                 _ => zeroclaw_config::schema::ResolvedContextLimits {
                     model_context_window: 32_000,
                     context_token_budget: 32_000,
                     model_context_window_source:
                         zeroclaw_config::schema::ModelContextWindowSource::CompatibilityFallback,
+                    context_send_budget: 0,
+                    keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
                 },
             }
         }));
@@ -19821,6 +19972,8 @@ model_provider = "custom.only"
                 context_token_budget: 7_200,
                 model_context_window_source:
                     zeroclaw_config::schema::ModelContextWindowSource::Configured,
+                context_send_budget: 0,
+                keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
             },
             "provider/model and their limits must change as one session state transition"
         );

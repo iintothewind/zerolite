@@ -295,17 +295,6 @@ mod tests {
         assert_eq!(queue.generation("gw_b"), 0, "generations are per session");
     }
 
-    #[test]
-    fn transcript_generation_advances_uniquely_per_session() {
-        let queue = SessionActorQueue::new(8, 30, 600);
-        assert_eq!(queue.generation("gw_a"), 0);
-        let first = queue.advance_generation("gw_a");
-        assert_eq!(queue.generation("gw_a"), first);
-        let second = queue.advance_generation("gw_a");
-        assert!(second > first, "a superseded generation never recurs");
-        assert_eq!(queue.generation("gw_b"), 0, "generations are per session");
-    }
-
     #[tokio::test]
     async fn idle_eviction() {
         let queue = SessionActorQueue::new(8, 5, 0); // 0s TTL

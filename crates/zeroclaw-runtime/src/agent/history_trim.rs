@@ -17,6 +17,10 @@ pub struct TrimResult {
     pub tokens_before: usize,
     pub tokens_after: usize,
     pub trimmed: bool,
+    /// After cascading to `kept_turns == 1`, history still exceeds `send_budget`.
+    pub exceeds_budget: bool,
+    /// True when a successful cascade kept fewer turns than `preferred_keep`.
+    pub below_preferred_keep: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -30,83 +34,6 @@ pub(crate) struct TurnCountTrimResult<T> {
 
 fn is_conversation_system(msg: &ConversationMessage) -> bool {
     matches!(msg, ConversationMessage::Chat(chat) if chat.role == "system")
-}
-
-fn is_conversation_turn_boundary(msg: &ConversationMessage, is_breadcrumb: bool) -> bool {
-    matches!(
-        msg,
-        ConversationMessage::Chat(chat)
-            if chat.role == "user"
-                && !chat
-                    .content
-                    .starts_with(zeroclaw_api::tool_carrier::TOOL_RESULTS_PREFIX)
-                && !is_breadcrumb
-    )
-}
-
-/// Keep at most `max_turns` recent structured conversation turns, while always
-/// retaining the newest complete turn. The legacy config key is named
-/// `max_history_messages`, but tool-call and tool-result rows do not consume
-/// independent slots.
-pub(crate) fn trim_conversation_to_recent_turns(
-    history: Vec<ConversationMessage>,
-    max_turns: usize,
-    has_leading_breadcrumb: bool,
-) -> TurnCountTrimResult<ConversationMessage> {
-    let first_non_system = history
-        .iter()
-        .position(|message| !is_conversation_system(message));
-    let breadcrumb_index = first_non_system.filter(|_| has_leading_breadcrumb);
-    let synthetic_messages = usize::from(breadcrumb_index.is_some());
-    let total_turns = history
-        .iter()
-        .enumerate()
-        .filter(|(index, message)| {
-            is_conversation_turn_boundary(message, Some(*index) == breadcrumb_index)
-        })
-        .count();
-    if total_turns <= max_turns || total_turns <= 1 {
-        return TurnCountTrimResult {
-            history,
-            dropped_messages: 0,
-            dropped_turns: 0,
-            kept_turns: total_turns,
-            trimmed: false,
-        };
-    }
-
-    let mut system = Vec::new();
-    let mut body = Vec::new();
-    for message in history {
-        if is_conversation_system(&message) {
-            system.push(message);
-        } else {
-            body.push(message);
-        }
-    }
-
-    let boundaries: Vec<usize> = body
-        .iter()
-        .enumerate()
-        .filter_map(|(index, message)| {
-            is_conversation_turn_boundary(message, has_leading_breadcrumb && index == 0)
-                .then_some(index)
-        })
-        .collect();
-
-    let kept_turns = max_turns.max(1).min(boundaries.len());
-    let dropped_turns = boundaries.len() - kept_turns;
-    let first_kept = boundaries[dropped_turns];
-
-    let dropped_messages = first_kept - synthetic_messages;
-    system.extend(body.into_iter().skip(first_kept));
-    TurnCountTrimResult {
-        history: system,
-        dropped_messages,
-        dropped_turns,
-        kept_turns,
-        trimmed: true,
-    }
 }
 
 fn is_turn_boundary(msg: &ChatMessage) -> bool {
@@ -159,6 +86,8 @@ pub fn trim_to_recent_turns_with_crumb(
             tokens_before,
             tokens_after: tokens_before,
             trimmed: false,
+            exceeds_budget: false,
+            below_preferred_keep: false,
         };
     }
 
@@ -180,6 +109,8 @@ pub fn trim_to_recent_turns_with_crumb(
             tokens_before,
             tokens_after: tokens_before,
             trimmed: false,
+            exceeds_budget: false,
+            below_preferred_keep: false,
         };
     }
 
@@ -203,6 +134,8 @@ pub fn trim_to_recent_turns_with_crumb(
             tokens_before,
             tokens_after: tokens_before,
             trimmed: false,
+            exceeds_budget: false,
+            below_preferred_keep: false,
         };
     }
 
@@ -221,6 +154,8 @@ pub fn trim_to_recent_turns_with_crumb(
         tokens_before,
         tokens_after,
         trimmed: true,
+        exceeds_budget: false,
+        below_preferred_keep: false,
     }
 }
 
@@ -322,6 +257,8 @@ pub fn trim_to_reported_budget_with_crumb(
             dropped_turns: 0,
             kept_turns: total_turns,
             trimmed: false,
+            exceeds_budget: false,
+            below_preferred_keep: false,
         };
     }
     // Native tool schemas are constant across a trim, so reserve them inside
@@ -400,14 +337,602 @@ pub fn insert_breadcrumb_deduped(history: &mut Vec<ChatMessage>, crumb_present: 
     true
 }
 
+// ── Budget-cascade primitives (water-line trigger, send-budget fit) ──────
+
+/// Provider-authoritative context size, replacing the bare local estimate
+/// wherever a trim decision is made after a billed response.
+///
+/// A provider reports the prompt size of a request **as it was sent**
+/// (`usage.input_tokens` / `prompt_tokens`). That is the occupancy support
+/// fact when present. Between that report and the next trim check, the loop
+/// appends messages the provider has not billed yet — the assistant reply and
+/// the tool results it just produced. Those unbilled rows are priced with the
+/// local heuristic.
+///
+/// Before any provider report exists (first iteration, or a provider that
+/// emits no usage), [`ContextCalibration::current`] degrades to the plain
+/// whole-history estimate.
+#[derive(Debug, Clone, Default)]
+pub struct ContextCalibration {
+    /// Prompt tokens as reported by the provider for the request sent when the
+    /// history had `calibrated_history_len` messages. `None` until a provider
+    /// reports usage.
+    reported_input_tokens: Option<usize>,
+    /// `history.len()` at the moment `reported_input_tokens` was captured.
+    calibrated_history_len: usize,
+}
+
+impl ContextCalibration {
+    /// A fresh calibration with no provider anchor: every read is the plain
+    /// whole-history estimate until [`Self::observe_reported`] lands.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a provider-authoritative prompt size for the current history.
+    /// Called each time a response carries `usage.input_tokens`; the reported
+    /// value is the full prompt the provider just saw, so the messages present
+    /// now are all accounted for and become the new anchor.
+    pub fn observe_reported(&mut self, reported_input_tokens: usize, history: &[ChatMessage]) {
+        self.reported_input_tokens = Some(reported_input_tokens);
+        self.calibrated_history_len = history.len();
+    }
+
+    /// Current context size: the authoritative anchor plus the estimated cost
+    /// of any messages appended since it was captured. With no anchor yet, the
+    /// whole history is estimated locally.
+    #[must_use]
+    pub fn current(&self, history: &[ChatMessage]) -> usize {
+        match self.reported_input_tokens {
+            None => estimate_history_tokens(history),
+            Some(reported) => {
+                let unbilled = history.len().saturating_sub(self.calibrated_history_len);
+                let tail = &history[history.len().saturating_sub(unbilled)..];
+                reported.saturating_add(estimate_history_tokens(tail))
+            }
+        }
+    }
+}
+
+/// When `context_send_budget` is unset (`0`), fall back to the water-line
+/// budget so fit checks still run in tests and legacy call sites.
+#[must_use]
+pub fn resolve_send_budget(context_send_budget: usize, context_token_budget: usize) -> usize {
+    if context_send_budget > 0 {
+        context_send_budget
+    } else {
+        context_token_budget
+    }
+}
+
+/// Pick the largest `kept_turns` in `1..=preferred` that fits `send_budget`
+/// using one per-message token pass + O(1) probes (no full-history clones).
+fn choose_keep_turns_for_budget<T>(
+    history: &[T],
+    preferred: usize,
+    send_budget: usize,
+    message_tokens: impl Fn(&T) -> usize,
+    is_system_msg: impl Fn(&T) -> bool,
+    is_boundary: impl Fn(&T, usize) -> bool,
+) -> usize {
+    let total_turns = history
+        .iter()
+        .enumerate()
+        .filter(|(index, m)| is_boundary(m, *index))
+        .count()
+        .max(1);
+    let mut chosen_keep = preferred.max(1).min(total_turns);
+    if send_budget == 0 {
+        return chosen_keep;
+    }
+
+    let leading_system = history.iter().take_while(|m| is_system_msg(m)).count();
+    let msg_tokens: Vec<usize> = history.iter().map(|m| message_tokens(m)).collect();
+    let system_tokens: usize = msg_tokens[..leading_system].iter().copied().sum();
+
+    let body = &history[leading_system..];
+    let boundaries: Vec<usize> = body
+        .iter()
+        .enumerate()
+        .filter(|(i, m)| is_boundary(m, leading_system + i))
+        .map(|(i, _)| i)
+        .collect();
+    if boundaries.is_empty() {
+        return 1;
+    }
+
+    let n = msg_tokens.len();
+    let mut suffix = vec![0usize; n + 1];
+    for i in (0..n).rev() {
+        suffix[i] = suffix[i + 1].saturating_add(msg_tokens[i]);
+    }
+
+    while chosen_keep > 1 {
+        let start = boundaries[boundaries.len() - chosen_keep];
+        let abs_start = leading_system + start;
+        let after = system_tokens.saturating_add(suffix[abs_start]);
+        if after <= send_budget {
+            break;
+        }
+        chosen_keep -= 1;
+    }
+    chosen_keep
+}
+
+/// Drop oldest whole turns, retaining the `keep_turns` most recent whole
+/// turns plus every leading system message. Primitive keep-N cut used by
+/// [`trim_to_budget`]; callers that need the budget cascade should use that.
+/// `exceeds_budget` is always false — this primitive ignores token budgets.
+/// Keep-N whole turns, treating a leading synthetic breadcrumb as a
+/// non-turn: it never consumes a keep-N slot and is never dropped.
+fn trim_to_recent_turns_by_count(
+    history: Vec<ChatMessage>,
+    keep_turns: usize,
+    has_leading_breadcrumb: bool,
+) -> TrimResult {
+    // At least the most recent turn always survives; `keep_turns == 0` is
+    // normalised to 1 so the slice index below can never run past the end.
+    let keep = keep_turns.max(1);
+    let tokens_before = estimate_history_tokens(&history);
+
+    let leading_system = history.iter().take_while(|m| is_system(m)).count();
+    let system: Vec<ChatMessage> = history[..leading_system].to_vec();
+    // A leading synthetic breadcrumb is not a turn: it sits between the
+    // system prefix and the first real turn.
+    let crumb_offset = usize::from(has_leading_breadcrumb && history.len() > leading_system);
+    let body_start = leading_system + crumb_offset;
+    let body = &history[body_start..];
+    let total_turns = count_turns(body);
+
+    let boundaries: Vec<usize> = body
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| is_turn_boundary(m))
+        .map(|(i, _)| i)
+        .collect();
+
+    // Nothing to drop when the body already fits within `keep` turns, or
+    // when there is only a single turn (the newest must always survive).
+    if boundaries.len() <= keep {
+        return TrimResult {
+            history,
+            dropped_messages: 0,
+            dropped_turns: 0,
+            kept_turns: total_turns,
+            tokens_before,
+            tokens_after: tokens_before,
+            trimmed: false,
+            exceeds_budget: false,
+            below_preferred_keep: false,
+        };
+    }
+
+    // Retain the `keep` most recent turns: start the body at the boundary that
+    // begins the keep-th turn counted from the end.
+    let start = boundaries[boundaries.len() - keep];
+    let dropped_messages = start;
+    let dropped_turns = boundaries.iter().filter(|&&b| b < start).count();
+    let mut kept = system;
+    if crumb_offset > 0 {
+        kept.push(history[leading_system].clone());
+    }
+    kept.extend_from_slice(&body[start..]);
+    let kept_turns = total_turns - dropped_turns;
+    let tokens_after = estimate_history_tokens(&kept);
+
+    TrimResult {
+        history: kept,
+        dropped_messages,
+        dropped_turns,
+        kept_turns,
+        tokens_before,
+        tokens_after,
+        trimmed: true,
+        exceeds_budget: false,
+        below_preferred_keep: false,
+    }
+}
+
+/// Prefer `preferred_keep` newest turns, then choose the largest keep in
+/// `1..=preferred` that fits under `send_budget`. `send_budget == 0` skips the
+/// fit check.
+pub fn trim_to_budget(
+    history: Vec<ChatMessage>,
+    preferred_keep: usize,
+    send_budget: usize,
+) -> TrimResult {
+    trim_to_budget_with_crumb(history, preferred_keep, send_budget, false)
+}
+
+/// Like [`trim_to_budget`], but treating a leading synthetic breadcrumb as a
+/// non-turn: it never consumes a keep-N slot and is never dropped by the
+/// cascade.
+pub fn trim_to_budget_with_crumb(
+    history: Vec<ChatMessage>,
+    preferred_keep: usize,
+    send_budget: usize,
+    has_leading_breadcrumb: bool,
+) -> TrimResult {
+    let tokens_before = estimate_history_tokens(&history);
+    let preferred = preferred_keep.max(1);
+    let leading_system = history.iter().take_while(|m| is_system(m)).count();
+    let crumb_index = if has_leading_breadcrumb && history.len() > leading_system {
+        Some(leading_system)
+    } else {
+        None
+    };
+    let chosen_keep = choose_keep_turns_for_budget(
+        &history,
+        preferred,
+        send_budget,
+        |m| estimate_history_tokens(std::slice::from_ref(m)),
+        is_system,
+        |m, index| crumb_index != Some(index) && is_turn_boundary(m),
+    );
+
+    let mut result =
+        trim_to_recent_turns_by_count(history, chosen_keep, has_leading_breadcrumb);
+    result.tokens_before = tokens_before;
+    // The fit check must use the same estimator the selection used (the
+    // per-message sum), not a re-estimate of the retained set: the two can
+    // differ by a few framing tokens, which would make a fitting retention
+    // look like an over-budget floor.
+    let retained_tokens: usize = result
+        .history
+        .iter()
+        .map(|m| estimate_history_tokens(std::slice::from_ref(m)))
+        .sum();
+    result.tokens_after = retained_tokens;
+    result.exceeds_budget = send_budget > 0 && retained_tokens > send_budget;
+    result.below_preferred_keep =
+        result.trimmed && !result.exceeds_budget && result.kept_turns < preferred;
+    result
+}
+
+/// Outcome of trimming durable [`ConversationMessage`] history. Mirrors
+/// [`TrimResult`] accounting so Agent / session / UI stay aligned with the
+/// provider-facing cascade.
+#[derive(Debug, Clone)]
+pub struct ConversationTrimResult {
+    pub history: Vec<ConversationMessage>,
+    pub dropped_messages: usize,
+    pub dropped_turns: usize,
+    pub kept_turns: usize,
+    pub tokens_before: usize,
+    pub tokens_after: usize,
+    pub trimmed: bool,
+    pub exceeds_budget: bool,
+    pub below_preferred_keep: bool,
+}
+
+/// A durable turn boundary: a plain user chat message that is not the
+/// synthetic `[Tool results]` continuation row.
+fn is_conversation_boundary(message: &ConversationMessage) -> bool {
+    matches!(
+        message,
+        ConversationMessage::Chat(chat)
+            if chat.role == "user"
+                && !chat
+                    .content
+                    .starts_with(zeroclaw_api::tool_carrier::TOOL_RESULTS_PREFIX)
+    )
+}
+
+/// Local token estimate for durable history: the same ~4 chars/token
+/// heuristic used for provider-facing history, applied to every text-bearing
+/// part of each row.
+pub(crate) fn estimate_conversation_tokens(history: &[ConversationMessage]) -> usize {
+    fn text_tokens(text: &str) -> usize {
+        if text.is_empty() {
+            return 0;
+        }
+        text.len().div_ceil(4)
+    }
+
+    history
+        .iter()
+        .map(|message| match message {
+            ConversationMessage::Chat(chat) => text_tokens(&chat.content).saturating_add(4),
+            ConversationMessage::AssistantToolCalls {
+                text,
+                tool_calls,
+                reasoning_content,
+            } => {
+                let mut n = 4usize;
+                if let Some(t) = text {
+                    n = n.saturating_add(text_tokens(t));
+                }
+                if let Some(r) = reasoning_content {
+                    n = n.saturating_add(text_tokens(r));
+                }
+                for call in tool_calls {
+                    n = n
+                        .saturating_add(text_tokens(&call.name))
+                        .saturating_add(text_tokens(&call.arguments))
+                        .saturating_add(4);
+                }
+                n
+            }
+            ConversationMessage::ToolResults(results) => results
+                .iter()
+                .map(|r| text_tokens(&r.content).saturating_add(4))
+                .sum(),
+        })
+        .sum()
+}
+
+/// Drop oldest whole turns from durable conversation history, retaining the
+/// `keep_turns` most recent whole turns plus every leading system chat
+/// message. Primitive keep-N cut used by [`trim_conversation_to_budget`].
+/// Keep-N whole turns, treating a leading synthetic breadcrumb as a
+/// non-turn: it never consumes a keep-N slot and is never dropped.
+fn trim_conversation_to_recent_turns_by_count(
+    history: Vec<ConversationMessage>,
+    keep_turns: usize,
+    has_leading_breadcrumb: bool,
+) -> ConversationTrimResult {
+    let keep = keep_turns.max(1);
+    let tokens_before = estimate_conversation_tokens(&history);
+
+    let leading_system = history
+        .iter()
+        .take_while(|m| is_conversation_system(m))
+        .count();
+    let system: Vec<ConversationMessage> = history[..leading_system].to_vec();
+    let crumb_offset =
+        usize::from(has_leading_breadcrumb && history.len() > leading_system);
+    let body_start = leading_system + crumb_offset;
+    let body = &history[body_start..];
+    let total_turns = body.iter().filter(|m| is_conversation_boundary(m)).count();
+
+    let boundaries: Vec<usize> = body
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| is_conversation_boundary(m))
+        .map(|(i, _)| i)
+        .collect();
+
+    if boundaries.len() <= keep {
+        return ConversationTrimResult {
+            history,
+            dropped_messages: 0,
+            dropped_turns: 0,
+            kept_turns: total_turns,
+            tokens_before,
+            tokens_after: tokens_before,
+            trimmed: false,
+            exceeds_budget: false,
+            below_preferred_keep: false,
+        };
+    }
+
+    let start = boundaries[boundaries.len() - keep];
+    let dropped_messages = start;
+    let dropped_turns = boundaries.iter().filter(|&&b| b < start).count();
+    let mut kept = system;
+    if crumb_offset > 0 {
+        kept.push(history[leading_system].clone());
+    }
+    kept.extend_from_slice(&body[start..]);
+    let kept_turns = total_turns - dropped_turns;
+    let tokens_after = estimate_conversation_tokens(&kept);
+
+    ConversationTrimResult {
+        history: kept,
+        dropped_messages,
+        dropped_turns,
+        kept_turns,
+        tokens_before,
+        tokens_after,
+        trimmed: true,
+        exceeds_budget: false,
+        below_preferred_keep: false,
+    }
+}
+
+/// Durable conversation cascade — same stages as [`trim_to_budget`].
+pub fn trim_conversation_to_budget(
+    history: Vec<ConversationMessage>,
+    preferred_keep: usize,
+    send_budget: usize,
+) -> ConversationTrimResult {
+    trim_conversation_to_budget_with(
+        history,
+        preferred_keep,
+        send_budget,
+        estimate_conversation_tokens,
+    )
+}
+
+/// Like [`trim_conversation_to_budget`], but sizes history with `estimate`
+/// (e.g. provider-view estimate via `to_provider_messages`).
+pub fn trim_conversation_to_budget_with(
+    history: Vec<ConversationMessage>,
+    preferred_keep: usize,
+    send_budget: usize,
+    estimate: impl Fn(&[ConversationMessage]) -> usize,
+) -> ConversationTrimResult {
+    trim_conversation_to_budget_with_crumb(history, preferred_keep, send_budget, estimate, false)
+}
+
+/// Like [`trim_conversation_to_budget_with`], but treating a leading
+/// synthetic breadcrumb as a non-turn: it never consumes a keep-N slot and is
+/// never dropped by the cascade.
+pub fn trim_conversation_to_budget_with_crumb(
+    history: Vec<ConversationMessage>,
+    preferred_keep: usize,
+    send_budget: usize,
+    estimate: impl Fn(&[ConversationMessage]) -> usize,
+    has_leading_breadcrumb: bool,
+) -> ConversationTrimResult {
+    let tokens_before = estimate(&history);
+    let preferred = preferred_keep.max(1);
+    let leading_system = history
+        .iter()
+        .take_while(|m| is_conversation_system(m))
+        .count();
+    let crumb_index = if has_leading_breadcrumb && history.len() > leading_system {
+        Some(leading_system)
+    } else {
+        None
+    };
+    let chosen_keep = choose_keep_turns_for_budget(
+        &history,
+        preferred,
+        send_budget,
+        |m| estimate(std::slice::from_ref(m)),
+        is_conversation_system,
+        |m, index| crumb_index != Some(index) && is_conversation_boundary(m),
+    );
+
+    let mut result = trim_conversation_to_recent_turns_by_count(
+        history,
+        chosen_keep,
+        has_leading_breadcrumb,
+    );
+    result.tokens_before = tokens_before;
+    // The fit check uses the same per-message estimator the selection used, so
+    // a retention that fits the target is not rejected by a few framing tokens
+    // of estimator drift.
+    let retained_tokens: usize = result
+        .history
+        .iter()
+        .map(|m| estimate(std::slice::from_ref(m)))
+        .sum();
+    result.tokens_after = retained_tokens;
+    result.exceeds_budget = send_budget > 0 && retained_tokens > send_budget;
+    result.below_preferred_keep =
+        result.trimmed && !result.exceeds_budget && result.kept_turns < preferred;
+    result
+}
+
+fn warn_below_preferred_keep_inner(
+    preferred_keep: usize,
+    send_budget: usize,
+    below_preferred_keep: bool,
+    kept_turns: usize,
+    tokens_after: usize,
+) {
+    if !below_preferred_keep {
+        return;
+    }
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_category(::zeroclaw_log::EventCategory::Agent)
+            .with_attrs(::serde_json::json!({
+                "preferred_keep": preferred_keep,
+                "kept_turns": kept_turns,
+                "send_budget": send_budget,
+                "tokens_after": tokens_after,
+                "error_key": "context_trim_below_preferred_keep",
+            })),
+        format!(
+            "Context trim kept {kept_turns} turn(s), below preferred keep_recent_turns={preferred_keep}, to fit send budget {send_budget}"
+        )
+    );
+}
+
+/// Log a warning when the cascade kept fewer turns than the preferred keep.
+pub fn warn_if_below_preferred_keep(
+    preferred_keep: usize,
+    send_budget: usize,
+    result: &TrimResult,
+) {
+    warn_below_preferred_keep_inner(
+        preferred_keep,
+        send_budget,
+        result.below_preferred_keep,
+        result.kept_turns,
+        result.tokens_after,
+    );
+}
+
+/// Durable-history variant of [`warn_if_below_preferred_keep`].
+pub fn warn_if_conversation_below_preferred_keep(
+    preferred_keep: usize,
+    send_budget: usize,
+    result: &ConversationTrimResult,
+) {
+    warn_below_preferred_keep_inner(
+        preferred_keep,
+        send_budget,
+        result.below_preferred_keep,
+        result.kept_turns,
+        result.tokens_after,
+    );
+}
+
 /// Insert the trim breadcrumb into structured history after leading system
-/// messages. The owning Agent tracks whether a synthetic breadcrumb exists.
-pub(crate) fn insert_conversation_breadcrumb(history: &mut Vec<ConversationMessage>) {
+/// messages, unless one is already sitting there.
+pub(crate) fn insert_conversation_breadcrumb_deduped(history: &mut Vec<ConversationMessage>) {
     let system_count = history
         .iter()
-        .take_while(|message| is_conversation_system(message))
+        .take_while(|m| is_conversation_system(m))
         .count();
-    history.insert(system_count, ConversationMessage::Chat(breadcrumb()));
+    let crumb = breadcrumb();
+    let already_present = history.get(system_count).is_some_and(|m| {
+        matches!(
+            m,
+            ConversationMessage::Chat(c) if c.role == crumb.role && c.content == crumb.content
+        )
+    });
+    if already_present {
+        return;
+    }
+    history.insert(system_count, ConversationMessage::Chat(crumb));
+}
+
+/// Build a [`zeroclaw_api::agent::TurnEvent::HistoryTrimmed`] from trim accounting.
+#[must_use]
+pub fn history_trimmed_turn_event(
+    dropped_messages: usize,
+    kept_turns: usize,
+    reason: String,
+    tokens_after: Option<usize>,
+    tokens_before: Option<usize>,
+    dropped_turns: Option<usize>,
+) -> zeroclaw_api::agent::TurnEvent {
+    zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
+        dropped_messages,
+        dropped_turns: dropped_turns.unwrap_or(0),
+        kept_turns,
+        reason,
+        token_budget: None,
+        tokens_before: tokens_before.map(|v| v as u64),
+        tokens_after: tokens_after.map(|v| v as u64),
+        tokens_before_source: None,
+        tokens_after_source: None,
+        unsatisfiable_floor: None,
+        retained_context: None,
+    }
+}
+
+/// Build an observer HistoryTrimmed event from trim accounting.
+#[must_use]
+pub fn history_trimmed_observer_event(
+    dropped_messages: usize,
+    kept_turns: usize,
+    reason: String,
+    tokens_after: Option<usize>,
+    tokens_before: Option<usize>,
+    _dropped_turns: Option<usize>,
+) -> zeroclaw_api::observability_traits::ObserverEvent {
+    zeroclaw_api::observability_traits::ObserverEvent::HistoryTrimmed {
+        dropped_messages,
+        kept_turns,
+        reason,
+        channel: None,
+        agent_alias: None,
+        turn_id: None,
+        token_budget: None,
+        tokens_before: tokens_before.map(|v| v as u64),
+        tokens_after: tokens_after.map(|v| v as u64),
+        tokens_before_source: None,
+        tokens_after_source: None,
+        unsatisfiable_floor: None,
+    }
 }
 
 #[cfg(test)]
@@ -505,7 +1030,7 @@ mod tests {
         history.push(conversation_assistant("workflow complete"));
         assert_eq!(history.len(), 64);
 
-        let result = trim_conversation_to_recent_turns(history, 50, false);
+        let result = trim_conversation_to_budget_with(history, 50, usize::MAX, |m: &[ConversationMessage]| crate::agent::history_trim::estimate_conversation_tokens(m));
 
         assert!(!result.trimmed);
         assert_eq!(result.dropped_messages, 0);
@@ -537,7 +1062,7 @@ mod tests {
         }
         history.push(conversation_assistant("new answer"));
 
-        let result = trim_conversation_to_recent_turns(history, 1, false);
+        let result = trim_conversation_to_budget_with(history, 1, usize::MAX, |m: &[ConversationMessage]| crate::agent::history_trim::estimate_conversation_tokens(m));
 
         assert!(result.trimmed);
         assert_eq!(result.dropped_turns, 1);
@@ -567,7 +1092,7 @@ mod tests {
             history.push(conversation_assistant(&format!("answer {turn}")));
         }
 
-        let result = trim_conversation_to_recent_turns(history, 50, false);
+        let result = trim_conversation_to_budget_with(history, 50, usize::MAX, |m: &[ConversationMessage]| crate::agent::history_trim::estimate_conversation_tokens(m));
 
         assert!(result.trimmed);
         assert_eq!(result.dropped_turns, 10);
@@ -594,7 +1119,7 @@ mod tests {
             conversation_assistant("new answer"),
         ];
 
-        let result = trim_conversation_to_recent_turns(history, 0, false);
+        let result = trim_conversation_to_budget_with(history, 0, usize::MAX, |m: &[ConversationMessage]| crate::agent::history_trim::estimate_conversation_tokens(m));
 
         assert!(result.trimmed);
         assert_eq!(result.dropped_messages, 2);
@@ -619,24 +1144,24 @@ mod tests {
             conversation_assistant("new answer"),
         ];
 
-        let result = trim_conversation_to_recent_turns(history, 1, false);
+        let result = trim_conversation_to_budget_with(history, 1, usize::MAX, |m: &[ConversationMessage]| crate::agent::history_trim::estimate_conversation_tokens(m));
 
         assert!(result.trimmed);
-        assert_eq!(result.dropped_messages, 2);
+        assert_eq!(result.dropped_messages, 3);
         assert_eq!(result.dropped_turns, 1);
         assert_eq!(result.kept_turns, 1);
-        assert_eq!(result.history.len(), 4);
+        // Only the LEADING system prefix is non-droppable: tools and skills
+        // live there. A system row that sits inside the body belongs to the
+        // turn it appears in and falls with it.
+        assert_eq!(result.history.len(), 3);
         assert!(matches!(
             &result.history[..],
             [
                 ConversationMessage::Chat(first_system),
-                ConversationMessage::Chat(second_system),
                 ConversationMessage::Chat(user),
                 ConversationMessage::Chat(assistant),
             ] if first_system.role == "system"
                 && first_system.content == "primary system"
-                && second_system.role == "system"
-                && second_system.content == "late system"
                 && user.role == "user"
                 && user.content == "new request"
                 && assistant.role == "assistant"
@@ -653,7 +1178,7 @@ mod tests {
         ];
         let original = serde_json::to_value(&history).expect("fixture should serialize");
 
-        let result = trim_conversation_to_recent_turns(history, 3, false);
+        let result = trim_conversation_to_budget_with(history, 3, usize::MAX, |m: &[ConversationMessage]| crate::agent::history_trim::estimate_conversation_tokens(m));
 
         assert!(!result.trimmed);
         assert_eq!(result.dropped_messages, 0);
@@ -675,7 +1200,7 @@ mod tests {
         ];
         let original = serde_json::to_value(&history).expect("fixture should serialize");
 
-        let result = trim_conversation_to_recent_turns(history, 1, false);
+        let result = trim_conversation_to_budget_with(history, 1, usize::MAX, |m: &[ConversationMessage]| crate::agent::history_trim::estimate_conversation_tokens(m));
 
         assert!(!result.trimmed);
         assert_eq!(result.dropped_messages, 0);
@@ -695,7 +1220,7 @@ mod tests {
         history.push(conversation_assistant("done"));
         let original = serde_json::to_value(&history).expect("fixture should serialize");
 
-        let result = trim_conversation_to_recent_turns(history, 1, false);
+        let result = trim_conversation_to_budget_with(history, 1, usize::MAX, |m: &[ConversationMessage]| crate::agent::history_trim::estimate_conversation_tokens(m));
 
         assert!(!result.trimmed);
         assert_eq!(result.dropped_messages, 0);
@@ -719,7 +1244,7 @@ mod tests {
             conversation_assistant("new answer"),
         ];
 
-        let result = trim_conversation_to_recent_turns(history, 1, false);
+        let result = trim_conversation_to_budget_with(history, 1, usize::MAX, |m: &[ConversationMessage]| crate::agent::history_trim::estimate_conversation_tokens(m));
 
         assert!(result.trimmed);
         assert_eq!(result.dropped_messages, 2);
@@ -750,7 +1275,7 @@ mod tests {
             conversation_assistant("new answer"),
         ];
 
-        let result = trim_conversation_to_recent_turns(history, 1, false);
+        let result = trim_conversation_to_budget_with(history, 1, usize::MAX, |m: &[ConversationMessage]| crate::agent::history_trim::estimate_conversation_tokens(m));
 
         assert!(result.trimmed);
         assert_eq!(result.dropped_messages, 2);
@@ -781,7 +1306,7 @@ mod tests {
             conversation_assistant("new answer"),
         ];
 
-        let result = trim_conversation_to_recent_turns(history, 2, false);
+        let result = trim_conversation_to_budget_with(history, 2, usize::MAX, |m: &[ConversationMessage]| crate::agent::history_trim::estimate_conversation_tokens(m));
 
         assert!(result.trimmed);
         assert_eq!(result.dropped_messages, 2);
@@ -811,7 +1336,13 @@ mod tests {
             conversation_assistant("middle answer"),
         ];
 
-        let first = trim_conversation_to_recent_turns(history, 2, true);
+        let first = trim_conversation_to_budget_with_crumb(
+            history,
+            2,
+            usize::MAX,
+            |m: &[ConversationMessage]| crate::agent::history_trim::estimate_conversation_tokens(m),
+            true,
+        );
         assert!(
             !first.trimmed,
             "a synthetic breadcrumb must not push an exactly-at-cap body over the limit"
@@ -820,14 +1351,22 @@ mod tests {
         history = first.history;
         history.push(conversation_user("new request"));
         history.push(conversation_assistant("new answer"));
-        let mut second = trim_conversation_to_recent_turns(history, 2, true);
+        let second = trim_conversation_to_budget_with_crumb(
+            history,
+            2,
+            usize::MAX,
+            |m: &[ConversationMessage]| crate::agent::history_trim::estimate_conversation_tokens(m),
+            true,
+        );
 
         assert!(second.trimmed);
         assert_eq!(second.dropped_messages, 2);
         assert_eq!(second.dropped_turns, 1);
         assert_eq!(second.kept_turns, 2);
-        assert_eq!(second.history.len(), 5);
-        insert_conversation_breadcrumb(&mut second.history);
+        // The leading breadcrumb is not a turn: it survives the trim in place
+        // and never consumes a keep-N slot, so the retained set is the system
+        // prefix, the crumb, and the two newest whole turns.
+        assert_eq!(second.history.len(), 6);
         let breadcrumb_content = breadcrumb().content;
         assert_eq!(
             second
@@ -1586,5 +2125,86 @@ mod tests {
             with_marker.get(2),
             Some(m) if m.role == "user" && m.content == "newest request"
         ));
+    }
+    // ── §2 post-merge invariants ──────────────────────────────────────
+
+    fn multi_turn_history(turns: usize, body: &str) -> Vec<ChatMessage> {
+        let mut h = vec![sys("system")];
+        for i in 0..turns {
+            h.push(user(&format!("t{i} {body}")));
+            h.push(asst(&format!("a{i} {body}")));
+        }
+        h
+    }
+
+    /// §2: the keep-N cascade prefers `keep_recent_turns` newest whole turns
+    /// and never splits a turn.
+    #[test]
+    fn the_cascade_keeps_exactly_the_preferred_whole_turns() {
+        let h = multi_turn_history(5, "body");
+        let r = trim_to_budget(h, 2, usize::MAX);
+        assert!(r.trimmed);
+        assert_eq!(r.kept_turns, 2);
+        assert!(!r.exceeds_budget);
+        assert!(!r.below_preferred_keep);
+        // The two newest turns survive, whole.
+        assert!(r.history.iter().any(|m| m.content.contains("t4")));
+        assert!(r.history.iter().any(|m| m.content.contains("t3")));
+        assert!(!r.history.iter().any(|m| m.content.contains("t2")));
+    }
+
+    /// §2: the cascade bottoms out at one turn and reports the unsatisfiable
+    /// floor instead of silently claiming the history fits.
+    #[test]
+    fn the_cascade_floors_at_one_turn_and_reports_exceeds_budget() {
+        let h = multi_turn_history(4, &"x".repeat(2_000));
+        let r = trim_to_budget(h, 5, 10);
+        assert_eq!(r.kept_turns, 1);
+        assert!(r.exceeds_budget, "a floor that cannot fit must be reported");
+        // The newest turn is never dropped.
+        assert!(r.history.iter().any(|m| m.content.contains("t3")));
+        assert!(!r.history.iter().any(|m| m.content.contains("t0")));
+    }
+
+    /// §2: `ContextCalibration` anchors the size on the provider's reported
+    /// count and prices only the not-yet-billed tail.
+    #[test]
+    fn the_calibration_anchors_on_the_provider_reported_size() {
+        let mut h = vec![sys("base"), user("first")];
+        let mut cal = ContextCalibration::new();
+        cal.observe_reported(1_000, &h);
+        assert_eq!(cal.current(&h), 1_000);
+        h.push(asst("reply"));
+        let expected = 1_000 + estimate_history_tokens(&h[h.len() - 1..]);
+        assert_eq!(cal.current(&h), expected);
+    }
+
+    /// §2: the retention path drops whole turns only — no model-written
+    /// summary is ever inserted.
+    #[test]
+    fn the_retention_path_keeps_whole_turns_and_no_summary() {
+        let h = multi_turn_history(4, "body");
+        let r = trim_to_budget(h, 2, usize::MAX);
+        let mut seen_user = false;
+        for m in &r.history {
+            if m.role == "user" {
+                seen_user = true;
+            }
+            if m.role == "assistant" {
+                assert!(seen_user, "an assistant row must follow its turn head");
+            }
+        }
+        // No synthesized summary text: every retained row is one the caller
+        // supplied.
+        let supplied: Vec<String> = (0..4)
+            .flat_map(|i| [format!("t{i} body"), format!("a{i} body")])
+            .collect();
+        for m in &r.history {
+            assert!(
+                supplied.contains(&m.content) || m.role == "system",
+                "unexpected content in the retained set: {:?}",
+                m.content
+            );
+        }
     }
 }

@@ -1508,7 +1508,9 @@ fn done_frame_context_limits(
                 context_token_budget: 0,
                 model_context_window_source:
                     zeroclaw_config::schema::ModelContextWindowSource::CompatibilityFallback,
-            }),
+                context_send_budget: 0,
+                keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
+                                                                                                                                                                                                                                                                                                                 }),
         ),
     }
 }
@@ -2508,7 +2510,9 @@ mod tests {
             context_token_budget: 180_000,
             model_context_window_source:
                 zeroclaw_config::schema::ModelContextWindowSource::Configured,
-        };
+            context_send_budget: 0,
+            keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
+                                                                                                                                                                                                                                      };
         assert_eq!(
             resolve_done_context_limits(Some(7_200), Some(8_000), stale_startup_limits),
             (7_200, Some(8_000)),
@@ -2523,7 +2527,9 @@ mod tests {
             context_token_budget: 0,
             model_context_window_source:
                 zeroclaw_config::schema::ModelContextWindowSource::Configured,
-        };
+            context_send_budget: 0,
+            keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
+                                                                                                                                                                                                                              };
         assert_eq!(
             resolve_done_context_limits(None, None, active_limits),
             (0, Some(8_000)),
@@ -2537,7 +2543,9 @@ mod tests {
             context_token_budget: 16_000,
             model_context_window_source:
                 zeroclaw_config::schema::ModelContextWindowSource::CompatibilityFallback,
-        };
+            context_send_budget: 0,
+            keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
+                                                                                                                                                                                                                                                                                                      };
         assert_eq!(
             resolve_done_context_limits(None, None, active_limits),
             (16_000, None),
@@ -2554,7 +2562,9 @@ mod tests {
             context_token_budget: 7_200,
             model_context_window_source:
                 zeroclaw_config::schema::ModelContextWindowSource::Configured,
-        };
+            context_send_budget: 0,
+            keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
+                                                                                                                                                                                                                                  };
         // Earlier usage-bearing text route left 180k/200k on the wire trackers.
         assert_eq!(
             done_frame_context_limits(Some(final_vision), Some(180_000), Some(200_000), None),
@@ -2572,7 +2582,9 @@ mod tests {
             context_token_budget: 180_000,
             model_context_window_source:
                 zeroclaw_config::schema::ModelContextWindowSource::Configured,
-        };
+            context_send_budget: 0,
+            keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
+                                                                                                                                                                                                                                      };
         // No final route, no usage: fall back to the resolved route.
         assert_eq!(
             done_frame_context_limits(None, None, None, Some(fallback)),
@@ -2860,7 +2872,10 @@ data: {\"type\":\"message_stop\"}\n\n",
         config.runtime_profiles.insert(
             "fixture".to_string(),
             zeroclaw_config::schema::RuntimeProfileConfig {
-                max_history_messages: Some(2),
+                context: zeroclaw_config::scattered_types::ContextConfig {
+                    keep_recent_turns: Some(2),
+                    ..Default::default()
+                },
                 ..Default::default()
             },
         );
@@ -4828,7 +4843,10 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             runtime_profiles.insert(
                 "coding".to_string(),
                 RuntimeProfileConfig {
-                    max_context_tokens: Some(expected_max_ctx as usize),
+                    context: zeroclaw_config::scattered_types::ContextConfig {
+                        max_input_tokens: Some(expected_max_ctx as usize),
+                        ..Default::default()
+                    },
                     ..RuntimeProfileConfig::default()
                 },
             );
@@ -4936,8 +4954,11 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             runtime_profiles.insert(
                 "coding".to_string(),
                 RuntimeProfileConfig {
-                    max_context_tokens: Some(800_000),
-                    ..RuntimeProfileConfig::default()
+                    context: zeroclaw_config::scattered_types::ContextConfig {
+                    max_input_tokens: Some(800_000),
+                    ..Default::default()
+                },
+                ..RuntimeProfileConfig::default()
                 },
             );
 
@@ -5030,8 +5051,11 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         runtime_profiles.insert(
             "coding".to_string(),
             RuntimeProfileConfig {
-                max_context_tokens: Some(800_000),
-                ..RuntimeProfileConfig::default()
+                context: zeroclaw_config::scattered_types::ContextConfig {
+                    max_input_tokens: Some(800_000),
+                    ..Default::default()
+                },
+            ..RuntimeProfileConfig::default()
             },
         );
 

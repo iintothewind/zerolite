@@ -1050,6 +1050,8 @@ mod graceful_summary_metering_tests {
                     assert_eq!(model, "summary-model");
                     ResolvedContextLimits {
                         model_context_window: budget,
+                        context_send_budget: 0,
+                        keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
                         ..ResolvedContextLimits::legacy_fallback(budget)
                     }
                 },
@@ -1199,6 +1201,8 @@ mod graceful_summary_metering_tests {
                     assert_eq!(model, "summary-model");
                     ResolvedContextLimits {
                         model_context_window: budget,
+                        context_send_budget: 0,
+                        keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
                         ..ResolvedContextLimits::legacy_fallback(budget)
                     }
                 },
@@ -1270,6 +1274,8 @@ mod graceful_summary_metering_tests {
                 None,
                 |_, _| ResolvedContextLimits {
                     model_context_window: budget,
+                    context_send_budget: 0,
+                    keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
                     ..ResolvedContextLimits::legacy_fallback(if disable_soft_budget {
                         0
                     } else {

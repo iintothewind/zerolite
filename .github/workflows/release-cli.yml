@@ -113,13 +113,52 @@ jobs:
       # ignores the web-dist artifact above and devices keep serving a stale
       # on-disk gateway.web_dist_dir — WebUI changes look like they "did not
       # ship". Mirror scripts/dev/build-cli-local.sh.
+      #
+      # plugins-wasm-cranelift ships the WASM plugin host: `zeroclaw plugin`
+      # exists and registry `.wasm` packages are JIT-compiled on load, so a
+      # package is not tied to one host wasmtime version or target arch. Costs
+      # roughly +23% binary size; ARM32 would need plugins-wasm-pulley instead,
+      # which these three targets do not cover.
       - name: Build release
         shell: bash
         run: >
           cargo build --release --locked
           --target ${{ matrix.target }}
-          --features embedded-web
+          --features embedded-web,plugins-wasm-cranelift
           --bin zeroclaw
+
+      # Upstream v0.8.6 gates release publication on a per-archive plugin
+      # smoke test, so a broken WASM host cannot ship. The packages are
+      # target-independent (wasm32-wasip2), so build them once per runner.
+      # The aarch64 leg runs the smoke under qemu-user because the archive
+      # targets a foreign architecture.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Build plugin smoke packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup target add wasm32-wasip2
+          bash scripts/ci/build_plugin_smoke_packages.sh "$RUNNER_TEMP/plugin-smoke-packages"
+      - name: Plugin host smoke test
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          BIN: ${{ matrix.bin }}
+        run: |
+          set -euo pipefail
+          bin="target/${TARGET}/release/${BIN}"
+          smoke() { bash scripts/ci/plugin_artifact_smoke.sh "$@"; }
+          if [[ "$TARGET" == "aarch64-unknown-linux-gnu" ]]; then
+            docker run --rm --platform linux/arm64 \
+              -v "$PWD":/build -w /build -v "$RUNNER_TEMP/plugin-smoke-packages":/packages \
+              rust:1-bookworm \
+              bash scripts/ci/plugin_artifact_smoke.sh \
+                --binary "$bin" --expect host --packages /packages
+          else
+            smoke --binary "$bin" --expect host --packages "$RUNNER_TEMP/plugin-smoke-packages"
+          fi
 
       - name: Package artifact
         shell: bash

@@ -29,6 +29,16 @@ pub fn create_runtime(config: &RuntimeConfig) -> anyhow::Result<Box<dyn RuntimeA
 
 #[cfg(unix)]
 fn validate_shell(shell: &str) -> anyhow::Result<()> {
+    validate_shell_with_path(shell, None)
+}
+
+/// Validate the configured shell. `path` is the injected PATH the runtime
+/// will actually search (the TUI's captured environment, when the caller
+/// supplies one): a shell that is absent from the PROCESS PATH but present in
+/// the injected one is a valid configuration, and rejecting it here would
+/// refuse a shell the runtime resolves successfully moments later.
+#[cfg(unix)]
+fn validate_shell_with_path(shell: &str, injected_path: Option<&OsStr>) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     // Android pins the shell to /system/bin/sh; the configured value is never
@@ -49,7 +59,14 @@ fn validate_shell(shell: &str) -> anyhow::Result<()> {
             "runtime.shell {shell:?} is a relative path; use a bare name resolved on PATH (e.g. \"bash\") or an absolute path (e.g. \"/bin/bash\")"
         );
     } else {
-        match std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        let search_path: Vec<std::path::PathBuf> = match injected_path {
+            Some(path) => std::env::split_paths(path).collect(),
+            None => std::env::var_os("PATH")
+                .map(|value| std::env::split_paths(&value).collect())
+                .unwrap_or_default(),
+        };
+        match search_path
+            .into_iter()
             .map(|dir| dir.join(shell))
             .find(|candidate| candidate.is_file())
         {
@@ -328,7 +345,7 @@ pub fn create_runtime_with_path(
         RuntimeKind::Native => {
             let shell = config.shell.clone().unwrap_or_else(native::default_shell);
             #[cfg(unix)]
-            validate_shell(&shell)?;
+            validate_shell_with_path(&shell, path)?;
             #[cfg(windows)]
             validate_shell_windows(&shell)?;
             #[cfg(unix)]

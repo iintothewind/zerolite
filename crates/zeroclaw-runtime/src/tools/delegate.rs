@@ -1730,15 +1730,7 @@ impl DelegateTool {
                 resolved.max_tool_iterations = profile.max_tool_iterations;
             }
             resolved.max_execution_tree_iterations = profile.max_execution_tree_iterations;
-            if profile.max_context_tokens.is_some() {
-                resolved.max_context_tokens = profile.max_context_tokens;
-            }
-            if let Some(ratio) = profile
-                .context_compact_ratio
-                .filter(|r| *r > 0.0 && *r <= 1.0)
-            {
-                resolved.context_compact_ratio = Some(ratio);
-            }
+            resolved.context = profile.context.clone();
             if let Some(parallel_tools) = profile.parallel_tools {
                 resolved.parallel_tools = parallel_tools;
             }
@@ -1773,15 +1765,7 @@ impl DelegateTool {
             if profile.max_tool_iterations > 0 {
                 resolved.max_tool_iterations = profile.max_tool_iterations;
             }
-            if let Some(max_context_tokens) = profile.max_context_tokens {
-                resolved.max_context_tokens = Some(max_context_tokens);
-            }
-            if let Some(ratio) = profile
-                .context_compact_ratio
-                .filter(|r| *r > 0.0 && *r <= 1.0)
-            {
-                resolved.context_compact_ratio = Some(ratio);
-            }
+            resolved.context = profile.context.clone();
             if let Some(parallel_tools) = profile.parallel_tools {
                 resolved.parallel_tools = parallel_tools;
             }

@@ -2,7 +2,7 @@
   <img src="web/public/logo.png" alt="ZeroLite" width="360" />
 </p>
 
-<h1 align="center">ZeroLite 1.1.0 — Personal AI Assistant</h1>
+<h1 align="center">ZeroLite 1.2.0 — Personal AI Assistant</h1>
 
 <p align="center">
   <strong>A ZeroClaw fork. You own the agent, the data, and the machine it runs on.</strong>
@@ -10,7 +10,7 @@
 
 ---
 
-ZeroLite is a fork of [ZeroClaw](https://github.com/zeroclaw-labs/zeroclaw). The binary, config file, and commands stay `zeroclaw`. This tree is crate version `1.1.0`; the release tag is `v1.1.0`.
+ZeroLite is a fork of [ZeroClaw](https://github.com/zeroclaw-labs/zeroclaw). The binary, config file, and commands stay `zeroclaw`. This tree is crate version `1.2.0`; the release tag is `v1.2.0`.
 
 It is still one Rust binary: LLM providers (Anthropic, OpenAI, Ollama, and ~20 others), 30+ channels (Discord, Telegram, Matrix, email, voice, webhooks, CLI), and tools (shell, browser, HTTP, hardware, custom MCP servers). Everything runs on your machine, with your keys, in your workspace.
 
@@ -52,31 +52,31 @@ keep_recent_turns = 5           # default, clamped 1–10
 
 ## Install
 
-Install from the [ZeroLite 1.1.0 release](https://github.com/iintothewind/zeroclaw/releases/tag/v1.1.0). Each binary has the web dashboard embedded. There is no macOS build.
+Install from the [ZeroLite 1.2.0 release](https://github.com/iintothewind/zeroclaw/releases/tag/v1.2.0). Each binary has the web dashboard embedded and carries the WASM plugin host. There is no macOS build.
 
 | Platform | Asset |
 |---|---|
-| Windows x64 | `zerolite-1.1.0-x86_64-pc-windows-msvc.zip` |
-| Linux x64 | `zerolite-1.1.0-x86_64-unknown-linux-gnu.tar.gz` |
-| Linux arm64 | `zerolite-1.1.0-aarch64-unknown-linux-gnu.tar.gz` |
+| Windows x64 | `zerolite-1.2.0-x86_64-pc-windows-msvc.zip` |
+| Linux x64 | `zerolite-1.2.0-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux arm64 | `zerolite-1.2.0-aarch64-unknown-linux-gnu.tar.gz` |
 
 Linux x64:
 
 ```sh
-gh release download v1.1.0 -R iintothewind/zeroclaw -p 'zerolite-1.1.0-x86_64-unknown-linux-gnu.tar.gz'
-tar -xzf zerolite-1.1.0-x86_64-unknown-linux-gnu.tar.gz
+gh release download v1.2.0 -R iintothewind/zeroclaw -p 'zerolite-1.2.0-x86_64-unknown-linux-gnu.tar.gz'
+tar -xzf zerolite-1.2.0-x86_64-unknown-linux-gnu.tar.gz
 install -m 755 zeroclaw "${CARGO_HOME:-$HOME/.cargo}/bin/zeroclaw"
 zeroclaw quickstart
 ```
 
-Linux arm64: same steps, with `zerolite-1.1.0-aarch64-unknown-linux-gnu.tar.gz`.
+Linux arm64: same steps, with `zerolite-1.2.0-aarch64-unknown-linux-gnu.tar.gz`.
 
 Windows (PowerShell):
 
 ```powershell
-gh release download v1.1.0 -R iintothewind/zeroclaw -p 'zerolite-1.1.0-x86_64-pc-windows-msvc.zip'
-Expand-Archive .\zerolite-1.1.0-x86_64-pc-windows-msvc.zip -DestinationPath "$env:USERPROFILE\.cargo\bin"
-Rename-Item "$env:USERPROFILE\.cargo\bin\zerolite-1.1.0-x86_64-pc-windows-msvc.exe" zeroclaw.exe
+gh release download v1.2.0 -R iintothewind/zeroclaw -p 'zerolite-1.2.0-x86_64-pc-windows-msvc.zip'
+Expand-Archive .\zerolite-1.2.0-x86_64-pc-windows-msvc.zip -DestinationPath "$env:USERPROFILE\.cargo\bin"
+Rename-Item "$env:USERPROFILE\.cargo\bin\zerolite-1.2.0-x86_64-pc-windows-msvc.exe" zeroclaw.exe
 zeroclaw quickstart
 ```
 
@@ -90,6 +90,24 @@ zeroclaw service start            # run it always-on in the background
 ```
 
 Full walkthrough: `zeroclaw quickstart` — or pass `--yolo` to skip the safety gates on dev boxes.
+
+## Plugins
+
+The release binaries carry the WASM plugin host, so channel and tool packages
+install by name — no Rust toolchain needed:
+
+```bash
+zeroclaw plugin search discord     # look in the registry
+zeroclaw plugin install discord    # install, load-check, and bind a channel
+zeroclaw plugin list --verify      # installed packages and their load verdict
+```
+
+The registry offers 13 packages built for upstream v0.8.6's plugin contract:
+the Discord, Matrix, Telegram, Bluesky, Gitea, Mattermost, Mochat, Notion,
+Reddit, X (Twitter), WeChat and WeCom channels, plus the `redact-text` tool.
+Plugins stay disabled until you enable them. Operator guide:
+[Plugins](docs/book/src/plugins/index.md) · release notes:
+[docs/releases/v1.2.0.md](docs/releases/v1.2.0.md).
 
 ## What the runtime does
 

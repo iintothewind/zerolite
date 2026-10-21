@@ -1,18 +1,14 @@
 //! Maintainer surface generation. `cargo generate installers` renders install
-//! surfaces from canonical route semantics; `cargo generate review-docs`
-//! materializes repeated PR-review policy. Typed specs own policy, renderers
+//! surfaces from canonical route semantics. Typed specs own policy, renderers
 //! own generated content, and text outside generated zones stays hand-authored.
 
 pub mod container;
 pub mod container_base;
 pub mod docker_tags;
-pub mod docs;
 pub mod install_sh;
 pub mod packaging;
-pub mod review_docs;
 pub mod runtime_locales;
 pub mod setup_bat;
-pub mod sop_syntax;
 pub mod spec;
 pub mod tools_ftl;
 pub mod zerocode_themes;
@@ -47,11 +43,6 @@ fn registry() -> Vec<Surface> {
             render: |root, cur| setup_bat::render_file(root, cur),
         },
         Surface {
-            name: "install-docs",
-            file: "docs/book/src/_snippets/install.md",
-            render: docs::render_file,
-        },
-        Surface {
             name: "runtime-locales",
             file: "crates/zeroclaw-runtime/src/generated_locales.rs",
             render: runtime_locales::render_file,
@@ -60,31 +51,6 @@ fn registry() -> Vec<Surface> {
             name: "tools-en-ftl",
             file: "crates/zeroclaw-tools/locales/en/tools.ftl",
             render: tools_ftl::render_file,
-        },
-        Surface {
-            name: "readme-unix-fast",
-            file: "README.md",
-            render: docs::render_readme_unix_fast_zone,
-        },
-        Surface {
-            name: "linux-unix-fast",
-            file: "docs/book/src/setup/linux.md",
-            render: docs::render_unix_fast_command_zone,
-        },
-        Surface {
-            name: "macos-unix-fast",
-            file: "docs/book/src/setup/macos.md",
-            render: docs::render_unix_fast_command_zone,
-        },
-        Surface {
-            name: "hardware-unix-fast",
-            file: "docs/book/src/hardware/subsystem.md",
-            render: docs::render_unix_fast_command_zone,
-        },
-        Surface {
-            name: "windows-prebuilt-guide",
-            file: "docs/book/src/setup/windows.md",
-            render: docs::render_windows_guide,
         },
         Surface {
             name: "containerfile",

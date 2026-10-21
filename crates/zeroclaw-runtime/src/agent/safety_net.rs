@@ -613,7 +613,9 @@ async fn safety_net_thinking_never_leaks_into_draft_or_chunks() {
                     context_token_budget: 100_000,
                     model_context_window_source:
                         zeroclaw_config::schema::ModelContextWindowSource::Configured,
-                },
+                    context_send_budget: 0,
+                    keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
+                                                                                                                                                                                                                                                                      },
                 context_limits_resolver: None,
                 knobs: &crate::agent::loop_::LoopKnobs::default(),
             },
@@ -1028,7 +1030,9 @@ async fn safety_net_task_locals_probe_per_entry_path() {
                             context_token_budget: 100_000,
                             model_context_window_source:
                                 zeroclaw_config::schema::ModelContextWindowSource::Configured,
-                        },
+                            context_send_budget: 0,
+                            keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
+                                                                                                                                                                                                                                                                                                      },
                         context_limits_resolver: None,
                         knobs: &crate::agent::loop_::LoopKnobs::default(),
                     },
@@ -1302,8 +1306,12 @@ async fn safety_net_turn_survives_in_loop_history_pruning() {
     let filler = "x".repeat(400);
     let runtime = zeroclaw_config::schema::ResolvedRuntime {
         // ~40 seeded messages × (100 tokens content + 4 framing) ≫ 500.
-        // Explicit absolute budget keeps proactive trimming at 500.
-        max_context_tokens: Some(500),
+        // A 1% trim threshold on a 50k window keeps proactive trimming at 500.
+        model_context_window: 50_000,
+        context: zeroclaw_config::scattered_types::ContextConfig {
+            trim_threshold_percent: 1,
+            ..Default::default()
+        },
         ..zeroclaw_config::schema::ResolvedRuntime::default()
     };
 

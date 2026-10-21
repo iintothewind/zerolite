@@ -117,7 +117,7 @@ pub struct UpdateInfo {
 /// Fork builds do not self-update from zeroclaw-labs releases.
 fn fork_self_update_disabled() -> Result<()> {
     bail!(
-        "self-update is disabled on this fork build ({}). Build and deploy from source: scripts/dev/build-cli-local.sh",
+        "self-update is disabled on this fork build ({}). Build and deploy from source: docs/maintainers/build-cli-binaries.md",
         env!("CARGO_PKG_VERSION")
     )
 }

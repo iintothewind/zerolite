@@ -27477,12 +27477,15 @@ mod tests {
         use zeroclaw_config::providers::Providers;
         use zeroclaw_config::schema::{AliasedAgentConfig, Config, RuntimeProfileConfig};
 
-        // (runtime_profile.max_context_tokens, provider.context_window, expected)
+        // (context.max_input_tokens, provider.context_window, expected water-line)
+        //
+        // The water-line is `min(model window, input ceiling) × percent / 100`,
+        // so a ceiling and an unknown capacity both bound it.
         let cases: &[(Option<usize>, Option<usize>, u64)] = &[
-            (Some(128_000), None, 128_000), // unknown capacity never caps an explicit budget
-            (Some(128_000), Some(200_000), 128_000),
-            (None, Some(200_000), 32_000), // meter reads profile budget (32k), not provider window
-            (None, None, 32_000),          // hard stub
+            (Some(128_000), None, 25_600),  // unknown capacity (32k stub) × 80%
+            (Some(128_000), Some(200_000), 102_400), // ceiling 128k × 80%
+            (None, Some(200_000), 160_000), // model window 200k × 80%
+            (None, None, 25_600),           // hard stub 32k × 80%
         ];
 
         for (profile, window, expected) in cases {
@@ -27491,7 +27494,10 @@ mod tests {
                 runtime_profiles.insert(
                     "coding".to_string(),
                     RuntimeProfileConfig {
-                        max_context_tokens: Some(*t),
+                        context: zeroclaw_config::scattered_types::ContextConfig {
+                            max_input_tokens: Some(*t),
+                            ..Default::default()
+                        },
                         ..RuntimeProfileConfig::default()
                     },
                 );
@@ -27554,7 +27560,10 @@ mod tests {
         runtime_profiles.insert(
             "coding".to_string(),
             RuntimeProfileConfig {
-                max_context_tokens: Some(800_000), // 80% of 1M
+                context: zeroclaw_config::scattered_types::ContextConfig {
+                    max_input_tokens: Some(800_000),
+                    ..Default::default()
+                },
                 ..RuntimeProfileConfig::default()
             },
         );
@@ -27619,8 +27628,8 @@ mod tests {
 
         assert_eq!(v["params"]["type"], "context_usage");
         assert_eq!(
-            v["params"]["max_context_tokens"], 800_000,
-            "emitted context_usage must carry the runtime-profile trim budget"
+            v["params"]["max_context_tokens"], 640_000,
+            "emitted context_usage must carry the water-line: 80% of the clamped window"
         );
         assert_eq!(
             v["params"]["model_context_window"], 1_000_000,
@@ -27640,7 +27649,10 @@ mod tests {
         runtime_profiles.insert(
             "coding".to_string(),
             RuntimeProfileConfig {
-                max_context_tokens: Some(128_000),
+                context: zeroclaw_config::scattered_types::ContextConfig {
+                    max_input_tokens: Some(128_000),
+                    ..Default::default()
+                },
                 ..RuntimeProfileConfig::default()
             },
         );
@@ -27705,8 +27717,9 @@ mod tests {
 
         assert_eq!(v["params"]["type"], "context_usage");
         assert_eq!(
-            v["params"]["max_context_tokens"], 128_000,
-            "an explicit profile budget is not clamped to the unknown-capacity stub (#10068)"
+            v["params"]["max_context_tokens"], 25_600,
+            "the water-line is 80% of the effective window: the unknown-capacity stub, \
+             clamped by the explicit input ceiling"
         );
         assert!(
             v["params"].get("model_context_window").is_none(),
@@ -27882,7 +27895,10 @@ mod tests {
         runtime_profiles.insert(
             "coding".to_string(),
             RuntimeProfileConfig {
-                max_context_tokens: Some(800_000),
+                context: zeroclaw_config::scattered_types::ContextConfig {
+                    max_input_tokens: Some(800_000),
+                    ..Default::default()
+                },
                 ..RuntimeProfileConfig::default()
             },
         );
@@ -27969,8 +27985,8 @@ mod tests {
         let v = parse(&json);
         assert_eq!(v["params"]["type"], "context_usage");
         assert_eq!(
-            v["params"]["max_context_tokens"], 800_000,
-            "the explicit profile budget survives the same-profile fallback (#10068)"
+            v["params"]["max_context_tokens"], 25_600,
+            "the water-line survives the same-profile fallback: 80% of the effective window"
         );
         assert!(
             v["params"].get("model_context_window").is_none(),
@@ -28180,8 +28196,11 @@ mod tests {
         runtime_profiles.insert(
             "coding".to_string(),
             RuntimeProfileConfig {
-                max_context_tokens,
-                context_compact_ratio: Some(0.9),
+                context: zeroclaw_config::scattered_types::ContextConfig {
+                    max_input_tokens: max_context_tokens,
+                    trim_threshold_percent: 90,
+                    ..Default::default()
+                },
                 ..RuntimeProfileConfig::default()
             },
         );
@@ -28217,20 +28236,20 @@ mod tests {
         );
     }
 
-    /// In ratio mode an explicit `max_context_tokens` value caps the derived
-    /// budget; the model-window helper is unaffected.
+    /// An explicit input ceiling clamps the effective window, so the
+    /// water-line follows it; the model-window helper is unaffected.
     #[test]
-    fn context_usage_max_tokens_clamped_by_explicit_cap() {
+    fn context_usage_max_tokens_clamped_by_explicit_ceiling() {
         let cfg = cfg_with_window_and_cap(Some(200_000), Some(50_000));
         assert_eq!(
             context_usage_max_tokens(&cfg, "coder"),
-            50_000,
-            "explicit max_context_tokens must clamp the budget down"
+            45_000,
+            "the input ceiling clamps the effective window, so the water-line is 50k × 90%"
         );
         assert_eq!(
             context_usage_model_window(&cfg, "coder"),
             200_000,
-            "model window is independent of the absolute budget"
+            "model window is independent of the input ceiling"
         );
     }
 
@@ -28240,14 +28259,20 @@ mod tests {
         cfg.runtime_profiles
             .get_mut("coding")
             .unwrap()
-            .context_compact_ratio = None;
-        assert_eq!(context_usage_max_tokens(&cfg, "coder"), 32_000);
+            .context
+            .trim_threshold_percent = 80;
+        assert_eq!(context_usage_max_tokens(&cfg, "coder"), 160_000);
     }
 
+    /// Trimming can never be disabled: no `[context]` value yields a zero
+    /// water-line.
     #[test]
-    fn context_usage_preserves_zero_disable_sentinel() {
+    fn context_usage_never_reports_a_zero_trim_budget() {
         let cfg = cfg_with_window_and_cap(Some(200_000), Some(0));
-        assert_eq!(context_usage_max_tokens(&cfg, "coder"), 0);
+        assert!(
+            context_usage_max_tokens(&cfg, "coder") > 0,
+            "the trim budget must never be zero: there is no disable switch"
+        );
     }
 
     /// The model-window helper reports the provider `context_window` distinctly
@@ -28295,8 +28320,8 @@ mod tests {
 
         assert_eq!(v["params"]["type"], "context_usage");
         assert_eq!(
-            v["params"]["max_context_tokens"], 50_000,
-            "wire max_context_tokens must carry the (clamped) trim budget"
+            v["params"]["max_context_tokens"], 45_000,
+            "wire max_context_tokens must carry the water-line: 90% of the clamped window"
         );
         assert_eq!(
             v["params"]["model_context_window"], 200_000,
@@ -29469,7 +29494,10 @@ mod tests {
         config.runtime_profiles.insert(
             "default".to_string(),
             zeroclaw_config::schema::RuntimeProfileConfig {
-                max_history_messages: Some(2),
+                context: zeroclaw_config::scattered_types::ContextConfig {
+                    keep_recent_turns: Some(2),
+                    ..Default::default()
+                },
                 ..Default::default()
             },
         );
@@ -31901,7 +31929,10 @@ mod tests {
             config.runtime_profiles.insert(
                 "default".into(),
                 zeroclaw_config::schema::RuntimeProfileConfig {
-                    max_history_messages: Some(1),
+                    context: zeroclaw_config::scattered_types::ContextConfig {
+                        keep_recent_turns: Some(1),
+                        ..Default::default()
+                    },
                     ..Default::default()
                 },
             );
@@ -32442,10 +32473,10 @@ mod tests {
 
         // The limit counts complete turns: keeping one turn retains the
         // newest exchange and drops the older tool-bearing turn whole.
-        let active = crate::agent::history_trim::trim_conversation_to_recent_turns(
+        let active = crate::agent::history_trim::trim_conversation_to_budget(
             durable.clone(),
             1,
-            false,
+            usize::MAX,
         );
         assert!(active.trimmed);
         assert!(!active.history.iter().any(|message| matches!(
@@ -38495,7 +38526,10 @@ mod tests {
         config.runtime_profiles.insert(
             "reloadable".into(),
             zeroclaw_config::schema::RuntimeProfileConfig {
-                max_history_messages: Some(10),
+                context: zeroclaw_config::scattered_types::ContextConfig {
+                    keep_recent_turns: Some(10),
+                    ..Default::default()
+                },
                 ..Default::default()
             },
         );
@@ -38507,7 +38541,7 @@ mod tests {
                 .runtime_profiles
                 .get_mut("reloadable")
                 .expect("runtime profile exists")
-                .max_history_messages = Some(1);
+                .context.keep_recent_turns = Some(1);
         });
 
         let agent = dispatcher

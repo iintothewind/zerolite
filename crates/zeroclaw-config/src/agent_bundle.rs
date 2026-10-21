@@ -538,17 +538,10 @@ pub fn plan_export(config: &Config, alias: &str) -> Result<ExportPlan, ExportErr
     // warning-and-skip edges; following both here preserves the source route.
     // Credentials are scrubbed below, leaving keyless entries for the operator
     // to fill in.
-    let mut model_provider_refs = vec![
+    let model_provider_refs = vec![
         agent.model_provider.trim(),
         agent.classifier_provider.trim(),
     ];
-    // A carried runtime profile can name a summarizer provider of its own,
-    // independently of the agent. `Config::validate()` checks that reference
-    // per profile, so a closure carrying the profile without the provider
-    // fails on the target even though the agent never named it.
-    if let Some(profile) = config.runtime_profiles.get(runtime_alias) {
-        model_provider_refs.push(profile.context_compression.summary_provider.trim());
-    }
     carry_model_provider_closure(
         &mut out,
         &masked_root,
@@ -2428,8 +2421,7 @@ mod tests {
             crate::schema::OpenAITtsProviderConfig::default(),
         );
 
-        let mut profile = RuntimeProfileConfig::default();
-        profile.context_compression.summary_provider = "anthropic.summarizer".into();
+        let profile = RuntimeProfileConfig::default();
         config
             .runtime_profiles
             .insert("standard".to_string(), profile);
@@ -2526,17 +2518,6 @@ mod tests {
                 "agents.researcher.classifier_provider",
             ),
             (
-                "summary provider",
-                |config| {
-                    config
-                        .agents
-                        .get_mut("researcher")
-                        .unwrap()
-                        .summary_provider = "anthropic.gone".into();
-                },
-                "agents.researcher.summary_provider",
-            ),
-            (
                 "tts provider",
                 |config| {
                     config.agents.get_mut("researcher").unwrap().tts_provider =
@@ -2568,19 +2549,6 @@ mod tests {
                     config.agents.get_mut("researcher").unwrap().runtime_profile = "gone".into();
                 },
                 "agents.researcher.runtime_profile",
-            ),
-            (
-                "provider named by a carried runtime profile",
-                |config| {
-                    let mut profile = RuntimeProfileConfig::default();
-                    profile.context_compression.summary_provider = "anthropic.gone".into();
-                    config
-                        .runtime_profiles
-                        .insert("standard".to_string(), profile);
-                    config.agents.get_mut("researcher").unwrap().runtime_profile =
-                        "standard".into();
-                },
-                "runtime_profiles.standard.context_compression.summary_provider",
             ),
             (
                 "skill bundle",
@@ -2629,40 +2597,6 @@ mod tests {
             );
             assert!(text.contains(expected), "{family}: {text}");
         }
-    }
-
-    /// The reference that only exists on the carried profile, never on the
-    /// agent: without it the closure imports a runtime profile pointing at a
-    /// provider the target has never heard of.
-    #[test]
-    fn a_profile_owned_summary_provider_is_carried_and_validates() {
-        let mut config = fixture();
-        config.providers.models.anthropic.insert(
-            "summarizer".to_string(),
-            crate::schema::AnthropicModelProviderConfig::default(),
-        );
-        let mut profile = RuntimeProfileConfig::default();
-        profile.context_compression.summary_provider = "anthropic.summarizer".into();
-        config
-            .runtime_profiles
-            .insert("standard".to_string(), profile);
-        if let Some(agent) = config.agents.get_mut("researcher") {
-            agent.runtime_profile = "standard".into();
-        }
-
-        let plan = plan_export(&config, "researcher").unwrap();
-        assert!(
-            lookup(
-                &plan.config,
-                &["providers", "models", "anthropic", "summarizer"]
-            )
-            .is_some(),
-            "the profile's own summarizer provider is carried"
-        );
-
-        let text = render_config_toml(&plan).unwrap();
-        let imported: Config = toml::from_str(&text).unwrap();
-        imported.validate().expect("closure validates");
     }
 
     #[test]

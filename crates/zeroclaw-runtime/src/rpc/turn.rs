@@ -627,7 +627,9 @@ mod tests {
             model_context_window_source:
                 zeroclaw_config::schema::ModelContextWindowSource::Configured,
             context_token_budget: 150_000,
-        };
+            context_send_budget: 0,
+            keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
+                                                                                                                                                                                                                                      };
         let mut fold = TurnUsageFold::default();
         fold.apply(&usage("a.primary", "m1", None, None, None, true));
         let totals = fold.totals(Some(limits)).expect("a route served the turn");

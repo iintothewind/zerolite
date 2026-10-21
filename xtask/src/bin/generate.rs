@@ -20,19 +20,6 @@ enum Cmd {
         #[arg(long)]
         check: bool,
     },
-    /// Render tracked PR-review policy documentation from its canonical spec.
-    ReviewDocs {
-        /// Regenerate to memory and diff against on-disk; nonzero on drift.
-        /// Writes nothing. This is the focused review-docs drift gate.
-        #[arg(long)]
-        check: bool,
-    },
-    /// Render the source-backed SOP syntax reference.
-    SopSyntax {
-        /// Regenerate to memory and diff against on-disk; nonzero on drift.
-        #[arg(long)]
-        check: bool,
-    },
     /// Print the resolved feature list for a build selection, comma-joined.
     /// Surfaces and CI consume this instead of hardcoding feature names.
     Features {
@@ -53,8 +40,6 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Cmd::Installers { targets, check } => xtask::generate::run(&targets, check),
-        Cmd::ReviewDocs { check } => xtask::generate::review_docs::run(check),
-        Cmd::SopSyntax { check } => xtask::generate::sop_syntax::run(check),
         Cmd::Features {
             selection,
             target,

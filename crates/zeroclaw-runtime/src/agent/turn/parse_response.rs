@@ -918,7 +918,9 @@ mod cost_usd_regression_tests {
                 context_token_budget: 32_000,
                 model_context_window_source:
                     zeroclaw_config::schema::ModelContextWindowSource::Configured,
-            },
+                context_send_budget: 0,
+                keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
+                                                                                                                                                                                                                                                    },
             temperature: None,
             approval: None,
             channel_name: "",

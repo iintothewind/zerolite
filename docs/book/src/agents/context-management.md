@@ -1,5 +1,118 @@
 # Context management
 
+> **Status: specification.** This page defines ZeroLite's context-management
+> semantics. The code conforms to this page, not the other way round. Where
+> upstream ZeroClaw differs, upstream is the one that is different — see the
+> decision record (§1) and the merge guideline (§2) below.
+
+## 1. Decision record: why these semantics
+
+ZeroLite's context management is an independent design, not a modified copy
+of upstream's. The two diverged from a common ancestor and evolved
+separately; neither is a bug-fixed version of the other.
+The semantics on this page rest on six reasons. They are the actual grounds
+for the decisions — a future change that cannot answer them has not made its
+case.
+
+- **R1 — Cache economics come first.** Replaying the message prefix to a
+  provider is the dominant cost of a turn: every byte that changes forces a
+  re-prefill, in latency and in money, and on local inference prefill is the
+  slowest part of the pipeline. Every decision below is subordinate to
+  keeping the replayed prefix byte-stable. This is also why the runtime never
+  injects wall-clock time or other per-turn noise into the prefix (see
+  "Locked prompt / catalog decisions").
+- **R2 — The window is a property of the model, not of the config file.**
+  The selected model can change mid-session — routing, a provider fallback, a
+  user switching models. A budget written as an absolute token count is tuned
+  for one model and silently wrong for the next. Budgets are therefore
+  derived from the effective window (a percentage, a reserve), so they travel
+  with the model.
+- **R3 — One decision, one knob.** If two settings can each change the same
+  outcome, the operator cannot tell which one is in effect, and incoherent
+  combinations become representable. Context policy therefore lives in
+  exactly one table, each field with exactly one job.
+- **R4 — Fail loud, never silently pretend.** A trim that did not happen must
+  not look like one that did, and a request that cannot fit must fail where
+  the cause is known, not later at the provider as an opaque error. There is
+  no "disable trimming" switch and no silent no-op: both defer a knowable
+  failure to a place where it cannot be diagnosed.
+- **R5 — The provider's reported size is ground truth.** A local estimate
+  cannot account for tool schemas, multimodal payloads, or tokenizer
+  differences, so it drifts from what the provider actually charges for.
+  Sizing decisions anchor on the provider-reported `usage.input_tokens` and
+  price only the not-yet-billed tail locally.
+- **R6 — Retention is by dropping, never by rewriting.** History is retained
+  or dropped in whole turns only. Summarization-based compaction rewrites
+  the record: it destroys the byte-stable prefix (R1), inserts model-written
+  text into history as if it were fact, costs an extra model call, and its
+  errors compound invisibly. Dropping whole turns is lossy but honest, and
+  the surviving turns remain exactl| # | Upstream | ZeroLite (this page) | Grounded in |
+| --- | --- | --- | --- |
+| 1 | One resolved number, `context_token_budget`, serves as **both** the proactive-trim trigger and the fit target. It is absolute by default (`max_context_tokens`, else the 32k legacy default); `context_compact_ratio` can derive it from the window, but in every mode the same number does both jobs | Two different numbers derived from the effective window: the **water-line** (`min(window × trim_threshold_percent/100, window − reserve_tokens)`) decides when trimming engages; the **send / fit budget** (`window − reserve_tokens`) decides whether the retained set is small enough | R2, R3 — conflating the two roles makes "engage early, fit later" inexpressible |
+| 2 | No keep-N preference: `trim_to_recent_turns(budget)` keeps whatever fits the budget | `keep_recent_turns` is the **preferred** whole-turn retention; if those turns do not fit, the runtime **cascades** down to `kept_turns == 1` | The preference is the operator's (a stable working memory across models); the cascade is the runtime's. Budget-only retention makes retained history a pure function of the budget, so the same conversation keeps wildly different amounts of context on different models |
+| 3 | Five layered knobs on the runtime profile — `max_history_messages`, `max_context_tokens`, `context_compact_ratio`, `history_pruning.*`, `context_compression.*` — combined by a `min()` chain in which any one can become the binding constraint | **One** table, `[runtime_profiles.<alias>.context]`, four fields, each with exactly one job | R3 |
+| 4 | `max_context_tokens = Some(0)` is a sentinel that disables proactive trimming (upstream's own comment: "Preserve zero as the explicit proactive-trimming disable sentinel") | No disable switch. Trimming is always on; every field has a non-zero default | R4 — a disabled trim silently lets the request exceed the window and fail at the provider |
+| 5 | `max_context_tokens` can cap the *budget*, but the model window itself cannot be clamped by an operator ceiling, so the utilization meter's denominator is whatever the provider or table claims | `max_input_tokens` clamps the effective window: `model_window.min(max_input_tokens)`; the clamped window is also the meter denominator | Without a clamp, an operator whose provider reports an unknown or inflated window has no way to bound it, and the meter is dishonest |
+| 6 | No output-reserve concept in context policy | `reserve_tokens` bounds the water-line from above **and** defines the send budget | Without a reserve, a successful trim can leave no room for the model's own output, and the request fails immediately after |
+| 7 | No `ContextCalibration`. A reported-budget trim path exists (`trim_to_reported_budget`) that proportionally scales a local estimate by the reported/estimated ratio — but the proactive trigger is sized from the local estimate alone | `ContextCalibration` re-anchors on the provider-reported `usage.input_tokens`; only the unbilled tail is priced locally. The calibrated size feeds **both** the trigger measurement and the trim | R5 — proportional scaling preserves the local estimate's error; anchoring replaces it at the anchor point |
+| 8 | A trim that cannot fit is a silent no-op: even with only the floor remaining and still over budget, the trim returns the oversized history unchanged with `trimmed: false` and no error | A floor that cannot fit is a **hard failure**: an error to the caller, and **no** `HistoryTrimmed` notice | R4 |
+| 9 | `context_compression.*`: summarization-based compaction rewrites older history into a model-written summary | Removed entirely. There is no summarization anywhere in the retention path | R6, R1 | is no summarization anywhere in the retention path | R6, R1 |
+
+The practical consequence: **`[runtime_profiles.<alias>.context]` is the
+only place context policy is configured.** A knob that appears in upstream
+and not here was not overlooked; absent a new decision record that answers
+R1–R6, it was rejected.
+
+## 2. Merge guideline
+
+**The rule has two lanes, decided by whether ZeroLite has decided the
+question before:**
+
+- **A prior ZeroLite decision covers it → apply that decision directly.**
+  Decisions already made — in §1, in "Locked prompt / catalog decisions", or
+  in any other recorded fork decision — are precedent. When an upstream
+  change conflicts with one, the upstream change does not enter the merge
+  and the fork behavior stays, without re-argument and without escalation:
+  the question is already answered. Do not "adapt" fork code to upstream
+  semantics, and do not re-introduce an upstream knob under a fork name. A
+  one-line entry in the merge report (upstream commit, file, decision
+  number, "skipped per §1 #N") is the whole procedure.
+- **No prior decision covers it — it is new semantics → report it.** An
+  upstream change that introduces semantics ZeroLite has never decided (a
+  new knob, a new retention mechanism, a new failure behavior) is not the
+  merge agent's to accept or to reject. It does not enter the merge. Report
+  it to the maintainer: the upstream commit, what the new semantics is, and
+  what adopting or refusing it would change. The maintainer decides; the
+  outcome is written into §1, after which it is precedent and the first lane
+  applies. When it is unclear whether a prior decision covers a case, treat
+  it as new semantics and report — silence is not a decision.
+
+What counts as semantics: the config surface and the meaning of a field; the
+trim trigger and the fit target; the retention policy (what is kept, in what
+units); failure behavior on an un-fittable floor; how context size is
+measured; and every "Locked prompt / catalog decisions" item. The semantic
+surface to watch is (paths as of writing; the semantics, not the paths, are
+the invariant):
+`crates/zeroclaw-config/src/scattered_types.rs` (`ContextConfig`),
+`crates/zeroclaw-config/src/schema.rs` (runtime resolution and validation),
+`crates/zeroclaw-config/src/context_window.rs`,
+`crates/zeroclaw-runtime/src/agent/history.rs` (estimates),
+`crates/zeroclaw-runtime/src/agent/history_trim.rs`, and
+`crates/zeroclaw-runtime/src/agent/turn/context*.rs`.
+
+- **What may merge freely.** Anything that touches no semantics at all —
+  bug fixes, providers, channels, security, performance — including changes
+  inside the same files, as long as the decisions above are preserved.
+- **Post-merge check.** A type, table, or test surviving a merge does not
+  prove the semantics survived — this has already happened once:
+  `ContextConfig` still parsed and its unit tests still passed while no
+  runtime code read it. Verify the resolution path actually consumes the fork config: the
+  invariants are that `[context]` is the only effective config surface, the
+  water-line differs from the send budget, keep-N cascades to a floor of 1
+  and hard-fails there, trimming cannot be disabled, size is anchored by
+  `ContextCalibration`, and no summarization compaction exists in the
+  retention path.
+
 Context management in ZeroClaw is, at its core, **cache management**. Every
 byte that changes in the message prefix replayed to a provider forces that
 provider to re-prefill the prefix, which costs both latency and money. The

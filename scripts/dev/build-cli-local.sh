@@ -13,6 +13,7 @@
 #   scripts/dev/build-cli-local.sh --target aarch64-unknown-linux-gnu
 #   scripts/dev/build-cli-local.sh --target x86_64-unknown-linux-gnu
 #   scripts/dev/build-cli-local.sh --skip-web   # ONLY when web/dist is already fresh
+#   scripts/dev/build-cli-local.sh --plugins-wasm  # add the WASM plugin host (zeroclaw plugin)
 #
 # Pipeline (always, unless --skip-web):
 #   1. wipe web/dist (keep .gitkeep)
@@ -29,7 +30,7 @@
 #   dist/bin/<target>/zeroclaw          (via collect-dist.sh)
 # cargo's target/<target>/release/zeroclaw is removed on exit (success or fail).
 #
-# Docs: see AGENTS.md rule 12
+# Docs: docs/maintainers/build-cli-local.md
 #
 # Windows: always run under Git Bash (not WSL). WSL's `bash` does not see
 # Windows `cargo.exe` as `cargo`, and Docker volume mounts from WSL vs
@@ -106,6 +107,10 @@ set -euo pipefail
 
 TARGET="aarch64-unknown-linux-gnu"
 SKIP_WEB=0
+# Build the WASM plugin host into the binary: without it `zeroclaw plugin` is
+# absent, and .cwasm packages cannot load. Keep it optional so an ARM32 target
+# can still build (Cranelift is unavailable there).
+PLUGINS_WASM=0
 RUST_IMAGE="${ZEROCLAW_RUST_IMAGE:-rust:1-bookworm}"
 
 while [ $# -gt 0 ]; do
@@ -113,6 +118,7 @@ while [ $# -gt 0 ]; do
     --target)   TARGET="${2:-}"; shift 2 ;;
     --target=*) TARGET="${1#*=}"; shift ;;
     --skip-web) SKIP_WEB=1; shift ;;
+    --plugins-wasm) PLUGINS_WASM=1; shift ;;
     --image)    RUST_IMAGE="${2:-}"; shift 2 ;;
     --image=*)  RUST_IMAGE="${1#*=}"; shift ;;
     -h|--help)
@@ -214,6 +220,9 @@ echo "    web fingerprint: $FINGERPRINT"
 # default features do NOT include embedded-web. Passing it explicitly is what
 # makes include_dir!("…/web/dist") compile into the binary.
 FEATURES="embedded-web"
+if [ "$PLUGINS_WASM" -eq 1 ]; then
+  FEATURES="$FEATURES,plugins-wasm-cranelift"
+fi
 
 DOCKER_ENV=(-e "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc")
 APT_PKGS="gcc-aarch64-linux-gnu g++-aarch64-linux-gnu"

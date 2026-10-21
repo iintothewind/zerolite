@@ -2649,7 +2649,8 @@ mod tests {
             .runtime_profiles
             .get_mut(TEST_AGENT)
             .unwrap()
-            .max_context_tokens = Some(0);
+            .context
+            .trim_threshold_percent = 1;
         let security = test_security(&config);
         let mut job = test_job("");
         job.job_type = JobType::Agent;

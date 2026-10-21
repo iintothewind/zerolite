@@ -4,7 +4,7 @@ exclude = ["vendor/crossterm-0.29.0"]
 resolver = "2"
 
 [workspace.package]
-version = "1.1.0"
+version = "1.2.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/zeroclaw-labs/zeroclaw"
@@ -12,30 +12,30 @@ homepage = "https://www.zeroclaw.com"
 rust-version = "1.96.0"
 
 [workspace.dependencies]
-zeroclaw-api = { path = "crates/zeroclaw-api", version = "1.1.0" }
-zeroclaw-infra = { path = "crates/zeroclaw-infra", version = "1.1.0" }
-zeroclaw-config = { path = "crates/zeroclaw-config", version = "1.1.0", default-features = false }
-zeroclaw-context = { path = "crates/zeroclaw-context", version = "1.1.0" }
-zeroclaw-dist = { path = "crates/zeroclaw-dist", version = "1.1.0" }
-zeroclaw-log = { path = "crates/zeroclaw-log", version = "1.1.0" }
-zeroclaw-tls = { path = "crates/zeroclaw-tls", version = "1.1.0" }
-zeroclaw-relay-proto = { path = "crates/zeroclaw-relay-proto", version = "1.1.0" }
-zerorelay = { path = "apps/zerorelay", version = "1.1.0" }
-zeroclaw-spawn = { path = "crates/zeroclaw-spawn", version = "1.1.0" }
-zeroclaw-commands = { path = "crates/zeroclaw-commands", version = "1.1.0" }
-zeroclaw-providers = { path = "crates/zeroclaw-providers", version = "1.1.0" }
-zeroclaw-memory = { path = "crates/zeroclaw-memory", version = "1.1.0" }
-zeroclaw-channels = { path = "crates/zeroclaw-channels", version = "1.1.0", default-features = false }
-zeroclaw-tools = { path = "crates/zeroclaw-tools", version = "1.1.0" }
-zeroclaw-sop-graph = { path = "crates/zeroclaw-sop-graph", version = "1.1.0", default-features = false }
-zeroclaw-runtime = { path = "crates/zeroclaw-runtime", version = "1.1.0", default-features = false }
-zeroclaw-eval = { path = "crates/zeroclaw-eval", version = "1.1.0" }
-zeroclaw-plugins = { path = "crates/zeroclaw-plugins", version = "1.1.0" }
-zeroclaw-gateway = { path = "crates/zeroclaw-gateway", version = "1.1.0" }
-zeroclaw-hardware = { path = "crates/zeroclaw-hardware", version = "1.1.0" }
-zeroclaw-tool-call-parser = { path = "crates/zeroclaw-tool-call-parser", version = "1.1.0" }
-zeroclaw-macros = { path = "crates/zeroclaw-macros", version = "1.1.0" }
-zerocode = { path = "apps/zerocode", version = "1.1.0" }
+zeroclaw-api = { path = "crates/zeroclaw-api", version = "1.2.0" }
+zeroclaw-infra = { path = "crates/zeroclaw-infra", version = "1.2.0" }
+zeroclaw-config = { path = "crates/zeroclaw-config", version = "1.2.0", default-features = false }
+zeroclaw-context = { path = "crates/zeroclaw-context", version = "1.2.0" }
+zeroclaw-dist = { path = "crates/zeroclaw-dist", version = "1.2.0" }
+zeroclaw-log = { path = "crates/zeroclaw-log", version = "1.2.0" }
+zeroclaw-tls = { path = "crates/zeroclaw-tls", version = "1.2.0" }
+zeroclaw-relay-proto = { path = "crates/zeroclaw-relay-proto", version = "1.2.0" }
+zerorelay = { path = "apps/zerorelay", version = "1.2.0" }
+zeroclaw-spawn = { path = "crates/zeroclaw-spawn", version = "1.2.0" }
+zeroclaw-commands = { path = "crates/zeroclaw-commands", version = "1.2.0" }
+zeroclaw-providers = { path = "crates/zeroclaw-providers", version = "1.2.0" }
+zeroclaw-memory = { path = "crates/zeroclaw-memory", version = "1.2.0" }
+zeroclaw-channels = { path = "crates/zeroclaw-channels", version = "1.2.0", default-features = false }
+zeroclaw-tools = { path = "crates/zeroclaw-tools", version = "1.2.0" }
+zeroclaw-sop-graph = { path = "crates/zeroclaw-sop-graph", version = "1.2.0", default-features = false }
+zeroclaw-runtime = { path = "crates/zeroclaw-runtime", version = "1.2.0", default-features = false }
+zeroclaw-eval = { path = "crates/zeroclaw-eval", version = "1.2.0" }
+zeroclaw-plugins = { path = "crates/zeroclaw-plugins", version = "1.2.0" }
+zeroclaw-gateway = { path = "crates/zeroclaw-gateway", version = "1.2.0" }
+zeroclaw-hardware = { path = "crates/zeroclaw-hardware", version = "1.2.0" }
+zeroclaw-tool-call-parser = { path = "crates/zeroclaw-tool-call-parser", version = "1.2.0" }
+zeroclaw-macros = { path = "crates/zeroclaw-macros", version = "1.2.0" }
+zerocode = { path = "apps/zerocode", version = "1.2.0" }
 directories = "6.0"
 sys-locale = "0.3"
 hmac = "0.12"
@@ -120,6 +120,9 @@ serde_json = { version = "1.0", default-features = false, features = ["std"] }
 # Config
 directories = "6.0"
 toml = "1.0"
+
+# Version precedence for the `plugin update` notice about an older version
+semver = { version = "1.0", optional = true }
 
 # JSON Schema generation for config export
 schemars = { version = "1.2", optional = true }
@@ -353,6 +356,7 @@ sandbox-bubblewrap = ["zeroclaw-runtime/sandbox-bubblewrap"]
 browser-native = ["zeroclaw-tools/browser-native"]
 plugins-wasm = [
     "dep:zeroclaw-plugins",
+    "dep:semver",
     "zeroclaw-runtime/plugins-wasm",
     "zeroclaw-gateway?/plugins-wasm",
 ]

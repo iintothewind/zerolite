@@ -4020,16 +4020,8 @@ fn append_sender_turn(
         );
     }
 
-    // Use the user-configured max_history_messages (fall back to
-    // MAX_CHANNEL_HISTORY when the config value is 0 or absent).
-    let max_history = {
-        let configured = ctx.agent_cfg.resolved.max_history_messages;
-        if configured > 0 {
-            configured
-        } else {
-            MAX_CHANNEL_HISTORY
-        }
-    };
+    // Channel message-row cache bound is independent of model-side trim.
+    let max_history = MAX_CHANNEL_HISTORY;
 
     let mut histories = ctx
         .conversation_histories
@@ -18217,7 +18209,10 @@ fn test_channel_ctx_with_backend_channel_and_provider(
     prompt_config.runtime_profiles.insert(
         "test".to_string(),
         zeroclaw_config::schema::RuntimeProfileConfig {
-            max_context_tokens: Some(context_token_budget),
+            context: zeroclaw_config::scattered_types::ContextConfig {
+                max_input_tokens: Some(context_token_budget),
+                ..Default::default()
+            },
             ..Default::default()
         },
     );
@@ -24180,9 +24175,9 @@ api_key = "anthropic-key"
 
     #[test]
     fn hydration_fails_closed_on_a_corrupt_breadcrumb_sidecar_on_disk() {
-        // Exercises the real `SessionStore::get_trim_breadcrumb` (not a
+        // Exercises the real `SessionStore::get_session_trim_breadcrumb` (not a
         // simulated failure): a sidecar that is empty, holds an unrecognized
-        // byte, or has trailing garbage is not a value `set_trim_breadcrumb`
+        // byte, or has trailing garbage is not a value `set_session_trim_breadcrumb`
         // ever wrote, so it must surface as an `Err` and hydration must fail
         // closed on it rather than treating it as "no record" and falling
         // back to a text guess.
@@ -24196,7 +24191,7 @@ api_key = "anthropic-key"
             store
                 .append(&sender, &ChatMessage::assistant("ok"))
                 .unwrap();
-            store.set_trim_breadcrumb(&sender, true).unwrap();
+            store.set_session_trim_breadcrumb(&sender, true).unwrap();
 
             let sidecar_path = tmp.path().join("sessions").join(format!(
                 "{}.trim_breadcrumb",
@@ -24205,7 +24200,7 @@ api_key = "anthropic-key"
             std::fs::write(&sidecar_path, corrupt_contents).unwrap();
 
             assert!(
-                store.get_trim_breadcrumb(&sender).is_err(),
+                store.get_session_trim_breadcrumb(&sender).is_err(),
                 "corrupt sidecar {corrupt_contents:?} must not read as a verified flag"
             );
 
@@ -31743,8 +31738,11 @@ BTC is currently around $65,000 based on latest tool output."#
             cfg.runtime_profiles.insert(
                 "trim-switch".to_string(),
                 zeroclaw_config::schema::RuntimeProfileConfig {
-                    max_context_tokens: Some(8_000),
-                    ..Default::default()
+                    context: zeroclaw_config::scattered_types::ContextConfig {
+                        max_input_tokens: Some(8_000),
+                        ..Default::default()
+                    },
+                    ..zeroclaw_config::schema::RuntimeProfileConfig::default()
                 },
             );
             cfg.agents.insert(
@@ -41243,7 +41241,10 @@ BTC is currently around $65,000 based on latest tool output."#
         cfg.runtime_profiles.insert(
             "ratio".to_string(),
             RuntimeProfileConfig {
-                context_compact_ratio: Some(0.9),
+                context: zeroclaw_config::scattered_types::ContextConfig {
+                    trim_threshold_percent: 90,
+                    ..Default::default()
+                },
                 ..RuntimeProfileConfig::default()
             },
         );
