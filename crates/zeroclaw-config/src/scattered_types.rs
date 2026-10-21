@@ -191,12 +191,15 @@ fn default_trim_threshold_percent() -> usize {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "agent.context"]
 pub struct ContextConfig {
-    /// Hard ceiling on total request input tokens. `None` means "no explicit
-    /// ceiling": the effective context window is the sole limit. This is the
-    /// only override knob for providers whose real window is unknown — it is
-    /// a ceiling, and does NOT trigger trimming by itself.
+    /// The configured ceiling on total request input tokens. `None` means "no
+    /// explicit ceiling": the model's own context window is the sole limit.
+    ///
+    /// This is a CEILING, not a window: it clamps the effective context
+    /// window down (`effective_context_window = model_window.min(ceiling)`)
+    /// and therefore also clamps the meter denominator. It never widens the
+    /// window, and it does NOT trigger trimming by itself.
     #[serde(default)]
-    pub max_input_tokens: Option<usize>,
+    pub request_token_ceiling: Option<usize>,
     /// Percentage of the effective context window at which history trimming
     /// engages. Must be in `1..=100`; invalid values are a hard config error.
     /// Default: [`DEFAULT_CONTEXT_TRIM_THRESHOLD_PERCENT`].
@@ -256,7 +259,7 @@ impl ContextConfig {
 impl Default for ContextConfig {
     fn default() -> Self {
         Self {
-            max_input_tokens: None,
+            request_token_ceiling: None,
             trim_threshold_percent: default_trim_threshold_percent(),
             reserve_tokens: None,
             keep_recent_turns: None,
@@ -854,7 +857,7 @@ mod tests {
             cfg.trim_threshold_percent,
             DEFAULT_CONTEXT_TRIM_THRESHOLD_PERCENT
         );
-        assert_eq!(cfg.max_input_tokens, None);
+        assert_eq!(cfg.request_token_ceiling, None);
         assert_eq!(cfg.reserve_tokens, None);
         assert!(cfg.out_of_range_fields().is_empty());
     }
@@ -881,10 +884,10 @@ mod tests {
     #[test]
     fn context_config_deserializes_from_toml() {
         let cfg: ContextConfig = toml::from_str(
-            "max_input_tokens = 200000\ntrim_threshold_percent = 90\nreserve_tokens = 16384\n",
+            "request_token_ceiling = 200000\ntrim_threshold_percent = 90\nreserve_tokens = 16384\n",
         )
         .expect("valid context TOML");
-        assert_eq!(cfg.max_input_tokens, Some(200_000));
+        assert_eq!(cfg.request_token_ceiling, Some(200_000));
         assert_eq!(cfg.trim_threshold_percent, 90);
         assert_eq!(cfg.reserve_tokens, Some(16_384));
 
@@ -894,7 +897,7 @@ mod tests {
             cfg.trim_threshold_percent,
             DEFAULT_CONTEXT_TRIM_THRESHOLD_PERCENT
         );
-        assert_eq!(cfg.max_input_tokens, None);
+        assert_eq!(cfg.request_token_ceiling, None);
     }
 
     #[test]

@@ -442,6 +442,9 @@ pub(crate) async fn record_accepted_chat_response(
                     .context_limits
                     .configured_model_context_window()
                     .map(|tokens| tokens as u64),
+                effective_context_window: Some(
+                    ctx.context_limits.effective_context_window() as u64,
+                ),
                 provider_ref: effective_provider.to_string(),
                 model: effective_model.to_string(),
                 accepted: true,
@@ -920,7 +923,8 @@ mod cost_usd_regression_tests {
                     zeroclaw_config::schema::ModelContextWindowSource::Configured,
                 context_send_budget: 0,
                 keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
-                                                                                                                                                                                                                                                    },
+                request_token_ceiling: None,
+                                                                                                                                                                                                                                                                                                                                                                                            },
             temperature: None,
             approval: None,
             channel_name: "",

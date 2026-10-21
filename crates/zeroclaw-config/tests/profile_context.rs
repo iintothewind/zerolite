@@ -7,7 +7,7 @@ const PROFILE_CONTEXT_TOML: &str = r#"
 schema_version = 4
 
 [runtime_profiles.coder.context]
-max_input_tokens = 100_000
+request_token_ceiling = 100_000
 trim_threshold_percent = 80
 reserve_tokens = 16_384
 keep_recent_turns = 5
@@ -27,7 +27,7 @@ fn profile_config() -> Config {
 fn profile_context_table_deserializes_into_its_own_field() {
     let cfg = profile_config();
     let context = &cfg.runtime_profiles["coder"].context;
-    assert_eq!(context.max_input_tokens, Some(100_000));
+    assert_eq!(context.request_token_ceiling, Some(100_000));
     assert_eq!(context.trim_threshold_percent, 80);
     assert_eq!(context.reserve_tokens, Some(16_384));
     assert_eq!(context.keep_recent_turns, Some(5));
@@ -39,7 +39,7 @@ fn profile_context_round_trips_to_the_same_toml_shape() {
     let serialized = toml::to_string(&cfg).expect("the config serializes");
     let reparsed: Config = toml::from_str(&serialized).expect("the serialized config parses back");
     assert_eq!(
-        reparsed.runtime_profiles["coder"].context.max_input_tokens,
+        reparsed.runtime_profiles["coder"].context.request_token_ceiling,
         Some(100_000)
     );
     assert_eq!(
@@ -73,7 +73,7 @@ risk_profile = "default"
     )
     .expect("a config without a context table parses");
     let context = cfg.effective_context_config("coder");
-    assert_eq!(context.max_input_tokens, None);
+    assert_eq!(context.request_token_ceiling, None);
     assert_eq!(context.trim_threshold_percent, 80);
     assert_eq!(context.reserve_tokens, None);
     assert_eq!(context.keep_recent_turns, None);
@@ -137,7 +137,7 @@ fn the_input_ceiling_clamps_the_effective_context_window() {
         .resolved;
     // The model window is unknown here, so the ceiling is the binding limit.
     assert!(resolved.effective_context_window() <= 100_000);
-    assert_eq!(resolved.context.max_input_tokens, Some(100_000));
+    assert_eq!(resolved.context.request_token_ceiling, Some(100_000));
 }
 
 #[test]
@@ -206,7 +206,7 @@ fn no_context_value_disables_trimming() {
                 .expect("the profile exists")
                 .context;
             context.trim_threshold_percent = percent;
-            context.max_input_tokens = ceiling;
+            context.request_token_ceiling = ceiling;
             context.reserve_tokens = None;
             let resolved = cfg
                 .resolved_agent_config("coder")

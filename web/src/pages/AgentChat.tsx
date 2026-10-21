@@ -108,7 +108,8 @@ export function AgentChatInner({
     abortSession,
     pendingApproval,
     respondToApproval,
-    contextMaxTokens,
+    contextEffectiveWindow,
+    contextWaterlineTokens,
     contextInputTokens,
     liveStats,
     liveTurn,
@@ -985,7 +986,8 @@ export function AgentChatInner({
           inputRef={inputRef}
           fileInputRef={fileInputRef}
           contextInputTokens={contextInputTokens}
-          contextMaxTokens={contextMaxTokens}
+          contextEffectiveWindow={contextEffectiveWindow}
+          contextWaterlineTokens={contextWaterlineTokens}
           liveStats={liveStats}
           onInputChange={handleTextareaChange}
           onKeyDown={handleKeyDown}

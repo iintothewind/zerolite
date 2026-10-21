@@ -184,6 +184,11 @@ pub enum TurnEvent {
         /// `None` means the runtime used the compatibility fallback because no
         /// authoritative capacity was configured.
         model_context_window: Option<u64>,
+        /// The effective context window for that route: the model's capacity
+        /// clamped by the configured input ceiling. This is the meter
+        /// denominator — the population the request is actually measured
+        /// against, and the ceiling the model side enforces.
+        effective_context_window: Option<u64>,
         /// The `<type>.<alias>` config reference of the provider that served
         /// this call. Used for accurate context window resolution and cost
         /// attribution when vision routing or provider switches are active.

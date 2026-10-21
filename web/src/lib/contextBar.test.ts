@@ -3,8 +3,9 @@ import test from 'node:test';
 
 import { resolveContextBarState } from './contextBar.ts';
 
-test('uses model window as denominator and marks the trim budget', () => {
-  const state = resolveContextBarState(180_000, 200_000, 100_000);
+test('uses the effective window as denominator and marks the water-line', () => {
+  // (effectiveWindow, waterlineTokens, used)
+  const state = resolveContextBarState(200_000, 180_000, 100_000);
   assert.ok(state);
   assert.equal(state.denominator, 200_000);
   assert.equal(state.percent, 50);
@@ -12,18 +13,15 @@ test('uses model window as denominator and marks the trim budget', () => {
   assert.equal(state.cells[14], '│');
 });
 
-test('falls back to the legacy absolute budget when capacity is absent', () => {
-  const state = resolveContextBarState(32_000, null, 16_000);
+test('a water-line at the effective window has no marker', () => {
+  const state = resolveContextBarState(32_000, 32_000, 16_000);
   assert.ok(state);
   assert.equal(state.denominator, 32_000);
   assert.equal(state.percent, 50);
   assert.equal(state.trimMarkerIndex, null);
 });
 
-test('zero disable sentinel does not fabricate a denominator', () => {
+test('no effective window fabricates no denominator', () => {
   assert.equal(resolveContextBarState(0, null, 100), null);
-  const state = resolveContextBarState(0, 8_000, 100);
-  assert.ok(state);
-  assert.equal(state.denominator, 8_000);
-  assert.equal(state.trimMarkerIndex, null);
+  assert.equal(resolveContextBarState(null, null, 100), null);
 });

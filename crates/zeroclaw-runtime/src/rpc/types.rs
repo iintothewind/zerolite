@@ -1750,12 +1750,12 @@ pub enum SessionUpdateEvent {
         timeout_secs: u64,
     },
     /// Per-LLM-call token usage. `input_tokens` is the cumulative context size
-    /// for this turn. `max_context_tokens` is the preemptive-trim budget (the
-    /// resolved `effective_context_budget`), preserving its original meaning as
-    /// the value the meter fills toward. `model_context_window` is the model's
-    /// full context window (provider `context_window`), exposed distinctly so a
-    /// client can render capacity and budget separately. Any may be absent when
-    /// the provider doesn't report usage or the value can't be resolved.
+    /// for this turn. `max_context_tokens` is the WATER-LINE — the token count
+    /// at which proactive trimming engages. `model_context_window` is the
+    /// model's own capacity (provider `context_window`). `effective_context_window`
+    /// is the effective window (`model_window.min(request_token_ceiling)`) and
+    /// is the meter denominator. Any may be absent when the provider doesn't
+    /// report usage or the value can't be resolved.
     ///
     /// `input_tokens_source` states where `input_tokens` came from. It is
     /// `provider` for a provider-reported count and `estimate` when the
@@ -1772,6 +1772,8 @@ pub enum SessionUpdateEvent {
         max_context_tokens: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model_context_window: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effective_context_window: Option<u64>,
     },
     /// Emitted when the TodoWrite tool produces a plan. The `entries` array
     /// carries the normalized `PlanEntry` values (content, status, priority,
@@ -1926,12 +1928,18 @@ rpc_type! {
         pub model: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub last_input_tokens: Option<u64>,
-        /// Proactive-trim budget of the serving route.
+        /// The water-line of the serving route: where proactive trimming
+        /// engages. A trigger, not a limit.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub max_context_tokens: Option<u64>,
         /// Configured context window of the serving model.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub model_context_window: Option<u64>,
+        /// The effective context window of the serving route: the model's
+        /// capacity clamped by `[context].request_token_ceiling`. The meter
+        /// denominator.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub effective_context_window: Option<u64>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub usage_by_provider: Vec<ProviderUsageTotals>,
     }
@@ -2313,7 +2321,9 @@ mod tests {
                 last_input_tokens: Some(10),
                 max_context_tokens: Some(8000),
                 model_context_window: Some(128_000),
-                usage_by_provider: vec![ProviderUsageTotals {
+
+                effective_context_window: None,
+                                usage_by_provider: vec![ProviderUsageTotals {
                     provider_ref: "openai.default".into(),
                     model: "small".into(),
                     input_tokens: 10,

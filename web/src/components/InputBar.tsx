@@ -20,7 +20,10 @@ interface InputBarProps {
   inputRef: RefObject<HTMLTextAreaElement | null>;
   fileInputRef: RefObject<HTMLInputElement | null>;
   contextInputTokens: number | null;
-  contextMaxTokens: number | null;
+  /** The effective context window: the meter denominator. */
+  contextEffectiveWindow: number | null;
+  /** The water-line: where proactive trimming engages. A trigger, not a limit. */
+  contextWaterlineTokens: number | null;
   liveStats: LiveStats;
   onInputChange: (e: ChangeEvent<HTMLTextAreaElement>) => void;
   onKeyDown: (e: KeyboardEvent<HTMLTextAreaElement>) => void;
@@ -45,7 +48,8 @@ export function InputBar(props: InputBarProps) {
     inputRef,
     fileInputRef,
     contextInputTokens,
-    contextMaxTokens,
+    contextEffectiveWindow,
+    contextWaterlineTokens,
     liveStats,
     onInputChange,
     onKeyDown,
@@ -132,7 +136,11 @@ export function InputBar(props: InputBarProps) {
             <SessionStatsRow stats={liveStats} compact />
           </div>
           <div className={css.trailing}>
-            <ContextRing used={contextInputTokens} max={contextMaxTokens} />
+            <ContextRing
+              used={contextInputTokens}
+              max={contextEffectiveWindow}
+              waterline={contextWaterlineTokens}
+            />
             {typing ? (
               <button
                 type="button"

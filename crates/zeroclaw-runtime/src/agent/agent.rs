@@ -10821,7 +10821,8 @@ mod tests {
                     zeroclaw_config::schema::ModelContextWindowSource::Configured,
                 context_send_budget: 0,
                 keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
-            }
+                request_token_ceiling: None,
+                                                                                                                                                                                                                                                                                                                                                                                              }
         }));
 
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
@@ -10849,6 +10850,9 @@ mod tests {
             TurnEvent::Usage {
                 context_token_budget: Some(160_000),
                 model_context_window: Some(200_000),
+                // The effective window is the meter denominator: the model's
+                // capacity, clamped by any configured input ceiling.
+                effective_context_window: Some(200_000),
                 ..
             }
         ));
@@ -18276,7 +18280,8 @@ mod tests {
                     zeroclaw_config::schema::ModelContextWindowSource::Configured,
                 context_send_budget: 0,
                 keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
-            }
+                request_token_ceiling: None,
+                                                                                                                                                                                                                                                                                                                                                                                              }
         }));
 
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
@@ -19937,7 +19942,8 @@ model_provider = "custom.only"
                         zeroclaw_config::schema::ModelContextWindowSource::Configured,
                     context_send_budget: 0,
                     keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
-                },
+                    request_token_ceiling: None,
+                                                                                                                                                                                                                                                                                                                                                                                                                      },
                 ("ollama.small", "small") => zeroclaw_config::schema::ResolvedContextLimits {
                     model_context_window: 8_000,
                     context_token_budget: 7_200,
@@ -19945,7 +19951,8 @@ model_provider = "custom.only"
                         zeroclaw_config::schema::ModelContextWindowSource::Configured,
                     context_send_budget: 0,
                     keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
-                },
+                    request_token_ceiling: None,
+                                                                                                                                                                                                                                                                                                                                                                                                                  },
                 _ => zeroclaw_config::schema::ResolvedContextLimits {
                     model_context_window: 32_000,
                     context_token_budget: 32_000,
@@ -19953,7 +19960,8 @@ model_provider = "custom.only"
                         zeroclaw_config::schema::ModelContextWindowSource::CompatibilityFallback,
                     context_send_budget: 0,
                     keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
-                },
+                    request_token_ceiling: None,
+                                                                                                                                                                                                                                                                                                                                                                                                                               },
             }
         }));
 
@@ -19974,7 +19982,8 @@ model_provider = "custom.only"
                     zeroclaw_config::schema::ModelContextWindowSource::Configured,
                 context_send_budget: 0,
                 keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
-            },
+                request_token_ceiling: None,
+                                                                                                                                                                                                                                                                                                                                                                                          },
             "provider/model and their limits must change as one session state transition"
         );
     }

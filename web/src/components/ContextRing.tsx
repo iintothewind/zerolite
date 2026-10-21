@@ -4,8 +4,18 @@ import { t } from '@/lib/i18n';
 interface ContextRingProps {
   /** Prompt size of the most recent LLM call, or null before the first `done`. */
   used: number | null;
-  /** Effective context window, or null until the gateway reports it. */
+  /**
+   * The effective context window — the model's capacity clamped by
+   * `[context].request_token_ceiling` — or null until the gateway reports it.
+   * This is the meter denominator; the water-line (where trimming engages) is
+   * a trigger, not this limit.
+   */
   max: number | null;
+  /**
+   * The water-line: the token count at which proactive trimming engages. It
+   * is a trigger, not a limit — shown so the two numbers are never confused.
+   */
+  waterline?: number | null;
 }
 
 const SIZE = 22;
@@ -25,7 +35,7 @@ function formatExactTokens(n: number): string {
  * (a freshly loaded conversation, before any `done` frame) rather than
  * inventing a fill — the ring is a meter, not a progress indicator.
  */
-export default function ContextRing({ used, max }: ContextRingProps) {
+export default function ContextRing({ used, max, waterline }: ContextRingProps) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
 
@@ -48,6 +58,9 @@ export default function ContextRing({ used, max }: ContextRingProps) {
   }, [open]);
 
   const hasWindow = typeof max === 'number' && max > 0;
+  // The water-line is only worth showing when it is strictly below the limit
+  // (it always is, unless the percentage is 100).
+  const hasWaterline = typeof waterline === 'number' && waterline > 0 && waterline < (max ?? 0);
   const usedTokens = typeof used === 'number' && used > 0 ? used : 0;
   const pct = hasWindow ? Math.min((usedTokens / (max as number)) * 100, 100) : 0;
   // The templates carry their own `%`, so they take the bare number; only the
@@ -118,6 +131,17 @@ export default function ContextRing({ used, max }: ContextRingProps) {
               hasWindow ? formatExactTokens(max as number) : '—',
             )}
           </div>
+          {hasWaterline && (
+            <div
+              className="px-3 py-1 text-xs font-mono tabular-nums"
+              style={{ color: 'var(--pc-text-secondary)' }}
+            >
+              {t('agent.context.ring_detail_waterline').replace(
+                '{count}',
+                formatExactTokens(waterline as number),
+              )}
+            </div>
+          )}
           {hasWindow && (
             <div
               className="px-3 py-1 text-xs font-mono tabular-nums"

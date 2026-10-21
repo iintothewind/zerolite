@@ -3986,6 +3986,8 @@ mod tests {
             // filtering, so the unresolved variant is the honest fixture here.
             context_token_budget: None,
             model_context_window: None,
+
+            effective_context_window: None,
             provider_ref: "stub".into(),
             model: "stub-model".into(),
             accepted: true,
@@ -4067,6 +4069,8 @@ mod tests {
             cost_usd: None,
             context_token_budget: Some(180_000),
             model_context_window: Some(200_000),
+
+            effective_context_window: None,
             provider_ref: "llamacpp.default".into(),
             model: "local-model".into(),
             accepted: true,

@@ -6,14 +6,21 @@ export interface ContextBarState {
   trimMarkerIndex: number | null;
 }
 
-/** Build the provider-route-aware state shared by the context meter UI. */
+/**
+ * Build the provider-route-aware state shared by the context meter UI.
+ *
+ * The denominator is the **effective context window** — the model's capacity
+ * clamped by `[context].request_token_ceiling`. The water-line (the token
+ * count at which proactive trimming engages) is NOT a limit: it only marks
+ * where trimming starts, so it is drawn as a marker inside the bar.
+ */
 export function resolveContextBarState(
-  contextMaxTokens: number | null,
-  contextModelWindow: number | null,
+  contextEffectiveWindow: number | null,
+  contextWaterlineTokens: number | null,
   contextInputTokens: number | null,
   barWidth = 16,
 ): ContextBarState | null {
-  const denominator = contextModelWindow ?? contextMaxTokens;
+  const denominator = contextEffectiveWindow;
   if (!denominator || denominator <= 0 || barWidth <= 0) return null;
 
   const used = contextInputTokens ?? 0;
@@ -22,13 +29,13 @@ export function resolveContextBarState(
   const cells = ('█'.repeat(filled) + '░'.repeat(Math.max(0, barWidth - filled))).split('');
   let trimMarkerIndex: number | null = null;
   if (
-    contextModelWindow &&
-    contextMaxTokens !== null &&
-    contextMaxTokens > 0 &&
-    contextMaxTokens < contextModelWindow
+    denominator &&
+    contextWaterlineTokens !== null &&
+    contextWaterlineTokens > 0 &&
+    contextWaterlineTokens < denominator
   ) {
     trimMarkerIndex = Math.min(
-      Math.round((contextMaxTokens / contextModelWindow) * barWidth),
+      Math.round((contextWaterlineTokens / denominator) * barWidth),
       barWidth - 1,
     );
     cells[trimMarkerIndex] = '│';

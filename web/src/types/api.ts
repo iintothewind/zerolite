@@ -286,10 +286,15 @@ export interface WsMessage {
   served_model?: string;
   fallback_kind?: "server" | "client" | "client_server";
   // Context window info (present on "done" frames). See #7311.
-  // `max_context_tokens` is the preemptive-trim budget the bar fills toward;
-  // `model_context_window` is the model's full capacity (bar denominator when present).
+  // `max_context_tokens` is the WATER-LINE: the token count at which proactive
+  // trimming engages. It is a trigger, not a limit.
+  // `model_context_window` is the model's own capacity, before the
+  // `[context].request_token_ceiling` clamp.
+  // `effective_context_window` is the EFFECTIVE context window
+  // (`model_window.min(request_token_ceiling)`) — the meter denominator.
   max_context_tokens?: number;
   model_context_window?: number | null;
+  effective_context_window?: number | null;
   input_tokens?: number;
   output_tokens?: number;
   // Emitted as JSON null when the accepted call reports no usage (stale

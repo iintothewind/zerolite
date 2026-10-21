@@ -4479,6 +4479,7 @@ mod tests {
                 zeroclaw_config::schema::ModelContextWindowSource::CompatibilityFallback,
             context_send_budget: 0,
             keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
+            request_token_ceiling: None,
         }
     }
 
@@ -18287,7 +18288,8 @@ Let me check the result."#;
             context_token_budget: 7_200,
             context_send_budget: 28_800,
             keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
-        };
+            request_token_ceiling: None,
+                                                                                                                                                                                                                                                                                                                                                                        };
         let recovery_budget = interactive_context_recovery_budget(context_limits);
         assert_eq!(
             recovery_budget, 28_800,
@@ -18929,7 +18931,8 @@ Let me check the result."#;
                                 zeroclaw_config::schema::ModelContextWindowSource::Configured,
                             context_send_budget: 0,
                             keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
-                        },
+                            request_token_ceiling: None,
+                                                                                                                                                                                                                                                                                                                                                                                                                                                              },
                         context_limits_resolver: None,
                         receipt_generator: None,
                         knobs: &LoopKnobs::default(),
@@ -21904,8 +21907,9 @@ Let me check the result."#;
                             },
                             context_send_budget: 0,
                             keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
+                            request_token_ceiling: None,
                             ..test_context_limits(budget)
-                        }
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     }
                     })),
                     receipt_generator: None,
                     knobs: &LoopKnobs::default(),
@@ -22291,8 +22295,9 @@ Let me check the result."#;
                         model_context_window: 2_000,
                         context_send_budget: 0,
                         keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
+                        request_token_ceiling: None,
                         ..test_context_limits(2_000)
-                    },
+                                                                                                                                                                                                                                                                                          },
                     context_limits_resolver: None,
                     receipt_generator: None,
                     knobs: &LoopKnobs::default(),
@@ -22419,8 +22424,9 @@ Let me check the result."#;
                         model_context_window,
                         context_send_budget: 0,
                         keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
+                        request_token_ceiling: None,
                         ..test_context_limits(context_token_budget)
-                    },
+                                                                                                                                                                                                                                                                                                  },
                     context_limits_resolver: None,
                     receipt_generator: None,
                     knobs: &LoopKnobs::default(),
@@ -22695,8 +22701,9 @@ Let me check the result."#;
                         model_context_window: 500,
                         context_send_budget: 0,
                         keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
+                        request_token_ceiling: None,
                         ..test_context_limits(0)
-                    },
+                                                                                                                                                                                                                                                                                    },
                     context_limits_resolver: None,
                     receipt_generator: None,
                     knobs: &LoopKnobs::default(),

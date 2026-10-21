@@ -52,7 +52,7 @@ case.
 | 2 | No keep-N preference: `trim_to_recent_turns(budget)` keeps whatever fits the budget | `keep_recent_turns` is the **preferred** whole-turn retention; if those turns do not fit, the runtime **cascades** down to `kept_turns == 1` | The preference is the operator's (a stable working memory across models); the cascade is the runtime's. Budget-only retention makes retained history a pure function of the budget, so the same conversation keeps wildly different amounts of context on different models |
 | 3 | Five layered knobs on the runtime profile — `max_history_messages`, `max_context_tokens`, `context_compact_ratio`, `history_pruning.*`, `context_compression.*` — combined by a `min()` chain in which any one can become the binding constraint | **One** table, `[runtime_profiles.<alias>.context]`, four fields, each with exactly one job | R3 |
 | 4 | `max_context_tokens = Some(0)` is a sentinel that disables proactive trimming (upstream's own comment: "Preserve zero as the explicit proactive-trimming disable sentinel") | No disable switch. Trimming is always on; every field has a non-zero default | R4 — a disabled trim silently lets the request exceed the window and fail at the provider |
-| 5 | `max_context_tokens` can cap the *budget*, but the model window itself cannot be clamped by an operator ceiling, so the utilization meter's denominator is whatever the provider or table claims | `max_input_tokens` clamps the effective window: `model_window.min(max_input_tokens)`; the clamped window is also the meter denominator | Without a clamp, an operator whose provider reports an unknown or inflated window has no way to bound it, and the meter is dishonest |
+| 5 | `max_context_tokens` can cap the *budget*, but the model window itself cannot be clamped by an operator ceiling, so the utilization meter's denominator is whatever the provider or table claims | `request_token_ceiling` clamps the effective window: `model_window.min(request_token_ceiling)`; the clamped window is also the meter denominator | Without a clamp, an operator whose provider reports an unknown or inflated window has no way to bound it, and the meter is dishonest |
 | 6 | No output-reserve concept in context policy | `reserve_tokens` bounds the water-line from above **and** defines the send budget | Without a reserve, a successful trim can leave no room for the model's own output, and the request fails immediately after |
 | 7 | No `ContextCalibration`. A reported-budget trim path exists (`trim_to_reported_budget`) that proportionally scales a local estimate by the reported/estimated ratio — but the proactive trigger is sized from the local estimate alone | `ContextCalibration` re-anchors on the provider-reported `usage.input_tokens`; only the unbilled tail is priced locally. The calibrated size feeds **both** the trigger measurement and the trim | R5 — proportional scaling preserves the local estimate's error; anchoring replaces it at the anchor point |
 | 8 | A trim that cannot fit is a silent no-op: even with only the floor remaining and still over budget, the trim returns the oversized history unchanged with `trimmed: false` and no error | A floor that cannot fit is a **hard failure**: an error to the caller, and **no** `HistoryTrimmed` notice | R4 |
@@ -148,7 +148,7 @@ It is resolved in this order (first match wins):
 The resolved window is then clamped by the `[context]` input ceiling:
 
 ```text
-effective_context_window = model_window.min(max_input_tokens)   # max_input_tokens: None ⇒ no clamp
+effective_context_window = model_window.min(request_token_ceiling)   # request_token_ceiling: None ⇒ no clamp
 ```
 
 The same `effective_context_window` is the denominator for the context
@@ -169,21 +169,21 @@ resolution to `1..=10` (see the field table below).
 
 ```toml
 [runtime_profiles.coder.context]
-max_input_tokens = 100_000    # hard ceiling on request input tokens (optional)
+request_token_ceiling = 100_000    # hard ceiling on request input tokens (optional)
 trim_threshold_percent = 80    # where history trimming engages (default: 80)
 reserve_tokens = 16_384        # output headroom held back from the threshold (optional)
 keep_recent_turns = 5          # preferred whole turns retained when trimming fires (default: 5)
 ```
 
 | Field | Type / default | Meaning |
-|-------|----------------|---------|
-| `max_input_tokens` | `Option<usize>`, default `None` | Hard ceiling on total request input tokens. `None` means the effective context window is the sole limit. This is the only override knob for providers whose real window is unknown. It is a **ceiling** and does **not** by itself trigger trimming. When set, it clamps the effective window (and thus the UI meter denominator) down via `model_window.min(max_input_tokens)`. |
+| --- | --- | --- |
+| `request_token_ceiling` | `Option<usize>`, default `None` | Hard ceiling on total request input tokens. `None` means the effective context window is the sole limit. This is the only override knob for providers whose real window is unknown. It is a **ceiling** and does **not** by itself trigger trimming. When set, it clamps the effective window (and thus the UI meter denominator) down via `model_window.min(request_token_ceiling)`. |
 | `trim_threshold_percent` | `usize`, default `80` | Percentage of the effective context window at which history trimming engages. Must be in `1..=100`; `0` or `>100` is a hard config error. |
 | `reserve_tokens` | `Option<usize>`, default `None` | Output headroom. (1) Bounds the water-line from above: `trim_threshold ≤ window − reserve`. (2) Defines the **send / fit budget** after trim: `send_budget = window − reserve` (or the full window when unset). Must not exceed **50%** of the effective window — beyond that the reserve would strand most of the window, which is a hard config error checked against the resolved model window. |
 | `keep_recent_turns` | `usize`, default `5` | Preferred how many of the newest **whole turns** the trim action retains when it fires. Clamped at resolution to `1..=10` (`0` becomes `1`, `>10` becomes `10`). If those turns still exceed **`send_budget`**, the runtime cascades down to `kept_turns == 1`; it never drops the newest turn. |
 
 All four have defaults, so an existing `config.toml` needs no changes to keep
-working: omit the table entirely and you get `max_input_tokens = None`,
+working: omit the table entirely and you get `request_token_ceiling = None`,
 `trim_threshold_percent = 80`, `reserve_tokens = None`, `keep_recent_turns = 5`.
 
 ## The trim threshold (water-line) vs the send / fit budget
@@ -292,7 +292,7 @@ retries only when the cascade lands under **`send_budget`**.
 In short: `keep_recent_turns` is the **preferred** retain count; the cascade may
 keep fewer turns (down to 1) to fit. When the window cannot hold the floor, the
 correct fixes are operational — raise
-`[runtime_profiles.<name>].context.max_input_tokens` (or the provider
+`[runtime_profiles.<name>].context.request_token_ceiling` (or the provider
 `context_window`), disable unused integrations to shrink the tool surface, or
 point the agent at a larger-window model.
 
@@ -313,8 +313,8 @@ report `None` and the metric simply stays at zero for them.
 
 ## Troubleshooting the meter
 
-- **The denominator looks wrong (too small).** The agent's `max_input_tokens` is
-  clamping the window. Check `[runtime_profiles.<alias>.context].max_input_tokens`.
+- **The denominator looks wrong (too small).** The agent's `request_token_ceiling` is
+  clamping the window. Check `[runtime_profiles.<alias>.context].request_token_ceiling`.
 - **The denominator is `32,000`.** No provider `context_window` is set and the
   model id is not in the per-model table. Set an explicit
   `[providers.<id>].context_window`, or fix the model id so it matches a table

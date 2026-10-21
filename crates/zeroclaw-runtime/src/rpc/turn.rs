@@ -434,6 +434,7 @@ pub(crate) struct TurnUsageFold {
     last_input_tokens: Option<u64>,
     last_context_token_budget: Option<u64>,
     last_model_context_window: Option<u64>,
+    last_effective_context_window: Option<u64>,
     by_provider: std::collections::HashMap<(String, String), ProviderUsageTotals>,
     saw_usage: bool,
 }
@@ -447,6 +448,7 @@ impl TurnUsageFold {
             cost_usd,
             context_token_budget,
             model_context_window,
+            effective_context_window,
             provider_ref,
             model,
             accepted,
@@ -471,6 +473,7 @@ impl TurnUsageFold {
             self.last_model = Some(model.clone());
             self.last_context_token_budget = *context_token_budget;
             self.last_model_context_window = *model_context_window;
+            self.last_effective_context_window = *effective_context_window;
             // An accepted call without usage clears the previous route's
             // snapshot rather than rendering it against this route's window.
             self.last_input_tokens = *input_tokens;
@@ -521,14 +524,17 @@ impl TurnUsageFold {
             (None, None) => None,
             (i, o) => Some(i.unwrap_or(0).saturating_add(o.unwrap_or(0))),
         };
-        let (max_context_tokens, model_context_window) = match final_limits {
+        let (max_context_tokens, model_context_window, effective_context_window) = match final_limits
+        {
             Some(limits) => (
                 Some(limits.context_token_budget as u64),
                 limits.configured_model_context_window().map(|w| w as u64),
+                Some(limits.effective_context_window() as u64),
             ),
             None => (
                 self.last_context_token_budget,
                 self.last_model_context_window,
+                self.last_effective_context_window,
             ),
         };
         Some(TurnUsageTotals {
@@ -541,6 +547,7 @@ impl TurnUsageFold {
             last_input_tokens: self.last_input_tokens,
             max_context_tokens,
             model_context_window,
+            effective_context_window,
             usage_by_provider,
         })
     }
@@ -570,7 +577,9 @@ mod tests {
             cost_usd: cost,
             context_token_budget: Some(1000),
             model_context_window: Some(4000),
-            provider_ref: provider_ref.into(),
+
+            effective_context_window: None,
+                        provider_ref: provider_ref.into(),
             model: model.into(),
             accepted,
             estimated_input_tokens: None,
@@ -629,7 +638,8 @@ mod tests {
             context_token_budget: 150_000,
             context_send_budget: 0,
             keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
-                                                                                                                                                                                                                                      };
+            request_token_ceiling: None,
+                                                                                                                                                                                                                                                                                                                                                                      };
         let mut fold = TurnUsageFold::default();
         fold.apply(&usage("a.primary", "m1", None, None, None, true));
         let totals = fold.totals(Some(limits)).expect("a route served the turn");
@@ -649,7 +659,9 @@ mod tests {
             cost_usd: None,
             context_token_budget: Some(180_000),
             model_context_window: Some(200_000),
-            provider_ref: "llamacpp.default".into(),
+
+            effective_context_window: None,
+                        provider_ref: "llamacpp.default".into(),
             model: "local-model".into(),
             accepted: true,
             estimated_input_tokens: Some(4_200),

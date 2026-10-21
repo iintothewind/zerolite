@@ -24,7 +24,7 @@ max_tool_iterations = 50
 max_tool_result_chars = 50000
 
 [runtime_profiles.default.context]
-max_input_tokens = 32000
+request_token_ceiling = 32000
 
 [gateway]
 port = 42617

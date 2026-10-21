@@ -18210,7 +18210,7 @@ fn test_channel_ctx_with_backend_channel_and_provider(
         "test".to_string(),
         zeroclaw_config::schema::RuntimeProfileConfig {
             context: zeroclaw_config::scattered_types::ContextConfig {
-                max_input_tokens: Some(context_token_budget),
+                request_token_ceiling: Some(context_token_budget),
                 ..Default::default()
             },
             ..Default::default()
@@ -31739,7 +31739,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 "trim-switch".to_string(),
                 zeroclaw_config::schema::RuntimeProfileConfig {
                     context: zeroclaw_config::scattered_types::ContextConfig {
-                        max_input_tokens: Some(8_000),
+                        request_token_ceiling: Some(8_000),
                         ..Default::default()
                     },
                     ..zeroclaw_config::schema::RuntimeProfileConfig::default()

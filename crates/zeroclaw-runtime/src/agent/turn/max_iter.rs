@@ -57,6 +57,7 @@ async fn emit_summary_attempt_usage(
                     cost_usd: summary.cost_usd,
                     context_token_budget: None,
                     model_context_window: None,
+                    effective_context_window: None,
                     provider_ref: summary.provider_ref.clone(),
                     model: summary.model.clone(),
                     accepted: summary.accepted,
@@ -1052,8 +1053,9 @@ mod graceful_summary_metering_tests {
                         model_context_window: budget,
                         context_send_budget: 0,
                         keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
+                        request_token_ceiling: None,
                         ..ResolvedContextLimits::legacy_fallback(budget)
-                    }
+                                                                                                                                                                                                                                                                                                               }
                 },
                 &mut crumb_present,
                 None,
@@ -1203,8 +1205,9 @@ mod graceful_summary_metering_tests {
                         model_context_window: budget,
                         context_send_budget: 0,
                         keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
+                        request_token_ceiling: None,
                         ..ResolvedContextLimits::legacy_fallback(budget)
-                    }
+                                                                                                                                                                                                                                                                                                               }
                 },
                 &mut crumb_present,
                 None,
@@ -1276,6 +1279,7 @@ mod graceful_summary_metering_tests {
                     model_context_window: budget,
                     context_send_budget: 0,
                     keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
+                    request_token_ceiling: None,
                     ..ResolvedContextLimits::legacy_fallback(if disable_soft_budget {
                         0
                     } else {

@@ -13758,6 +13758,7 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<St
             output_tokens: _,
             context_token_budget,
             model_context_window,
+            effective_context_window,
             cost_usd: _,
             accepted: true,
             estimated_input_tokens,
@@ -13786,6 +13787,7 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<St
                 input_tokens_source,
                 max_context_tokens: *context_token_budget,
                 model_context_window: *model_context_window,
+                effective_context_window: *effective_context_window,
             }
         }
         TurnEvent::Plan { entries } => SessionUpdateEvent::Plan {
@@ -27477,7 +27479,7 @@ mod tests {
         use zeroclaw_config::providers::Providers;
         use zeroclaw_config::schema::{AliasedAgentConfig, Config, RuntimeProfileConfig};
 
-        // (context.max_input_tokens, provider.context_window, expected water-line)
+        // (context.request_token_ceiling, provider.context_window, expected water-line)
         //
         // The water-line is `min(model window, input ceiling) × percent / 100`,
         // so a ceiling and an unknown capacity both bound it.
@@ -27495,7 +27497,7 @@ mod tests {
                     "coding".to_string(),
                     RuntimeProfileConfig {
                         context: zeroclaw_config::scattered_types::ContextConfig {
-                            max_input_tokens: Some(*t),
+                            request_token_ceiling: Some(*t),
                             ..Default::default()
                         },
                         ..RuntimeProfileConfig::default()
@@ -27561,7 +27563,7 @@ mod tests {
             "coding".to_string(),
             RuntimeProfileConfig {
                 context: zeroclaw_config::scattered_types::ContextConfig {
-                    max_input_tokens: Some(800_000),
+                    request_token_ceiling: Some(800_000),
                     ..Default::default()
                 },
                 ..RuntimeProfileConfig::default()
@@ -27600,7 +27602,9 @@ mod tests {
         let mut event = TurnEvent::Usage {
             context_token_budget: None,
             model_context_window: None,
-            input_tokens: Some(100),
+
+            effective_context_window: None,
+                        input_tokens: Some(100),
             cached_input_tokens: None,
             output_tokens: Some(50),
             cost_usd: Some(0.01),
@@ -27650,7 +27654,7 @@ mod tests {
             "coding".to_string(),
             RuntimeProfileConfig {
                 context: zeroclaw_config::scattered_types::ContextConfig {
-                    max_input_tokens: Some(128_000),
+                    request_token_ceiling: Some(128_000),
                     ..Default::default()
                 },
                 ..RuntimeProfileConfig::default()
@@ -27694,7 +27698,9 @@ mod tests {
         let mut event = TurnEvent::Usage {
             context_token_budget: None,
             model_context_window: None,
-            input_tokens: Some(100),
+
+            effective_context_window: None,
+                        input_tokens: Some(100),
             cached_input_tokens: None,
             output_tokens: Some(50),
             cost_usd: None,
@@ -27852,7 +27858,9 @@ mod tests {
         let mut event = TurnEvent::Usage {
             context_token_budget: None,
             model_context_window: None,
-            input_tokens: Some(100),
+
+            effective_context_window: None,
+                        input_tokens: Some(100),
             cached_input_tokens: None,
             output_tokens: Some(50),
             cost_usd: None,
@@ -27896,7 +27904,7 @@ mod tests {
             "coding".to_string(),
             RuntimeProfileConfig {
                 context: zeroclaw_config::scattered_types::ContextConfig {
-                    max_input_tokens: Some(800_000),
+                    request_token_ceiling: Some(800_000),
                     ..Default::default()
                 },
                 ..RuntimeProfileConfig::default()
@@ -27946,7 +27954,9 @@ mod tests {
         let mut event = TurnEvent::Usage {
             context_token_budget: None,
             model_context_window: None,
-            input_tokens: Some(1000),
+
+            effective_context_window: None,
+                        input_tokens: Some(1000),
             cached_input_tokens: None,
             output_tokens: Some(500),
             cost_usd: Some(0.01),
@@ -28003,7 +28013,9 @@ mod tests {
             cost_usd: Some(0.01),
             context_token_budget: Some(180_000),
             model_context_window: Some(200_000),
-            provider_ref: "openai.default".to_string(),
+
+            effective_context_window: None,
+                        provider_ref: "openai.default".to_string(),
             model: "model-a".to_string(),
             accepted: true,
             estimated_input_tokens: None,
@@ -28036,7 +28048,9 @@ mod tests {
             cost_usd: None,
             context_token_budget: Some(180_000),
             model_context_window: Some(200_000),
-            provider_ref: "llamacpp.default".to_string(),
+
+            effective_context_window: None,
+                        provider_ref: "llamacpp.default".to_string(),
             model: "local-model".to_string(),
             accepted: true,
             estimated_input_tokens: Some(4_200),
@@ -28066,7 +28080,9 @@ mod tests {
             cost_usd: Some(0.01),
             context_token_budget: Some(180_000),
             model_context_window: Some(200_000),
-            provider_ref: "openai.default".to_string(),
+
+            effective_context_window: None,
+                        provider_ref: "openai.default".to_string(),
             model: "model-a".to_string(),
             accepted: true,
             estimated_input_tokens: None,
@@ -28090,7 +28106,9 @@ mod tests {
             cost_usd: None,
             context_token_budget: Some(180_000),
             model_context_window: Some(200_000),
-            provider_ref: "anthropic.default".to_string(),
+
+            effective_context_window: None,
+                        provider_ref: "anthropic.default".to_string(),
             model: "model-c".to_string(),
             accepted: true,
             // What `record_accepted_chat_response` actually produces for this
@@ -28121,7 +28139,9 @@ mod tests {
             cost_usd: None,
             context_token_budget: Some(180_000),
             model_context_window: Some(200_000),
-            provider_ref: "anthropic.default".to_string(),
+
+            effective_context_window: None,
+                        provider_ref: "anthropic.default".to_string(),
             model: "model-c".to_string(),
             accepted: true,
             estimated_input_tokens: None,
@@ -28147,7 +28167,9 @@ mod tests {
             cost_usd: Some(0.01),
             context_token_budget: Some(180_000),
             model_context_window: Some(200_000),
-            provider_ref: "openai.fallback".to_string(),
+
+            effective_context_window: None,
+                        provider_ref: "openai.fallback".to_string(),
             model: "model-b".to_string(),
             accepted: false,
             estimated_input_tokens: None,
@@ -28197,7 +28219,7 @@ mod tests {
             "coding".to_string(),
             RuntimeProfileConfig {
                 context: zeroclaw_config::scattered_types::ContextConfig {
-                    max_input_tokens: max_context_tokens,
+                    request_token_ceiling: max_context_tokens,
                     trim_threshold_percent: 90,
                     ..Default::default()
                 },
@@ -28310,7 +28332,9 @@ mod tests {
             cost_usd: Some(0.01),
             context_token_budget: Some(max_ctx),
             model_context_window: Some(model_win),
-            provider_ref: "custom.default".to_string(),
+
+            effective_context_window: None,
+                        provider_ref: "custom.default".to_string(),
             model: "model-a".to_string(),
             accepted: true,
             estimated_input_tokens: None,
@@ -28338,7 +28362,9 @@ mod tests {
             cost_usd: None,
             context_token_budget: None,
             model_context_window: None,
-            provider_ref: "openai.default".to_string(),
+
+            effective_context_window: None,
+                        provider_ref: "openai.default".to_string(),
             model: "model-a".to_string(),
             accepted: true,
             estimated_input_tokens: None,
@@ -28362,7 +28388,9 @@ mod tests {
             cost_usd: None,
             context_token_budget: Some(200_000),
             model_context_window: None,
-            provider_ref: "openai.default".to_string(),
+
+            effective_context_window: None,
+                        provider_ref: "openai.default".to_string(),
             model: "model-a".to_string(),
             accepted: true,
             estimated_input_tokens: None,
@@ -28387,7 +28415,9 @@ mod tests {
             cost_usd: None,
             context_token_budget: Some(100_000),
             model_context_window: None,
-            provider_ref: "openai.default".to_string(),
+
+            effective_context_window: None,
+                        provider_ref: "openai.default".to_string(),
             model: "model-a".to_string(),
             accepted: true,
             estimated_input_tokens: None,

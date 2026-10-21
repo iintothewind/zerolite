@@ -1468,8 +1468,9 @@ fn is_observability_telemetry(event: &serde_json::Value) -> bool {
 fn resolve_done_context_limits(
     usage_budget: Option<u64>,
     usage_model_window: Option<u64>,
+    usage_effective_window: Option<u64>,
     active_limits: zeroclaw_config::schema::ResolvedContextLimits,
-) -> (u64, Option<u64>) {
+) -> (u64, Option<u64>, Option<u64>) {
     (
         usage_budget.unwrap_or(active_limits.context_token_budget as u64),
         usage_model_window.or_else(|| {
@@ -1477,6 +1478,8 @@ fn resolve_done_context_limits(
                 .configured_model_context_window()
                 .map(|tokens| tokens as u64)
         }),
+        usage_effective_window
+            .or_else(|| Some(active_limits.effective_context_window() as u64)),
     )
 }
 
@@ -1493,16 +1496,19 @@ fn done_frame_context_limits(
     final_limits: Option<zeroclaw_config::schema::ResolvedContextLimits>,
     usage_budget: Option<u64>,
     usage_model_window: Option<u64>,
+    usage_effective_window: Option<u64>,
     fallback_limits: Option<zeroclaw_config::schema::ResolvedContextLimits>,
-) -> (u64, Option<u64>) {
+) -> (u64, Option<u64>, Option<u64>) {
     match final_limits {
         Some(limits) => (
             limits.context_token_budget as u64,
             limits.configured_model_context_window().map(|t| t as u64),
+            Some(limits.effective_context_window() as u64),
         ),
         None => resolve_done_context_limits(
             usage_budget,
             usage_model_window,
+            usage_effective_window,
             fallback_limits.unwrap_or(zeroclaw_config::schema::ResolvedContextLimits {
                 model_context_window: zeroclaw_config::schema::UNCONFIGURED_CONTEXT_WINDOW_FALLBACK,
                 context_token_budget: 0,
@@ -1510,7 +1516,8 @@ fn done_frame_context_limits(
                     zeroclaw_config::schema::ModelContextWindowSource::CompatibilityFallback,
                 context_send_budget: 0,
                 keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
-                                                                                                                                                                                                                                                                                                                 }),
+                request_token_ceiling: None,
+                                                                                                                                                                                                                                                                                                                                                                                                                                                         }),
         ),
     }
 }
@@ -1548,6 +1555,7 @@ struct UsageFold {
     last_input_tokens: Option<u64>,
     last_context_token_budget: Option<u64>,
     last_model_context_window: Option<u64>,
+    last_effective_context_window: Option<u64>,
     usage_by_provider: std::collections::HashMap<(String, String), ProviderUsageEntry>,
 }
 
@@ -1560,6 +1568,7 @@ impl UsageFold {
             cost_usd,
             context_token_budget,
             model_context_window,
+            effective_context_window,
             provider_ref,
             model: served_model,
             accepted,
@@ -1589,6 +1598,7 @@ impl UsageFold {
             self.last_model = Some(served_model.clone());
             self.last_context_token_budget = context_token_budget;
             self.last_model_context_window = model_context_window;
+            self.last_effective_context_window = effective_context_window;
             if let Some(it) = input_tokens {
                 self.last_input_tokens = Some(it);
             } else {
@@ -1665,6 +1675,7 @@ struct DoneFrameMeta<'a> {
     provider_ref: &'a str,
     max_context_tokens: u64,
     model_context_window: Option<u64>,
+    effective_context_window: Option<u64>,
     last_input_tokens: Option<u64>,
     last_serving_provider_ref: Option<&'a str>,
     last_serving_model: Option<&'a str>,
@@ -1703,6 +1714,9 @@ fn build_done_frame_json(
     });
     if let Some(window) = meta.model_context_window {
         done["model_context_window"] = serde_json::Value::from(window);
+    }
+    if let Some(window) = meta.effective_context_window {
+        done["effective_context_window"] = serde_json::Value::from(window);
     }
     done
 }
@@ -2305,12 +2319,14 @@ async fn process_chat_message(
                 .final_context_limits
                 .is_none()
                 .then(|| agent.context_limits_for_route(&active_provider, &active_model));
-            let (max_context_tokens, model_context_window) = done_frame_context_limits(
-                outcome.final_context_limits,
-                usage_fold.last_context_token_budget,
-                usage_fold.last_model_context_window,
-                fallback_limits,
-            );
+            let (max_context_tokens, model_context_window, effective_context_window) =
+                done_frame_context_limits(
+                    outcome.final_context_limits,
+                    usage_fold.last_context_token_budget,
+                    usage_fold.last_model_context_window,
+                    usage_fold.last_effective_context_window,
+                    fallback_limits,
+                );
             let effective_model = usage_fold.last_model.as_deref().unwrap_or(&active_model);
             let provider_ref_full = usage_fold
                 .last_provider_ref
@@ -2327,6 +2343,7 @@ async fn process_chat_message(
                 provider_ref: provider_ref_full,
                 max_context_tokens,
                 model_context_window,
+                effective_context_window,
                 last_input_tokens: usage_fold.last_input_tokens,
                 last_serving_provider_ref: usage_fold.last_provider_ref.as_deref(),
                 last_serving_model: usage_fold.last_model.as_deref(),
@@ -2512,10 +2529,11 @@ mod tests {
                 zeroclaw_config::schema::ModelContextWindowSource::Configured,
             context_send_budget: 0,
             keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
-                                                                                                                                                                                                                                      };
+            request_token_ceiling: None,
+                                                                                                                                                                                                                                                                                                                                                                      };
         assert_eq!(
-            resolve_done_context_limits(Some(7_200), Some(8_000), stale_startup_limits),
-            (7_200, Some(8_000)),
+            resolve_done_context_limits(Some(7_200), Some(8_000), None, stale_startup_limits),
+            (7_200, Some(8_000), Some(6_400)),
             "the done frame must report the route that produced the usage event"
         );
     }
@@ -2529,10 +2547,11 @@ mod tests {
                 zeroclaw_config::schema::ModelContextWindowSource::Configured,
             context_send_budget: 0,
             keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
-                                                                                                                                                                                                                              };
+            request_token_ceiling: None,
+                                                                                                                                                                                                                                                                                                                                                              };
         assert_eq!(
-            resolve_done_context_limits(None, None, active_limits),
-            (0, Some(8_000)),
+            resolve_done_context_limits(None, None, None, active_limits),
+            (0, Some(8_000), Some(6_400)),
         );
     }
 
@@ -2545,10 +2564,11 @@ mod tests {
                 zeroclaw_config::schema::ModelContextWindowSource::CompatibilityFallback,
             context_send_budget: 0,
             keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
-                                                                                                                                                                                                                                                                                                      };
+            request_token_ceiling: None,
+                                                                                                                                                                                                                                                                                                                                                                                                                                      };
         assert_eq!(
-            resolve_done_context_limits(None, None, active_limits),
-            (16_000, None),
+            resolve_done_context_limits(None, None, None, active_limits),
+            (16_000, None, Some(6_400)),
         );
     }
 
@@ -2564,11 +2584,12 @@ mod tests {
                 zeroclaw_config::schema::ModelContextWindowSource::Configured,
             context_send_budget: 0,
             keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
-                                                                                                                                                                                                                                  };
+            request_token_ceiling: None,
+                                                                                                                                                                                                                                                                                                                                                                  };
         // Earlier usage-bearing text route left 180k/200k on the wire trackers.
         assert_eq!(
-            done_frame_context_limits(Some(final_vision), Some(180_000), Some(200_000), None),
-            (7_200, Some(8_000)),
+            done_frame_context_limits(Some(final_vision), Some(180_000), Some(200_000), None, None),
+            (7_200, Some(8_000), Some(6_400)),
             "a final no-usage vision route must override the earlier text route's usage numbers"
         );
     }
@@ -2584,16 +2605,17 @@ mod tests {
                 zeroclaw_config::schema::ModelContextWindowSource::Configured,
             context_send_budget: 0,
             keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
-                                                                                                                                                                                                                                      };
+            request_token_ceiling: None,
+                                                                                                                                                                                                                                                                                                                                                                      };
         // No final route, no usage: fall back to the resolved route.
         assert_eq!(
-            done_frame_context_limits(None, None, None, Some(fallback)),
-            (180_000, Some(200_000)),
+            done_frame_context_limits(None, None, None, None, Some(fallback)),
+            (180_000, Some(200_000), Some(160_000)),
         );
         // No final route but usage present: usage wins (legacy path).
         assert_eq!(
-            done_frame_context_limits(None, Some(7_200), Some(8_000), Some(fallback)),
-            (7_200, Some(8_000)),
+            done_frame_context_limits(None, Some(7_200), Some(8_000), None, Some(fallback)),
+            (7_200, Some(8_000), Some(6_400)),
         );
     }
 
@@ -4844,7 +4866,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
                 "coding".to_string(),
                 RuntimeProfileConfig {
                     context: zeroclaw_config::scattered_types::ContextConfig {
-                        max_input_tokens: Some(expected_max_ctx as usize),
+                        request_token_ceiling: Some(expected_max_ctx as usize),
                         ..Default::default()
                     },
                     ..RuntimeProfileConfig::default()
@@ -4899,7 +4921,8 @@ data: {{\"type\":\"message_stop\"}}\n\n"
                 provider_ref: provider_alias,
                 max_context_tokens: max_ctx,
                 model_context_window: model_ctx_window,
-                last_input_tokens: Some(100),
+                effective_context_window: None,
+                                last_input_tokens: Some(100),
                 last_serving_provider_ref: Some(provider_alias),
                 last_serving_model: Some("glm-5.2"),
             };
@@ -4955,7 +4978,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
                 "coding".to_string(),
                 RuntimeProfileConfig {
                     context: zeroclaw_config::scattered_types::ContextConfig {
-                    max_input_tokens: Some(800_000),
+                    request_token_ceiling: Some(800_000),
                     ..Default::default()
                 },
                 ..RuntimeProfileConfig::default()
@@ -5016,7 +5039,8 @@ data: {{\"type\":\"message_stop\"}}\n\n"
                 provider_ref: live_provider_ref,
                 max_context_tokens: max_ctx,
                 model_context_window: model_ctx_window,
-                last_input_tokens: Some(100),
+                effective_context_window: None,
+                                last_input_tokens: Some(100),
                 last_serving_provider_ref: Some(live_provider_ref),
                 last_serving_model: Some("glm-5.2"),
             };
@@ -5052,7 +5076,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             "coding".to_string(),
             RuntimeProfileConfig {
                 context: zeroclaw_config::scattered_types::ContextConfig {
-                    max_input_tokens: Some(800_000),
+                    request_token_ceiling: Some(800_000),
                     ..Default::default()
                 },
             ..RuntimeProfileConfig::default()
@@ -5133,7 +5157,8 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             provider_ref,
             max_context_tokens: max_ctx,
             model_context_window: model_ctx_window,
-            last_input_tokens: Some(1000),
+            effective_context_window: None,
+                        last_input_tokens: Some(1000),
             last_serving_provider_ref: Some(provider_ref),
             last_serving_model: Some(effective_model),
         };
@@ -5212,6 +5237,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             cost_usd,
             context_token_budget: None,
             model_context_window: None,
+            effective_context_window: None,
             provider_ref: provider_ref.to_string(),
             model: model.to_string(),
             accepted,
@@ -5279,7 +5305,8 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             provider_ref: "openrouter.a",
             max_context_tokens: 800_000,
             model_context_window: Some(1_000_000),
-            last_input_tokens: Some(1000),
+            effective_context_window: None,
+                        last_input_tokens: Some(1000),
             last_serving_provider_ref: Some("openrouter.a"),
             last_serving_model: Some("model-a"),
         };
@@ -5383,7 +5410,8 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             provider_ref: "ollama.b",
             max_context_tokens: 800_000,
             model_context_window: Some(1_000_000),
-            last_input_tokens: None,
+            effective_context_window: None,
+                        last_input_tokens: None,
             last_serving_provider_ref: Some("ollama.b"),
             last_serving_model: Some("model-b"),
         };
@@ -5423,7 +5451,8 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             provider_ref: "openrouter.a",
             max_context_tokens: 800_000,
             model_context_window: None,
-            last_input_tokens: None,
+            effective_context_window: None,
+                        last_input_tokens: None,
             last_serving_provider_ref: Some("openrouter.a"),
             last_serving_model: Some("model-a"),
         };

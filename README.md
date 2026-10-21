@@ -24,7 +24,7 @@ What this fork adds on top of upstream ZeroClaw 0.8.6. Inherited runtime behavio
 
 ```toml
 [runtime_profiles.coder.context]
-max_input_tokens = 100_000      # optional window ceiling
+request_token_ceiling = 100_000      # optional window ceiling
 trim_threshold_percent = 80     # default water-line
 reserve_tokens = 16_384         # output headroom
 keep_recent_turns = 5           # default, clamped 1–10

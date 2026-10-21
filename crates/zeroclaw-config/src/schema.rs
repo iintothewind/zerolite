@@ -3920,6 +3920,21 @@ pub struct ResolvedContextLimits {
     pub context_send_budget: usize,
     /// Preferred whole-turn retention when a trim fires.
     pub keep_recent_turns: usize,
+    /// The configured input ceiling (`[context].request_token_ceiling`) for this
+    /// route, when one is set. `None` means the model's own window is the
+    /// limit.
+    pub request_token_ceiling: Option<usize>,
+}
+
+impl ResolvedContextLimits {
+    /// The effective context window: the model's capacity clamped down by the
+    /// configured input ceiling. This is the meter denominator — the same
+    /// population the request is measured against.
+    #[must_use]
+    pub fn effective_context_window(&self) -> usize {
+        self.model_context_window
+            .min(self.request_token_ceiling.unwrap_or(usize::MAX))
+    }
 }
 
 impl Default for ResolvedContextLimits {
@@ -3930,6 +3945,7 @@ impl Default for ResolvedContextLimits {
             context_token_budget: 0,
             context_send_budget: 0,
             keep_recent_turns: crate::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
+            request_token_ceiling: None,
         }
     }
 }
@@ -3973,6 +3989,7 @@ impl ResolvedContextLimits {
             context_token_budget: budget.min(model_context_window),
             context_send_budget: 0,
             keep_recent_turns: crate::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
+            request_token_ceiling: None,
         }
     }
 
@@ -4006,7 +4023,7 @@ impl ResolvedRuntime {
         };
 
         let effective_window = model_context_window
-            .min(self.context.max_input_tokens.unwrap_or(usize::MAX));
+            .min(self.context.request_token_ceiling.unwrap_or(usize::MAX));
         let percent = self.context.trim_threshold_percent.clamp(1, 100);
         let percent_threshold = ((effective_window as u64) * (percent as u64) / 100) as usize;
         let context_token_budget = match self.context.reserve_tokens {
@@ -4031,6 +4048,7 @@ impl ResolvedRuntime {
             context_token_budget,
             context_send_budget,
             keep_recent_turns: self.keep_recent_turns(),
+            request_token_ceiling: self.context.request_token_ceiling,
         }
     }
 
@@ -4040,13 +4058,13 @@ impl ResolvedRuntime {
     }
 
     /// The effective context window: the resolved model window, clamped down
-    /// by an explicit `context.max_input_tokens` ceiling when configured.
+    /// by an explicit `context.request_token_ceiling` ceiling when configured.
     /// This is the denominator for utilization display and the base for the
     /// trim threshold — never a trim trigger on its own.
     #[must_use]
     pub fn effective_context_window(&self) -> usize {
         self.model_context_window
-            .min(self.context.max_input_tokens.unwrap_or(usize::MAX))
+            .min(self.context.request_token_ceiling.unwrap_or(usize::MAX))
     }
 
     /// Token threshold at which history trimming engages. Derived from the
@@ -4722,12 +4740,12 @@ impl Config {
     }
 
     /// Hard ceiling on total request input tokens, from
-    /// `runtime_profiles.<alias>.context.max_input_tokens`. `None` means the
+    /// `runtime_profiles.<alias>.context.request_token_ceiling`. `None` means the
     /// effective context window is the sole limit. This is a ceiling only —
     /// it does not trigger trimming by itself.
     #[must_use]
-    pub fn effective_max_input_tokens(&self, agent_alias: &str) -> Option<usize> {
-        self.effective_context_config(agent_alias).max_input_tokens
+    pub fn effective_request_token_ceiling(&self, agent_alias: &str) -> Option<usize> {
+        self.effective_context_config(agent_alias).request_token_ceiling
     }
 
     /// The model's context window exactly as configured, or `None` when no
@@ -29151,7 +29169,7 @@ mod tests {
             model_context_window: 200_000,
             model_context_window_source: ModelContextWindowSource::Configured,
             context: crate::scattered_types::ContextConfig {
-                max_input_tokens: Some(50_000),
+                request_token_ceiling: Some(50_000),
                 ..Default::default()
             },
             ..ResolvedRuntime::default()
@@ -29186,7 +29204,7 @@ mod tests {
             model_context_window: 8_000,
             model_context_window_source: ModelContextWindowSource::Configured,
             context: crate::scattered_types::ContextConfig {
-                max_input_tokens: Some(0),
+                request_token_ceiling: Some(0),
                 trim_threshold_percent: 1,
                 ..Default::default()
             },
@@ -29285,7 +29303,7 @@ mod tests {
             "normal".to_string(),
             RuntimeProfileConfig {
                 context: crate::scattered_types::ContextConfig {
-                    max_input_tokens: Some(1_000_000),
+                    request_token_ceiling: Some(1_000_000),
                     ..Default::default()
                 },
                 ..RuntimeProfileConfig::default()
@@ -29325,7 +29343,7 @@ mod tests {
             .get_mut("normal")
             .expect("profile exists")
             .context
-            .max_input_tokens = Some(10_000);
+            .request_token_ceiling = Some(10_000);
         let limits =
             cfg.resolved_context_limits_for_route("zerocode", "anthropic.clod", "claude-opus-5-5");
         assert_eq!(limits.context_token_budget, 8_000);
@@ -44066,7 +44084,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         assert_description(&thinking, ".native_thinking", "selected level has a budget");
 
         let context = crate::scattered_types::ContextConfig::default().prop_fields();
-        assert_description(&context, ".max_input_tokens", "ceiling");
+        assert_description(&context, ".request_token_ceiling", "ceiling");
         assert_description(&context, ".trim_threshold_percent", "history trimming");
         assert_description(&context, ".reserve_tokens", "Output headroom");
         assert_description(&context, ".keep_recent_turns", "recent whole turns");
@@ -47181,7 +47199,7 @@ allowed_users = []
         assert!(
             fields
                 .iter()
-                .any(|field| field.name == "runtime_profiles.fast.context.max_input_tokens"),
+                .any(|field| field.name == "runtime_profiles.fast.context.request_token_ceiling"),
             "the context table is a runtime-profile field, emitted under the profile alias"
         );
         assert!(
@@ -47192,11 +47210,11 @@ allowed_users = []
         );
 
         config
-            .set_prop("runtime_profiles.fast.context.max_input_tokens", "100000")
+            .set_prop("runtime_profiles.fast.context.request_token_ceiling", "100000")
             .expect("set_prop should accept the runtime-profile nested path");
         assert_eq!(
             config
-                .get_prop("runtime_profiles.fast.context.max_input_tokens")
+                .get_prop("runtime_profiles.fast.context.request_token_ceiling")
                 .expect("get_prop should accept the runtime-profile nested path"),
             "100000"
         );

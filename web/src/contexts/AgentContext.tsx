@@ -24,6 +24,7 @@ import {
 } from '@/lib/api';
 import { primeModelProviderCatalog, modelProviderDisplayName } from '@/lib/modelProviders';
 import { resolveAvailableModels } from './modelPicker.logic';
+import { contextLimitsFromDoneFrame } from './contextLimits.logic';
 import type { ToolCall } from '@/lib/toolCall';
 import { emptyLiveTurn, type LiveTurn, type TurnSegments } from '@/lib/turnSegments';
 import { resolveToolResultIndex } from '@/lib/toolCardMatch';
@@ -166,8 +167,12 @@ export interface AgentContextValue {
    */
   pendingApproval: PendingApproval | null;
   respondToApproval: (decision: ApprovalDecision) => void;
-  // Context window tracking (from "done" WS frames). See #7311.
-  contextMaxTokens: number | null;
+  // Context window tracking (from "done" WS frames). See #7311 and
+  // docs/book/src/agents/context-management.md.
+  /** The effective context window: the meter denominator. */
+  contextEffectiveWindow: number | null;
+  /** The water-line: where proactive trimming engages. A trigger, not a limit. */
+  contextWaterlineTokens: number | null;
   contextInputTokens: number | null;
   /** Composer stats. See `webui-overall-plan.md` §10 "Composer stats semantics". */
   liveStats: LiveStats;
@@ -295,7 +300,8 @@ export function AgentProvider({
   const [modelInfoVersion, setModelInfoVersion] = useState(0);
   const [pendingApproval, setPendingApproval] = useState<PendingApproval | null>(null);
   // Context window tracking (from "done" WS frames). See #7311.
-  const [contextMaxTokens, setContextMaxTokens] = useState<number | null>(null);
+  const [contextEffectiveWindow, setContextEffectiveWindow] = useState<number | null>(null);
+  const [contextWaterlineTokens, setContextWaterlineTokens] = useState<number | null>(null);
   const [contextInputTokens, setContextInputTokens] = useState<number | null>(null);
   const [tokenStats, setTokenStats] = useState<TokenStats>(emptyTokenStats);
   // Mirrored from the turn-stream ref for the live trajectory view.
@@ -517,8 +523,12 @@ export function AgentProvider({
           // counts `Usage` events, and they diverge only when the page missed
           // part of the turn.
           setTokenStats((s) => applyDone(s, msg));
-          if (typeof msg.max_context_tokens === 'number') {
-            setContextMaxTokens(msg.max_context_tokens);
+          {
+            // One authoritative snapshot per done frame: the effective window
+            // (meter denominator) and the water-line (trim trigger).
+            const limits = contextLimitsFromDoneFrame(msg);
+            setContextEffectiveWindow(limits.effectiveWindow);
+            setContextWaterlineTokens(limits.waterlineTokens);
           }
           // Prefer last_input_tokens (accurate per-turn prompt size) over
           // accumulated input_tokens for context-bar rendering.
@@ -1361,7 +1371,8 @@ export function AgentProvider({
     pendingApproval,
     respondToApproval,
     // Context window tracking (from "done" WS frames). See #7311.
-    contextMaxTokens,
+    contextEffectiveWindow,
+    contextWaterlineTokens,
     contextInputTokens,
     liveStats,
     liveTurn,
