@@ -2624,6 +2624,96 @@ mod tests {
         assert!(is_synthetic_user_message(&breadcrumb()));
     }
 
+    /// The behaviour behind "trim fires every turn".
+    ///
+    /// `keep` is a retention preference, not a water-line: once the transcript
+    /// holds `keep` turns, every new turn pushes the oldest one out, so the
+    /// trim fires on every subsequent turn by construction. It is steady
+    /// state, not a leak — but it must stay steady: the breadcrumb the first
+    /// trim inserts is machinery, and if it counted as a turn each pass would
+    /// drop one turn *more* than `keep` allows and the transcript would keep
+    /// shrinking.
+    #[test]
+    fn a_full_transcript_trims_exactly_one_turn_per_new_turn() {
+        let keep = 5;
+        let mut history: Vec<ConversationMessage> = vec![conversation_system("s")];
+        for i in 0..keep {
+            history.push(conversation_user(&format!("turn {i}")));
+            history.push(conversation_assistant(&format!("answer {i}")));
+        }
+
+        // First pass: the transcript is exactly at `keep`, so nothing drops.
+        let at_capacity = trim_conversation_to_fit_with_crumb(
+            history.clone(), keep, usize::MAX, 0, estimate_conversation_tokens, false,
+        );
+        assert!(!at_capacity.trimmed, "at `keep` turns there is nothing to drop");
+
+        // One more turn puts it over, and that is the trigger.
+        history.push(conversation_user("turn 5"));
+        history.push(conversation_assistant("answer 5"));
+        let mut crumb_present = false;
+        let first = trim_conversation_to_fit_with_crumb(
+            history.clone(), keep, usize::MAX, 0, estimate_conversation_tokens, crumb_present,
+        );
+        assert!(first.trimmed, "one turn past `keep` must trim");
+        assert_eq!(first.kept_turns, keep, "the trim retains exactly `keep` turns");
+
+        // Now replay the steady state the way the agent does: keep the trimmed
+        // transcript plus its breadcrumb, append a turn, trim again.
+        let mut running = first.history.clone();
+        insert_conversation_breadcrumb_deduped(&mut running);
+        crumb_present = true;
+
+        for turn in 6..12 {
+            running.push(conversation_user(&format!("turn {turn}")));
+            running.push(conversation_assistant(&format!("answer {turn}")));
+
+            let pass = trim_conversation_to_fit_with_crumb(
+                running.clone(), keep, usize::MAX, 0, estimate_conversation_tokens, crumb_present,
+            );
+            assert!(pass.trimmed, "every new turn past `keep` trims again (turn {turn})");
+            assert_eq!(
+                pass.kept_turns, keep,
+                "the retained count must not drift down (turn {turn})"
+            );
+            assert_eq!(
+                pass.dropped_turns, 1,
+                "a steady transcript drops exactly one turn per new turn (turn {turn})"
+            );
+            running = pass.history;
+            // The breadcrumb is deduplicated, so it is never inserted twice.
+            insert_conversation_breadcrumb_deduped(&mut running);
+        }
+    }
+
+    /// The breadcrumb must not be counted as an operator turn. If it were,
+    /// every pass would see `keep + 1` boundaries and drop an extra turn,
+    /// shrinking the transcript one turn at a time.
+    #[test]
+    fn the_breadcrumb_does_not_consume_a_keep_slot() {
+        let keep = 5;
+        let mut history: Vec<ConversationMessage> = vec![conversation_system("s")];
+        for i in 0..=keep {
+            history.push(conversation_user(&format!("turn {i}")));
+            history.push(conversation_assistant(&format!("answer {i}")));
+        }
+        let result = trim_conversation_to_fit_with_crumb(
+            history.clone(), keep, usize::MAX, 0, estimate_conversation_tokens, false,
+        );
+        let mut kept = result.history.clone();
+        insert_conversation_breadcrumb_deduped(&mut kept);
+
+        // Re-trimming the breadcrumbed transcript must see `keep` turns, not
+        // `keep + 1`, so it must not trim at all.
+        let again = trim_conversation_to_fit_with_crumb(
+            kept.clone(), keep, usize::MAX, 0, estimate_conversation_tokens, true,
+        );
+        assert!(
+            !again.trimmed,
+            "the breadcrumb is machinery: a transcript of `keep` turns plus a breadcrumb is not over the limit"
+        );
+    }
+
     #[test]
     fn synthetic_leaves_operator_turns_alone() {
         assert!(!is_synthetic_user_message(&user("read the build script")));
