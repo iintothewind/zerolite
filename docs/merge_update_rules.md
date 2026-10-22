@@ -7,6 +7,64 @@ the agent must not deviate from.
 Kept out of `AGENTS.md` on purpose: it is read only when a merge is actually
 happening, and `AGENTS.md` stays a short set of standing rules.
 
+## Workflow
+
+```mermaid
+flowchart TD
+    A["Upstream changes arrive"] --> B["1 Pre-check<br/>feature list + docs/design"]
+    B --> C{"Classify each change"}
+
+    C -->|"a: no semantics"| D["May merge"]
+    C -->|"b: fork decision exists"| E["Precedent lane"]
+    C -->|"c: new semantics"| F["Report lane"]
+
+    D --> G["2 Merge plan"]
+    E --> G
+    F --> G
+
+    G --> H{"3 Conflict?"}
+    H -->|"no"| I["Apply"]
+    H -->|"documented"| J["Favor ZeroLite<br/>skip hunk, log 1 line"]
+    H -->|"undocumented"| K["STOP<br/>report + wait"]
+
+    K -->|"decision made"| G
+    J --> I
+
+    I --> L["4 Verify per feature<br/>by behavior, not commits"]
+    L --> M{"Behavior + tests pass?"}
+    M -->|"no"| N["Fix / re-add fork tests<br/>add new tests"]
+    N --> L
+    M -->|"yes"| O["5 Update docs<br/>design docs + mirrors"]
+
+    O --> P{"Docs updated?"}
+    P -->|"no"| O
+    P -->|"yes"| Q["6 Complete"]
+
+    %% mermaid's classDef accepts currentColor or a literal colour only —
+    %% var(--…) fails to parse — so what kind of step a node is rides on
+    %% the line style, keeping the diagram readable in light and dark.
+    classDef gate stroke-width:3px
+    classDef fork stroke-dasharray:5 3
+    classDef stop stroke-dasharray:2 2
+    classDef done stroke-width:5px
+
+    class G,K gate
+    class E,J fork
+    class F,N stop
+    class Q done
+```
+
+Thick solid marks a gate that waits for the user, dashed a fork decision
+applied over upstream, dotted a stop or a repair loop, and heaviest the
+finish.
+
+Two gates stop the flow on their own: the plan review before any write
+(§2), and an undocumented conflict (§3). Neither is a warning — the merge
+does not advance until the user answers.
+
+The loop back from §5 is the one people skip: docs are a completion
+criterion, so a merge with green tests and stale docs is still open.
+
 ## 1. Pre-check
 
 Read `zerolite_feature_list.md` and every design doc in `docs/design/`
