@@ -717,21 +717,34 @@ async fn turn_propagates_provider_error() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 8. History trimming during long conversations
+// 8. History retention across long conversations
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// `keep_recent_turns` is a keep-N *preference*, not a per-turn cap: it
+/// applies when the water-line fires. A long conversation that stays under the
+/// water-line must keep every turn — the upstream per-turn cap cut the
+/// transcript back to keep-N on every success, which is what made
+/// `service start` report a trim on every turn.
 #[tokio::test]
-async fn history_trims_after_max_turns() {
-    let max_history = 6;
+async fn history_keeps_every_turn_while_under_the_water_line() {
+    // The retention preference is 6 and the run is 11 turns, so the transcript
+    // passes `keep_recent_turns` on turn 7. Nothing may be dropped: the turn
+    // count is not a trigger — only the token water-line is, and this
+    // transcript never reaches it.
+    let keep_recent = 6;
+    let turns = keep_recent + 5;
     let mut responses = vec![];
-    for _ in 0..max_history + 5 {
+    for _ in 0..turns {
         responses.push(text_response("ok"));
     }
 
     let model_provider = Box::new(ScriptedModelProvider::new(responses));
     let config = AliasedAgentConfig {
         resolved: zeroclaw_config::schema::ResolvedRuntime {
-            max_history_messages: max_history,
+            context: zeroclaw_config::scattered_types::ContextConfig {
+                keep_recent_turns: Some(keep_recent),
+                ..Default::default()
+            },
             ..Default::default()
         },
         ..AliasedAgentConfig::default()
@@ -739,37 +752,39 @@ async fn history_trims_after_max_turns() {
 
     let mut agent = build_agent_with_config(model_provider, vec![], config);
 
-    for i in 0..max_history + 5 {
+    for i in 0..turns {
         let _ = agent.turn(&format!("msg {i}")).await.unwrap();
     }
 
     let breadcrumb = crate::i18n::get_required_cli_string("history-trim-breadcrumb");
+    assert!(
+        !agent.history().iter().any(|message| matches!(
+            message,
+            ConversationMessage::Chat(chat) if chat.content == breadcrumb
+        )),
+        "nothing may be trimmed below the water-line"
+    );
+
     let retained_messages: Vec<_> = agent
         .history()
         .iter()
         .filter(|message| match message {
-            ConversationMessage::Chat(chat) => chat.role != "system" && chat.content != breadcrumb,
+            ConversationMessage::Chat(chat) => chat.role != "system",
             _ => true,
         })
         .collect();
 
-    let (turns, remainder) = retained_messages.as_chunks::<2>();
+    let (kept_turns, remainder) = retained_messages.as_chunks::<2>();
     assert!(remainder.is_empty(), "history must retain whole turns");
-    assert!(
-        turns.len() <= max_history,
-        "Retained turn count {} exceeds max {}",
-        turns.len(),
-        max_history,
+    assert_eq!(
+        kept_turns.len(),
+        turns,
+        "every turn must survive while the transcript is under the water-line"
     );
-    assert!(turns.iter().all(|turn| matches!(
-        turn,
-        [ConversationMessage::Chat(user), ConversationMessage::Chat(assistant)]
-            if user.role == "user" && assistant.role == "assistant"
-    )));
     assert!(agent.history().iter().any(|message| matches!(
         message,
         ConversationMessage::Chat(chat)
-            if chat.role == "user" && chat.content.ends_with("msg 10")
+            if chat.role == "user" && chat.content.ends_with(&format!("msg {}", turns - 1))
     )));
 
     // System prompt should always be preserved
@@ -1362,36 +1377,32 @@ async fn builder_fails_without_provider() {
 
 #[tokio::test]
 async fn multi_turn_maintains_growing_history() {
-    let model_provider = Box::new(ScriptedModelProvider::new(vec![
-        text_response("response 1"),
-        text_response("response 2"),
-        text_response("response 3"),
-    ]));
+    // More turns than the default `keep_recent_turns` (5). The v1.0.0
+    // baseline only ran three turns, which can never reach a keep-N boundary:
+    // a per-turn cap that cut the transcript back to 5 would still pass. This
+    // keeps the baseline's expectation (history grows on every turn) but runs
+    // long enough for a cap to show up.
+    let turns = 8;
+    let responses = (1..=turns)
+        .map(|i| text_response(&format!("response {i}")))
+        .collect();
+    let model_provider = Box::new(ScriptedModelProvider::new(responses));
 
     let mut agent = build_agent_with(model_provider, vec![], Box::new(NativeToolDispatcher));
 
-    let r1 = agent.turn("msg 1").await.unwrap();
-    let len_after_1 = agent.history().len();
+    let mut previous = agent.history().len();
+    for i in 1..=turns {
+        let response = agent.turn(&format!("msg {i}")).await.unwrap();
+        assert_eq!(response, format!("response {i}"));
 
-    let r2 = agent.turn("msg 2").await.unwrap();
-    let len_after_2 = agent.history().len();
-
-    let r3 = agent.turn("msg 3").await.unwrap();
-    let len_after_3 = agent.history().len();
-
-    assert_eq!(r1, "response 1");
-    assert_eq!(r2, "response 2");
-    assert_eq!(r3, "response 3");
-
-    // History should grow with each turn (user + assistant per turn)
-    assert!(
-        len_after_2 > len_after_1,
-        "History should grow after turn 2"
-    );
-    assert!(
-        len_after_3 > len_after_2,
-        "History should grow after turn 3"
-    );
+        let current = agent.history().len();
+        assert!(
+            current > previous,
+            "history must grow on every turn below the water-line \
+             (turn {i}: {previous} -> {current})"
+        );
+        previous = current;
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

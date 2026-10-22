@@ -54,12 +54,6 @@ fn open_calls_after(events: impl IntoIterator<Item = ToolEventKind>) -> usize {
     open
 }
 
-/// Canonical breadcrumb text, duplicated from
-/// `zeroclaw_runtime::agent::history::HISTORY_TRIM_BREADCRUMB_CANONICAL`.
-/// This crate sits below `zeroclaw-runtime` in the dependency graph and
-/// cannot import it; used only for one-time legacy-row migration below.
-/// Keep in sync with the runtime constant.
-const HISTORY_TRIM_BREADCRUMB_CANONICAL: &str = "[earlier turns omitted to fit the context window]";
 const SYNTHETIC_INTERRUPTION_ROLE: &str = "__zeroclaw_turn_stream_interrupted__";
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -608,49 +602,6 @@ impl AcpSessionStore {
         Ok(())
     }
 
-    /// One-time legacy migration for rows written before the
-    /// `trim_breadcrumb` column existed (`NULL`): infer provenance from
-    /// whether the first non-system message is exactly the canonical
-    /// breadcrumb text. A genuine user turn that happens to equal that text
-    /// is misclassified on this one-time migration only; callers must
-    /// persist the result via `record_inferred_trim_breadcrumb` so the
-    /// column stops being `NULL` and later restores read the recorded fact
-    /// instead of re-inferring it from message text on every load. This
-    /// mirrors the JSONL interactive-session migration in
-    /// `zeroclaw_runtime::agent::history::load_interactive_session_history_with_crumb`,
-    /// restricted to the locale-independent canonical string because this
-    /// crate sits below the runtime i18n layer.
-    fn infer_legacy_trim_breadcrumb(messages: &[ConversationMessage]) -> bool {
-        messages
-            .iter()
-            .find_map(|m| match m {
-                ConversationMessage::Chat(chat) if chat.role != "system" => Some(chat),
-                _ => None,
-            })
-            .is_some_and(|first| {
-                first.role == "user" && first.content == HISTORY_TRIM_BREADCRUMB_CANONICAL
-            })
-    }
-
-    /// Write the one-time `infer_legacy_trim_breadcrumb` result back to the
-    /// still-`NULL` column, using the connection the caller already holds
-    /// (avoids re-locking `self.conn`, which the caller's `load_session*`
-    /// query has open). After this, the column is no longer `NULL` for this
-    /// session, so the next restore reads the recorded fact rather than
-    /// inferring it again from user-controlled text.
-    fn record_inferred_trim_breadcrumb(
-        conn: &Connection,
-        session_uuid: &str,
-        inferred: bool,
-    ) -> Result<()> {
-        conn.execute(
-            "UPDATE acp_sessions SET trim_breadcrumb = ?1 WHERE session_uuid = ?2",
-            params![i64::from(inferred), session_uuid],
-        )
-        .context("Failed to record inferred legacy trim_breadcrumb")?;
-        Ok(())
-    }
-
     /// Record a new session stamped with its owning principal (RFC 7141
     /// session isolation). `principal_id` is the caller's scope, or `None` for
     /// an unscoped/admin connection (NULL owner => visible only to unscoped
@@ -824,11 +775,9 @@ impl AcpSessionStore {
         let retained_context = Self::load_retained_context(&conn, session_id)?;
         let trim_breadcrumb = match trim_breadcrumb_raw {
             Some(v) => v != 0,
-            None => {
-                let inferred = Self::infer_legacy_trim_breadcrumb(&messages);
-                Self::record_inferred_trim_breadcrumb(&conn, session_uuid, inferred)?;
-                inferred
-            }
+            // No recorded provenance: legacy row. Provenance is never
+            // inferred from message text, so it restores as `false`.
+            None => false,
         };
 
         Ok(Some(AcpSessionData {
@@ -1078,11 +1027,9 @@ impl AcpSessionStore {
         let retained_context = Self::load_retained_context(&conn, session_id)?;
         let trim_breadcrumb = match trim_breadcrumb_raw {
             Some(v) => v != 0,
-            None => {
-                let inferred = Self::infer_legacy_trim_breadcrumb(&messages);
-                Self::record_inferred_trim_breadcrumb(&conn, session_uuid, inferred)?;
-                inferred
-            }
+            // No recorded provenance: legacy row. Provenance is never
+            // inferred from message text, so it restores as `false`.
+            None => false,
         };
 
         Ok(Some(AcpSessionData {
@@ -1205,11 +1152,9 @@ impl AcpSessionStore {
         let retained_context = Self::load_retained_context(&conn, session_id)?;
         let trim_breadcrumb = match trim_breadcrumb_raw {
             Some(v) => v != 0,
-            None => {
-                let inferred = Self::infer_legacy_trim_breadcrumb(&messages);
-                Self::record_inferred_trim_breadcrumb(&conn, session_uuid, inferred)?;
-                inferred
-            }
+            // No recorded provenance: legacy row. Provenance is never
+            // inferred from message text, so it restores as `false`.
+            None => false,
         };
 
         Ok(AcpSessionRestore::Restorable(Box::new(AcpSessionData {
@@ -7026,7 +6971,7 @@ mod tests {
             .append_turn(
                 "sess-legacy-marker",
                 &[
-                    ConversationMessage::Chat(ChatMessage::user(HISTORY_TRIM_BREADCRUMB_CANONICAL)),
+                    ConversationMessage::Chat(ChatMessage::user("[earlier turns omitted to fit the context window]")),
                     ConversationMessage::Chat(ChatMessage::user("real turn")),
                 ],
             )

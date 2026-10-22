@@ -1626,7 +1626,7 @@ impl SessionStore {
         let sessions = self.sessions.lock().await;
         let s = sessions.get(id)?;
         let h = s.agent.lock().await;
-        // Saturate: `trim_history` can shift indices past `from` between polls.
+        // Saturate: a trim can shift indices past `from` between polls.
         let history = h.history();
         Some(history[from.min(history.len())..].to_vec())
     }

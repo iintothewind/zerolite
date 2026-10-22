@@ -5176,6 +5176,7 @@ impl DelegateTool {
         let execution = tokio::time::timeout(
             Duration::from_secs(agentic_timeout_secs),
             run_tool_call_loop(ToolLoop {
+                history_was_trimmed: None,
                 served_route_sink: None,
                 sop_reassembly: None,
                 exec: ResolvedAgentExecution::resolve(

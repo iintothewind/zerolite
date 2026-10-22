@@ -112,6 +112,14 @@ the invariant):
   and hard-fails there, trimming cannot be disabled, size is anchored by
   `ContextCalibration`, and no summarization compaction exists in the
   retention path.
+- **An action must not survive a merge as a trigger.** The v0.8.6 merge
+  (`1f379c6de`) swapped the post-loop re-sync for an upstream
+  `Agent::trim_history` — keep-N with no water-line test — and hung it on the
+  turn's success path. It compiled, and no test went red; the only symptom was
+  a trim notice on *every* turn. The rule: a function that drops turns is an
+  **action**; each of its call sites must be a trigger that can name its own
+  evidence — the water-line was crossed, or the loop itself dropped turns.
+  A call site that cannot name its trigger does not belong there.
 
 Context management in ZeroClaw is, at its core, **cache management**. Every
 byte that changes in the message prefix replayed to a provider forces that
@@ -261,32 +269,55 @@ How stage 2 is decided does not matter to operators: the runtime may probe by de
 
 ### When the provider reports no usage
 
-The trigger above reads the **provider-reported** `input_tokens`, which is
-authoritative because it is what the provider actually billed. Not every
-endpoint reports it: OpenAI-compatible servers, local runtimes, and some
-streaming responses omit usage entirely.
+Two decision points read different evidence. Do not collapse them:
 
-Without a reported count the runtime has no authoritative number, so the local
-estimate is **not** a substitute for it — it cannot see what the provider
-really charged. Trimming on the estimate would cut history away on a guess,
-and the breadcrumb that records the cut can itself push the retained set past
-the window. So with no reported usage the runtime:
+| Decision point | Evidence | Is the estimate the trigger? |
+| --- | --- | --- |
+| **Pre-send**, before a request leaves | the population about to be sent; no report for it can exist yet | **yes** — the water-line above *is* the local estimate |
+| **Post-response**, after a reply lands | `usage.input_tokens` for the request just sent | **no** — without a report the estimate is not a measurement of what was billed |
 
-- **does not trim proactively** — the water-line trigger stays inactive, because
-  the estimate is not a measurement;
-- **only acts as an overflow guard** — when the local estimate says the request
-  could not fit the model's window at all, the runtime trims and retries;
+The water-line trigger runs **pre-send**. Nothing has been sent, so no provider
+report for this request exists and none can; refusing to trim until one arrives
+would mean never trimming the request that is about to overflow. The local
+estimate is the correct — and only — evidence there.
+
+The **post-response** check is the one that must not act on a guess. It re-reads
+the just-sent request's size to decide whether the *next* request needs to
+shrink. The provider-reported `input_tokens` is authoritative there because it
+is what the provider actually billed. Not every endpoint reports it:
+OpenAI-compatible servers, local runtimes, and some streaming responses omit
+usage entirely. Without a reported count the estimate cannot see what the
+provider really charged, and trimming on it would cut history away on a guess —
+the breadcrumb that records the cut can itself push the retained set past the
+window. So on that path, with no reported usage, the runtime:
+
+- **does not trim proactively** — the post-response water-line check stays
+  inactive, because the estimate is not a measurement of the request just sent;
+- **only acts as an overflow guard** — when the estimate plus the output
+  reserve cannot fit the effective window (`estimate > send_budget`), the
+  runtime trims and retries;
 - **skips the guard when there is nothing to drop** — if only one whole turn
   remains, trimming cannot make the request smaller, so the request is
   dispatched rather than failed on a difference the trim cannot close.
 
-A provider that reports usage keeps the full behaviour: the water-line
-triggers the trim, and the send budget decides what still fits.
+The guard's threshold is `send_budget`, not the raw window, for two reasons.
+The reserve is **physical output space, not a preference**: a prompt that fits
+the window but leaves the model no room to answer in has already failed, so the
+comparison is a correctness check rather than the proactive strategy the
+water-line implements. And `send_budget` is what carries
+`request_token_ceiling` into the check — the ceiling is an operator-declared
+hard limit, not a strategy knob, so a guard measured against the raw model
+window would ignore it.
+
+A provider that reports usage keeps the full behaviour on both paths: pre-send
+the water-line triggers the trim, post-response the reported count anchors it,
+and the send budget decides what still fits.
 
 **The floor is the model's capacity, not the send budget.** A retention that
-misses the send budget but still fits the model's window is a *soft floor*: the
-newest turn is dispatched rather than rejected. Only a population the model
-cannot take is an unsatisfiable floor.
+misses the send budget but still fits the **effective window** (the model window
+clamped by `request_token_ceiling`) is a *soft floor*: the newest turn is
+dispatched rather than rejected. Only a population the model cannot take is an
+unsatisfiable floor.
 
 **Settlement.** Stage 2 selects by summing per-message estimates, which is only
 exact when the estimator is additive. A provider view that prices the whole

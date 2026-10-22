@@ -23,14 +23,6 @@ pub struct TrimResult {
     pub below_preferred_keep: bool,
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct TurnCountTrimResult<T> {
-    pub history: Vec<T>,
-    pub dropped_messages: usize,
-    pub dropped_turns: usize,
-    pub kept_turns: usize,
-    pub trimmed: bool,
-}
 
 fn is_conversation_system(msg: &ConversationMessage) -> bool {
     matches!(msg, ConversationMessage::Chat(chat) if chat.role == "system")
@@ -137,127 +129,6 @@ fn keep_recent_whole_turns(
         trimmed: true,
         exceeds_budget: false,
         below_preferred_keep: false,
-    }
-}
-
-/// Keep at most `max_turns` recent provider-facing turns. This is the
-/// count-based companion to the keep-N cut; both use identical turn
-/// boundaries and always retain the newest complete turn.
-pub(crate) fn trim_to_recent_turn_count(
-    history: Vec<ChatMessage>,
-    max_turns: usize,
-    has_leading_breadcrumb: bool,
-) -> TurnCountTrimResult<ChatMessage> {
-    let total_turns = count_turns(&history).saturating_sub(usize::from(has_leading_breadcrumb));
-    if total_turns <= max_turns || total_turns <= 1 {
-        return TurnCountTrimResult {
-            history,
-            dropped_messages: 0,
-            dropped_turns: 0,
-            kept_turns: total_turns,
-            trimmed: false,
-        };
-    }
-
-    let leading_system = history
-        .iter()
-        .take_while(|message| is_system(message))
-        .count();
-    let system = history[..leading_system].to_vec();
-    let body = &history[leading_system..];
-    let breadcrumb_index = has_leading_breadcrumb.then_some(0);
-    let boundaries: Vec<usize> = body
-        .iter()
-        .enumerate()
-        .filter_map(|(index, message)| {
-            (is_turn_boundary(message) && Some(index) != breadcrumb_index).then_some(index)
-        })
-        .collect();
-    let kept_turns = max_turns.max(1).min(boundaries.len());
-    let dropped_turns = boundaries.len() - kept_turns;
-    let first_kept = boundaries[dropped_turns];
-
-    let mut kept = system;
-    if has_leading_breadcrumb {
-        kept.push(body[0].clone());
-    }
-    kept.extend_from_slice(&body[first_kept..]);
-    TurnCountTrimResult {
-        history: kept,
-        dropped_messages: first_kept - usize::from(has_leading_breadcrumb),
-        dropped_turns,
-        kept_turns,
-        trimmed: true,
-    }
-}
-
-pub fn trim_to_reported_budget(
-    history: Vec<ChatMessage>,
-    budget_tokens: usize,
-    reported_input_tokens: usize,
-    // Estimated token count of the exact message population that produced
-    // `reported_input_tokens` (the pre-request `prepared_messages`, before any
-    // assistant/tool-result output for this iteration was appended to
-    // `history`). Scaling the selection target against this measured population
-    // keeps it consistent with the calibration ratio used for `tokens_after`;
-    // re-estimating the larger post-append `history` here would select more
-    // retention than the calibration justifies and let the final history
-    // overrun the budget.
-    reported_population_estimated: usize,
-    tool_schema_tokens: usize,
-) -> TrimResult {
-    trim_to_reported_budget_with_crumb(
-        history,
-        budget_tokens,
-        reported_input_tokens,
-        reported_population_estimated,
-        tool_schema_tokens,
-        false,
-    )
-}
-
-/// Crumb-aware variant: when `crumb_present` is true the population carries
-/// the synthetic breadcrumb immediately after leading system messages.
-/// The breadcrumb is never counted as a turn and never dropped.
-pub fn trim_to_reported_budget_with_crumb(
-    history: Vec<ChatMessage>,
-    budget_tokens: usize,
-    reported_input_tokens: usize,
-    reported_population_estimated: usize,
-    tool_schema_tokens: usize,
-    crumb_present: bool,
-) -> TrimResult {
-    let estimated = reported_population_estimated;
-    if budget_tokens == 0 || reported_input_tokens <= budget_tokens || estimated == 0 {
-        let total_turns = count_turns(&history).saturating_sub(usize::from(crumb_present));
-        return TrimResult {
-            tokens_before: reported_input_tokens,
-            tokens_after: reported_input_tokens,
-            history,
-            dropped_messages: 0,
-            dropped_turns: 0,
-            kept_turns: total_turns,
-            trimmed: false,
-            exceeds_budget: false,
-            below_preferred_keep: false,
-        };
-    }
-    // Native tool schemas are constant across a trim, so reserve them inside
-    // the scaled total and trim the history portion to what remains: the
-    // retained history plus tools then fits the budget when the reported
-    // count is faithful.
-    let target_total =
-        (budget_tokens as u128 * estimated as u128 / reported_input_tokens as u128).max(1) as usize;
-    let scaled = target_total.saturating_sub(tool_schema_tokens).max(1);
-    let preferred = zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS;
-    // The reported-budget path has no model window of its own: the
-    // caller's budget is the only ceiling, so the hard floor is not judged here.
-    let result = trim_to_fit_with_crumb(history, preferred, scaled, 0, crumb_present);
-    let ratio = reported_input_tokens as f64 / estimated as f64;
-    TrimResult {
-        tokens_before: reported_input_tokens,
-        tokens_after: ((result.tokens_after + tool_schema_tokens) as f64 * ratio).round() as usize,
-        ..result
     }
 }
 
@@ -1468,10 +1339,10 @@ mod tests {
     /// tool-result row as a `user` row whose content starts with
     /// `[Tool results]`, so a genuine user message that happens to begin with
     /// that prefix is grouped with the preceding assistant turn instead of
-    /// opening a turn of its own. This pins that grouping: the row is dropped
-    /// together with that turn and never counted as an independent turn.
+    /// opening a turn of its own. Every trim path shares `is_turn_boundary`,
+    /// so this pins the rule itself rather than one trim entry point.
     #[test]
-    fn user_text_matching_tool_results_prefix_is_dropped_with_its_turn() {
+    fn user_text_matching_tool_results_prefix_is_not_a_turn_boundary() {
         let history = vec![
             sys("system"),
             user("old request"),
@@ -1482,21 +1353,14 @@ mod tests {
             asst("new answer"),
         ];
 
-        let result = trim_to_recent_turn_count(history, 1, false);
-
-        assert!(result.trimmed);
-        assert_eq!(
-            result.dropped_turns, 1,
-            "the prefix-matching row must not count as a turn of its own"
-        );
-        assert_eq!(result.kept_turns, 1);
-        assert_eq!(result.dropped_messages, 4);
         assert!(
-            !result
-                .history
-                .iter()
-                .any(|message| message.content == "[Tool results]\nthis is literal user text"),
-            "the prefix-matching row drops with its turn rather than surviving as its own"
+            !is_turn_boundary(&history[3]),
+            "a `[Tool results]`-prefixed row must not open a turn of its own"
+        );
+        assert_eq!(
+            count_turns(&history),
+            2,
+            "the prefix-matching row groups with the preceding turn"
         );
     }
 
@@ -1644,186 +1508,6 @@ mod tests {
         assert_eq!(result.dropped_turns, 1);
         assert_eq!(result.kept_turns, 1);
         assert!(result.history.iter().any(|m| m.content == "new request"));
-    }
-
-    #[test]
-    fn second_count_trim_excludes_explicit_leading_breadcrumb_from_turn_counts() {
-        let history = vec![
-            sys("system"),
-            breadcrumb(),
-            user("old request"),
-            asst("old answer"),
-            user("new request"),
-            asst("new answer"),
-        ];
-
-        let result = trim_to_recent_turn_count(history, 1, true);
-
-        assert!(result.trimmed);
-        assert_eq!(result.dropped_messages, 2);
-        assert_eq!(result.dropped_turns, 1);
-        assert_eq!(result.kept_turns, 1);
-        assert!(result.history.iter().any(|m| m.content == "new request"));
-    }
-
-    #[test]
-    fn reported_budget_trims_when_reported_exceeds_budget() {
-        let big = "x".repeat(2000);
-        let h = vec![
-            sys("system"),
-            user(&format!("turn1 {big}")),
-            asst("a1"),
-            user(&format!("turn2 {big}")),
-            asst("a2"),
-            user("turn3 short"),
-            asst("a3"),
-        ];
-        let estimated = estimate_history_tokens(&h);
-        let reported = estimated * 4;
-        let budget = reported / 2;
-        let r = trim_to_reported_budget(h, budget, reported, estimated, 0);
-        assert!(
-            r.trimmed,
-            "must trim when provider-reported tokens exceed budget"
-        );
-        assert!(r.dropped_turns >= 1);
-        assert!(r.history.iter().any(|m| m.content.contains("turn3 short")));
-    }
-
-    #[test]
-    fn reported_budget_no_trim_when_real_tokens_fit() {
-        let h = vec![sys("system"), user("hi"), asst("hello")];
-        let estimated = estimate_history_tokens(&h);
-        let r = trim_to_reported_budget(h, estimated * 4, estimated, estimated, 0);
-        assert!(!r.trimmed);
-    }
-
-    #[test]
-    fn reported_budget_trims_under_extreme_ratio() {
-        let big = "x".repeat(4000);
-        let h = vec![
-            sys("system"),
-            user(&format!("old {big}")),
-            asst("a1"),
-            user("recent short"),
-            asst("a2"),
-        ];
-        let estimated = estimate_history_tokens(&h);
-        let reported = estimated * 5000;
-        let budget = reported / 100;
-        let r = trim_to_reported_budget(h, budget, reported, estimated, 0);
-        assert!(r.trimmed, "extreme ratio must still enforce, not no-op");
-        assert!(r.history.iter().any(|m| m.content.contains("recent short")));
-    }
-
-    #[test]
-    fn reported_budget_reserves_room_for_large_native_tool_schema() {
-        let big = "x".repeat(2000);
-        let h = vec![
-            sys("system"),
-            user(&format!("turn1 {big}")),
-            asst("a1"),
-            user(&format!("turn2 {big}")),
-            asst("a2"),
-            user("turn3 short"),
-            asst("a3"),
-        ];
-        // A large native tool schema that a provider would serialize into the
-        // request and count in `input_tokens` alongside the messages.
-        let spec = crate::tools::ToolSpec::new(
-            "large_schema_tool",
-            "a tool with a very large parameter schema",
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "payload": {
-                        "type": "string",
-                        "description": "big".repeat(300),
-                    }
-                }
-            }),
-        );
-        let tool_tokens = crate::agent::history::estimate_tool_schema_tokens(&[spec]);
-        assert!(
-            tool_tokens > 0,
-            "a large tool schema must contribute a nonzero token estimate"
-        );
-
-        // Faithful provider: reported == messages + tool schemas.
-        let estimated = estimate_history_tokens(&h) + tool_tokens;
-        let reported = estimated;
-        let budget = reported / 2;
-        assert!(budget > tool_tokens, "budget must leave headroom for tools");
-
-        let r = trim_to_reported_budget(h, budget, reported, estimated, tool_tokens);
-        assert!(
-            r.trimmed,
-            "must trim when reported population exceeds budget"
-        );
-        let kept_total = estimate_history_tokens(&r.history) + tool_tokens;
-        assert!(
-            kept_total <= budget,
-            "retained history plus constant tool schemas must fit the budget (kept {kept_total}, budget {budget})"
-        );
-        assert_eq!(
-            r.tokens_after, kept_total,
-            "tokens_after must cover the full provider population, tool schemas included"
-        );
-        assert!(r.history.iter().any(|m| m.content.contains("turn3 short")));
-    }
-
-    #[test]
-    fn reported_budget_calibrates_selection_against_the_measured_population() {
-        // `reported_population_estimated` describes the population that produced
-        // `reported` — the pre-request transcript. `history` here is the
-        // already-appended transcript (the provider calls back with a larger
-        // estimate after the assistant/tool output was added). The selection
-        // target must scale from the MEASURED population, not from the fresher,
-        // larger post-append estimate, or the retained set would exceed the
-        // budget once calibrated.
-        let big = "x".repeat(2000);
-        // The measured (pre-request) population: several substantial turns so
-        // there is plenty of room to trim toward the budget.
-        let mut measured = vec![sys("system")];
-        for i in 0..8 {
-            measured.push(user(format!("m{i} {big}").as_str()));
-            measured.push(asst(format!("a{i}").as_str()));
-        }
-        let reported = estimate_history_tokens(&measured) * 4;
-        let budget = reported / 2;
-        let measured_population_estimated = estimate_history_tokens(&measured);
-
-        // Post-request append: this iteration's assistant output lands on the
-        // same transcript `trim_to_reported_budget` sees, making it larger than
-        // the measured population — but small enough that the newest whole turn
-        // still fits the post-trim target (no oversized-turn exception).
-        let appended = "y".repeat(400);
-        let mut history = measured;
-        history.push(ChatMessage::assistant(&appended));
-        assert!(
-            estimate_history_tokens(&history) > measured_population_estimated,
-            "the appended output must make the post-append estimate the larger one"
-        );
-
-        let r =
-            trim_to_reported_budget(history, budget, reported, measured_population_estimated, 0);
-        assert!(r.trimmed, "must trim when reported exceeds budget");
-        assert!(
-            r.tokens_after <= budget,
-            "selection must not outpace the calibration ratio: tokens_after {} > budget {budget}",
-            r.tokens_after
-        );
-        // The retained history must also fit the budget under the measured
-        // calibration ratio (the calibration's own check).
-        let kept = estimate_history_tokens(&r.history);
-        let calibrated = (kept as f64 * reported as f64
-            / measured_population_estimated.max(1) as f64)
-            .round() as u64;
-        assert!(
-            calibrated <= budget as u64,
-            "retained history must respect the budget under the measured ratio \
-             (calibrated {calibrated}, budget {budget})"
-        );
     }
 
     #[test]
@@ -2144,19 +1828,88 @@ mod tests {
         assert!(!r.history.iter().any(|m| m.content.contains("t0")));
     }
 
-    /// §2: `ContextCalibration` anchors the size on the provider's reported
-    /// count and prices only the not-yet-billed tail.
-    #[test]
-    fn the_calibration_anchors_on_the_provider_reported_size() {
-        let mut h = vec![sys("base"), user("first")];
-        let mut cal = ContextCalibration::new();
-        cal.observe_reported(1_000, &h);
-        assert_eq!(cal.current(&h), 1_000);
-        h.push(asst("reply"));
-        let expected = 1_000 + estimate_history_tokens(&h[h.len() - 1..]);
-        assert_eq!(cal.current(&h), expected);
+    /// §"The trim action": stage 2 must **warn** when the chosen keep is below
+    /// preferred. `below_preferred_keep` is asserted at struct level elsewhere;
+    /// this pins that the warning actually reaches the log, carrying the numbers
+    /// an operator needs to decide whether to raise the window or shrink the
+    /// tool surface.
+    #[tokio::test]
+    async fn a_cascade_below_the_preferred_keep_emits_the_warning() {
+        // Five turns of ~1k tokens each. A 2.5k send budget fits two turns but
+        // not the preferred five, so stage 2 lands below preferred and still
+        // fits — the one combination that warns.
+        let history = multi_turn_history(5, &"x".repeat(2_000));
+        let preferred = 5;
+        let send_budget = 2_500;
+        let result = trim_to_fit(history, preferred, send_budget, 0);
+        assert!(result.trimmed);
+        assert!(
+            !result.exceeds_budget,
+            "a retention that fits must not be reported as a floor"
+        );
+        assert_eq!(result.kept_turns, 2, "the cascade keeps the largest fit");
+        assert!(
+            result.below_preferred_keep,
+            "kept_turns < preferred is exactly the warn condition"
+        );
+
+        // The broadcast hook is process-wide: a parallel test that calls
+        // `subscribe_or_install` replaces the sender and closes this receiver.
+        // Re-subscribe and re-emit rather than fail — the warning is idempotent
+        // and what is pinned here is its shape, not its delivery count.
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+        warn_if_below_preferred_keep(preferred, send_budget, &result);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let record = loop {
+            if std::time::Instant::now() >= deadline {
+                panic!("did not observe the context_trim_below_preferred_keep record in time");
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let step = remaining.min(std::time::Duration::from_millis(50));
+            match tokio::time::timeout(step, rx.recv()).await {
+                Ok(Ok(value))
+                    if value
+                        .get("attributes")
+                        .and_then(|a| a.get("error_key"))
+                        .and_then(|v| v.as_str())
+                        == Some("context_trim_below_preferred_keep") =>
+                {
+                    break value;
+                }
+                Ok(Ok(_)) | Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                    rx = zeroclaw_log::subscribe_or_install();
+                    while rx.try_recv().is_ok() {}
+                    warn_if_below_preferred_keep(preferred, send_budget, &result);
+                }
+                Err(_elapsed) => {
+                    // The record may have gone to a hook we were not on yet.
+                    warn_if_below_preferred_keep(preferred, send_budget, &result);
+                }
+            }
+        };
+
+        let attrs = record.get("attributes").expect("record carries attributes");
+        assert_eq!(
+            attrs.get("preferred_keep").and_then(|v| v.as_u64()),
+            Some(preferred as u64),
+            "the warning must name the preference that could not be honoured"
+        );
+        assert_eq!(
+            attrs.get("kept_turns").and_then(|v| v.as_u64()),
+            Some(result.kept_turns as u64)
+        );
+        assert_eq!(
+            attrs.get("send_budget").and_then(|v| v.as_u64()),
+            Some(send_budget as u64)
+        );
     }
 
+
+    /// §2: `ContextCalibration` anchors the size on the provider's reported
+    /// count and prices only the not-yet-billed tail.
     /// §2: the retention path drops whole turns only — no model-written
     /// summary is ever inserted.
     #[test]
@@ -2429,7 +2182,10 @@ mod tests {
     }
 
     #[test]
-    fn trim_to_fit_uses_send_budget_not_token_budget() {
+    /// Baseline name from v1.0.0. The primitive it names is now
+    /// [`trim_to_fit`] (budget trim by whole turns); the assertions are
+    /// unchanged from the baseline.
+    fn trim_to_budget_uses_send_budget_not_token_budget() {
         let big = "x".repeat(800);
         let h = multi_turn_history(6, &big);
         let keep2 = trim_to_fit(h.clone(), 2, 0, 0);
@@ -2624,17 +2380,22 @@ mod tests {
         assert!(is_synthetic_user_message(&breadcrumb()));
     }
 
-    /// The behaviour behind "trim fires every turn".
+    /// The keep-N *action* under an unbounded fit budget — never a trigger.
     ///
-    /// `keep` is a retention preference, not a water-line: once the transcript
-    /// holds `keep` turns, every new turn pushes the oldest one out, so the
-    /// trim fires on every subsequent turn by construction. It is steady
-    /// state, not a leak — but it must stay steady: the breadcrumb the first
-    /// trim inserts is machinery, and if it counted as a turn each pass would
-    /// drop one turn *more* than `keep` allows and the transcript would keep
-    /// shrinking.
+    /// `keep` is a retention preference. Called with `send_budget = usize::MAX`
+    /// the fit check can never fail, so stage 1 retains the newest `keep` whole
+    /// turns and drops everything older. That is truncation, and it is all this
+    /// function ever does: it is the action a trigger opens, never a trigger.
+    ///
+    /// No production trigger calls it this way. The water-line decides *when*,
+    /// and it is a token test, so a transcript under the water-line is never
+    /// handed here however many turns it holds. What is pinned below is only
+    /// that repeated application is stable: the breadcrumb the first pass
+    /// inserts is machinery, and if it counted as a turn each pass would drop
+    /// one turn *more* than `keep` allows and the transcript would shrink turn
+    /// by turn.
     #[test]
-    fn a_full_transcript_trims_exactly_one_turn_per_new_turn() {
+    fn the_keep_n_action_truncates_to_keep_and_holds_steady_across_passes() {
         let keep = 5;
         let mut history: Vec<ConversationMessage> = vec![conversation_system("s")];
         for i in 0..keep {
@@ -2642,24 +2403,25 @@ mod tests {
             history.push(conversation_assistant(&format!("answer {i}")));
         }
 
-        // First pass: the transcript is exactly at `keep`, so nothing drops.
+        // A transcript of exactly `keep` turns is already the action's fixed
+        // point: there is nothing older to drop.
         let at_capacity = trim_conversation_to_fit_with_crumb(
             history.clone(), keep, usize::MAX, 0, estimate_conversation_tokens, false,
         );
         assert!(!at_capacity.trimmed, "at `keep` turns there is nothing to drop");
 
-        // One more turn puts it over, and that is the trigger.
+        // One turn older than `keep` is, and the action drops it.
         history.push(conversation_user("turn 5"));
         history.push(conversation_assistant("answer 5"));
         let mut crumb_present = false;
         let first = trim_conversation_to_fit_with_crumb(
             history.clone(), keep, usize::MAX, 0, estimate_conversation_tokens, crumb_present,
         );
-        assert!(first.trimmed, "one turn past `keep` must trim");
-        assert_eq!(first.kept_turns, keep, "the trim retains exactly `keep` turns");
+        assert!(first.trimmed, "the action drops the turns older than `keep`");
+        assert_eq!(first.kept_turns, keep, "the action retains exactly `keep` turns");
 
-        // Now replay the steady state the way the agent does: keep the trimmed
-        // transcript plus its breadcrumb, append a turn, trim again.
+        // Replay the action's own output plus its breadcrumb, append a turn,
+        // apply the action again: the retained count must not drift.
         let mut running = first.history.clone();
         insert_conversation_breadcrumb_deduped(&mut running);
         crumb_present = true;
@@ -2671,14 +2433,14 @@ mod tests {
             let pass = trim_conversation_to_fit_with_crumb(
                 running.clone(), keep, usize::MAX, 0, estimate_conversation_tokens, crumb_present,
             );
-            assert!(pass.trimmed, "every new turn past `keep` trims again (turn {turn})");
+            assert!(pass.trimmed, "the action still truncates at pass {turn}");
             assert_eq!(
                 pass.kept_turns, keep,
-                "the retained count must not drift down (turn {turn})"
+                "the retained count must not drift down (pass {turn})"
             );
             assert_eq!(
                 pass.dropped_turns, 1,
-                "a steady transcript drops exactly one turn per new turn (turn {turn})"
+                "one new turn in, exactly one old turn out (pass {turn})"
             );
             running = pass.history;
             // The breadcrumb is deduplicated, so it is never inserted twice.

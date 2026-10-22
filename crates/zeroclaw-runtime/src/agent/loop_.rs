@@ -311,7 +311,7 @@ pub use super::cost::{
 pub use super::history::{
     append_or_merge_system_message, estimate_history_tokens, load_interactive_session_history,
     load_interactive_session_history_with_crumb, normalize_system_messages,
-    save_interactive_session_history, save_interactive_session_history_with_crumb, trim_history,
+    save_interactive_session_history, save_interactive_session_history_with_crumb,
     truncate_tool_result,
 };
 
@@ -1221,6 +1221,7 @@ async fn agent_turn_with_sop_reassembly(
         context_token_budget,
     );
     let result = Box::pin(run_tool_call_loop(ToolLoop {
+        history_was_trimmed: None,
         sop_reassembly,
         history_has_trim_breadcrumb,
         injected_memory_preamble,
@@ -1607,7 +1608,6 @@ pub async fn run(
         // ── Effective per-agent runtime tunables ──────────────────────
         // Profile values (when set) override the agent's inline fields.
         // See `Config::resolved_agent_config` for precedence rules.
-        let eff_max_history_turns = agent.resolved.max_history_messages;
         let eff_compact_context = agent.resolved.compact_context;
         let eff_max_system_prompt_chars = agent.resolved.max_system_prompt_chars;
         let eff_prompt_injection_mode = agent.resolved.prompt_injection_mode;
@@ -2365,6 +2365,7 @@ pub async fn run(
                         TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                             cost_tracking_context.clone(),
                             run_tool_call_loop(ToolLoop {
+                                history_was_trimmed: None,
                                     exec: ResolvedAgentExecution::resolve(
                                     ResolvedModelAccess {
                                         model_provider: model_provider.as_ref(),
@@ -3032,6 +3033,7 @@ pub async fn run(
                             TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                                 cost_tracking_context.clone(),
                                 run_tool_call_loop(ToolLoop {
+                                    history_was_trimmed: None,
                                     exec: ResolvedAgentExecution::resolve(
                                         ResolvedModelAccess {
                                             model_provider: model_provider.as_ref(),
@@ -3375,13 +3377,6 @@ pub async fn run(
                         eprintln!("\x1b[2m{}\x1b[0m", msg);
                     }
                 }
-
-                // Whole-turn retention limit as a safety net.
-                trim_history(
-                    &mut history,
-                    eff_max_history_turns,
-                    &mut history_has_trim_breadcrumb,
-                );
 
                 // Restore base system prompt after the per-turn tool framing
                 // and optional thinking prefix have been applied.
@@ -4458,7 +4453,7 @@ mod tests {
         );
     }
 
-    use crate::agent::history::{DEFAULT_MAX_HISTORY_MESSAGES, InteractiveSessionState};
+    use crate::agent::history::InteractiveSessionState;
     use crate::agent::tool_execution::{ToolDispatchContext, execute_one_tool};
     use parking_lot::RwLock;
     use std::collections::HashMap;
@@ -6157,6 +6152,7 @@ mod tests {
         let observer = NoopObserver;
 
         run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -6407,6 +6403,7 @@ mod tests {
         let mut injected_memory_preamble: Option<crate::agent::turn::MemoryPreamble> = None;
         let _ = (&mut history_has_trim_breadcrumb, &mut injected_memory_preamble);
         let _ = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -6839,6 +6836,7 @@ mod tests {
         let observer = NoopObserver;
 
         let err = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -6924,6 +6922,7 @@ mod tests {
         };
 
         let result = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -7039,6 +7038,7 @@ mod tests {
         let turn_id = uuid::Uuid::new_v4().to_string();
 
         let result = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -7208,6 +7208,7 @@ mod tests {
             let mut provider_image_state = crate::agent::turn::ProviderImageState::default();
 
             let result = run_tool_call_loop(ToolLoop {
+                history_was_trimmed: None,
                 parent_agent_alias: None,
                 served_route_sink: None,
                 sop_reassembly: None,
@@ -7306,6 +7307,7 @@ mod tests {
         let turn_id = uuid::Uuid::new_v4().to_string();
 
         let result = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -7403,6 +7405,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -7485,6 +7488,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -7570,6 +7574,7 @@ mod tests {
         };
 
         let err = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -7656,6 +7661,7 @@ mod tests {
         // Even though vision_model_provider points to a nonexistent model_provider, this
         // should succeed because there are no image markers to trigger routing.
         let result = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -7729,6 +7735,7 @@ mod tests {
             let turn_id = uuid::Uuid::new_v4().to_string();
 
             run_tool_call_loop(ToolLoop {
+                history_was_trimmed: None,
                 parent_agent_alias: None,
                 served_route_sink: None,
                 sop_reassembly: None,
@@ -7925,6 +7932,7 @@ mod tests {
             let turn_id = uuid::Uuid::new_v4().to_string();
 
             run_tool_call_loop(ToolLoop {
+                history_was_trimmed: None,
                 parent_agent_alias: None,
                 served_route_sink: None,
                 sop_reassembly: None,
@@ -8058,6 +8066,7 @@ mod tests {
         };
 
         let err = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -8143,6 +8152,7 @@ mod tests {
         };
 
         let result = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -8227,6 +8237,7 @@ mod tests {
         };
 
         let err = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -8396,6 +8407,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -8565,6 +8577,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -8700,6 +8713,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -8921,6 +8935,7 @@ mod tests {
         let _ = (&mut history_has_trim_breadcrumb, &mut injected_memory_preamble);
 
         let run = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -9074,6 +9089,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -9257,6 +9273,7 @@ mod tests {
         let mut injected_memory_preamble: Option<crate::agent::turn::MemoryPreamble> = None;
         let _ = (&mut history_has_trim_breadcrumb, &mut injected_memory_preamble);
         let _ = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -9373,6 +9390,7 @@ mod tests {
         let turn_id = uuid::Uuid::new_v4().to_string();
 
         let result = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -9473,6 +9491,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -9565,6 +9584,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -9665,6 +9685,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -9768,6 +9789,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -9877,6 +9899,7 @@ mod tests {
         );
 
         let result = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -9981,6 +10004,7 @@ mod tests {
         let mut injected_memory_preamble: Option<crate::agent::turn::MemoryPreamble> = None;
         let _ = (&mut history_has_trim_breadcrumb, &mut injected_memory_preamble);
         let _ = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -10166,6 +10190,7 @@ mod tests {
         };
 
         let result = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -10310,6 +10335,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -10424,6 +10450,7 @@ mod tests {
         let dedup_exempt = vec!["shell".to_string()];
 
         let err = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -10524,6 +10551,7 @@ mod tests {
         let exempt = vec!["count_tool".to_string()];
 
         let result = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -10628,6 +10656,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -10734,6 +10763,7 @@ mod tests {
         let exempt = vec!["count_tool".to_string()];
 
         let _result = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -10858,6 +10888,7 @@ mod tests {
                     let observer = NoopObserver;
                     let turn_id = uuid::Uuid::new_v4().to_string();
                     let result = run_tool_call_loop(ToolLoop {
+                        history_was_trimmed: None,
                         parent_agent_alias: None,
                         served_route_sink: None,
                         sop_reassembly: None,
@@ -10956,6 +10987,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -11052,6 +11084,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -11143,6 +11176,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -11232,6 +11266,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -11327,6 +11362,7 @@ mod tests {
             tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(8);
 
         let result = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -11449,6 +11485,7 @@ mod tests {
             tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(16);
 
         let result = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -11577,6 +11614,7 @@ mod tests {
             tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(16);
 
         let result = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -11693,6 +11731,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
 
         let result = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -11788,6 +11827,7 @@ mod tests {
         let expected_content = format!("visible\n\n{interrupted_marker}");
 
         let error = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -11885,6 +11925,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -11966,6 +12007,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -12048,6 +12090,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -12130,6 +12173,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -12214,6 +12258,7 @@ This is an example, not an invocation."#;
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -12302,6 +12347,7 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
 
         let result = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -12402,6 +12448,7 @@ This is an example, not an invocation."#;
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -12486,6 +12533,7 @@ Done."#;
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -12573,6 +12621,7 @@ Done."#;
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -12658,6 +12707,7 @@ Done."#;
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -12744,6 +12794,7 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
 
         let result = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -12887,6 +12938,7 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
 
         let result = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -12981,6 +13033,7 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
 
         let result = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -13078,6 +13131,7 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
 
         let result = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -13198,6 +13252,7 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
 
         let result = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -13331,6 +13386,7 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(32);
 
         let result = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -13434,6 +13490,7 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(64);
 
         let result = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -13548,6 +13605,7 @@ This is an example, not an invocation."#;
 
         let turn_id = uuid::Uuid::new_v4().to_string();
         let result = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -14465,6 +14523,7 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(64);
 
         let result = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -14581,6 +14640,7 @@ This is an example, not an invocation."#;
         let turn_id = uuid::Uuid::new_v4().to_string();
 
         let result = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -14692,6 +14752,7 @@ This is an example, not an invocation."#;
         let turn_id = uuid::Uuid::new_v4().to_string();
 
         let result = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -14803,6 +14864,7 @@ This is an example, not an invocation."#;
         let turn_id = uuid::Uuid::new_v4().to_string();
 
         let result = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -14972,6 +15034,7 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(32);
 
         let result = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -15783,41 +15846,6 @@ This is an example, not an invocation."#;
     }
 
     #[test]
-    fn trim_history_preserves_system_prompt() {
-        let mut history = vec![ChatMessage::system("system prompt")];
-        for i in 0..DEFAULT_MAX_HISTORY_MESSAGES + 20 {
-            history.push(ChatMessage::user(format!("msg {i}")));
-        }
-        let original_len = history.len();
-        assert!(original_len > DEFAULT_MAX_HISTORY_MESSAGES + 1);
-
-        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES, &mut false);
-
-        // System prompt preserved
-        assert_eq!(history[0].role, "system");
-        assert_eq!(history[0].content, "system prompt");
-        // Trimmed to limit
-        assert_eq!(history.len(), DEFAULT_MAX_HISTORY_MESSAGES + 1); // +1 for system
-        // Most recent messages preserved
-        let last = &history[history.len() - 1];
-        assert_eq!(
-            last.content,
-            format!("msg {}", DEFAULT_MAX_HISTORY_MESSAGES + 19)
-        );
-    }
-
-    #[test]
-    fn trim_history_noop_when_within_limit() {
-        let mut history = vec![
-            ChatMessage::system("sys"),
-            ChatMessage::user("hello"),
-            ChatMessage::assistant("hi"),
-        ];
-        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES, &mut false);
-        assert_eq!(history.len(), 3);
-    }
-
-    #[test]
     fn autosave_memory_key_has_prefix_and_uniqueness() {
         let key1 = autosave_memory_key("user_msg");
         let key2 = autosave_memory_key("user_msg");
@@ -16123,38 +16151,6 @@ This is an example, not an invocation."#;
     // Recovery Tests - History Management
     // ═══════════════════════════════════════════════════════════════════════
 
-    #[test]
-    fn trim_history_with_no_system_prompt() {
-        // Recovery: History without system prompt should trim correctly
-        let mut history = vec![];
-        for i in 0..DEFAULT_MAX_HISTORY_MESSAGES + 20 {
-            history.push(ChatMessage::user(format!("msg {i}")));
-        }
-        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES, &mut false);
-        assert_eq!(history.len(), DEFAULT_MAX_HISTORY_MESSAGES);
-    }
-
-    #[test]
-    fn trim_history_preserves_role_ordering() {
-        // Recovery: After trimming, role ordering should remain consistent
-        let mut history = vec![ChatMessage::system("system")];
-        for i in 0..DEFAULT_MAX_HISTORY_MESSAGES + 10 {
-            history.push(ChatMessage::user(format!("user {i}")));
-            history.push(ChatMessage::assistant(format!("assistant {i}")));
-        }
-        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES, &mut false);
-        assert_eq!(history[0].role, "system");
-        assert_eq!(history[history.len() - 1].role, "assistant");
-    }
-
-    #[test]
-    fn trim_history_with_only_system_prompt() {
-        // Recovery: Only system prompt should not be trimmed
-        let mut history = vec![ChatMessage::system("system prompt")];
-        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES, &mut false);
-        assert_eq!(history.len(), 1);
-    }
-
     // ═══════════════════════════════════════════════════════════════════════
     // Recovery Tests - Arguments Parsing
     // ═══════════════════════════════════════════════════════════════════════
@@ -16170,8 +16166,6 @@ This is an example, not an invocation."#;
     const _: () = {
         assert!(DEFAULT_MAX_TOOL_ITERATIONS > 0);
         assert!(DEFAULT_MAX_TOOL_ITERATIONS <= 100);
-        assert!(DEFAULT_MAX_HISTORY_MESSAGES > 0);
-        assert!(DEFAULT_MAX_HISTORY_MESSAGES <= 1000);
     };
 
     #[test]
@@ -16353,91 +16347,8 @@ Let me check the result."#;
     }
 
     // ─────────────────────────────────────────────────────────────────────
-    // TG4 (inline): trim_history edge cases
+    // System prompt framing
     // ─────────────────────────────────────────────────────────────────────
-
-    #[test]
-    fn trim_history_empty_history() {
-        let mut history: Vec<ChatMessage> = vec![];
-        trim_history(&mut history, 10, &mut false);
-        assert!(history.is_empty());
-    }
-
-    #[test]
-    fn trim_history_system_only() {
-        let mut history = vec![ChatMessage::system("system prompt")];
-        trim_history(&mut history, 10, &mut false);
-        assert_eq!(history.len(), 1);
-        assert_eq!(history[0].role, "system");
-    }
-
-    #[test]
-    fn trim_history_exactly_at_limit() {
-        let mut history = vec![
-            ChatMessage::system("system"),
-            ChatMessage::user("msg 1"),
-            ChatMessage::assistant("reply 1"),
-        ];
-        trim_history(&mut history, 1, &mut false);
-        assert_eq!(history.len(), 3, "should not trim when exactly at limit");
-    }
-
-    #[test]
-    fn trim_history_keeps_latest_complete_turns() {
-        let mut history = vec![
-            ChatMessage::system("system"),
-            ChatMessage::user("old user"),
-            ChatMessage::assistant("old reply"),
-            ChatMessage::user("middle user 1"),
-            ChatMessage::assistant("middle reply 2"),
-            ChatMessage::user("recent user"),
-            ChatMessage::assistant("recent reply"),
-        ];
-        trim_history(&mut history, 2, &mut false);
-        assert_eq!(history[0].role, "system");
-        assert_eq!(history[1].content, "middle user 1");
-        let last = history.last().expect("history not empty");
-        assert_eq!(last.content, "recent reply", "tail must be preserved");
-    }
-
-    #[test]
-    fn trim_history_keeps_newest_incomplete_turn_when_limit_is_one() {
-        let mut history = vec![
-            ChatMessage::system("system"),
-            ChatMessage::user("anchor"),
-            ChatMessage::assistant("middle"),
-            ChatMessage::user("recent"),
-        ];
-        trim_history(&mut history, 1, &mut false);
-        assert_eq!(history.len(), 2);
-        assert_eq!(history[0].role, "system");
-        assert_eq!(history[1].content, "recent");
-    }
-
-    #[test]
-    fn trim_history_does_not_count_tool_rows_as_turns() {
-        let mut history = vec![
-            ChatMessage::system("system"),
-            ChatMessage::user("run tools"),
-        ];
-        for index in 0..60 {
-            history.push(ChatMessage::assistant(format!("tool call {index}")));
-            history.push(ChatMessage::user(format!("[Tool results]\nresult {index}")));
-        }
-        history.push(ChatMessage::assistant("done"));
-        let original: Vec<_> = history
-            .iter()
-            .map(|message| (message.role.clone(), message.content.clone()))
-            .collect();
-
-        trim_history(&mut history, 1, &mut false);
-
-        let retained: Vec<_> = history
-            .iter()
-            .map(|message| (message.role.clone(), message.content.clone()))
-            .collect();
-        assert_eq!(retained, original, "tool rows must remain part of one turn");
-    }
 
     #[test]
     fn native_tools_system_prompt_contains_zero_xml() {
@@ -17962,6 +17873,7 @@ Let me check the result."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(64);
 
         let result = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -18154,6 +18066,7 @@ Let me check the result."#;
             .scope(
                 Some(ctx),
                 run_tool_call_loop(ToolLoop {
+                    history_was_trimmed: None,
                     parent_agent_alias: None,
                     served_route_sink: None,
                     sop_reassembly: None,
@@ -18282,6 +18195,7 @@ Let me check the result."#;
             .scope(
                 Some(usage_ctx.clone()),
                 run_tool_call_loop(ToolLoop {
+                    history_was_trimmed: None,
                     parent_agent_alias: None,
                     sop_reassembly: None,
                     served_route_sink: None,
@@ -18501,6 +18415,7 @@ Let me check the result."#;
             .scope(
                 Some(usage_ctx.clone()),
                 run_tool_call_loop(ToolLoop {
+                    history_was_trimmed: None,
                     parent_agent_alias: None,
                     sop_reassembly: None,
                     exec: ResolvedAgentExecution {
@@ -18610,6 +18525,7 @@ Let me check the result."#;
         ];
 
         let result = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -18738,6 +18654,7 @@ Let me check the result."#;
             .scope(
                 Some(ctx),
                 run_tool_call_loop(ToolLoop {
+                    history_was_trimmed: None,
                     parent_agent_alias: None,
                     served_route_sink: None,
                     sop_reassembly: None,
@@ -18839,6 +18756,7 @@ Let me check the result."#;
         let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
 
         let result = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -18940,6 +18858,7 @@ Let me check the result."#;
         let mut injected_memory_preamble: Option<crate::agent::turn::MemoryPreamble> = None;
         let _ = (&mut history_has_trim_breadcrumb, &mut injected_memory_preamble);
         let _ = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -20704,6 +20623,7 @@ Let me check the result."#;
         let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
 
         let result = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -20805,6 +20725,7 @@ Let me check the result."#;
             let result = scope_session_key(
                 Some(session_key.to_string()),
                 run_tool_call_loop(ToolLoop {
+                    history_was_trimmed: None,
                     parent_agent_alias: None,
                     served_route_sink: None,
                     sop_reassembly: None,
@@ -21047,6 +20968,7 @@ Let me check the result."#;
         let turn_id = uuid::Uuid::new_v4().to_string();
 
         run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -21154,6 +21076,7 @@ Let me check the result."#;
         let turn_id = uuid::Uuid::new_v4().to_string();
 
         let result = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -21476,6 +21399,7 @@ Let me check the result."#;
         let result = scope_tool_protocol_prompts(
             Arc::new(ToolProtocolPrompts::new(native_prompt, text_prompt)),
             run_tool_call_loop(ToolLoop {
+                history_was_trimmed: None,
                 parent_agent_alias: None,
                 sop_reassembly: None,
                 exec: ResolvedAgentExecution {
@@ -21868,6 +21792,7 @@ Let me check the result."#;
         scope_tool_protocol_prompts(
             prompts,
             run_tool_call_loop(ToolLoop {
+                history_was_trimmed: None,
                 parent_agent_alias: None,
                 sop_reassembly: None,
                 exec: ResolvedAgentExecution {
@@ -21995,6 +21920,7 @@ Let me check the result."#;
         let result = scope_tool_protocol_prompts(
             prompts,
             run_tool_call_loop(ToolLoop {
+                history_was_trimmed: None,
                 parent_agent_alias: None,
                 sop_reassembly: None,
                 exec: ResolvedAgentExecution {
@@ -22272,6 +22198,7 @@ Let me check the result."#;
         scope_tool_protocol_prompts(
             prompts,
             run_tool_call_loop(ToolLoop {
+                history_was_trimmed: None,
                 parent_agent_alias: None,
                 sop_reassembly: None,
                 exec: ResolvedAgentExecution {
@@ -23834,6 +23761,7 @@ Pin 13: LED
         let mut injected_memory_preamble: Option<crate::agent::turn::MemoryPreamble> = None;
         let _ = (&mut history_has_trim_breadcrumb, &mut injected_memory_preamble);
         let _ = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             history_has_trim_breadcrumb: &mut history_has_trim_breadcrumb,

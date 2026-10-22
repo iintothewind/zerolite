@@ -31,8 +31,12 @@ impl TrimDecision {
 
 /// Decide whether to trim before a send, and to what budget.
 ///
-/// - `tokens_now`: the provider-authoritative size of the history about to be
-///   sent (from [`ContextCalibration::current`] or a reported usage count).
+/// - `tokens_now`: the size of the history about to be sent. **Pre-send** it
+///   is the local estimate, because no report for a request that has not been
+///   sent can exist; that is the water-line's whole job. **Post-response** it
+///   is [`ContextCalibration::current`], anchored on the provider's reported
+///   `input_tokens` when there is one. The caller owns which evidence applies;
+///   this kernel only compares the number it is handed.
 /// - `trim_threshold`: the configured budget. `0` means the budget is disabled,
 ///   so the pipeline never trims.
 /// - `forced_shrink`: overflow recovery. A provider already rejected this

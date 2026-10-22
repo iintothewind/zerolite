@@ -673,7 +673,6 @@ mod tests {
 
         assert!(resolved.resolved.strict_tool_parsing);
         assert_eq!(resolved.resolved.max_tool_iterations, 4);
-        assert_eq!(resolved.resolved.max_history_messages, resolved.resolved.context.resolved_keep_recent_turns());
         assert_eq!(resolved.resolved.context.request_token_ceiling, Some(8_000));
         assert!(resolved.resolved.compact_context);
         assert!(!resolved.resolved.parallel_tools);

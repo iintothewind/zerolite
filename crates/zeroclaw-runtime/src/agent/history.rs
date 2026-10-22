@@ -7,11 +7,6 @@ use zeroclaw_providers::multimodal::ImageMarkerDisposition;
 use zeroclaw_providers::multimodal::image_marker_dispositions;
 use zeroclaw_providers::multimodal::message_image_summary;
 
-/// Default complete-turn retention limit. Prefer passing the config-driven
-/// value via `run_tool_call_loop`; this constant is only used when callers omit
-/// the parameter. The name is retained for config compatibility.
-pub const DEFAULT_MAX_HISTORY_MESSAGES: usize = 50;
-
 /// Returns the largest UTF-8 character boundary at or before `index`.
 ///
 /// This compatibility wrapper preserves the previously exported helper while
@@ -377,45 +372,6 @@ pub fn append_or_merge_system_message(history: &mut Vec<ChatMessage>, content: i
     normalize_system_messages(history);
 }
 
-pub fn trim_history(
-    history: &mut Vec<ChatMessage>,
-    max_history_turns: usize,
-    history_has_trim_breadcrumb: &mut bool,
-) {
-    let result = crate::agent::history_trim::trim_to_recent_turn_count(
-        std::mem::take(history),
-        max_history_turns,
-        *history_has_trim_breadcrumb,
-    );
-    let crate::agent::history_trim::TurnCountTrimResult {
-        history: trimmed_history,
-        dropped_messages,
-        dropped_turns,
-        kept_turns,
-        trimmed,
-    } = result;
-    let messages_before = trimmed_history.len().saturating_add(dropped_messages);
-    *history = trimmed_history;
-    if trimmed {
-        remove_orphaned_tool_messages(history);
-        normalize_system_messages(history);
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({
-                    "messages_before": messages_before,
-                    "messages_after": history.len(),
-                    "dropped_messages": dropped_messages,
-                    "dropped_turns": dropped_turns,
-                    "kept_turns": kept_turns,
-                    "max_history_turns": max_history_turns,
-                })),
-            "trim_history: dropped oldest whole turns"
-        );
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InteractiveSessionState {
     pub version: u32,
@@ -442,40 +398,13 @@ pub fn load_interactive_session_history(
     Ok(history)
 }
 
-/// Canonical breadcrumb text used for trim markers. This is the English
-/// string that has been stable across all locales; it is the locale-
-/// independent anchor for legacy migration. Injected breadcrumbs are always
-/// produced via `get_required_cli_string("history-trim-breadcrumb")`, which
-/// currently resolves to this same English text in every locale. Checking
-/// the canonical value makes restore independent of the current process
-/// locale.
-pub const HISTORY_TRIM_BREADCRUMB_CANONICAL: &str =
-    "[earlier turns omitted to fit the context window]";
 
-pub fn is_history_trim_breadcrumb_text(text: &str) -> bool {
-    if text == HISTORY_TRIM_BREADCRUMB_CANONICAL {
-        return true;
-    }
-    // Best-effort cross-locale coverage: if a future translation changes the
-    // breadcrumb in a non-English locale, a legacy v1 file trimmed in that
-    // locale will still be recognised after a restart with a different locale.
-    // v2 files carry an explicit flag and never reach this path.
-    text == crate::i18n::get_required_cli_string("history-trim-breadcrumb")
-}
-
-/// Load interactive history plus the persisted breadcrumb provenance. Legacy
-/// files without the flag are migrated by inspecting the restored history:
-/// if the first non-system message equals the breadcrumb string, the flag is
-/// recovered as true. v2 records carry an explicit
+/// Load interactive history plus the persisted breadcrumb provenance.
+/// Provenance is only ever the persisted record: v2 files carry an explicit
 /// `history_has_trim_breadcrumb` (true or false) so a genuine user message
 /// that collides with the breadcrumb text keeps its real turn-boundary role.
-/// Legacy v1 migration is locale-independent: it checks the canonical
-/// English breadcrumb plus the current-locale string, covering both the
-/// stable historical value and any future translated variant. A v1 file whose
-/// first user turn genuinely equals the breadcrumb text cannot be
-/// distinguished from a synthetic marker on its one-time migration; after the
-/// next persist the file becomes v2 with the (mis)classified flag, which is
-/// the documented one-time limitation for unmarked legacy state.
+/// Legacy v1 files carry no record at all and restore as `false` — the flag
+/// is never inferred from message text.
 pub fn load_interactive_session_history_with_crumb(
     path: &Path,
     system_prompt: &str,
@@ -498,27 +427,10 @@ pub fn load_interactive_session_history_with_crumb(
 
     remove_orphaned_tool_messages(&mut state.history);
 
-    // Migration: only legacy v1 files lack explicit provenance. v2 records
-    // carry an explicit `history_has_trim_breadcrumb` (true or false) — a
-    // fresh v2 session where the user legitimately sent the breadcrumb text
-    // must not be reclassified as synthetic. Infer only when the persisted
-    // version is < 2 and the flag is false.
-    let mut has_crumb = state.history_has_trim_breadcrumb;
-    if !has_crumb && state.version < 2 {
-        let leading_system = state
-            .history
-            .iter()
-            .take_while(|m| m.role == "system")
-            .count();
-        if let Some(first) = state.history.get(leading_system)
-            && first.role == "user"
-            && is_history_trim_breadcrumb_text(&first.content)
-        {
-            has_crumb = true;
-        }
-    }
-
-    Ok((state.history, has_crumb))
+    // Provenance is only ever the persisted record. A legacy v1 file carries
+    // no record, so it restores as `false`: inferring the flag from message
+    // text is exactly the guess this record exists to avoid.
+    Ok((state.history, state.history_has_trim_breadcrumb))
 }
 
 pub fn save_interactive_session_history(path: &Path, history: &[ChatMessage]) -> Result<()> {
@@ -544,6 +456,58 @@ pub fn save_interactive_session_history_with_crumb(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Provenance is only ever the persisted record. A legacy v1 file has no
+    /// record, and its leading breadcrumb text must not be used to manufacture
+    /// one: the flag restores as `false` and every row comes back verbatim.
+    #[test]
+    fn legacy_v1_session_restores_without_inferring_breadcrumb_provenance() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("session.json");
+        let breadcrumb = crate::i18n::get_required_cli_string("history-trim-breadcrumb");
+        let payload = serde_json::json!({
+            "version": 1,
+            "history": [
+                { "role": "system", "content": "sys" },
+                { "role": "user", "content": breadcrumb },
+                { "role": "assistant", "content": "reply" },
+            ]
+        });
+        std::fs::write(&path, payload.to_string()).expect("write session");
+
+        let (history, has_crumb) =
+            load_interactive_session_history_with_crumb(&path, "sys").expect("load session");
+
+        assert!(
+            !has_crumb,
+            "a v1 file must not have its provenance inferred from message text"
+        );
+        assert_eq!(history.len(), 3, "restore keeps every row");
+    }
+
+    /// A v2 record owns its flag: `false` stays `false` even when the first
+    /// user message reads exactly like the breadcrumb.
+    #[test]
+    fn v2_session_keeps_an_explicit_false_provenance() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("session.json");
+        let breadcrumb = crate::i18n::get_required_cli_string("history-trim-breadcrumb");
+        let state = InteractiveSessionState {
+            version: 2,
+            history: vec![
+                ChatMessage::system("sys"),
+                ChatMessage::user(breadcrumb),
+                ChatMessage::assistant("reply"),
+            ],
+            history_has_trim_breadcrumb: false,
+        };
+        std::fs::write(&path, serde_json::to_string(&state).unwrap()).expect("write session");
+
+        let (_, has_crumb) =
+            load_interactive_session_history_with_crumb(&path, "sys").expect("load session");
+
+        assert!(!has_crumb, "an explicit false must not be re-derived from text");
+    }
 
     /// Verifies the exported compatibility wrapper retains the legacy UTF-8 boundary contract.
     #[allow(deprecated)]

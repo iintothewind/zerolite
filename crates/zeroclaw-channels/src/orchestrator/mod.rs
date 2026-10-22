@@ -4067,7 +4067,7 @@ fn turns_appended_after<'a>(
 /// beyond `known_prefix` — by content, not length — and that tail is
 /// appended after `trimmed_turns` instead of being silently discarded by a
 /// wholesale replace. A raw length comparison is not enough here: the cache
-/// is bounded by `max_history_messages` and evicts from the front, so a
+/// is bounded and evicts from the front, so a
 /// concurrent worker's append can rotate `known_prefix`'s own earliest
 /// messages out of the live cache without changing its length, or even
 /// shrinking it below `known_prefix.len()`.
@@ -8887,48 +8887,29 @@ fn resolve_cold_crumb_provenance(
     resolve_cold_crumb_provenance_result(store, history_key, history).unwrap_or_default()
 }
 
-/// Tri-state provenance resolution: `Ok(flag)` for an explicit record or a
-/// legacy migration, `Err(())` when the provenance record is unreadable.
-/// Callers that pair the result with an installed cache or authoritative
-/// trim state must treat `Err(())` as "unreconciled", never as a confirmed
-/// `false`.
+/// Tri-state provenance resolution: `Ok(flag)` for an explicit record,
+/// `Err(())` when the provenance record is unreadable. Provenance is never
+/// inferred from message text: a session with no record resolves to
+/// `false`. Callers that pair the result with an installed cache or
+/// authoritative trim state must treat `Err(())` as "unreconciled", never
+/// as a confirmed `false`.
 fn resolve_cold_crumb_provenance_result(
     store: Option<&dyn zeroclaw_infra::session_backend::SessionBackend>,
     history_key: &str,
-    history: &[ChatMessage],
+    _history: &[ChatMessage],
 ) -> Result<bool, ()> {
-    // Legacy fallback, used only when no owner record exists anywhere:
-    // infer from the restored transcript for old histories predating the
-    // provenance column. A fresh v2 session that happens to start with the
-    // breadcrumb text will have an explicit `false` entry after its first
-    // turn, so it will not be misclassified here. Migration is
-    // locale-independent: check the canonical English breadcrumb (stable
-    // across locales) plus the current-locale string, covering both the
-    // historical value and any future translation. This is best-effort for
-    // unmarked legacy state; a genuine user message that collides with the
-    // breadcrumb on its one-time v1 migration will be misclassified until
-    // the next persist upgrades it to v2.
-    fn legacy_inference(history: &[ChatMessage]) -> bool {
-        let leading_system = history.iter().take_while(|m| m.role == "system").count();
-        if let Some(first) = history.get(leading_system) {
-            first.role == "user"
-                && zeroclaw_runtime::agent::history::is_history_trim_breadcrumb_text(&first.content)
-        } else {
-            false
-        }
-    }
     let Some(store) = store else {
         // No durability at all: the in-memory map is the only owner, and
-        // there is no canonical record to consult. Preserve the original
-        // inference behavior for this configuration.
-        return Ok(legacy_inference(history));
+        // there is no canonical record to consult, so nothing may be
+        // claimed about provenance.
+        return Ok(false);
     };
     match store.get_session_trim_breadcrumb(history_key) {
         Ok(Some(flag)) => Ok(flag),
         // The backend answers but has never recorded a flag for this
-        // sender: a legacy session, so inference is the documented
-        // migration path.
-        Ok(None) => Ok(legacy_inference(history)),
+        // sender: a legacy session with no provenance record, so the
+        // answer is `false` rather than a text guess.
+        Ok(None) => Ok(false),
         Err(e) => {
             ::zeroclaw_log::record!(
                 DEBUG,
@@ -10135,6 +10116,7 @@ async fn process_channel_message_body(
                 };
             loop_knobs.provider_attempt_allowlist = attempt_allowlist.clone();
             let tool_loop = Box::pin(run_tool_call_loop(ToolLoop {
+                history_was_trimmed: None,
                 exec: ResolvedAgentExecution::resolve(
                     ResolvedModelAccess {
                         model_provider: active_model_provider.as_ref(),
@@ -16445,13 +16427,11 @@ fn hydrate_session_transcript(
             return Err(HydrationFailed);
         }
     };
-    // Structural check made BEFORE the cap below can remove it: whether the
-    // loaded transcript's leading message is physically the synthetic
-    // marker the durable flag says is present.
-    let marker_present_pre_drain = msgs.first().is_some_and(|first| {
-        first.role == "user"
-            && zeroclaw_runtime::agent::history::is_history_trim_breadcrumb_text(&first.content)
-    });
+    // Structural check made BEFORE the cap below can remove it: a synthetic
+    // breadcrumb is the leading non-system row. Provenance itself comes from
+    // the durable flag; this only asks whether the row the flag claims is
+    // still physically there, never whether its text matches.
+    let marker_present_pre_drain = msgs.first().is_some_and(|first| first.role == "user");
     let truncated = msgs.len() > MAX_CHANNEL_HISTORY;
     if truncated {
         msgs.drain(..msgs.len() - MAX_CHANNEL_HISTORY);
@@ -16484,10 +16464,7 @@ fn hydrate_session_transcript(
     // carries it and ownership must not be inferred from a message that is
     // no longer there.
     let marker_present_post_cap = if truncated {
-        msgs.first().is_some_and(|first| {
-            first.role == "user"
-                && zeroclaw_runtime::agent::history::is_history_trim_breadcrumb_text(&first.content)
-        })
+        msgs.first().is_some_and(|first| first.role == "user")
     } else {
         marker_present_pre_drain
     };
@@ -18829,7 +18806,7 @@ fn cold_crumb_provenance_fails_closed_on_provenance_read_error() {
     use zeroclaw_providers::ChatMessage;
 
     fn crumb_text() -> String {
-        zeroclaw_runtime::agent::history::HISTORY_TRIM_BREADCRUMB_CANONICAL.to_string()
+        "[earlier turns omitted to fit the context window]".to_string()
     }
 
     struct UnreadableProvenanceBackend;
@@ -19193,11 +19170,11 @@ fn channel_trim_resync_preserves_a_concurrent_workers_later_turn() {
     );
 }
 
-/// A bounded cache (`max_history_messages`) evicts from the front, so a
+/// A bounded cache evicts from the front, so a
 /// concurrent worker's turns can rotate worker A's own observed prefix out of
 /// the cache without growing it past `known_prefix.len()` — the exact case a
 /// raw length comparison cannot distinguish from "nothing changed". With
-/// `max_history_messages = 2`, worker A observes `[old, A-user]`; worker B
+/// a two-message cache, worker A observes `[old, A-user]`; worker B
 /// then appends its own user/reply pair, which evicts both of A's messages
 /// and leaves the cache at the same length (`2`) it was when A took its
 /// snapshot. A's resync must still preserve B's turns instead of discarding
@@ -19224,14 +19201,7 @@ fn channel_trim_resync_preserves_a_concurrent_workers_later_turn_across_eviction
     backend.append(&sender, &old_turn).expect("seed append");
     backend.append(&sender, &a_user).expect("seed append");
 
-    let mut ctx = test_channel_ctx_with_backend(backend.clone());
-    Arc::get_mut(&mut ctx)
-        .expect("sole owner right after construction")
-        .agent_cfg = Arc::new({
-        let mut cfg = zeroclaw_config::schema::AliasedAgentConfig::default();
-        cfg.resolved.max_history_messages = 2;
-        cfg
-    });
+    let ctx = test_channel_ctx_with_backend(backend.clone());
     ctx.conversation_histories
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -23613,7 +23583,7 @@ api_key = "anthropic-key"
     }
 
     fn breadcrumb_text() -> String {
-        zeroclaw_runtime::agent::history::HISTORY_TRIM_BREADCRUMB_CANONICAL.to_string()
+        "[earlier turns omitted to fit the context window]".to_string()
     }
 
     #[test]

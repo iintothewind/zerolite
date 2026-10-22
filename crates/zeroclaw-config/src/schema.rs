@@ -3852,9 +3852,6 @@ pub struct ResolvedRuntime {
     pub compact_context: bool,
     pub max_tool_iterations: usize,
     pub max_execution_tree_iterations: Option<usize>,
-    /// History retention limit. Structured Agent and legacy loop sessions
-    /// interpret this as complete turns; channel caches retain message rows.
-    pub max_history_messages: usize,
     /// Model's context window (max input tokens) — from provider config.
     pub model_context_window: usize,
     /// Whether `model_context_window` came from the selected provider profile
@@ -4123,7 +4120,6 @@ impl Default for ResolvedRuntime {
             compact_context: true,
             max_tool_iterations: 10,
             max_execution_tree_iterations: None,
-            max_history_messages: crate::scattered_types::ContextConfig::default().resolved_keep_recent_turns(),
             model_context_window: 32_000,
             model_context_window_source: ModelContextWindowSource::CompatibilityFallback,
             parallel_tools: false,
@@ -4716,16 +4712,6 @@ impl Config {
             .and_then(|p| p.max_execution_tree_iterations)
     }
 
-    /// Resolve the whole-turn history cap used by structured `Agent` sessions.
-    ///
-    /// The single source is `[runtime_profiles.<alias>.context].keep_recent_turns`:
-    /// the preferred number of newest whole turns a trim retains. Tool-call and
-    /// tool-result rows do not consume independent slots.
-    #[must_use]
-    pub fn effective_structured_max_history_messages(&self, agent_alias: &str) -> usize {
-        self.effective_context_config(agent_alias).resolved_keep_recent_turns()
-    }
-
     /// Context management policy for an agent: the `[context]` table on its
     /// runtime profile. Consumed by the context pipeline for the trim
     /// threshold, the input ceiling, and the output reserve.
@@ -4984,9 +4970,6 @@ impl Config {
             max_tool_iterations: self.effective_max_tool_iterations(agent_alias),
             max_execution_tree_iterations: self
                 .effective_max_execution_tree_iterations(agent_alias),
-            max_history_messages: self
-                .effective_context_config(agent_alias)
-                .resolved_keep_recent_turns(),
             model_context_window: model_context_window.tokens,
             model_context_window_source: model_context_window.source,
             compact_context: self.effective_compact_context(agent_alias),
@@ -34208,7 +34191,6 @@ reasoning_effort = "turbo"
         assert!(cfg.resolved.compact_context);
         assert_eq!(cfg.resolved.max_tool_iterations, 10);
         assert_eq!(cfg.resolved.max_execution_tree_iterations, None);
-        assert_eq!(cfg.resolved.max_history_messages, 5);
         assert!(!cfg.resolved.parallel_tools);
         assert_eq!(cfg.resolved.tool_dispatcher, "auto");
         assert!(!cfg.resolved.strict_tool_parsing);
@@ -34266,7 +34248,6 @@ default_temperature = 0.7
 [agents.default]
 compact_context = true
 max_tool_iterations = 20
-max_history_messages = 80
 parallel_tools = true
 tool_dispatcher = "xml"
 strict_tool_parsing = true
@@ -34338,7 +34319,6 @@ runtime_profile = "missing"
         // back to the global default rather than 0.
         let raw = r#"
 [runtime_profiles.fast]
-max_history_messages = 80
 
 [agents.default]
 runtime_profile = "fast"
@@ -34404,96 +34384,9 @@ runtime_profile = "default"
     }
 
     #[test]
-    async fn runtime_profile_structured_history_cap_counts_turns_when_omitted() {
-        let raw = r#"
-[runtime_profiles.long_turn]
-max_tool_iterations = 100
-
-[agents.default]
-runtime_profile = "long_turn"
-"#;
-        let parsed = parse_test_config(raw);
-        assert_eq!(
-            parsed.effective_structured_max_history_messages("default"),
-            5
-        );
-        let agent = parsed.resolved_agent_config("default").unwrap();
-        assert_eq!(agent.resolved.max_history_messages, 5);
-    }
-
-    #[test]
-    async fn runtime_profile_history_cap_explicit_value_remains_authoritative() {
-        let raw = r#"
-[runtime_profiles.long_turn]
-max_tool_iterations = 100
-
-[runtime_profiles.long_turn.context]
-keep_recent_turns = 8
-
-[agents.default]
-runtime_profile = "long_turn"
-"#;
-        let parsed = parse_test_config(raw);
-        assert_eq!(
-            parsed.effective_structured_max_history_messages("default"),
-            8
-        );
-        let agent = parsed.resolved_agent_config("default").unwrap();
-        assert_eq!(agent.resolved.max_history_messages, 8);
-    }
-
-    #[test]
-    async fn runtime_profile_history_cap_is_clamped_not_rejected() {
-        let raw = r#"
-[runtime_profiles.long_turn]
-
-[runtime_profiles.long_turn.context]
-keep_recent_turns = 0
-
-[agents.default]
-runtime_profile = "long_turn"
-"#;
-        let parsed = parse_test_config(raw);
-        assert_eq!(
-            parsed.effective_structured_max_history_messages("default"),
-            1,
-            "keep_recent_turns clamps up to 1 rather than failing validation"
-        );
-    }
-
-    #[test]
-    async fn runtime_profile_tool_iterations_do_not_change_history_turn_limit() {
-        let mut config = Config::default();
-        config.runtime_profiles.insert(
-            "long_turn".to_string(),
-            RuntimeProfileConfig {
-                max_tool_iterations: usize::MAX,
-                ..RuntimeProfileConfig::default()
-            },
-        );
-        config.agents.insert(
-            "default".to_string(),
-            AliasedAgentConfig {
-                runtime_profile: "long_turn".into(),
-                ..AliasedAgentConfig::default()
-            },
-        );
-
-        assert_eq!(
-            config.effective_structured_max_history_messages("default"),
-            5
-        );
-    }
-
-    #[test]
-    async fn default_runtime_profile_history_cap_is_the_documented_default() {
+    async fn default_runtime_profile_tool_iterations_is_the_documented_default() {
         let parsed = parse_test_config("");
         assert_eq!(parsed.effective_max_tool_iterations("default"), 10);
-        assert_eq!(
-            parsed.effective_structured_max_history_messages("default"),
-            5,
-            "keep_recent_turns defaults to 5 whole turns"
-        );
     }
     #[test]
     async fn pacing_config_defaults_are_all_none_or_empty() {

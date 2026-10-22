@@ -865,6 +865,16 @@ pub struct ToolLoop<'a> {
     /// locale changes for the runtime's lifetime. Trim paths write back any
     /// crumb they insert through this reference.
     pub history_has_trim_breadcrumb: &'a mut bool,
+    /// When set, flipped to `true` if any in-loop trim drops whole turns, so
+    /// the owner can re-trim its durable `ConversationMessage` history after
+    /// the loop. `None` when the caller keeps no durable history to sync.
+    ///
+    /// The flag is the gate on the post-loop trim, not a hint: that trim's
+    /// action is keep-N, which is a retention preference and not a budget
+    /// test, so calling it unconditionally would cut the transcript back to
+    /// `keep_recent_turns` on every single turn no matter how small the
+    /// history is.
+    pub history_was_trimmed: Option<&'a mut bool>,
     /// Out-param the loop writes through when it injects a recalled-memory
     /// preamble onto the last user message for this turn's provider request
     /// only: the exact rendered block. Write-back strips that block solely
@@ -1117,28 +1127,22 @@ async fn enforce_reported_budget(
     _injected_memory_preamble: &mut Option<MemoryPreamble>,
     history: &mut Vec<ChatMessage>,
     reported_input_tokens: usize,
-    _reported_population_estimated: usize,
-    _tool_schema_tokens: usize,
     // The water-line: the token count at which proactive trimming engages.
     context_token_budget: usize,
     // The send / fit budget: the largest retained population that still
     // fits the effective window. Distinct from the water-line by design.
     context_send_budget: usize,
-    // The model's own capacity: the hard floor. A retention that misses the
-    // send budget but still fits the window is a soft floor, dispatched
-    // rather than rejected.
-    model_context_window: usize,
+    // The model's capacity as this deployment may use it — the model window
+    // clamped by `request_token_ceiling`. This is the hard floor: a retention
+    // that misses the send budget but still fits it is a soft floor,
+    // dispatched rather than rejected.
+    effective_context_window: usize,
     // Preferred whole-turn retention when the trim fires.
     keep_recent_turns: usize,
     event_tx: Option<&tokio::sync::mpsc::Sender<TurnEvent>>,
     observer: &dyn crate::observability::Observer,
     agent_alias: Option<&str>,
     turn_id: &str,
-    _multimodal_config: &zeroclaw_config::schema::MultimodalConfig,
-    _degrade_strip_images: bool,
-    _image_cache: Option<&mut zeroclaw_providers::multimodal::LocalImageCache>,
-    _next_use_native_tools: bool,
-    _hook_reserve_tokens: usize,
     crumb_present: &mut bool,
 ) -> Result<(), anyhow::Error> {
     // The pre-send kernel decides whether the request already fits.
@@ -1149,15 +1153,16 @@ async fn enforce_reported_budget(
     // substitute for it: the estimate cannot see what the provider really
     // charged, so trimming on it would cut history away on a guess and add a
     // breadcrumb that may push the retained set over the window. Without a
-    // reported count we therefore only act when the estimate says the
-    // request cannot fit the model window at all — the overflow guard, not
-    // the proactive trim.
+    // reported count we therefore only act when the request provably cannot
+    // go out — the overflow guard, not the proactive trim.
     let reported = reported_input_tokens > 0;
     let tokens_now = if reported {
         reported_input_tokens
     } else {
         crate::agent::history::estimate_history_tokens(history)
     };
+    let send_budget =
+        crate::agent::history_trim::resolve_send_budget(context_send_budget, context_token_budget);
     if reported {
         let decision = crate::agent::turn::context_pipeline::plan_pre_send_trim(
             tokens_now,
@@ -1167,9 +1172,16 @@ async fn enforce_reported_budget(
         if !decision.should_trim {
             return Ok(());
         }
-    } else if model_context_window == 0 || tokens_now <= model_context_window {
-        // No reported usage and the local estimate still fits the window:
-        // dispatch as-is rather than trimming on a guess.
+    } else if send_budget == 0 || tokens_now <= send_budget {
+        // No reported usage, and the estimate plus the output reserve still
+        // fit the effective window: dispatch as-is rather than trim on a guess.
+        //
+        // The threshold is `send_budget`, not the raw window, because the
+        // reserve is physical output space rather than a preference: a prompt
+        // that leaves the model too little room to answer in has already
+        // failed, even though it "fits" the window. `send_budget` is also what
+        // carries `request_token_ceiling` into this check — the ceiling is an
+        // operator-declared hard limit, not a strategy knob.
         return Ok(());
     } else if crate::agent::history_trim::count_turns(history) <= 1 {
         // No reported usage, the estimate says the request overflows, and
@@ -1178,8 +1190,6 @@ async fn enforce_reported_budget(
         // difference the trim cannot close.
         return Ok(());
     }
-    let send_budget =
-        crate::agent::history_trim::resolve_send_budget(context_send_budget, context_token_budget);
     let taken = std::mem::take(history);
     // The synthetic crumb is not a turn: it must not consume a keep-N slot nor
     // be dropped by the cascade.
@@ -1188,7 +1198,7 @@ async fn enforce_reported_budget(
         taken,
         keep_recent_turns,
         send_budget,
-        model_context_window,
+        effective_context_window,
         taken_had_crumb,
     );
     result.tokens_before = tokens_now;
@@ -1463,6 +1473,7 @@ async fn run_tool_call_loop_impl<'a>(
         .unwrap_or_else(|| Arc::new(std::sync::Mutex::new(None)));
     p.exec.model_switch_callback = Some(Arc::clone(&model_switch_state));
     let ToolLoop {
+        mut history_was_trimmed,
         exec,
         history: raw_history,
         history_has_trim_breadcrumb,
@@ -2229,9 +2240,9 @@ async fn run_tool_call_loop_impl<'a>(
             trim_budget,
         );
         *history_has_trim_breadcrumb = turn_state.crumb_present;
-        let history_was_trimmed = turn_state.history.len() != history_len_before
+        let trimmed_this_pass = turn_state.history.len() != history_len_before
             || turn_state.crumb_present != crumb_before;
-        if history_was_trimmed && hook_structural_mutation {
+        if trimmed_this_pass && hook_structural_mutation {
             // The rebuild below reconstructs the post-hook request by
             // trimming `post_hook_snapshot` as if everything past
             // `pre_hook_messages.len()` were a hook-appended suffix and
@@ -2250,7 +2261,7 @@ async fn run_tool_call_loop_impl<'a>(
                 "turn-context-hook-mutation-unsafe-error",
             )));
         }
-        if history_was_trimmed {
+        if trimmed_this_pass {
             // Recount the prepared population after every removal. A raw
             // estimate cannot predict the contribution of an image or hook
             // suffix, so it must not choose several drops ahead of this check.
@@ -2340,6 +2351,12 @@ async fn run_tool_call_loop_impl<'a>(
                 if !dropped_more {
                     break;
                 }
+            }
+            // Report the whole trim cascade, not one round: the outer owner
+            // re-trims its durable history once, after the loop, and it must
+            // know whether anything was dropped at all.
+            if let Some(flag) = history_was_trimmed.as_deref_mut() {
+                *flag |= dropped_turns > 0;
             }
             let exceeds_model_window = tokens_after_dispatch > model_context_window as u64;
             let event_budget = if exceeds_model_window {
@@ -3034,23 +3051,15 @@ async fn run_tool_call_loop_impl<'a>(
                     injected_memory_preamble,
                     turn_state.history,
                     reported_input_tokens.unwrap_or(0) as usize,
-                    reported_population_estimated,
-                    tool_schema_tokens,
                     ctx.context_limits.context_token_budget,
                     ctx.context_limits.context_send_budget,
-                    ctx.context_limits.model_context_window,
+                    ctx.context_limits.effective_context_window(),
                     ctx.context_limits.keep_recent_turns,
                     event_tx.as_ref(),
                     observer,
                     agent_alias,
                     turn_id,
-                    multimodal_config,
-                    degrade_strip_images,
-                    image_cache.as_mut().map(|state| &mut *state.cache),
-                    use_native_tools,
-                    0,
-                    &mut turn_state.crumb_present,
-                ))
+                    &mut turn_state.crumb_present))
                 .await?;
             }
             *history_has_trim_breadcrumb = turn_state.crumb_present;
@@ -4288,6 +4297,7 @@ async fn drive_live_sop_actions(
                                 crate::sop::executor::scope_step_call_sink(
                                     step_call_sink.clone(),
                                     Box::pin(run_tool_call_loop(ToolLoop {
+                                        history_was_trimmed: None,
                                     exec: ResolvedAgentExecution::resolve(
                                         ResolvedModelAccess {
                                             model_provider: eff_model_provider,
@@ -4868,42 +4878,27 @@ mod reported_budget_tests {
         injected_memory_preamble: &mut Option<MemoryPreamble>,
         history: &mut Vec<ChatMessage>,
         reported_input_tokens: usize,
-        reported_population_estimated: usize,
-        tool_schema_tokens: usize,
         context_token_budget: usize,
         context_send_budget: usize,
-        model_context_window: usize,
+        effective_context_window: usize,
         keep_recent_turns: usize,
         event_tx: Option<&tokio::sync::mpsc::Sender<TurnEvent>>,
         observer: &dyn crate::observability::Observer,
-        multimodal_config: &zeroclaw_config::schema::MultimodalConfig,
-        degrade_strip_images: bool,
-        image_cache: Option<&mut zeroclaw_providers::multimodal::LocalImageCache>,
-        next_use_native_tools: bool,
-        hook_reserve_tokens: usize,
         crumb_present: &mut bool,
     ) -> Result<(), anyhow::Error> {
         super::enforce_reported_budget(
             injected_memory_preamble,
             history,
             reported_input_tokens,
-            reported_population_estimated,
-            tool_schema_tokens,
             context_token_budget,
             context_send_budget,
-            model_context_window,
+            effective_context_window,
             keep_recent_turns,
             event_tx,
             observer,
             None,
             "test",
-            multimodal_config,
-            degrade_strip_images,
-            image_cache,
-            next_use_native_tools,
-            hook_reserve_tokens,
-            crumb_present,
-        )
+            crumb_present)
         .await
     }
 
@@ -4950,8 +4945,6 @@ mod reported_budget_tests {
             &mut None,
             &mut history,
             estimated * 4,
-            estimated,
-            0,
             estimated * 2,
             estimated * 2,
             estimated * 2,
@@ -4960,13 +4953,7 @@ mod reported_budget_tests {
             &observer,
             Some("effective-agent"),
             "turn-2",
-            &zeroclaw_config::schema::MultimodalConfig::default(),
-            false,
-            None,
-            false,
-            0,
-            &mut false,
-        )
+            &mut false)
         .await;
         let events = observer.0.lock().expect("trim events lock");
         assert!(events.iter().any(|event| matches!(
@@ -4991,21 +4978,13 @@ mod reported_budget_tests {
             &mut None,
             &mut history,
             reported,
-            estimated,
-            0,
             budget,
             budget,
             budget,
             1,
             None,
             &NoopObserver,
-            &zeroclaw_config::schema::MultimodalConfig::default(),
-            false,
-            None,
-            false,
-            0,
-            &mut false,
-        )
+            &mut false)
         .await
         .expect("budget enforcement succeeds");
         assert!(
@@ -5032,21 +5011,13 @@ mod reported_budget_tests {
             &mut None,
             &mut history,
             estimated,
-            estimated,
-            0,
             estimated * 4,
             0,
             estimated * 4,
             5,
             None,
             &NoopObserver,
-            &zeroclaw_config::schema::MultimodalConfig::default(),
-            false,
-            None,
-            false,
-            0,
-            &mut false,
-        )
+            &mut false)
         .await
         .expect("budget enforcement succeeds");
         let after: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
@@ -5061,26 +5032,17 @@ mod reported_budget_tests {
         // The rejected attempt's 80 input tokens remain billed separately; the
         // accepted response reports 80 input tokens, which is within this
         // model's 100-token context budget and must not trim history.
-        let estimated = crate::agent::history::estimate_history_tokens(&history);
         enforce_reported_budget(
             &mut None,
             &mut history,
             80,
-            estimated,
-            0,
             100,
             0,
             100,
             0,
             None,
             &NoopObserver,
-            &zeroclaw_config::schema::MultimodalConfig::default(),
-            false,
-            None,
-            false,
-            0,
-            &mut false,
-        )
+            &mut false)
         .await
         .expect("budget enforcement succeeds");
 
@@ -5099,26 +5061,165 @@ mod reported_budget_tests {
             &mut None,
             &mut history,
             usize::MAX,
-            usize::MAX,
-            0,
             0,
             0,
             0,
             0,
             None,
             &NoopObserver,
-            &zeroclaw_config::schema::MultimodalConfig::default(),
-            false,
-            None,
-            false,
-            0,
-            &mut false,
-        )
+            &mut false)
         .await
         .expect("budget enforcement succeeds");
         let after: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
         assert_eq!(after, before, "zero budget disables enforcement");
     }
+
+    /// Post-response path with no reported usage. The estimate is not a
+    /// measurement of what the provider billed, so the water-line stays
+    /// inactive even when the estimate is far above it — trimming here would
+    /// cut history away on a guess.
+    #[tokio::test]
+    async fn enforce_ignores_the_estimate_without_a_report_under_the_window() {
+        let mut history = big_history();
+        let before: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
+        let estimated = crate::agent::history::estimate_history_tokens(&history);
+        enforce_reported_budget(
+            &mut None,
+            &mut history,
+            0,
+            // Water-line far below the estimate: without a report it is not
+            // consulted at all.
+            estimated / 4,
+            // The fit budget has room, so the overflow guard stays inactive.
+            estimated * 4,
+            estimated * 4,
+            1,
+            None,
+            &NoopObserver,
+            &mut false)
+        .await
+        .expect("budget enforcement succeeds");
+        let after: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
+        assert_eq!(
+            after, before,
+            "without a provider report the estimate must not open the water-line trigger"
+        );
+    }
+
+    /// Post-response path with no reported usage, where the estimate says the
+    /// request cannot fit at all. That is the overflow guard, not the
+    /// proactive trim, and it does act.
+    #[tokio::test]
+    async fn enforce_guards_the_window_without_a_report() {
+        let mut history = big_history();
+        let before_len = history.len();
+        let estimated = crate::agent::history::estimate_history_tokens(&history);
+        let window = estimated / 2;
+        enforce_reported_budget(
+            &mut None,
+            &mut history,
+            0,
+            window,
+            window,
+            window,
+            1,
+            None,
+            &NoopObserver,
+            &mut false)
+        .await
+        .expect("the overflow guard must trim rather than fail");
+        assert!(
+            history.len() < before_len,
+            "an estimate over the window must trim even with no provider report"
+        );
+        assert_eq!(history[0].role, "system", "system prompt is preserved");
+        assert!(
+            history.iter().any(|m| m.content.contains("final answer")),
+            "the newest turn survives the guard"
+        );
+    }
+
+    /// The output reserve is physical space, not a preference: a prompt that
+    /// fits the raw window but leaves the model too little room to answer in
+    /// has already failed. Without a report the guard therefore measures the
+    /// estimate against `send_budget` (effective window − reserve), not the
+    /// window.
+    #[tokio::test]
+    async fn enforce_guards_the_output_reserve_without_a_report() {
+        let mut history = big_history();
+        let before_len = history.len();
+        let estimated = crate::agent::history::estimate_history_tokens(&history);
+        // A 1.25x window with a quarter of it held back for the reply: the
+        // estimate fits the window outright, but not the window minus reserve.
+        let window = estimated * 5 / 4;
+        let reserve = window / 4;
+        let send_budget = window - reserve;
+        assert!(
+            estimated < window,
+            "the fixture must fit the raw window ({estimated} >= {window})"
+        );
+        assert!(
+            estimated > send_budget,
+            "and must not fit the window minus the reserve ({estimated} <= {send_budget})"
+        );
+
+        enforce_reported_budget(
+            &mut None,
+            &mut history,
+            0,
+            window,
+            send_budget,
+            window,
+            1,
+            None,
+            &NoopObserver,
+            &mut false)
+        .await
+        .expect("the reserve guard must trim rather than fail");
+
+        assert!(
+            history.len() < before_len,
+            "the output reserve must bound the guard, not the raw window"
+        );
+        assert!(
+            history.iter().any(|m| m.content.contains("final answer")),
+            "the newest turn survives the guard"
+        );
+    }
+
+    /// Post-response path with no reported usage, an estimate over the window,
+    /// and only one whole turn left: trimming cannot make the request smaller,
+    /// so it is dispatched instead of failed on a difference the trim cannot
+    /// close.
+    #[tokio::test]
+    async fn enforce_skips_the_overflow_guard_with_a_single_turn() {
+        let big = "x".repeat(20_000);
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user(format!("only turn {big}")),
+            ChatMessage::assistant("only answer".to_string()),
+        ];
+        let before: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
+        enforce_reported_budget(
+            &mut None,
+            &mut history,
+            0,
+            1_000,
+            0,
+            1_000,
+            5,
+            None,
+            &NoopObserver,
+            &mut false)
+        .await
+        .expect("a single-turn overflow must dispatch, not fail");
+        let after: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
+        assert_eq!(
+            after, before,
+            "nothing can be dropped, so the request goes out unchanged"
+        );
+    }
+
 
     #[tokio::test]
     async fn calibration_ignores_output_appended_after_the_measured_request() {
@@ -5141,21 +5242,13 @@ mod reported_budget_tests {
             &mut None,
             &mut history,
             reported,
-            estimated,
-            0,
             budget,
             budget,
             budget,
             1,
             Some(&tx),
             &NoopObserver,
-            &zeroclaw_config::schema::MultimodalConfig::default(),
-            false,
-            None,
-            false,
-            0,
-            &mut false,
-        )
+            &mut false)
         .await
         .expect("budget enforcement succeeds");
 
@@ -5239,21 +5332,13 @@ mod reported_budget_tests {
             &mut None,
             &mut history,
             reported,
-            prepared_estimated,
-            0,
             budget,
             budget,
             budget,
             1,
             Some(&tx),
             &NoopObserver,
-            &config,
-            false,
-            Some(&mut image_cache),
-            false,
-            0,
-            &mut false,
-        )
+            &mut false)
         .await
         .expect("budget enforcement succeeds");
 
@@ -5317,21 +5402,13 @@ mod reported_budget_tests {
             &mut None,
             &mut history,
             reported,
-            estimated,
-            0,
             budget,
             budget,
             budget,
             1,
             Some(&tx),
             &NoopObserver,
-            &zeroclaw_config::schema::MultimodalConfig::default(),
-            false,
-            None,
-            false,
-            0,
-            &mut crumb_present,
-        )
+            &mut crumb_present)
         .await
         .expect("budget enforcement succeeds");
         assert!(
@@ -5919,6 +5996,7 @@ vision_model_provider = "custom.vision"
         let turn_id = "b3-two-iteration";
 
         let _ = run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
@@ -7039,6 +7117,7 @@ mod sop_step_reassembly_tests {
         let turn_id = uuid::Uuid::new_v4().to_string();
 
         run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution::resolve(
                 ResolvedModelAccess {
@@ -8881,6 +8960,7 @@ mod tool_lifecycle_abandonment_tests {
         let mut crumb_present = false;
         let mut injected_preamble = None;
         run_tool_call_loop(ToolLoop {
+            history_was_trimmed: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {

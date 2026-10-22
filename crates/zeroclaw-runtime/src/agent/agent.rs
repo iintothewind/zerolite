@@ -497,10 +497,6 @@ pub struct Agent {
     /// as `TurnMemory.cfg` on every turn.
     memory_inject_cfg: crate::agent::memory_inject::MemoryInjectConfig,
     config: zeroclaw_config::schema::AliasedAgentConfig,
-    /// Resolves the structured-history turn limit from canonical config at use time.
-    /// Daemon-backed sessions capture the shared live config handle so reloads
-    /// affect existing sessions without duplicating config-derived state.
-    structured_history_turn_limit_resolver: Option<Arc<dyn Fn() -> usize + Send + Sync>>,
     /// Resolves limits from canonical config for the provider/model route that
     /// is active when a turn starts. The route itself remains the source of truth.
     context_limits_resolver: Option<ContextLimitsResolver>,
@@ -762,7 +758,6 @@ pub struct AgentBuilder {
     tool_dispatcher: Option<Box<dyn ToolDispatcher>>,
     memory_inject_cfg: Option<crate::agent::memory_inject::MemoryInjectConfig>,
     config: Option<zeroclaw_config::schema::AliasedAgentConfig>,
-    structured_history_turn_limit_resolver: Option<Arc<dyn Fn() -> usize + Send + Sync>>,
     context_limits_resolver: Option<ContextLimitsResolver>,
     multimodal_config: Option<zeroclaw_config::schema::MultimodalConfig>,
     model_name: Option<String>,
@@ -827,7 +822,6 @@ impl AgentBuilder {
             tool_dispatcher: None,
             memory_inject_cfg: None,
             config: None,
-            structured_history_turn_limit_resolver: None,
             context_limits_resolver: None,
             multimodal_config: None,
             model_name: None,
@@ -932,22 +926,9 @@ impl AgentBuilder {
         self
     }
 
-    fn structured_history_turn_limit_resolver(
-        mut self,
-        resolver: Arc<dyn Fn() -> usize + Send + Sync>,
-    ) -> Self {
-        self.structured_history_turn_limit_resolver = Some(resolver);
-        self
-    }
-
     fn context_limits_resolver(mut self, resolver: ContextLimitsResolver) -> Self {
         self.context_limits_resolver = Some(resolver);
         self
-    }
-
-    #[cfg(test)]
-    pub(crate) fn structured_max_history_turns(self, max: usize) -> Self {
-        self.structured_history_turn_limit_resolver(Arc::new(move || max))
     }
 
     pub fn multimodal_config(
@@ -1305,7 +1286,6 @@ impl AgentBuilder {
                 )
             }),
             config,
-            structured_history_turn_limit_resolver: self.structured_history_turn_limit_resolver,
             context_limits_resolver: self.context_limits_resolver,
             multimodal_config: self.multimodal_config.unwrap_or_default(),
             model_name,
@@ -1456,17 +1436,19 @@ impl Agent {
         format!("[CURRENT DATE & TIME: {date_str}]\n\n{user_message}")
     }
 
-    /// Compact durable `ConversationMessage` history when the water-line is
-    /// exceeded. Cascades keep-N → keep≥1 until under the **send** budget; returns
-    /// `Err` when the floor still exceeds (turn must abort). Emits
-    /// `HistoryTrimmed` only when turns are dropped **and** the floor fits.
-    fn maybe_compact_durable_history(
+    /// Trim durable `ConversationMessage` history when the water-line is
+    /// exceeded — the only pre-send trigger.
+    ///
+    /// The water-line is a token test; the action it opens is keep-N, which
+    /// cascades down to keep≥1 until the history fits the **send** budget.
+    /// Returns `Err` when even that floor exceeds it, so the turn aborts
+    /// instead of sending an oversized request.
+    fn trim_durable_history_at_water_line(
         &mut self,
         dispatcher: &dyn crate::agent::dispatcher::ToolDispatcher,
         event_tx: Option<&tokio::sync::mpsc::Sender<TurnEvent>>,
     ) -> Result<(), anyhow::Error> {
         let water_line = self.config.resolved.context_trim_budget();
-        let send_budget = self.config.resolved.context_send_budget();
         if water_line == 0 {
             return Ok(());
         }
@@ -1479,7 +1461,56 @@ impl Agent {
         if !decision.should_trim {
             return Ok(());
         }
-        let keep = self.config.resolved.keep_recent_turns();
+        let notice =
+            self.trim_durable_history(dispatcher, self.config.resolved.keep_recent_turns())?;
+        if let Some(tx) = event_tx
+            && let Some(notice) = notice
+        {
+            let _ = tx.try_send(notice.into_turn_event());
+        }
+        Ok(())
+    }
+
+    /// Trim durable history after the tool loop, when the loop dropped turns
+    /// from its own `ChatMessage` view.
+    ///
+    /// The loop trims a provider-shaped copy; this re-syncs the durable
+    /// `ConversationMessage` history the session store and the UI read, so a
+    /// restart cannot resurrect turns the loop already dropped.
+    ///
+    /// `history_was_trimmed` is the gate, not a hint. The action below is
+    /// keep-N, which is a retention preference and not a budget test: called
+    /// unconditionally it would cut every transcript back to
+    /// `keep_recent_turns` on every single turn, however small. Only a loop
+    /// that actually dropped something opens this path.
+    fn trim_durable_history_after_loop(
+        &mut self,
+        dispatcher: &dyn crate::agent::dispatcher::ToolDispatcher,
+    ) -> Result<Option<HistoryTrimNotice>, anyhow::Error> {
+        self.trim_durable_history(dispatcher, self.config.resolved.keep_recent_turns())
+    }
+
+    /// The durable trim action itself: cascade keep-N down to the send budget,
+    /// insert the breadcrumb, record the observer event, and take the result
+    /// as the new history. Returns the notice so the caller can forward it to
+    /// the event bus; `None` when nothing was dropped.
+    ///
+    /// Callers own the decision to enter — see
+    /// [`Self::trim_durable_history_at_water_line`] (water-line) and
+    /// [`Self::trim_durable_history_after_loop`] (loop dropped turns). This
+    /// function is the action, never the trigger.
+    fn trim_durable_history(
+        &mut self,
+        dispatcher: &dyn crate::agent::dispatcher::ToolDispatcher,
+        keep: usize,
+    ) -> Result<Option<HistoryTrimNotice>, anyhow::Error> {
+        // `send_budget == 0` means "no fit constraint", not "do nothing": the
+        // keep-N preference still applies, and `trim_conversation_to_fit_with`
+        // treats a zero budget exactly that way.
+        let send_budget = self.config.resolved.context_send_budget();
+        let estimate = |h: &[zeroclaw_providers::ConversationMessage]| {
+            crate::agent::history::estimate_history_tokens(&dispatcher.to_provider_messages(h))
+        };
         let taken = std::mem::take(&mut self.history);
         let mut result = crate::agent::history_trim::trim_conversation_to_fit_with(
             taken,
@@ -1490,6 +1521,8 @@ impl Agent {
         );
         if result.trimmed && !result.exceeds_budget {
             crate::agent::history_trim::insert_conversation_breadcrumb_deduped(&mut result.history);
+            self.history_has_trim_breadcrumb = true;
+            self.history_trim_generation = self.history_trim_generation.wrapping_add(1);
             result.tokens_after = estimate(&result.history);
             crate::agent::history_trim::warn_if_conversation_below_preferred_keep(
                 keep,
@@ -1497,41 +1530,24 @@ impl Agent {
                 &result,
             );
             let reason = crate::i18n::get_required_cli_string("history-trim-reason-budget");
-            if let Some(tx) = event_tx {
-                if let Err(error) =
-                    tx.try_send(crate::agent::history_trim::history_trimmed_turn_event(
-                        result.dropped_messages,
-                        result.kept_turns,
-                        reason.clone(),
-                        Some(result.tokens_after),
-                        Some(result.tokens_before),
-                        Some(result.dropped_turns),
-                    ))
-                {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                            .with_category(::zeroclaw_log::EventCategory::Agent)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({
-                                "error": format!("{error}"),
-                                "error_key": "history_trimmed_event_dropped",
-                                "tokens_after": result.tokens_after,
-                            })),
-                        "Dropped HistoryTrimmed turn event: channel full or closed"
-                    );
-                }
-            }
             self.observer.record_event(
                 &crate::agent::history_trim::history_trimmed_observer_event(
                     result.dropped_messages,
                     result.kept_turns,
-                    reason,
+                    reason.clone(),
                     Some(result.tokens_after),
                     Some(result.tokens_before),
                     Some(result.dropped_turns),
                 ),
             );
+            self.history = result.history;
+            return Ok(Some(HistoryTrimNotice {
+                dropped_messages: result.dropped_messages,
+                dropped_turns: result.dropped_turns,
+                kept_turns: result.kept_turns,
+                reason,
+                retained_context: self.retained_context_snapshot(),
+            }));
         }
         self.history = result.history;
         if result.exceeds_budget {
@@ -1559,7 +1575,7 @@ impl Agent {
             );
             return Err(anyhow::anyhow!(msg));
         }
-        Ok(())
+        Ok(None)
     }
 
     pub fn set_channel_name(&mut self, name: String) {
@@ -2372,8 +2388,10 @@ impl Agent {
                 self.history.push(ConversationMessage::Chat(msg.clone()));
             }
         }
-        self.trim_history(None)
-            .map(HistoryTrimNotice::into_turn_event)
+        // Restored history is not capped at seed time: context is bounded by
+        // the water-line trim inside the turn. Trimming here would instead cut
+        // every restored transcript back to keep_recent_turns on load.
+        None
     }
 
     /// Hydrate the agent with a full `ConversationMessage` history (e.g. restored
@@ -2403,12 +2421,10 @@ impl Agent {
             }
             self.history.push(msg);
         }
-        // Trim immediately so pre_len snapshots (taken before the first turn)
-        // are always within the configured limit; otherwise a long restored
-        // history would cause history[pre_len..] to panic after trim_history
-        // shrinks the vec below pre_len during the turn.
-        self.trim_history(None)
-            .map(HistoryTrimNotice::into_turn_event)
+        // Restored history is not capped at seed time: context is bounded by
+        // the water-line trim inside the turn. Trimming here would instead cut
+        // every restored transcript back to keep_recent_turns on load.
+        None
     }
 
     pub async fn from_config(config: &Config, agent_alias: &str) -> Result<Self> {
@@ -3240,19 +3256,6 @@ impl Agent {
                 })
             };
 
-        let structured_history_turn_limit_resolver: Arc<dyn Fn() -> usize + Send + Sync> =
-            if let Some(cap_config) = live_config.clone() {
-                let cap_agent_alias = agent_alias.to_string();
-                Arc::new(move || {
-                    cap_config
-                        .read()
-                        .effective_structured_max_history_messages(&cap_agent_alias)
-                })
-            } else {
-                let max = config.effective_structured_max_history_messages(agent_alias);
-                Arc::new(move || max)
-            };
-
         let builder = Agent::builder();
         #[cfg(test)]
         let builder = builder.delegate_tool(built_delegate_tool);
@@ -3278,7 +3281,6 @@ impl Agent {
                     .resolved_agent_config(agent_alias)
                     .unwrap_or_else(|| agent_cfg.clone()),
             )
-            .structured_history_turn_limit_resolver(structured_history_turn_limit_resolver)
             .context_limits_resolver(context_limits_resolver)
             .multimodal_config(config.multimodal.clone())
             .agent_alias(agent_alias.to_string())
@@ -3349,108 +3351,6 @@ impl Agent {
         self.forwarded_environment.clone()
     }
 
-    fn trim_history(&mut self, turn_id: Option<&str>) -> Option<HistoryTrimNotice> {
-        let keep_recent = self.config.resolved.keep_recent_turns();
-        let resolver_max = self
-            .structured_history_turn_limit_resolver
-            .as_ref()
-            .map(|resolve| resolve());
-        let max_turns = match resolver_max {
-            Some(r) if r == 0 => keep_recent,
-            Some(r) => r.min(keep_recent),
-            None => keep_recent,
-        };
-        let send_budget = self.config.resolved.context_send_budget();
-        let taken = std::mem::take(&mut self.history);
-        let estimate = |h: &[zeroclaw_providers::ConversationMessage]| {
-            crate::agent::history::estimate_history_tokens(&self.tool_dispatcher.to_provider_messages(h))
-        };
-        // A leading synthetic breadcrumb is not a turn: it must not consume a
-        // keep-N slot and must not be counted in `dropped_messages`, or the
-        // caller cannot map the retained boundary back onto the stored
-        // transcript.
-        let mut result = crate::agent::history_trim::trim_conversation_to_fit_with_crumb(
-            taken,
-            max_turns,
-            send_budget,
-            self.config.resolved.effective_context_window(),
-            estimate,
-            self.history_has_trim_breadcrumb,
-        );
-        if !result.trimmed {
-        self.history = result.history;
-            return None;
-        }
-
-        crate::agent::history_trim::insert_conversation_breadcrumb_deduped(&mut result.history);
-        self.history_has_trim_breadcrumb = true;
-        self.history_trim_generation = self.history_trim_generation.wrapping_add(1);
-        result.tokens_after = estimate(&result.history);
-        crate::agent::history_trim::warn_if_conversation_below_preferred_keep(
-            max_turns,
-            send_budget,
-            &result,
-        );
-        let reason = crate::i18n::get_required_cli_string("history-trim-reason-message-cap");
-        let channel = self.channel_name.clone();
-        let agent_alias = self.observer_agent_alias();
-        let turn_id_owned = turn_id.map(str::to_owned);
-
-        {
-            let scope_span = ::zeroclaw_log::info_span!(
-                target: "zeroclaw_log_internal_scope",
-                "zeroclaw_scope",
-                agent_alias = ::zeroclaw_log::field::Empty,
-                channel = %channel,
-                trace_id = ::zeroclaw_log::field::Empty,
-            );
-            if let Some(agent_alias) = agent_alias.as_deref() {
-                scope_span.record("agent_alias", agent_alias);
-            }
-            if let Some(tid) = turn_id_owned.as_deref() {
-                scope_span.record("trace_id", tid);
-            }
-            let _scope_guard = scope_span.enter();
-            ::zeroclaw_log::record!(
-                DEBUG,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
-                    .with_category(::zeroclaw_log::EventCategory::Agent)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Success)
-                    .with_attrs(::serde_json::json!({
-                        "max_history_turns": max_turns,
-                        "dropped_messages": result.dropped_messages,
-                        "dropped_turns": result.dropped_turns,
-                        "kept_turns": result.kept_turns,
-                        "remaining_messages": result.history.len(),
-                    })),
-                "trim_history: dropped oldest whole turns"
-            );
-        }
-
-        self.history = result.history;
-        self.observer.record_event(&ObserverEvent::HistoryTrimmed {
-            dropped_messages: result.dropped_messages,
-            kept_turns: result.kept_turns,
-            reason: reason.clone(),
-            channel: Some(channel),
-            agent_alias,
-            turn_id: turn_id_owned,
-            token_budget: Some(send_budget as u64),
-            tokens_before: Some(result.tokens_before as u64),
-            tokens_after: Some(result.tokens_after as u64),
-            tokens_before_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
-            tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
-            unsatisfiable_floor: Some(result.exceeds_budget),
-        });
-
-        Some(HistoryTrimNotice {
-            dropped_messages: result.dropped_messages,
-            dropped_turns: result.dropped_turns,
-            kept_turns: result.kept_turns,
-            reason,
-            retained_context: self.retained_context_snapshot(),
-        })
-    }
 
     fn append_receipts_block(
         &self,
@@ -4065,7 +3965,7 @@ impl Agent {
                 "empty user message: refusing to dispatch a blank turn",
             ));
         }
-
+        let mut history_was_trimmed = false;
         if self.history.is_empty() {
             let system_prompt = self.build_system_prompt()?;
             self.history
@@ -4160,28 +4060,28 @@ impl Agent {
             match resolved {
                 Ok(dispatcher) => dispatcher,
                 Err(error) => {
-                    let _ = self.trim_history(Some(&turn_id));
                     return Err(error);
                 }
             }
         };
 
         if let Err(error) = self.rebuild_system_prompt_for_dispatcher(active_dispatcher.as_ref()) {
-            let _ = self.trim_history(Some(&turn_id));
             return Err(error);
         }
         let tool_protocol_prompts = match self.tool_protocol_prompts() {
             Ok(prompts) => prompts,
             Err(error) => {
-                let _ = self.trim_history(Some(&turn_id));
                 return Err(error);
             }
         };
 
-        // Durable water-line compaction: shrink Agent.history before building
-        // the provider view so session/UI and the model share one transcript.
-        if let Err(error) = self.maybe_compact_durable_history(active_dispatcher.as_ref(), None) {
-            let _ = self.trim_history(Some(&turn_id));
+        // Durable water-line trim: shrink Agent.history before building the
+        // provider view so session/UI and the model share one transcript. The
+        // water-line is the only pre-send trigger; the action it opens is
+        // keep-N.
+        if let Err(error) =
+            self.trim_durable_history_at_water_line(active_dispatcher.as_ref(), None)
+        {
             return Err(error);
         }
 
@@ -4197,9 +4097,7 @@ impl Agent {
                 self.history
                     .push(ConversationMessage::Chat(ChatMessage::assistant(
                         cached.clone(),
-                    )));
-                let _ = self.trim_history(Some(&turn_id));
-                return Ok(cached);
+                    )));return Ok(cached);
             }
             self.observer.record_event(&ObserverEvent::CacheMiss {
                 cache_type: "response".into(),
@@ -4253,6 +4151,7 @@ impl Agent {
                 receipt_scope.clone(),
                 Box::pin(crate::agent::loop_::run_tool_call_loop(
                     crate::agent::loop_::ToolLoop {
+                        history_was_trimmed: Some(&mut history_was_trimmed),
                         exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
                             crate::agent::loop_::ResolvedModelAccess {
                                 model_provider: self.model_provider.as_ref(),
@@ -4447,10 +4346,20 @@ impl Agent {
                 self.history.push(replayed);
             }
         }
+        // The loop trims its provider-shaped view; if it dropped turns, the
+        // durable history the session store and the UI read is re-trimmed so a
+        // restart cannot resurrect them. The flag is the gate: the action is
+        // keep-N, so calling it unconditionally would cut every transcript
+        // back to keep_recent_turns on every turn, however small. Placed before
+        // the loop outcome is matched so a turn that failed mid-loop still
+        // re-syncs the turns the loop already dropped.
+        if history_was_trimmed {
+            let _ = self.trim_durable_history_after_loop(active_dispatcher.as_ref());
+        }
+
         let response = match loop_result {
             Ok(response) => response,
             Err(error) => {
-                let _ = self.trim_history(Some(&turn_id));
                 return Err(error);
             }
         };
@@ -4486,8 +4395,6 @@ impl Agent {
             #[allow(clippy::cast_possible_truncation)]
             let _ = cache.put(key, &effective_model, &response, usage.output_tokens as u32);
         }
-
-        let _ = self.trim_history(Some(&turn_id));
 
         Ok(response)
     }
@@ -4602,7 +4509,7 @@ impl Agent {
                 new_messages: Vec::new(),
             });
         }
-
+        let mut history_was_trimmed = false;
         #[cfg(test)]
         if let Some(pause) = self.turn_entry_pause.clone() {
             pause.wait().await;
@@ -4696,8 +4603,6 @@ impl Agent {
             match resolved {
                 Ok(dispatcher) => dispatcher,
                 Err(error) => {
-                    let notice = self.trim_history(Some(&turn_id));
-                    forward_history_trim_notice(&event_tx, notice).await;
                     return Err(StreamedTurnError {
                         error,
                         committed_response: String::new(),
@@ -4708,8 +4613,6 @@ impl Agent {
         };
 
         if let Err(error) = self.rebuild_system_prompt_for_dispatcher(active_dispatcher.as_ref()) {
-            let notice = self.trim_history(Some(&turn_id));
-            forward_history_trim_notice(&event_tx, notice).await;
             return Err(StreamedTurnError {
                 error,
                 committed_response: String::new(),
@@ -4719,8 +4622,6 @@ impl Agent {
         let mut tool_protocol_prompts = match self.tool_protocol_prompts() {
             Ok(prompts) => prompts,
             Err(error) => {
-                let notice = self.trim_history(Some(&turn_id));
-                forward_history_trim_notice(&event_tx, notice).await;
                 return Err(StreamedTurnError {
                     error,
                     committed_response: String::new(),
@@ -4730,10 +4631,8 @@ impl Agent {
         };
 
         if let Err(error) =
-            self.maybe_compact_durable_history(active_dispatcher.as_ref(), Some(&event_tx))
+            self.trim_durable_history_at_water_line(active_dispatcher.as_ref(), Some(&event_tx))
         {
-            let notice = self.trim_history(Some(&turn_id));
-            forward_history_trim_notice(&event_tx, notice).await;
             return Err(StreamedTurnError {
                 error,
                 committed_response: String::new(),
@@ -4753,8 +4652,6 @@ impl Agent {
                 let cached_msg = ConversationMessage::Chat(ChatMessage::assistant(cached.clone()));
                 new_msgs.push(cached_msg.clone());
                 self.history.push(cached_msg);
-                let notice = self.trim_history(Some(&turn_id));
-                forward_history_trim_notice(&event_tx, notice).await;
                 self.observer.record_event(&ObserverEvent::TurnComplete);
                 committed_response.push_str(&cached);
                 return Ok(StreamedTurnSuccess {
@@ -4858,13 +4755,6 @@ impl Agent {
                 new_msgs.push(interruption.clone());
                 self.history.push(interruption);
                 committed_response.push_str(&marker);
-                let mut notice = self.trim_history(Some(&turn_id));
-                if let Some(notice) = notice.as_mut() {
-                    Self::strip_interruption_marker_from(
-                        &mut notice.retained_context.retained_messages,
-                    );
-                }
-                forward_history_trim_notice(&event_tx, notice).await;
                 return Err(StreamedTurnError {
                     error: crate::agent::loop_::ToolLoopCancelled.into(),
                     committed_response,
@@ -4903,6 +4793,7 @@ impl Agent {
                     receipt_scope.clone(),
                     Box::pin(crate::agent::turn::run_tool_call_loop_with_initial_ingress(
                         crate::agent::loop_::ToolLoop {
+                            history_was_trimmed: Some(&mut history_was_trimmed),
                             exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
                                 crate::agent::loop_::ResolvedModelAccess {
                                     model_provider: self.model_provider.as_ref(),
@@ -5125,8 +5016,16 @@ impl Agent {
                     // history/new_msgs (replay above) and committed_response
                     // before any steering continuation is folded in.
                     committed_response.push_str(&response);
-                    let notice = self.trim_history(Some(&turn_id));
-                    forward_history_trim_notice(&event_tx, notice).await;
+                    // Re-sync the durable transcript only when the loop dropped
+                    // turns of its own. keep-N is a retention preference, not a
+                    // budget test, so an untrimmed round must not cut anything.
+                    if history_was_trimmed {
+                        let notice = self
+                            .trim_durable_history_after_loop(active_dispatcher.as_ref())
+                            .ok()
+                            .flatten();
+                        forward_history_trim_notice(&event_tx, notice).await;
+                    }
 
                     // Spending the root's reserved final slot is terminal for
                     // the whole turn. Steering that arrives during that
@@ -5251,8 +5150,13 @@ impl Agent {
                         committed_response.push_str(&pending.display_text);
                         carried_reported_usage = pending.reported_usage;
                     }
-                    let notice = self.trim_history(Some(&turn_id));
-                    forward_history_trim_notice(&event_tx, notice).await;
+                    if history_was_trimmed {
+                        let notice = self
+                            .trim_durable_history_after_loop(active_dispatcher.as_ref())
+                            .ok()
+                            .flatten();
+                        forward_history_trim_notice(&event_tx, notice).await;
+                    }
                     let cancelled = cancel_token
                         .as_ref()
                         .is_some_and(tokio_util::sync::CancellationToken::is_cancelled);
@@ -5293,8 +5197,6 @@ impl Agent {
                         match refreshed {
                             Ok(prompts) => tool_protocol_prompts = prompts,
                             Err(error) => {
-                                let notice = self.trim_history(Some(&turn_id));
-                                forward_history_trim_notice(&event_tx, notice).await;
                                 return Err(StreamedTurnError {
                                     error,
                                     committed_response,
@@ -5302,8 +5204,13 @@ impl Agent {
                                 });
                             }
                         }
-                        let notice = self.trim_history(Some(&turn_id));
-                        forward_history_trim_notice(&event_tx, notice).await;
+                        if history_was_trimmed {
+                            let notice = self
+                                .trim_durable_history_after_loop(active_dispatcher.as_ref())
+                                .ok()
+                                .flatten();
+                            forward_history_trim_notice(&event_tx, notice).await;
+                        }
                         effective_model = new_effective_model;
                         selected_route = self.model_route_resolver.resolve(&effective_model);
                         continue;
@@ -5365,7 +5272,13 @@ impl Agent {
                         }
                         error
                     };
-                    let mut notice = self.trim_history(Some(&turn_id));
+                    let mut notice = if history_was_trimmed {
+                        self.trim_durable_history_after_loop(active_dispatcher.as_ref())
+                            .ok()
+                            .flatten()
+                    } else {
+                        None
+                    };
                     if crate::agent::loop_::is_tool_loop_cancelled(&error)
                         && let Some(notice) = notice.as_mut()
                     {
@@ -5382,9 +5295,6 @@ impl Agent {
                 }
             }
         }
-
-        let notice = self.trim_history(Some(&turn_id));
-        forward_history_trim_notice(&event_tx, notice).await;
         Err(StreamedTurnError {
             error: anyhow::Error::msg(format!(
                 "Agent exceeded maximum tool iterations ({})",
@@ -9006,18 +8916,6 @@ mod tests {
         }
     }
 
-    struct FailingPromptSection;
-
-    impl crate::agent::prompt::PromptSection for FailingPromptSection {
-        fn name(&self) -> &str {
-            "failing-test-section"
-        }
-
-        fn build(&self, _ctx: &PromptContext<'_>) -> Result<String> {
-            Err(anyhow::Error::msg("synthetic prompt rebuild failure"))
-        }
-    }
-
     struct ToolThenFailingModelProvider {
         calls: std::sync::atomic::AtomicUsize,
     }
@@ -11790,51 +11688,35 @@ mod tests {
         );
     }
 
+    /// Restored history is not capped at seed time: the water-line trim
+    /// inside the turn bounds it. Seeding a transcript that is already over
+    /// the configured keep-N does not trim it, and no transport event is
+    /// emitted — the trim that will actually drop turns happens when the turn
+    /// runs.
     #[test]
-    fn seed_history_trims_over_cap_restore_and_returns_transport_event() {
-        let capturing = Arc::new(CapturingObserver::default());
-        let observer: Arc<dyn Observer> = capturing.clone();
-        let mut agent = trim_history_test_agent(1, observer);
-
-        let event = agent.seed_history_with_event(&[
+    fn seed_history_does_not_trim_at_load() {
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = trim_test_agent(observer);
+        agent.seed_history(&[
             ChatMessage::user("old request"),
             ChatMessage::assistant("old answer"),
             ChatMessage::user("new request"),
             ChatMessage::assistant("new answer"),
         ]);
-
-        assert!(matches!(
-            event,
-            Some(TurnEvent::HistoryTrimmed {
-                dropped_messages: 2,
-                kept_turns: 1,
-                ..
-            })
-        ));
-        assert!(agent.history_has_trim_breadcrumb);
-        assert!(matches!(
-            agent.history.get(2),
-            Some(ConversationMessage::Chat(message))
-                if message.role == "user" && message.content == "new request"
-        ));
         assert_eq!(
-            capturing
-                .events
-                .lock()
-                .iter()
-                .filter(|event| matches!(event, ObserverEvent::HistoryTrimmed { .. }))
-                .count(),
-            1
+            agent.history.len(),
+            5,
+            "seed keeps every restored message; the turn's water-line trim bounds it"
         );
+        assert!(!agent.history_has_trim_breadcrumb);
     }
 
+    /// Same contract for the structured seed: no trim at load, no event.
     #[test]
-    fn seed_conversation_history_trims_over_cap_restore_without_splitting_tools() {
+    fn seed_conversation_history_does_not_trim_at_load() {
         use zeroclaw_providers::{ToolCall, ToolResultMessage};
-
-        let capturing = Arc::new(CapturingObserver::default());
-        let observer: Arc<dyn Observer> = capturing.clone();
-        let mut agent = trim_history_test_agent(1, observer);
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = trim_test_agent(observer);
         let event = agent.seed_conversation_history_with_event(vec![
             ConversationMessage::Chat(ChatMessage::user("old request")),
             ConversationMessage::Chat(ChatMessage::assistant("old answer")),
@@ -11856,62 +11738,51 @@ mod tests {
             }]),
             ConversationMessage::Chat(ChatMessage::assistant("new answer")),
         ]);
-
-        assert!(matches!(
-            event,
-            Some(TurnEvent::HistoryTrimmed {
-                dropped_messages: 2,
-                kept_turns: 1,
-                ..
-            })
-        ));
-        assert!(matches!(
-            (&agent.history[3], &agent.history[4]),
-            (
-                ConversationMessage::AssistantToolCalls { tool_calls, .. },
-                ConversationMessage::ToolResults(results),
-            ) if tool_calls[0].id == "seed-call" && results[0].tool_call_id == "seed-call"
-        ));
+        assert!(event.is_none(), "seed emits no transport event");
         assert_eq!(
-            capturing
-                .events
-                .lock()
-                .iter()
-                .filter(|event| matches!(event, ObserverEvent::HistoryTrimmed { .. }))
-                .count(),
-            1
+            agent.history.len(),
+            7,
+            "seed keeps every restored message; the turn's water-line trim bounds it"
         );
+        assert!(!agent.history_has_trim_breadcrumb);
     }
 
+    /// Seeding restores a transcript verbatim: it never trims and never claims
+    /// breadcrumb provenance. A genuine user message that reads like the
+    /// breadcrumb is still an operator turn, and it survives as one.
     #[test]
-    fn clear_history_resets_trim_breadcrumb_provenance_before_reuse() {
+    fn seed_history_restores_verbatim_without_trimming_or_claiming_provenance() {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
-        let mut agent = trim_history_test_agent(1, observer);
-        agent.history = vec![
-            ConversationMessage::Chat(ChatMessage::system("system")),
-            ConversationMessage::Chat(ChatMessage::user("old user")),
-            ConversationMessage::Chat(ChatMessage::assistant("old assistant")),
-            ConversationMessage::Chat(ChatMessage::user("new user")),
-            ConversationMessage::Chat(ChatMessage::assistant("new assistant")),
-        ];
-        let _ = agent.trim_history(None);
-        assert!(agent.history_has_trim_breadcrumb);
-
-        agent.clear_history();
-        assert!(!agent.history_has_trim_breadcrumb);
-
+        let mut agent = trim_test_agent(observer);
         let breadcrumb = crate::i18n::get_required_cli_string("history-trim-breadcrumb");
+
         agent.seed_history(&[
             ChatMessage::user(breadcrumb.clone()),
-            ChatMessage::assistant("user-authored marker reply"),
+            ChatMessage::assistant("reply"),
         ]);
-        assert!(!agent.history_has_trim_breadcrumb);
+        assert!(
+            !agent.history_has_trim_breadcrumb,
+            "seed must not infer provenance from message text"
+        );
+        assert_eq!(
+            agent.history.len(),
+            3,
+            "seed keeps every restored row, plus the system prompt it opens with"
+        );
 
         agent.seed_history(&[
             ChatMessage::user("later user"),
             ChatMessage::assistant("later assistant"),
         ]);
-        assert!(agent.history_has_trim_breadcrumb);
+        assert!(
+            !agent.history_has_trim_breadcrumb,
+            "appending seed turns must not trigger a trim or claim provenance"
+        );
+        assert!(agent.history.iter().any(|message| matches!(
+            message,
+            ConversationMessage::Chat(chat)
+                if chat.role == "user" && chat.content == "later user"
+        )));
         assert_eq!(
             agent
                 .history
@@ -11922,88 +11793,31 @@ mod tests {
                 ))
                 .count(),
             1,
-            "the user-authored marker must be dropped as an ordinary old turn before one synthetic breadcrumb is inserted"
+            "the user-authored breadcrumb-text row must survive verbatim"
         );
-        assert!(agent.history.iter().any(|message| matches!(
-            message,
-            ConversationMessage::Chat(chat)
-                if chat.role == "user" && chat.content == "later user"
-        )));
     }
 
+    /// Clearing a conversation must drop the provenance record with it: the
+    /// next seeded transcript starts from a clean flag, never inheriting the
+    /// previous conversation's breadcrumb ownership.
     #[test]
-    fn append_seed_history_preserves_existing_trim_breadcrumb_provenance() {
+    fn clear_history_resets_trim_breadcrumb_provenance() {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
-        let mut agent = trim_history_test_agent(1, observer);
-        agent.seed_history(&[
-            ChatMessage::user("old user"),
-            ChatMessage::assistant("old assistant"),
-            ChatMessage::user("kept user"),
-            ChatMessage::assistant("kept assistant"),
-        ]);
-        assert!(agent.history_has_trim_breadcrumb);
-
-        agent.seed_history(&[
-            ChatMessage::user("appended user"),
-            ChatMessage::assistant("appended assistant"),
-        ]);
-
-        let breadcrumb = crate::i18n::get_required_cli_string("history-trim-breadcrumb");
-        assert!(agent.history_has_trim_breadcrumb);
-        assert_eq!(
-            agent
-                .history
-                .iter()
-                .filter(|message| matches!(
-                    message,
-                    ConversationMessage::Chat(chat) if chat.content == breadcrumb
-                ))
-                .count(),
-            1
-        );
-        assert!(agent.history.iter().any(|message| matches!(
-            message,
-            ConversationMessage::Chat(chat)
-                if chat.role == "user" && chat.content == "appended user"
-        )));
-    }
-
-    #[test]
-    fn append_conversation_seed_preserves_existing_trim_breadcrumb_provenance() {
-        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
-        let mut agent = trim_history_test_agent(1, observer);
-        agent.seed_conversation_history(vec![
+        let mut agent = trim_test_agent_with_resolved(keep_one_turn_resolved(), observer);
+        agent.history = vec![
+            ConversationMessage::Chat(ChatMessage::system("system")),
             ConversationMessage::Chat(ChatMessage::user("old user")),
             ConversationMessage::Chat(ChatMessage::assistant("old assistant")),
-            ConversationMessage::Chat(ChatMessage::user("kept user")),
-            ConversationMessage::Chat(ChatMessage::assistant("kept assistant")),
-        ]);
+            ConversationMessage::Chat(ChatMessage::user("new user")),
+            ConversationMessage::Chat(ChatMessage::assistant("new assistant")),
+        ];
+        let _ = trim_durable_history_for_test(&mut agent);
         assert!(agent.history_has_trim_breadcrumb);
 
-        agent.seed_conversation_history(vec![
-            ConversationMessage::Chat(ChatMessage::user("appended user")),
-            ConversationMessage::Chat(ChatMessage::assistant("appended assistant")),
-        ]);
-
-        let breadcrumb = crate::i18n::get_required_cli_string("history-trim-breadcrumb");
-        assert!(agent.history_has_trim_breadcrumb);
-        assert_eq!(
-            agent
-                .history
-                .iter()
-                .filter(|message| matches!(
-                    message,
-                    ConversationMessage::Chat(chat) if chat.content == breadcrumb
-                ))
-                .count(),
-            1
-        );
-        assert!(agent.history.iter().any(|message| matches!(
-            message,
-            ConversationMessage::Chat(chat)
-                if chat.role == "user" && chat.content == "appended user"
-        )));
+        agent.clear_history();
+        assert!(!agent.history_has_trim_breadcrumb);
     }
+
 
     /// Mock provider that captures whether tool specs were passed to `stream_chat`
     /// and returns a tool call followed by a text response through the stream.
@@ -12850,7 +12664,19 @@ mod tests {
         );
     }
 
-    fn trim_history_test_agent(max_history_turns: usize, observer: Arc<dyn Observer>) -> Agent {
+    fn trim_test_agent(observer: Arc<dyn Observer>) -> Agent {
+        trim_test_agent_with_resolved(
+            zeroclaw_config::schema::ResolvedRuntime::default(),
+            observer,
+        )
+    }
+
+    /// The same fixture with an explicit runtime resolution, so a test can pin
+    /// the context window and water-line percentage the trim cascade reads.
+    fn trim_test_agent_with_resolved(
+        resolved: zeroclaw_config::schema::ResolvedRuntime,
+        observer: Arc<dyn Observer>,
+    ) -> Agent {
         let memory_cfg = zeroclaw_config::schema::MemoryConfig {
             backend: "none".into(),
             ..zeroclaw_config::schema::MemoryConfig::default()
@@ -12860,7 +12686,7 @@ mod tests {
                 .expect("memory creation should succeed with valid config"),
         );
         let agent_config = zeroclaw_config::schema::AliasedAgentConfig {
-            resolved: zeroclaw_config::schema::ResolvedRuntime::default(),
+            resolved,
             ..zeroclaw_config::schema::AliasedAgentConfig::default()
         };
 
@@ -12876,15 +12702,36 @@ mod tests {
             .tool_dispatcher(Box::new(NativeToolDispatcher))
             .workspace_dir(std::path::PathBuf::from("/tmp"))
             .config(agent_config)
-            .structured_max_history_turns(max_history_turns)
             .build()
             .expect("agent builder should succeed with valid config")
+    }
+
+    /// `keep_recent_turns = 1` so a two-turn fixture is already enough for the
+    /// durable action to drop something. The default keep is 5, which retains a
+    /// two-turn transcript intact and trims nothing at all.
+    fn keep_one_turn_resolved() -> zeroclaw_config::schema::ResolvedRuntime {
+        let mut resolved = zeroclaw_config::schema::ResolvedRuntime::default();
+        resolved.context.keep_recent_turns = Some(1);
+        resolved
+    }
+
+
+    /// Reach the durable trim action the way the turn paths reach it — with the
+    /// agent's own keep-N retention — without going through a trigger. Tests
+    /// that pin the *action* (breadcrumb provenance, tool rows, dropped turns)
+    /// call this; tests that pin a *trigger* drive `turn`/`turn_streamed`.
+    fn trim_durable_history_for_test(agent: &mut Agent) -> Option<HistoryTrimNotice> {
+        let dispatcher = NativeToolDispatcher;
+        let keep = agent.config.resolved.keep_recent_turns();
+        agent
+            .trim_durable_history(&dispatcher, keep)
+            .expect("trim must not hit an unrecoverable floor in these fixtures")
     }
 
     #[test]
     fn replace_history_suffix_is_atomic_on_structural_mismatch() {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
-        let mut agent = trim_history_test_agent(32, observer);
+        let mut agent = trim_test_agent(observer);
         agent.history = vec![
             ConversationMessage::Chat(ChatMessage::user("old")),
             ConversationMessage::Chat(ChatMessage::assistant("finished")),
@@ -12910,34 +12757,7 @@ mod tests {
         );
     }
 
-    fn seed_old_trim_test_turn(agent: &mut Agent) {
-        agent.history = vec![
-            ConversationMessage::Chat(ChatMessage::system("system")),
-            ConversationMessage::Chat(ChatMessage::user("old user")),
-            ConversationMessage::Chat(ChatMessage::assistant("old assistant")),
-        ];
-    }
-
-    fn assert_old_trim_test_turn_was_removed(agent: &Agent) {
-        assert!(agent.history_has_trim_breadcrumb);
-        assert!(!agent.history.iter().any(|message| matches!(
-            message,
-            ConversationMessage::Chat(chat)
-                if chat.content == "old user" || chat.content == "old assistant"
-        )));
-    }
-
-    fn drain_history_trim_events(event_rx: &mut tokio::sync::mpsc::Receiver<TurnEvent>) -> usize {
-        let mut count = 0;
-        while let Ok(event) = event_rx.try_recv() {
-            if matches!(event, TurnEvent::HistoryTrimmed { .. }) {
-                count += 1;
-            }
-        }
-        count
-    }
-
-    fn push_trim_history_tool_exchange(agent: &mut Agent, index: usize) {
+    fn push_trim_tool_exchange(agent: &mut Agent, index: usize) {
         use zeroclaw_providers::{ToolCall, ToolResultMessage};
 
         let tool_call_id = format!("trim-history-call-{index}");
@@ -12961,20 +12781,20 @@ mod tests {
     }
 
     #[test]
-    fn trim_history_does_not_count_tool_rows_as_turns() {
+    fn durable_trim_does_not_count_tool_rows_as_turns() {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
-        let mut agent = trim_history_test_agent(50, observer);
+        let mut agent = trim_test_agent(observer);
         agent
             .history
             .push(ConversationMessage::Chat(ChatMessage::user("start")));
         for index in 1..=31 {
-            push_trim_history_tool_exchange(&mut agent, index);
+            push_trim_tool_exchange(&mut agent, index);
         }
         agent
             .history
             .push(ConversationMessage::Chat(ChatMessage::assistant("done")));
 
-        let _ = agent.trim_history(None);
+        let _ = trim_durable_history_for_test(&mut agent);
 
         assert_eq!(
             agent.history.len(),
@@ -13009,10 +12829,11 @@ mod tests {
     }
 
     #[test]
-    fn trim_history_drops_old_turn_with_breadcrumb_and_observer_event() {
+    fn durable_trim_drops_old_turn_with_breadcrumb_and_observer_event() {
         let capturing = Arc::new(CapturingObserver::default());
         let observer: Arc<dyn Observer> = capturing.clone();
-        let mut agent = trim_history_test_agent(1, observer);
+        // keep-N = 1: two turns are then over the preference and a drop happens.
+        let mut agent = trim_test_agent_with_resolved(keep_one_turn_resolved(), observer);
         agent.history = vec![
             ConversationMessage::Chat(ChatMessage::system("system")),
             ConversationMessage::Chat(ChatMessage::user("old user")),
@@ -13021,7 +12842,7 @@ mod tests {
             ConversationMessage::Chat(ChatMessage::assistant("new assistant")),
         ];
 
-        let _ = agent.trim_history(None);
+        let _ = trim_durable_history_for_test(&mut agent);
 
         let breadcrumb = crate::i18n::get_required_cli_string("history-trim-breadcrumb");
         assert!(matches!(
@@ -13081,431 +12902,267 @@ mod tests {
         assert_eq!(trim_events[0].1, 1);
         assert_eq!(
             trim_events[0].2,
-            crate::i18n::get_required_cli_string("history-trim-reason-message-cap")
+            crate::i18n::get_required_cli_string("history-trim-reason-budget")
         );
     }
 
+    /// The regression this whole change exists for. `service start` reported a
+    /// trim on every single turn because the upstream `trim_history` cut the
+    /// transcript back to keep-N on the turn's success path. The water-line is
+    /// the only pre-send trigger, so a transcript that never crosses it must
+    /// come out of the turn intact.
     #[tokio::test]
-    async fn trim_history_runs_after_direct_tool_loop_provider_error() {
-        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
-            backend: "none".into(),
-            ..zeroclaw_config::schema::MemoryConfig::default()
-        };
-        let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
-                .expect("memory creation should succeed with valid config"),
-        );
+    async fn a_turn_below_the_water_line_keeps_every_turn() {
         let capturing = Arc::new(CapturingObserver::default());
         let observer: Arc<dyn Observer> = capturing.clone();
-        let config = zeroclaw_config::schema::AliasedAgentConfig {
-            resolved: zeroclaw_config::schema::ResolvedRuntime::default(),
-            ..Default::default()
-        };
-        let mut agent = Agent::builder()
-            .model_provider(Box::new(ToolThenFailingModelProvider {
-                calls: std::sync::atomic::AtomicUsize::new(0),
-            }))
-            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
-                vec![Box::new(MockTool)],
-            ))
-            .memory(mem)
-            .observer(observer)
-            .tool_dispatcher(Box::new(NativeToolDispatcher))
-            .workspace_dir(std::path::PathBuf::from("/tmp"))
-            .model_name("test-model".into())
-            .config(config)
-            .structured_max_history_turns(1)
-            .build()
-            .expect("agent builder should succeed with valid config");
-        agent.history = vec![
-            ConversationMessage::Chat(ChatMessage::system("system")),
-            ConversationMessage::Chat(ChatMessage::user("old request")),
-            ConversationMessage::Chat(ChatMessage::assistant("old answer")),
-        ];
-
-        let error = agent
-            .turn("new request")
-            .await
-            .expect_err("second provider call should fail");
-
-        assert!(
-            error
-                .to_string()
-                .contains("provider unavailable after tool")
-        );
-        assert!(agent.history_has_trim_breadcrumb);
-        assert!(!agent.history.iter().any(|message| matches!(
-            message,
-            ConversationMessage::Chat(chat)
-                if chat.content == "old request" || chat.content == "old answer"
-        )));
-        assert!(agent.history.iter().any(|message| matches!(
-            message,
-            ConversationMessage::Chat(chat)
-                if chat.role == "user" && chat.content.contains("new request")
-        )));
-        assert!(agent.history.windows(2).any(|pair| matches!(
-            pair,
-            [
-                ConversationMessage::AssistantToolCalls { tool_calls, .. },
-                ConversationMessage::ToolResults(results),
-            ] if tool_calls[0].id == "error-path-call"
-                && results[0].tool_call_id == "error-path-call"
-        )));
-        assert_eq!(
-            capturing
-                .events
-                .lock()
-                .iter()
-                .filter(|event| matches!(event, ObserverEvent::HistoryTrimmed { .. }))
-                .count(),
-            1
-        );
-    }
-
-    #[tokio::test]
-    async fn trim_history_runs_after_direct_vision_resolution_error() {
-        let capturing = Arc::new(CapturingObserver::default());
-        let observer: Arc<dyn Observer> = capturing.clone();
-        let mut agent = trim_history_test_agent(1, observer);
-        seed_old_trim_test_turn(&mut agent);
-
-        let error = agent
-            .turn("inspect [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]")
-            .await
-            .expect_err("missing vision support should fail before provider dispatch");
-
-        let capability_error = error
-            .downcast_ref::<zeroclaw_providers::ProviderCapabilityError>()
-            .expect("vision refusal must retain its structured capability error");
-        assert_eq!(capability_error.capability, "vision");
-        assert_old_trim_test_turn_was_removed(&agent);
-        assert_eq!(
-            capturing
-                .events
-                .lock()
-                .iter()
-                .filter(|event| matches!(event, ObserverEvent::HistoryTrimmed { .. }))
-                .count(),
-            1
-        );
-    }
-
-    #[tokio::test]
-    async fn trim_history_runs_after_streamed_vision_resolution_error() {
-        let capturing = Arc::new(CapturingObserver::default());
-        let observer: Arc<dyn Observer> = capturing.clone();
-        let mut agent = trim_history_test_agent(1, observer);
-        seed_old_trim_test_turn(&mut agent);
-        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(8);
-
-        let error = agent
-            .turn_streamed(
-                "inspect [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]",
-                event_tx,
-                None,
-            )
-            .await
-            .expect_err("missing vision support should fail before provider dispatch");
-
-        let capability_error = error
-            .downcast_ref::<zeroclaw_providers::ProviderCapabilityError>()
-            .expect("vision refusal must retain its structured capability error");
-        assert_eq!(capability_error.capability, "vision");
-        assert_old_trim_test_turn_was_removed(&agent);
-        assert_eq!(drain_history_trim_events(&mut event_rx), 1);
-    }
-
-    #[tokio::test]
-    async fn trim_history_runs_after_direct_system_prompt_rebuild_error() {
-        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
-        let mut agent = trim_history_test_agent(1, observer);
-        seed_old_trim_test_turn(&mut agent);
-        agent.prompt_builder =
-            SystemPromptBuilder::default().add_section(Box::new(FailingPromptSection));
-
-        let error = agent
-            .turn("new user")
-            .await
-            .expect_err("synthetic prompt rebuild should fail");
-
-        assert!(
-            error
-                .to_string()
-                .contains("synthetic prompt rebuild failure")
-        );
-        assert_old_trim_test_turn_was_removed(&agent);
-    }
-
-    #[tokio::test]
-    async fn trim_history_runs_after_streamed_system_prompt_rebuild_error() {
-        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
-        let mut agent = trim_history_test_agent(1, observer);
-        seed_old_trim_test_turn(&mut agent);
-        agent.prompt_builder =
-            SystemPromptBuilder::default().add_section(Box::new(FailingPromptSection));
-        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(8);
-
-        let error = agent
-            .turn_streamed("new user", event_tx, None)
-            .await
-            .expect_err("synthetic prompt rebuild should fail");
-
-        assert!(
-            error
-                .to_string()
-                .contains("synthetic prompt rebuild failure")
-        );
-        assert_old_trim_test_turn_was_removed(&agent);
-        assert_eq!(drain_history_trim_events(&mut event_rx), 1);
-    }
-
-    #[tokio::test]
-    async fn trim_history_runs_before_streamed_round_loop_exhaustion_error() {
-        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
-        let mut agent = trim_history_test_agent(1, observer);
-        agent.config.resolved.max_tool_iterations = 0;
-        seed_old_trim_test_turn(&mut agent);
-        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(8);
-
-        let error = agent
-            .turn_streamed("new user", event_tx, None)
-            .await
-            .expect_err("zero rounds should return the exhaustion error");
-
-        assert!(
-            error
-                .to_string()
-                .contains("exceeded maximum tool iterations (0)")
-        );
-        assert_old_trim_test_turn_was_removed(&agent);
-        assert_eq!(drain_history_trim_events(&mut event_rx), 1);
-    }
-
-    #[test]
-    fn trim_history_log_uses_canonical_attribution() {
-        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
-        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
-        zeroclaw_log::try_install_capture_subscriber();
-        let hook_preexisting = zeroclaw_log::current_broadcast_hook().is_some();
-        let mut log_rx = zeroclaw_log::subscribe_or_install();
-        let subscribed_hook = zeroclaw_log::current_broadcast_hook();
-        while log_rx.try_recv().is_ok() {}
-
-        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
-        let mut agent = trim_history_test_agent(1, observer);
-        agent.agent_alias = "trim-test-agent".into();
-        agent.channel_name = "trim-test-channel".into();
+        let mut agent = trim_test_agent(observer);
         agent.history = vec![
             ConversationMessage::Chat(ChatMessage::system("system")),
             ConversationMessage::Chat(ChatMessage::user("old user")),
             ConversationMessage::Chat(ChatMessage::assistant("old assistant")),
-            ConversationMessage::Chat(ChatMessage::user("new user")),
-            ConversationMessage::Chat(ChatMessage::assistant("new assistant")),
+            ConversationMessage::Chat(ChatMessage::user("older user")),
+            ConversationMessage::Chat(ChatMessage::assistant("older assistant")),
         ];
 
-        let trim_notice = agent
-            .trim_history(Some("trim-test-turn"))
-            .map(|notice| notice.dropped_messages);
+        agent.turn("new user").await.expect("turn should succeed");
 
-        let mut selected = None;
-        let mut candidates = Vec::new();
-        let mut received = 0_usize;
-        let mut lagged_reports = 0_usize;
-        let mut lagged_events = 0_u64;
-        let mut closed = false;
-        // `record_event` sends to the hook synchronously, so by now the trim
-        // event is either in this channel or it never will be; waiting cannot
-        // bring it back. The bounded wait only keeps reading while other
-        // threads' events are still arriving, so the counts reported below
-        // describe a settled channel rather than a single snapshot. The
-        // deadline is checked on every read because parallel tests can keep
-        // the channel from ever reporting `Empty`.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while selected.is_none() && std::time::Instant::now() < deadline {
-            match log_rx.try_recv() {
-                Ok(value) => {
-                    received += 1;
-                    if value.get("message").and_then(serde_json::Value::as_str)
-                        == Some("trim_history: dropped oldest whole turns")
-                    {
-                        if value.get("trace_id").and_then(serde_json::Value::as_str)
-                            == Some("trim-test-turn")
-                        {
-                            selected = Some(value.clone());
-                        }
-                        candidates.push(value);
-                    }
-                }
-                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(skipped)) => {
-                    lagged_reports += 1;
-                    lagged_events += skipped;
-                }
-                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
-                    closed = true;
-                    break;
-                }
-            }
+        assert!(
+            agent.history.iter().any(|message| matches!(
+                message,
+                ConversationMessage::Chat(chat) if chat.content == "older user"
+            )),
+            "a transcript under the water-line must not lose turns"
+        );
+        assert!(
+            !agent.history_has_trim_breadcrumb,
+            "nothing was dropped, so no breadcrumb may be inserted"
+        );
+        assert!(
+            !capturing
+                .events
+                .lock()
+                .iter()
+                .any(|event| matches!(event, ObserverEvent::HistoryTrimmed { .. })),
+            "no trim event may be emitted below the water-line"
+        );
+    }
+
+    /// The regression behind "only 5 turns survive": a trim that fires on the
+    /// turn count instead of on the water-line.
+    ///
+    /// `keep_recent_turns` is a **retention** preference — how many turns are
+    /// kept *if* the water-line fires — and never a trigger of its own. With
+    /// `keep = 2` and six turns (three times the preference), any per-turn cap
+    /// would have cut the transcript from turn 3 onward, which is exactly the
+    /// shape of the reported bug.
+    #[tokio::test]
+    async fn turn_count_never_triggers_a_trim() {
+        let keep = 2;
+        let turns = 6;
+        let mut resolved = zeroclaw_config::schema::ResolvedRuntime::default();
+        resolved.context.keep_recent_turns = Some(keep);
+
+        let capturing = Arc::new(CapturingObserver::default());
+        let observer: Arc<dyn Observer> = capturing.clone();
+        let mut agent = trim_test_agent_with_resolved(resolved, observer);
+
+        let mut previous = agent.history.len();
+        for index in 0..turns {
+            agent
+                .turn(&format!("msg {index}"))
+                .await
+                .expect("turn should succeed");
+
+            let current = agent.history.len();
+            assert!(
+                current > previous,
+                "history must grow on turn {index}: {previous} -> {current}"
+            );
+            previous = current;
+
+            assert!(
+                !agent.history_has_trim_breadcrumb,
+                "turn {index} is {} turn(s) in with keep = {keep}: passing the                  retention count is not a trigger",
+                index + 1
+            );
+            assert!(
+                !capturing
+                    .events
+                    .lock()
+                    .iter()
+                    .any(|event| matches!(event, ObserverEvent::HistoryTrimmed { .. })),
+                "no trim may be observable on turn {index}: the water-line was never crossed"
+            );
         }
-        let value = selected.unwrap_or_else(|| {
-            // Name which link dropped the event: the trim itself, the capture
-            // layer, the hook this receiver is attached to, or the ring buffer.
-            let current_hook = zeroclaw_log::current_broadcast_hook();
-            let same_hook = match (&subscribed_hook, &current_hook) {
-                (Some(subscribed), Some(current)) => Some(subscribed.same_channel(current)),
-                _ => None,
-            };
-            panic!(
-                "trim LogEvent with trace_id=trim-test-turn was not captured\n\
-                 trim_history dropped messages: {trim_notice:?} (None = nothing trimmed, nothing logged)\n\
-                 capture layer active on this thread: {}\n\
-                 DEBUG enabled for zeroclaw_log_event: {}\n\
-                 hook already installed before subscribing: {hook_preexisting}\n\
-                 current hook is the subscribed hook: {same_hook:?} (None = hook missing)\n\
-                 receivers on current hook: {:?}\n\
-                 events received: {received}; lagged reports: {lagged_reports}, events skipped: {lagged_events}; closed: {closed}\n\
-                 candidates: {candidates:#?}",
-                zeroclaw_log::__private_test_capture_layer_active(),
-                zeroclaw_log::debug_enabled(),
-                current_hook.as_ref().map(tokio::sync::broadcast::Sender::receiver_count),
-            )
+
+        // Every turn the operator sent is still there, whole.
+        for index in 0..turns {
+            assert!(
+                agent.history.iter().any(|message| matches!(
+                    message,
+                    ConversationMessage::Chat(chat)
+                        if chat.role == "user"
+                            && chat.content.ends_with(&format!("msg {index}"))
+                )),
+                "turn {index} must survive: the retention count is not a trigger"
+            );
+        }
+    }
+
+
+    /// The other half of the pre-send trigger. Above the water-line the trim
+    /// fires *before* the request is built, so the durable transcript — not
+    /// just the disposable provider view — is what shrinks.
+    #[tokio::test]
+    async fn a_turn_above_the_water_line_trims_before_sending() {
+        const WINDOW: usize = 40_000;
+        let mut resolved = zeroclaw_config::schema::ResolvedRuntime::default();
+        resolved.model_context_window = WINDOW;
+        // 30%: the water-line sits at 12k, comfortably under the window, so a
+        // transcript that already fits the window can still be over the
+        // trigger. That is the distinction the two numbers exist for.
+        resolved.context.trim_threshold_percent = 30;
+
+        let capturing = Arc::new(CapturingObserver::default());
+        let observer: Arc<dyn Observer> = capturing.clone();
+        let mut agent = trim_test_agent_with_resolved(resolved, observer);
+
+        // Seven old turns of ~1k tokens each: ~14k, above the 12k water-line,
+        // below the window, and more turns than keep-N prefers to retain.
+        let padding = "x".repeat(4_000);
+        agent.history = vec![ConversationMessage::Chat(ChatMessage::system("system"))];
+        for index in 0..7 {
+            agent
+                .history
+                .push(ConversationMessage::Chat(ChatMessage::user(format!(
+                    "old user {index} {padding}"
+                ))));
+            agent.history.push(ConversationMessage::Chat(ChatMessage::assistant(
+                format!("old assistant {index} {padding}"),
+            )));
+        }
+        let before = crate::agent::history::estimate_history_tokens(
+            &agent.tool_dispatcher.to_provider_messages(&agent.history),
+        );
+        assert!(
+            before > agent.config.resolved.context_trim_budget(),
+            "the fixture must start above the water-line ({before} <= {})",
+            agent.config.resolved.context_trim_budget()
+        );
+        assert!(
+            before <= WINDOW,
+            "and below the window ({before} > {WINDOW}), so only the water-line can fire"
+        );
+
+        agent.turn("new user").await.expect("turn should succeed");
+
+        assert!(
+            agent.history_has_trim_breadcrumb,
+            "crossing the water-line must trim and record the breadcrumb"
+        );
+        assert!(
+            !agent.history.iter().any(|message| matches!(
+                message,
+                ConversationMessage::Chat(chat) if chat.content.starts_with("old user 0")
+            )),
+            "the oldest turns are the ones dropped"
+        );
+        assert!(
+            agent.history.iter().any(|message| matches!(
+                message,
+                ConversationMessage::Chat(chat) if chat.content.starts_with("old user 6")
+            )),
+            "keep-N retains the newest turns"
+        );
+        assert!(
+            capturing
+                .events
+                .lock()
+                .iter()
+                .any(|event| matches!(event, ObserverEvent::HistoryTrimmed { .. })),
+            "a successful trim must be observable"
+        );
+    }
+
+
+    /// When the loop drops turns, the durable transcript must follow: the
+    /// session store and the UI read `Agent.history`, so a restart that
+    /// replayed it would resurrect turns the loop already dropped. The gate is
+    /// the loop's own drop — never a per-turn cap.
+    #[tokio::test]
+    async fn a_loop_trim_re_syncs_the_durable_history_after_the_turn() {
+        const WINDOW: usize = 40_000;
+        let mut resolved = zeroclaw_config::schema::ResolvedRuntime::default();
+        resolved.model_context_window = WINDOW;
+        // 100%: the water-line sits at the window, so it cannot fire on a
+        // transcript that still fits. Only the loop's own cascade can.
+        resolved.context.trim_threshold_percent = 100;
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = trim_test_agent_with_resolved(resolved, observer);
+
+        // Three old turns of ~10k tokens each: comfortably under the window at
+        // pre-send, over it once the round's reply lands.
+        let padding = "x".repeat(20_000);
+        agent.history = vec![ConversationMessage::Chat(ChatMessage::system("system"))];
+        for index in 0..3 {
+            agent
+                .history
+                .push(ConversationMessage::Chat(ChatMessage::user(format!(
+                    "old user {index} {padding}"
+                ))));
+            agent.history.push(ConversationMessage::Chat(ChatMessage::assistant(
+                format!("old assistant {index} {padding}"),
+            )));
+        }
+        let before = crate::agent::history::estimate_history_tokens(
+            &agent.tool_dispatcher.to_provider_messages(&agent.history),
+        );
+        assert!(
+            before < WINDOW,
+            "the fixture must start under the window ({before} >= {WINDOW})"
+        );
+
+        // One tool round whose reply alone pushes the next request past the
+        // window, so the loop has to drop a turn before dispatching again.
+        let reply = "y".repeat(4 * (WINDOW + 3_000 - before));
+        agent.model_provider = Box::new(MockModelProvider {
+            responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
+                text: Some(reply),
+                tool_calls: vec![zeroclaw_providers::ToolCall {
+                    id: "trim-loop-call".into(),
+                    name: "echo".into(),
+                    arguments: "{}".into(),
+                    extra_content: None,
+                }],
+                usage: None,
+                reasoning_content: None,
+            }]),
         });
-        let event: zeroclaw_log::LogEvent =
-            serde_json::from_value(value).expect("captured trim event should deserialize");
 
-        assert_eq!(event.zeroclaw.get("agent_alias"), Some("trim-test-agent"));
-        assert_eq!(
-            event.zeroclaw.get("channel_type"),
-            Some("trim-test-channel")
+        agent.turn("new user").await.expect("turn should succeed");
+
+        // The loop's fit cascade drops the oldest turn. The durable transcript
+        // must not still carry it, or a restart would replay a turn the model
+        // never sees again.
+        assert!(
+            !agent.history.iter().any(|message| matches!(
+                message,
+                ConversationMessage::Chat(chat) if chat.content.starts_with("old user 0")
+            )),
+            "the turn the loop dropped must not be resurrected in durable history"
         );
-        assert_eq!(event.zeroclaw.get("channel"), None);
-        assert_eq!(event.trace_id.as_deref(), Some("trim-test-turn"));
-        assert_eq!(
-            event
-                .attributes
-                .get("max_history_turns")
-                .and_then(serde_json::Value::as_u64),
-            Some(1),
-            "the configured whole-turn cap should be logged"
+        assert!(
+            agent.history.iter().any(|message| matches!(
+                message,
+                ConversationMessage::Chat(chat) if chat.content.starts_with("old user 2")
+            )),
+            "the newest old turn survives the loop's fit cascade"
         );
-        assert!(event.attributes.get("agent_alias").is_none());
-        assert!(event.attributes.get("channel").is_none());
-        assert!(event.attributes.get("turn_id").is_none());
-
-        zeroclaw_log::clear_broadcast_hook();
-    }
-
-    #[tokio::test]
-    async fn trim_history_streamed_turn_forwards_single_hard_cap_event() {
-        let capturing = Arc::new(CapturingObserver::default());
-        let observer: Arc<dyn Observer> = capturing.clone();
-        let mut agent = trim_history_test_agent(1, observer);
-        agent.history = vec![
-            ConversationMessage::Chat(ChatMessage::system("system")),
-            ConversationMessage::Chat(ChatMessage::user("old user")),
-            ConversationMessage::Chat(ChatMessage::assistant("old assistant")),
-        ];
-        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(16);
-
-        agent
-            .turn_streamed("new user", event_tx, None)
-            .await
-            .expect("streamed turn should succeed");
-
-        let mut trim_events = Vec::new();
-        while let Ok(event) = event_rx.try_recv() {
-            if let TurnEvent::HistoryTrimmed {
-                dropped_messages,
-                dropped_turns,
-                kept_turns,
-                reason,
-                ..
-            } = event
-            {
-                trim_events.push((dropped_messages, dropped_turns, kept_turns, reason));
-            }
-        }
-        assert_eq!(trim_events.len(), 1, "one streamed trim event is required");
-        assert_eq!(trim_events[0].0, 2);
-        assert_eq!(trim_events[0].1, 1);
-        assert_eq!(trim_events[0].2, 1);
-        assert_eq!(
-            trim_events[0].3,
-            crate::i18n::get_required_cli_string("history-trim-reason-message-cap")
+        assert!(
+            agent.history_has_trim_breadcrumb,
+            "the re-synced transcript must carry the breadcrumb"
         );
-        assert!(capturing.events.lock().iter().any(|event| matches!(
-            event,
-            ObserverEvent::HistoryTrimmed {
-                turn_id: Some(_),
-                ..
-            }
-        )));
-    }
-
-    #[tokio::test]
-    async fn trim_history_cancel_before_output_retains_synthesized_newest_turn() {
-        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
-        let mut agent = trim_history_test_agent(1, observer);
-        agent.history = vec![
-            ConversationMessage::Chat(ChatMessage::system("system")),
-            ConversationMessage::Chat(ChatMessage::user("old user")),
-            ConversationMessage::Chat(ChatMessage::assistant("old assistant")),
-        ];
-        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(16);
-        let cancel_token = tokio_util::sync::CancellationToken::new();
-        cancel_token.cancel();
-
-        let error = agent
-            .turn_streamed_with_steering_state("new user", event_tx, Some(cancel_token), None)
-            .await
-            .expect_err("pre-cancelled streamed turn should return cancellation");
-
-        let breadcrumb = crate::i18n::get_required_cli_string("history-trim-breadcrumb");
-        let interruption = crate::i18n::get_required_cli_string("turn-interrupted-by-user");
-        assert!(crate::agent::loop_::is_tool_loop_cancelled(&error.error));
-        assert_eq!(error.committed_response, interruption);
-        assert_eq!(agent.history.len(), 4);
-        assert!(matches!(
-            agent.history.first(),
-            Some(ConversationMessage::Chat(message))
-                if message.role == "system"
-        ));
-        assert!(matches!(
-            agent.history.get(1),
-            Some(ConversationMessage::Chat(message))
-                if message.role == "user" && message.content == breadcrumb
-        ));
-        assert!(matches!(
-            agent.history.get(2),
-            Some(ConversationMessage::Chat(message))
-                if message.role == "user" && message.content.contains("new user")
-        ));
-        assert!(matches!(
-            agent.history.last(),
-            Some(ConversationMessage::Chat(message))
-                if message.role == "assistant" && message.content == interruption
-        ));
-        assert!(!agent.history.iter().any(|message| matches!(
-            message,
-            ConversationMessage::Chat(chat)
-                if chat.content == "old user" || chat.content == "old assistant"
-        )));
-
-        let mut trim_events = Vec::new();
-        while let Ok(event) = event_rx.try_recv() {
-            if let TurnEvent::HistoryTrimmed {
-                dropped_messages,
-                kept_turns,
-                ..
-            } = event
-            {
-                trim_events.push((dropped_messages, kept_turns));
-            }
-        }
-        assert_eq!(trim_events, vec![(2, 1)]);
     }
 
     // ── Duplicate narration guard ────────────────────────────────────
@@ -17259,7 +16916,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn turn_streamed_returns_new_messages_at_history_limit() {
+    async fn turn_streamed_returns_new_messages_without_a_turn_cap() {
         let memory_cfg = zeroclaw_config::schema::MemoryConfig {
             backend: "none".into(),
             ..zeroclaw_config::schema::MemoryConfig::default()
@@ -17269,8 +16926,8 @@ mod tests {
                 .expect("memory creation should succeed with valid config"),
         );
 
-        // Use a small limit so that pre-filling to the limit forces a trim on
-        // the very first new turn.
+        // Default runtime resolution: the water-line is far above this
+        // transcript, so pre-filling must not trigger any trim.
         let agent_config = zeroclaw_config::schema::AliasedAgentConfig {
             resolved: zeroclaw_config::schema::ResolvedRuntime::default(),
             ..zeroclaw_config::schema::AliasedAgentConfig::default()
@@ -17292,12 +16949,12 @@ mod tests {
             .tool_dispatcher(Box::new(NativeToolDispatcher))
             .workspace_dir(std::path::PathBuf::from("/tmp"))
             .config(agent_config)
-            .structured_max_history_turns(2)
             .build()
             .expect("agent builder should succeed with valid config");
 
-        // Pre-fill history to exactly two complete turns so adding a third
-        // turn triggers the configured whole-turn limit.
+        // Pre-fill two complete turns. Under a count-based turn cap this
+        // would have forced a trim on the next turn; there is no such
+        // trigger any more, so every row must survive.
         agent
             .history
             .push(ConversationMessage::Chat(ChatMessage::system("sys")));
@@ -17327,7 +16984,7 @@ mod tests {
             .any(|m| matches!(m, ConversationMessage::Chat(c) if c.role == "user"));
         assert!(
             has_user,
-            "new_msgs must include the user message even after trim; got: {new_msgs:?}"
+            "new_msgs must include the user message; got: {new_msgs:?}"
         );
 
         // The returned Vec must contain the new assistant reply.
@@ -17336,7 +16993,7 @@ mod tests {
             .any(|m| matches!(m, ConversationMessage::Chat(c) if c.role == "assistant"));
         assert!(
             has_assistant,
-            "new_msgs must include the assistant reply even after trim; got: {new_msgs:?}"
+            "new_msgs must include the assistant reply; got: {new_msgs:?}"
         );
     }
 
@@ -19351,14 +19008,6 @@ model_provider = "custom.only"
                 retained_limits.context_token_budget
             ),
             (200_000, 160_000)
-        );
-        assert_eq!(
-            retained
-                .structured_history_turn_limit_resolver
-                .as_ref()
-                .expect("direct Agent history resolver")(),
-            3,
-            "independently live history policy must adopt the reload while route state stays pinned"
         );
         assert_eq!(
             retained
