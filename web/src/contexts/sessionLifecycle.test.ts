@@ -264,6 +264,46 @@ interface MountedChat {
   renderer: ReactTestRenderer;
   context(): AgentContextValue;
   drafts: Map<string, string>;
+  /// A sample host node, so tests can assert the mock's surface.
+  hostProbe(): Record<string, unknown>;
+}
+
+/// The stand-in host node for one rendered element.
+///
+/// Host nodes in this renderer are not DOM nodes, so the tree can only read
+/// what this returns. The contract test below walks the mounted pane and
+/// asserts nothing it touches is missing here — without that, a component
+/// adopting a new DOM surface (e.g. geometry for the follow-the-tail
+/// decision) throws during mount and takes the whole file down at once.
+function hostNodeMock(type: string): Record<string, unknown> {
+  if (type === 'textarea') {
+    return { style: {}, focus: () => {}, scrollHeight: 24 };
+  }
+  return {
+    focus: () => {},
+    scrollIntoView: () => {},
+    contains: () => false,
+    addEventListener: () => {},
+    removeEventListener: () => {},
+    scrollTop: 0,
+    scrollHeight: 0,
+    clientHeight: 0,
+    // The transcript re-pins by observing the content wrapper, and it reads
+    // its height before the observer ever fires. Height 0 is honest here:
+    // this renderer has no layout, so the pane never grows and the callback
+    // never re-pins.
+    getBoundingClientRect: () => ({
+      width: 0,
+      height: 0,
+      top: 0,
+      left: 0,
+      bottom: 0,
+      right: 0,
+      x: 0,
+      y: 0,
+      toJSON: () => ({}),
+    }),
+  };
 }
 
 async function mountChat(
@@ -316,18 +356,8 @@ async function mountChat(
         // DOM surface the tree touches: the composer textarea, the transcript
         // scroller (scroll listeners + geometry for the follow-the-tail
         // decision), and the generic node API used by the remaining widgets.
-        createNodeMock: (element) => element.type === 'textarea'
-          ? { style: {}, focus: () => {}, scrollHeight: 24 }
-          : {
-            focus: () => {},
-            scrollIntoView: () => {},
-            contains: () => false,
-            addEventListener: () => {},
-            removeEventListener: () => {},
-            scrollTop: 0,
-            scrollHeight: 0,
-            clientHeight: 0,
-          },
+        createNodeMock: (element) =>
+          hostNodeMock(typeof element.type === 'string' ? element.type : 'div'),
       },
     );
     await Promise.resolve();
@@ -340,6 +370,7 @@ async function mountChat(
       return currentContext;
     },
     drafts,
+    hostProbe: () => hostNodeMock('div'),
   };
 }
 
@@ -449,6 +480,33 @@ for (const scenario of ['unknown', 'disabled'] as const) {
   });
 }
 
+// The mount's `createNodeMock` is the contract between this harness and the
+// pane: host nodes are stand-ins, so every DOM surface the tree touches must
+// be listed there. A component that starts reading a new one (e.g. geometry
+// via `getBoundingClientRect`) throws during mount, which fails *every* test
+// in this file at once — a confusing blast radius for a one-line omission.
+// This asserts the mock keeps pace by rendering the pane and walking its host
+// instances against the mock's own key set.
+test('the mount mock covers every host surface the pane touches', async () => {
+  const runtime = new FakeSessionRuntime();
+  runtime.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
+  const mounted = await mountChat(runtime, true);
+  await openSocket(runtime, 0);
+  await settle();
+
+  const mockKeys = new Set(Object.keys(mounted.hostProbe()));
+  const missing = new Set<string>();
+  for (const node of mounted.renderer.root.findAll(() => true)) {
+    if (typeof node.type !== 'string') continue;
+    for (const key of Object.keys(node.instance ?? {})) {
+      // `style` is written by the pane, not read from the host node.
+      if (key === 'style') continue;
+      if (!mockKeys.has(key)) missing.add(`${node.type}.${key}`);
+    }
+  }
+  assert.deepEqual([...missing], [], 'the mount mock must expose every host surface the pane touches');
+  await unmount(mounted.renderer);
+});
 test('selecting the active picker row closes the menu', async () => {
   const runtime = new FakeSessionRuntime();
   runtime.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));

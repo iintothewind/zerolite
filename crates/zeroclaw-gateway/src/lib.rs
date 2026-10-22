@@ -947,6 +947,28 @@ fn config_admin_router(inbound_auth: &Arc<principal_gate::GatewayInboundAuth>) -
 // One parameter per daemon-owned dependency; a bundling struct would only
 // move the list. Matches the existing allowance on the runtime spawn paths.
 #[allow(clippy::too_many_arguments)]
+/// Resolve the pairing authority this gateway serves from.
+///
+/// A supervised run adopts the daemon's live authority verbatim, so a pairing
+/// change reaches the RPC surface and the gateway at the same time. A
+/// standalone run builds its own from the configuration.
+///
+/// The daemon's guard is adopted as-is on purpose: the gateway is not a second
+/// source of truth about which credential is valid. That makes the daemon's
+/// construction responsible for carrying every configured credential — a
+/// daemon that built its guard without the configured master code would leave
+/// the web pairing page rejecting a code the operator had configured, with no
+/// hint why.
+fn resolve_pairing_guard(
+    shared_pairing: Option<PairingGuard>,
+    gateway_config: &zeroclaw_config::schema::GatewayConfig,
+) -> Arc<PairingGuard> {
+    Arc::new(
+        shared_pairing
+            .unwrap_or_else(|| PairingGuard::from_gateway_config(gateway_config)),
+    )
+}
+
 pub async fn run_gateway(
     host: &str,
     port: u16,
@@ -1068,7 +1090,7 @@ pub async fn run_gateway_with_plugin_webhooks(
         ),
         None => (None, None, None),
     };
-    // ── Security: warn on public bind without tunnel or explicit opt-in ──
+// ── Security: warn on public bind without tunnel or explicit opt-in ──
     if is_public_bind(host)
         && config.tunnel.tunnel_provider == "none"
         && !config.gateway.allow_public_bind
@@ -1747,13 +1769,7 @@ pub async fn run_gateway_with_plugin_webhooks(
     // is resolved from config in exactly one guard: startup pairing,
     // `gateway get-paircode --new`, the dashboard pairing flow, and
     // rotate-device all issue through it.
-    let pairing = Arc::new(shared_pairing.unwrap_or_else(|| {
-        PairingGuard::new(
-            config.gateway.require_pairing,
-            &config.gateway.paired_tokens,
-            config.gateway.pairing_code,
-        )
-    }));
+    let pairing = resolve_pairing_guard(shared_pairing, &config.gateway);
     let rate_limit_max_keys = normalize_max_keys(
         config.gateway.rate_limit_max_keys,
         RATE_LIMIT_MAX_KEYS_DEFAULT,
@@ -1967,6 +1983,10 @@ pub async fn run_gateway_with_plugin_webhooks(
     } else {
         println!("  ⚠️  Pairing: DISABLED (all requests accepted)");
         println!();
+    }
+    if pairing.has_master_code() {
+        // Never print the value — only that recovery is configured.
+        println!("  🔑 Master recovery code: configured (value not printed)");
     }
     println!("  POST {pfx}/pair      — pair a new client (X-Pairing-Code header)");
     println!("  POST {pfx}/webhook   — {{\"message\": \"your prompt\"}}");
@@ -2869,69 +2889,23 @@ async fn handle_pair(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
+    // Configured static master code (recovery credential). Reusable and not
+    // rate-limited on a correct match; a wrong value falls through to the
+    // one-time-code path below, which still feeds the shared auth limiter.
+    if let Some(token) = state.pairing.try_master(code) {
+        // Route through the SAME finalizer as the web `/api/pair` handler and
+        // the master-code branch above, so every pairing response — one-time or
+        // master, legacy `/pair` or web `/api/pair` — carries one JSON contract.
+        return api_pairing::finalize_pairing(&state, &rate_key, None, None, token).await;
+    }
+
     match state.pairing.try_pair(code, &rate_key).await {
         Ok(Some(token)) => {
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                "new client paired successfully"
-            );
-            let token_hash = PairingGuard::token_hash(&token);
-            if let Some(ref registry) = state.device_registry {
-                if let Err(e) = registry.register(
-                    token_hash.clone(),
-                    api_pairing::DeviceInfo {
-                        id: uuid::Uuid::new_v4().to_string(),
-                        name: None,
-                        device_type: None,
-                        paired_at: chrono::Utc::now(),
-                        last_seen: chrono::Utc::now(),
-                        ip_address: Some(rate_key.clone()),
-                        capabilities: None,
-                    },
-                ) {
-                    ::zeroclaw_log::record!(
-                        ERROR,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({"error": format!("{e}")})),
-                        "device registry insert failed after successful legacy /pair; rolling back in-process token"
-                    );
-                    state.pairing.revoke_token_hash(&token_hash);
-                    let body = serde_json::json!({
-                        "paired": false,
-                        "persisted": false,
-                        "error": format!("Device registry error: {e}"),
-                        "message": "Pairing failed; the in-process token was not retained.",
-                    });
-                    return (StatusCode::INTERNAL_SERVER_ERROR, Json(body));
-                }
-            }
-            if let Err(err) = Box::pin(persist_pairing_tokens(&state)).await {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
-                    "pairing token persistence failed; rolling back in-process token"
-                );
-                state.pairing.revoke_token_hash(&token_hash);
-                let body = serde_json::json!({
-                    "paired": false,
-                    "persisted": false,
-                    "error": format!("Token persistence error: {err}"),
-                    "message": "Pairing failed; the in-process token was not retained.",
-                });
-                return (StatusCode::INTERNAL_SERVER_ERROR, Json(body));
-            }
-
-            let body = serde_json::json!({
-                "paired": true,
-                "persisted": true,
-                "token": token,
-                "message": "Save this token — use it as Authorization: Bearer <token>"
-            });
-            (StatusCode::OK, Json(body))
+            // Route through the SAME finalizer as the web `/api/pair` handler and
+            // the master-code branch above, so every pairing response — one-time or
+            // master, legacy `/pair` or web `/api/pair` — carries one JSON contract
+            // (no divergent "Save this token …" body on the legacy endpoint).
+            return api_pairing::finalize_pairing(&state, &rate_key, None, None, token).await;
         }
         Ok(None) => {
             state.auth_limiter.record_attempt(&rate_key);
@@ -5254,6 +5228,50 @@ pub(crate) static PRICING_BINDING_TEST_LOCK: tokio::sync::Mutex<()> =
 
 #[cfg(test)]
 mod tests {
+    /// A standalone gateway builds its own authority from the configuration,
+    /// so the configured recovery credential is live without a daemon.
+    #[test]
+    fn a_standalone_gateway_adopts_the_configured_master_code() {
+        let mut gateway = zeroclaw_config::schema::GatewayConfig::default();
+        gateway.require_pairing = true;
+        gateway.master_pair_code = Some("a-long-random-recovery-string".to_string());
+
+        let guard = super::resolve_pairing_guard(None, &gateway);
+
+        assert!(
+            guard.try_master("a-long-random-recovery-string").is_some(),
+            "the standalone gateway must accept the configured master code"
+        );
+    }
+
+    /// A supervised gateway adopts the daemon's live authority verbatim. The
+    /// daemon owns that authority, so the credential it carries is the
+    /// gateway's — the gateway must neither rebuild it nor paper over a
+    /// daemon that left a credential behind.
+    ///
+    /// The daemon side of this contract is covered in the runtime crate,
+    /// where the authority is built. This test pins the adoption: whatever
+    /// the daemon built is what the gateway serves.
+    #[test]
+    fn a_supervised_gateway_serves_the_daemons_authority_verbatim() {
+        let mut gateway = zeroclaw_config::schema::GatewayConfig::default();
+        gateway.require_pairing = true;
+        gateway.master_pair_code = Some("a-long-random-recovery-string".to_string());
+
+        // The daemon builds its authority from the same configuration.
+        let daemon_authority = PairingGuard::from_gateway_config(&gateway);
+        let guard = super::resolve_pairing_guard(Some(daemon_authority), &gateway);
+
+        assert!(
+            guard.try_master("a-long-random-recovery-string").is_some(),
+            "the supervised gateway must serve the daemon's master code"
+        );
+        assert!(
+            guard.try_master("not-the-master-code").is_none(),
+            "the supervised gateway must not accept a code the daemon's authority rejects"
+        );
+    }
+
     impl AppState {
         /// Install a mutated config as the next publication — the test
         /// stand-in for the raw handle write this state type no longer
@@ -13650,6 +13668,39 @@ data: [DONE]\n\n";
              persist; have {:?}",
             state.pairing.tokens()
         );
+    }
+
+    #[tokio::test]
+    async fn legacy_pair_accepts_master_code_and_mints_token() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut state = admin_paircode_state(&tmp, true, true);
+        // Built from the gateway configuration, the way the standalone
+        // gateway path builds the guard this endpoint pairs against.
+        let mut gateway = state.config.read().gateway.clone();
+        gateway.require_pairing = true;
+        gateway.master_pair_code = Some("recovery-secret".into());
+        state.pairing = Arc::new(PairingGuard::from_gateway_config(&gateway));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Pairing-Code",
+            HeaderValue::from_static("recovery-secret"),
+        );
+
+        let (status, body) = legacy_pair_response_json(
+            handle_pair(State(state.clone()), test_connect_info(), headers).await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "master code must pair on /pair");
+        assert_eq!(body["paired"], serde_json::Value::Bool(true));
+        assert_eq!(body["persisted"], serde_json::Value::Bool(true));
+        assert_eq!(body["message"], "Pairing successful");
+        let token = body["token"]
+            .as_str()
+            .expect("success body must include the plaintext token");
+        assert!(token.starts_with("zc_"));
+        assert!(state.pairing.is_authenticated(token));
     }
 }
 

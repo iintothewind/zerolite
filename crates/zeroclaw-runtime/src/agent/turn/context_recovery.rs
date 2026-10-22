@@ -67,6 +67,9 @@ pub(crate) async fn try_recover_context_overflow(
     observer: &dyn Observer,
     context_token_budget: usize,
     context_send_budget: usize,
+    // The model's own capacity: the hard floor. A retention that misses the
+    // send budget but still fits the window is a soft floor.
+    model_context_window: usize,
     keep_recent_turns: usize,
     calibration: &ContextCalibration,
     crumb_present: &mut bool,
@@ -109,10 +112,11 @@ pub(crate) async fn try_recover_context_overflow(
             true,
         )
         .target_budget;
-        let result = crate::agent::history_trim::trim_to_budget_with_crumb(
+        let result = crate::agent::history_trim::trim_to_fit_with_crumb(
             owned,
             keep_recent_turns,
             target_budget,
+            model_context_window,
             has_leading_breadcrumb,
         );
         let trimmed = result.trimmed;
@@ -263,6 +267,7 @@ mod tests {
             &observer,
             budget,
             budget,
+            budget,
             keep,
             &ContextCalibration::new(),
             &mut crumb_present,
@@ -304,6 +309,7 @@ mod tests {
             &observer,
             32_000,
             32_000,
+            32_000,
             5,
             &ContextCalibration::new(),
             &mut crumb_present,
@@ -342,6 +348,7 @@ mod tests {
             &observer,
             32_000,
             32_000,
+            32_000,
             5,
             &ContextCalibration::new(),
             &mut crumb_present,
@@ -361,7 +368,7 @@ mod tests {
     /// user is told the agent is compacting when it provably cannot.
     #[tokio::test]
     async fn overflow_that_cannot_trim_emits_no_compacting_context_lifecycle() {
-        // One system message plus a single user turn: `trim_to_recent_turns`
+        // One system message plus a single user turn: `trim_to_fit`
         // always keeps the current turn, so there is no whole turn to drop.
         let mut history = vec![
             ChatMessage::system("system"),
@@ -381,6 +388,7 @@ mod tests {
             None,
             Some(&delta_tx),
             &observer,
+            32_000,
             32_000,
             32_000,
             5,
@@ -420,6 +428,7 @@ mod tests {
             Some(&tx),
             None,
             &observer,
+            32_000,
             32_000,
             32_000,
             5,
@@ -482,6 +491,7 @@ mod tests {
             &observer,
             100,
             100,
+            100,
             5,
             &ContextCalibration::new(),
             &mut crumb_present,
@@ -521,6 +531,7 @@ mod tests {
             Some(&tx),
             None,
             &observer,
+            32_000,
             32_000,
             32_000,
             5,
@@ -567,6 +578,7 @@ mod tests {
             None,
             None,
             &observer,
+            budget,
             budget,
             budget,
             5,

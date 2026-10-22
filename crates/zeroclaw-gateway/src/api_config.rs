@@ -3565,16 +3565,17 @@ mod tests {
         assert!(!*reload_rx.borrow_and_update());
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn unreadable_existing_config_survives_failed_save_rollback() {
-        use std::os::unix::fs::PermissionsExt;
-
         let tmp = tempfile::tempdir().unwrap();
         let config_path = tmp.path().join("config.toml");
+        // A directory where the config file belongs: reading it fails for
+        // every user, including root, so the failure does not depend on
+        // permission bits the way `chmod 000` does. Its content stands in for
+        // "the source that could not be read".
         let original = b"# original config bytes\n";
-        std::fs::write(&config_path, original).unwrap();
-        std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        std::fs::create_dir(&config_path).unwrap();
+        std::fs::write(config_path.join("keep"), original).unwrap();
 
         let mut config = temp_config(&tmp);
         config.channels.cli = !config.channels.cli;
@@ -3585,12 +3586,15 @@ mod tests {
             authorize_config_write(&None, ConfigWriteSet::default(), &guard).unwrap();
         let result = persist_and_swap(&state, authorization, config, guard).await;
 
-        std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert!(
             result.is_err(),
             "the unreadable incremental source must fail"
         );
-        assert_eq!(std::fs::read(&config_path).unwrap(), original);
+        assert!(
+            config_path.is_dir(),
+            "the unreadable source must survive the failed save"
+        );
+        assert_eq!(std::fs::read(config_path.join("keep")).unwrap(), original);
     }
 
     #[tokio::test]

@@ -454,4 +454,24 @@ mod tests {
             "the internal fail-closed marker must be stripped before delivery: {body:?}"
         );
     }
+
+    #[test]
+    fn the_chat_turn_boundary_is_not_a_public_sse_event() {
+        // The frame is built by the production constructor, not by hand: a
+        // hand-written fixture would keep passing while the gateway broadcast
+        // a sessionless frame that leaks to every observer.
+        let chat_turn_boundary = crate::ws::agent_start_frame("sess-1", "test", "test-model");
+        let observability_bracket = serde_json::json!({
+            "type": "agent_start",
+            "source": "observability",
+            "model_provider": "test",
+            "model": "test-model",
+        });
+
+        assert!(
+            !is_public_sse_event(&chat_turn_boundary),
+            "the turn boundary must not reach the public event stream: {chat_turn_boundary}"
+        );
+        assert!(is_public_sse_event(&observability_bracket));
+    }
 }

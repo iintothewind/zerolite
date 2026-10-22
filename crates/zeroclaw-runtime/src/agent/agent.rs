@@ -2,7 +2,7 @@ use crate::agent::dispatcher::{NativeToolDispatcher, ToolDispatcher, XmlToolDisp
 use crate::agent::eval::AutoClassifyExt;
 use crate::agent::execution_tree_budget::ExecutionTreeBudget;
 use crate::agent::prompt::{
-    InteractionContext, PromptContext, SystemPromptBuilder, append_timestamp_orientation,
+    InteractionContext, PromptContext, SystemPromptBuilder,
 };
 use crate::approval::ApprovalManager;
 use crate::live_config_authority::AgentExecutionCapability;
@@ -1481,10 +1481,11 @@ impl Agent {
         }
         let keep = self.config.resolved.keep_recent_turns();
         let taken = std::mem::take(&mut self.history);
-        let mut result = crate::agent::history_trim::trim_conversation_to_budget_with(
+        let mut result = crate::agent::history_trim::trim_conversation_to_fit_with(
             taken,
             keep,
             send_budget,
+            self.config.resolved.effective_context_window(),
             estimate,
         );
         if result.trimmed && !result.exceeds_budget {
@@ -3364,11 +3365,17 @@ impl Agent {
         let estimate = |h: &[zeroclaw_providers::ConversationMessage]| {
             crate::agent::history::estimate_history_tokens(&self.tool_dispatcher.to_provider_messages(h))
         };
-        let mut result = crate::agent::history_trim::trim_conversation_to_budget_with(
+        // A leading synthetic breadcrumb is not a turn: it must not consume a
+        // keep-N slot and must not be counted in `dropped_messages`, or the
+        // caller cannot map the retained boundary back onto the stored
+        // transcript.
+        let mut result = crate::agent::history_trim::trim_conversation_to_fit_with_crumb(
             taken,
             max_turns,
             send_budget,
+            self.config.resolved.effective_context_window(),
             estimate,
+            self.history_has_trim_breadcrumb,
         );
         if !result.trimmed {
         self.history = result.history;
@@ -3633,9 +3640,6 @@ impl Agent {
             prompt.push_str("\n\n");
             prompt.push_str(&pinned_section);
         }
-        // Keep the runtime orientation at the end of the complete prompt so
-        // truncation cannot retain an earlier copy and append a second one.
-        append_timestamp_orientation(&mut prompt);
         // Match the channel/CLI prompt path: cap the fully assembled prompt,
         // including dispatcher instructions, receipts, and MCP sections.
         Ok(crate::agent::system_prompt::finalize_system_prompt(
@@ -10264,13 +10268,16 @@ mod tests {
             }];
             let assert_capped = |prompt: &str| {
                 assert_eq!(prompt.chars().count(), 4_000);
-                assert!(prompt.ends_with(crate::agent::prompt::TIMESTAMP_ORIENTATION));
+                assert!(
+                    !prompt.contains("timestamp metadata added by the runtime"),
+                    "the capped prompt must not inject runtime wall-clock prose"
+                );
                 assert_eq!(
                     prompt
-                        .matches(crate::agent::prompt::TIMESTAMP_ORIENTATION)
+                        .matches("timestamp metadata added by the runtime")
                         .count(),
-                    1,
-                    "the capped prompt must not repeat the timestamp orientation"
+                    0,
+                    "the capped prompt must never carry the timestamp orientation"
                 );
                 assert!(prompt.contains("## Project Context"));
             };
@@ -10302,42 +10309,6 @@ mod tests {
                 assert_capped(&system.content);
                 assert!(system.content.contains(XML_TOOLS_MARKER));
             }
-        }
-
-        #[tokio::test]
-        async fn streamed_agent_request_pairs_timestamp_orientation_with_labeled_user_text() {
-            let (provider, captured) = capturing_provider(true);
-            let mut agent = test_agent_with_provider(provider, Vec::new());
-            let (event_tx, _event_rx) = tokio::sync::mpsc::channel(64);
-
-            agent
-                .turn_streamed_with_steering_state("hi from zerocode", event_tx, None, None)
-                .await
-                .expect("streamed Agent turn should succeed");
-
-            let captured = captured.lock();
-            let first_request = captured.first().expect("provider request captured");
-            let system = first_request
-                .iter()
-                .find(|message| message.role == "system")
-                .expect("system prompt");
-            let user = first_request
-                .iter()
-                .find(|message| message.role == "user")
-                .expect("user message");
-
-            assert!(
-                system
-                    .content
-                    .contains("timestamp metadata added by the runtime"),
-                "Agent prompt must explain its runtime-owned user envelope"
-            );
-            assert!(
-                user.content.starts_with("[CURRENT DATE & TIME:")
-                    && user.content.ends_with("\n\nhi from zerocode"),
-                "provider must receive the labeled envelope and original text: {}",
-                user.content
-            );
         }
 
         #[test]

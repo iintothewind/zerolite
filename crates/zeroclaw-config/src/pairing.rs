@@ -366,6 +366,13 @@ pub struct PairingGuard {
     paired_tokens: Arc<RwLock<HashSet<String>>>,
     /// Brute-force protection: per-client failed attempt state + last sweep timestamp.
     failed_attempts: Arc<Mutex<(HashMap<String, FailedAttemptState>, Instant)>>,
+    /// Optional static "master" pairing code (configured recovery credential).
+    ///
+    /// When `Some`, submitting this exact value on a pairing endpoint mints a
+    /// bearer token without consuming the one-time startup/rotation code.
+    /// Reusable. Immutable for the life of the guard: the value is operator
+    /// configuration, never rotated at runtime.
+    master_pair_code: Option<String>,
     /// The admin token this gateway run accepts on the pairing-code admin
     /// routes. This is the authority; the token file is only how local
     /// clients learn it. `None` until a rotation fully succeeds, so a failed
@@ -449,8 +456,79 @@ impl PairingGuard {
             pairing_code: Arc::new(Mutex::new(code)),
             paired_tokens: Arc::new(RwLock::new(tokens)),
             failed_attempts: Arc::new(Mutex::new((HashMap::new(), Instant::now()))),
+            master_pair_code: None,
             admin_token: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Attach a configured static master pairing code. Blank/`None` values are
+    /// normalized to `None` so an empty config string behaves as "feature off".
+    pub fn with_master_code(mut self, code: Option<String>) -> Self {
+        self.master_pair_code = code.filter(|c| !c.trim().is_empty());
+        self
+    }
+
+    /// Build the guard from the gateway configuration.
+    ///
+    /// The master recovery code travels with the guard, so it is attached here
+    /// rather than at each construction site. A site that builds the guard by
+    /// hand and forgets `with_master_code` silently disables the recovery
+    /// credential — the pairing page then rejects the master code with no
+    /// hint that it was configured at all.
+    pub fn from_gateway_config(gateway: &crate::schema::GatewayConfig) -> Self {
+        Self::new(
+            gateway.require_pairing,
+            &gateway.paired_tokens,
+            gateway.pairing_code,
+        )
+        .with_master_code(gateway.master_pair_code.clone())
+    }
+
+    /// True when a static master pairing code is configured.
+    pub fn has_master_code(&self) -> bool {
+        self.master_pair_code
+            .as_deref()
+            .is_some_and(|c| !c.trim().is_empty())
+    }
+
+    /// Returns a freshly minted bearer token if `code` matches the configured
+    /// master pairing code (constant-time comparison). Reusable: this does NOT
+    /// consume the one-time code slot. Brute-force protection is the caller's
+    /// responsibility — this method only short-circuits on a *correct* match;
+    /// a wrong value falls through to the normal one-time pairing path, which
+    /// still feeds the shared auth limiter.
+    ///
+    /// Inert when pairing is globally disabled (`require_pairing == false`): a
+    /// disabled lock has no recovery path, and minting a token would be a side
+    /// effect behind no auth gate. Operator decision: `require_pairing = false`
+    /// ⇒ the master code does not take effect (matches the one-time-code path,
+    /// which is likewise unreachable for pairing when disabled).
+    ///
+    /// If the live one-time code equals the master value, the one-time slot is
+    /// consumed on a successful master match so the collision cannot leave a
+    /// permanently-redeemable one-time code.
+    pub fn try_master(&self, code: &str) -> Option<String> {
+        if !self.require_pairing {
+            return None;
+        }
+        let master = self.master_pair_code.as_deref()?.trim();
+        if !constant_time_eq(code.trim(), master) {
+            return None;
+        }
+        // Collision guard: master is checked before the one-time path, so an
+        // identical one-time code would otherwise stay redeemable forever via
+        // master.
+        {
+            let mut slot = self.pairing_code.lock();
+            if let Some(pending) = take_live(&mut slot)
+                && constant_time_eq(master, pending.code.trim())
+            {
+                *slot = None;
+            }
+        }
+        let token = generate_token();
+        self.paired_tokens.write().insert(hash_token(&token));
+        Some(token)
     }
 
     /// Start a new admin-token generation: forget the current token, mint a
@@ -1033,6 +1111,132 @@ mod tests {
         // Might succeed if code happens to be 000000, but extremely unlikely
         // Just check it returns Ok(None) normally
         let _ = result;
+    }
+
+    /// The wiring the API-level tests above cannot see: a guard built from
+    /// the gateway configuration must carry the configured master code.
+    ///
+    /// The production paths build their guard either from the configuration
+    /// directly or from a guard the daemon publishes. A site that builds one
+    /// by hand and forgets the master code disables the recovery credential
+    /// silently — the pairing page then rejects it with no hint that it was
+    /// configured at all.
+    #[test]
+    async fn a_guard_built_from_the_gateway_config_carries_the_master_code() {
+        let mut gateway = crate::schema::GatewayConfig::default();
+        assert!(
+            !PairingGuard::from_gateway_config(&gateway).has_master_code(),
+            "no configured master code means no master code"
+        );
+
+        gateway.master_pair_code = Some("recovery-secret".to_string());
+        let guard = PairingGuard::from_gateway_config(&gateway);
+        assert!(guard.has_master_code());
+        assert!(
+            guard.try_master("recovery-secret").is_some(),
+            "the configured master code must work on a config-built guard"
+        );
+
+        // A blank value is "feature off", not "a master code of whitespace".
+        gateway.master_pair_code = Some("   ".to_string());
+        assert!(!PairingGuard::from_gateway_config(&gateway).has_master_code());
+    }
+
+    #[test]
+    async fn try_master_issues_token_on_match_and_is_reusable() {
+        let guard = new_guard(true, &[]).with_master_code(Some("recovery-secret".to_string()));
+        assert!(guard.has_master_code());
+
+        let t1 = guard
+            .try_master("recovery-secret")
+            .expect("matching master code issues a token");
+        // Reusable: a second submission still works and mints a fresh token.
+        let t2 = guard
+            .try_master("recovery-secret")
+            .expect("master code is reusable");
+        assert_ne!(t1, t2, "each use mints a fresh token");
+        assert!(t1.starts_with("zc_"));
+        assert!(guard.is_authenticated(&t1));
+        assert!(guard.is_authenticated(&t2));
+    }
+
+    #[test]
+    async fn try_master_rejects_mismatch_and_blank_is_off() {
+        let guard = new_guard(true, &[]).with_master_code(Some("recovery-secret".to_string()));
+
+        // Wrong and empty submissions do not issue a token (and fall through to
+        // the one-time-code path, which feeds the shared auth limiter).
+        assert!(guard.try_master("wrong").is_none());
+        assert!(guard.try_master("").is_none());
+        assert!(guard.try_master("recovery-secret ").is_some(), "trims whitespace");
+
+        // A blank/whitespace-only config normalizes to "off".
+        let off = new_guard(true, &[]).with_master_code(Some("   ".to_string()));
+        assert!(!off.has_master_code());
+        assert!(off.try_master("   ").is_none());
+    }
+
+    #[test]
+    async fn try_master_is_inert_when_require_pairing_false() {
+        // Operator decision: with `require_pairing = false` the master code must
+        // not mint a token even when the submitted value is exactly correct.
+        let guard = new_guard(false, &[]).with_master_code(Some("recovery-secret".to_string()));
+        assert!(guard.has_master_code(), "code is still configured");
+        assert!(
+            guard.try_master("recovery-secret").is_none(),
+            "master code must be inert when pairing is disabled"
+        );
+    }
+
+    #[test]
+    async fn try_master_leaves_distinct_one_time_code_intact() {
+        // AC: master and one-time work independently — using master must not
+        // consume a distinct live one-time code.
+        let guard = new_guard(true, &[]).with_master_code(Some("recovery-secret".to_string()));
+        let one_time = guard.pairing_code().expect("startup mints a one-time code");
+        assert_ne!(one_time, "recovery-secret");
+
+        assert!(guard.try_master("recovery-secret").is_some());
+        assert_eq!(
+            guard.pairing_code().as_deref(),
+            Some(one_time.as_str()),
+            "distinct one-time code must survive a master login"
+        );
+        let token = guard
+            .try_pair(&one_time, "client")
+            .await
+            .unwrap()
+            .expect("one-time code must still pair after master use");
+        assert!(guard.is_authenticated(&token));
+        assert!(guard.pairing_code().is_none(), "one-time is consumed by try_pair");
+    }
+
+    #[test]
+    async fn try_master_consumes_one_time_slot_on_value_collision() {
+        // If the operator accidentally sets master == current one-time, a
+        // successful master match must burn the one-time slot so the shared
+        // value cannot stay permanently redeemable as a one-time code.
+        let guard = {
+            let g = new_guard(true, &[]);
+            let code = g.pairing_code().unwrap();
+            g.with_master_code(Some(code))
+        };
+        let colliding = guard.pairing_code().unwrap();
+        assert!(guard.try_master(&colliding).is_some());
+        assert!(
+            guard.pairing_code().is_none(),
+            "colliding one-time slot must be consumed on master match"
+        );
+        assert!(
+            guard
+                .try_pair(&colliding, "client")
+                .await
+                .unwrap()
+                .is_none(),
+            "consumed one-time must no longer redeem via try_pair"
+        );
+        // Master itself stays reusable.
+        assert!(guard.try_master(&colliding).is_some());
     }
 
     #[test]

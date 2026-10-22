@@ -10239,9 +10239,9 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                                 println!("  ✅ {message}");
                                 println!();
                             }
-                            println!("  ┌──────────────┐");
-                            println!("  │  {code}  │");
-                            println!("  └──────────────┘");
+                            for line in pairing_code_box_lines(&code) {
+                                println!("{line}");
+                            }
                             println!();
                             println!(
                                 "{}",
@@ -16576,11 +16576,55 @@ async fn dispatch_models_command(model_command: ModelCommands, config: &mut Conf
     }
 }
 
+/// Build the three lines of the decorative box that frames a pairing code,
+/// sized to the code so the border never overflows regardless of code length.
+fn pairing_code_box_lines(code: &str) -> [String; 3] {
+    // Inner padding mirrors "  │  {code}  │" → 2 spaces on each side (4 total),
+    // so the top/bottom bar is `code width + 4` columns.
+    let inner = code.chars().count() + 4;
+    let bar = "─".repeat(inner);
+    [
+        format!("  ┌{bar}┐"),
+        format!("  │  {code}  │"),
+        format!("  └{bar}┘"),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::{CommandFactory, Parser};
     use std::net::TcpListener;
+
+    #[test]
+    fn pairing_code_box_sized_to_code_width() {
+        // Regression for the original bug: a long generated code overflowed a
+        // hard-coded 14-column box so the right border was misaligned. The
+        // top/bottom border and the code row must share one outer width.
+        let code = "0dz6K8GTvBRPo6mMGZsEn2TqxGizramf";
+        let code_w = code.chars().count();
+        assert!(
+            code_w > 14,
+            "fixture must exceed the old hard-coded box width"
+        );
+        let lines = pairing_code_box_lines(code);
+        let top_w = lines[0].chars().count();
+        let mid_w = lines[1].chars().count();
+        let bot_w = lines[2].chars().count();
+        assert_eq!(top_w, mid_w, "top border and code row must align");
+        assert_eq!(top_w, bot_w, "top and bottom borders must align");
+        // top = 2 spaces + ┌ + bar(code_w+4) + ┐ = code_w + 8 columns
+        assert_eq!(top_w, code_w + 8);
+        assert!(lines[1].starts_with("  │  "));
+        assert!(lines[1].ends_with("  │"));
+        assert!(lines[1].contains(code), "code must appear inside the box");
+
+        // A short code must stay aligned too.
+        let short = "abc";
+        let s = pairing_code_box_lines(short);
+        assert_eq!(s[0].chars().count(), s[1].chars().count());
+        assert_eq!(s[0].chars().count(), s[2].chars().count());
+    }
 
     #[cfg(feature = "plugins-wasm")]
     #[test]

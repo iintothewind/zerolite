@@ -871,6 +871,40 @@ pub struct ImageMarkerSummary {
     pub image_refs: usize,
 }
 
+/// The text a message contributes to the provider view, with image parts
+/// lifted out, plus the number of images it dispatches.
+///
+/// [`message_image_summary`] answers the same question in bytes (enough for a
+/// byte-based estimate). Callers that price text by script — a CJK caption
+/// costs a token per character, not three bytes' worth — need the text
+/// itself, which this returns without a second scan of the message.
+pub fn message_image_text(message: &ChatMessage) -> (String, usize) {
+    let Some(parts) = classify(&message.role, &message.content) else {
+        let parsed = parse_image_markers_inner(&message.content, ParseMode::RewriteAndCollect);
+        return (parsed.cleaned, parsed.loadable_count);
+    };
+    if !parts.declared {
+        // Legacy carrier: nothing promoted, the body is delivered verbatim.
+        return (parts.text.clone(), 0);
+    }
+    let image_ref_count = image_refs(&parts).len();
+    match parts.kind {
+        CarrierKind::Native => (parts.text.clone(), image_ref_count),
+        CarrierKind::Prompt => {
+            let retained: Vec<RenderedMarker> = parts
+                .attachments
+                .iter()
+                .filter(|marker| marker.kind != MarkerKind::Image)
+                .cloned()
+                .collect();
+            (
+                render_prompt_tool_carrier(&parts.text, &retained),
+                image_ref_count,
+            )
+        }
+    }
+}
+
 pub fn image_marker_summary(content: &str) -> ImageMarkerSummary {
     let parsed = parse_image_markers_inner(content, ParseMode::Scan);
     ImageMarkerSummary {

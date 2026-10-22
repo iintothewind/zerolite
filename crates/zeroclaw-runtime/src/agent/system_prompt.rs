@@ -2,7 +2,6 @@
 //! These functions were originally in `channels/mod.rs` but live here to
 //! break a circular dependency between the channels and agent modules.
 
-use crate::agent::prompt::{TIMESTAMP_ORIENTATION, append_timestamp_orientation};
 use crate::identity;
 use crate::security::AutonomyLevel;
 use crate::skills::Skill;
@@ -508,16 +507,11 @@ pub fn build_system_prompt_with_mode_and_effective_tools(
         );
     }
 
-    // ── 6. Date ─────────────────────────────────────────────────
-    let now = chrono::Local::now();
-    let _ = writeln!(
-        prompt,
-        "## Current Date\n\n{} ({})\n",
-        now.format("%Y-%m-%d"),
-        now.format("%:z")
-    );
-
-    // ── 7. Runtime ──────────────────────────────────────────────
+    // ── 6. Runtime ──────────────────────────────────────────────
+    // No date section: the system prefix must stay byte-stable so provider
+    // prompt caching keeps hitting across turns (see
+    // `docs/book/src/agents/context-management.md`). Calendar guidance
+    // belongs in AGENTS.md / tools, not in runtime-injected prose.
     let host =
         hostname::get().map_or_else(|_| "unknown".into(), |h| h.to_string_lossy().to_string());
     // The shell is reported next to the OS because the OS alone does not
@@ -572,18 +566,6 @@ pub fn build_system_prompt_with_mode_and_effective_tools(
         prompt.push_str("- Calibration note: agents in this system currently err on the side of silence when a response would be appropriate, which users find frustrating. Skew toward replying. Memory is supplementary context that informs how you respond, not a gate on whether you respond.\n\n");
     } // end if !compact_context (full Channel Capabilities copy)
 
-    // Emitted unconditionally: small local models mistake the enrichment
-    // prefix for log/API data without this orientation. The prefix format
-    // is canonical in agent.rs `Agent::enrich_user_message` — keep in sync.
-    //
-    // This orientation is runtime-owned and must survive the compact/finite
-    // `max_system_prompt_chars` budget: it is what stops small local models
-    // from reading the timestamp prefix as a log/API payload.
-    // Because truncation below keeps only the *top* portion of the prompt,
-    // the orientation is re-emitted inside the retained budget after any
-    // truncation rather than left in the truncatable tail.
-    append_timestamp_orientation(&mut prompt);
-
     prompt = finalize_system_prompt(prompt, max_system_prompt_chars);
 
     if prompt.is_empty() {
@@ -595,34 +577,18 @@ pub fn build_system_prompt_with_mode_and_effective_tools(
 }
 
 /// Apply the final model-visible prompt budget in Unicode scalar values.
+///
+/// Truncation keeps the head (identity + safety) and never injects a
+/// runtime wall-clock section: the system prefix must stay byte-stable so
+/// provider prompt caching keeps hitting (see
+/// `docs/book/src/agents/context-management.md`).
 pub fn finalize_system_prompt(mut prompt: String, max_chars: usize) -> String {
     if max_chars > 0 && prompt.chars().count() > max_chars {
-        // The orientation is runtime-critical, so it must land inside the
-        // budget. Reserve room at the head-retained portion, then re-append it
-        // so it always survives even when the assembled prompt overflows.
-        let orientation_chars = TIMESTAMP_ORIENTATION.chars().count();
-        if max_chars >= orientation_chars {
-            // Keep the top portion (identity + safety) minus the required tail.
-            let end = max_chars - orientation_chars;
-            let byte_end = prompt
-                .char_indices()
-                .nth(end)
-                .map_or(prompt.len(), |(index, _)| index);
-            prompt.truncate(byte_end);
-            append_timestamp_orientation(&mut prompt);
-        } else {
-            // When the budget cannot hold both retained content and the
-            // critical tail, prioritize as much of the orientation as fits.
-            // This preserves the full orientation whenever possible without
-            // violating the configured prompt ceiling for very small budgets.
-            let end = max_chars.min(TIMESTAMP_ORIENTATION.chars().count());
-            let byte_end = TIMESTAMP_ORIENTATION
-                .char_indices()
-                .nth(end)
-                .map_or(TIMESTAMP_ORIENTATION.len(), |(index, _)| index);
-            prompt.clear();
-            prompt.push_str(&TIMESTAMP_ORIENTATION[..byte_end]);
-        }
+        let byte_end = prompt
+            .char_indices()
+            .nth(max_chars)
+            .map_or(prompt.len(), |(index, _)| index);
+        prompt.truncate(byte_end);
     }
     prompt
 }
@@ -1183,11 +1149,15 @@ mod tests {
     }
 
     #[test]
-    fn compact_context_carries_timestamp_orientation() {
+    fn compact_context_has_no_runtime_wall_clock_orientation() {
         let prompt = prompt_with_compact_context(true);
         assert!(
-            prompt.contains("timestamp metadata added by the runtime"),
-            "compact system prompt must orient the model on the date/time-prefix convention: {prompt}"
+            !prompt.contains("timestamp metadata added by the runtime"),
+            "compact system prompt must not inject wall-clock orientation: {prompt}"
+        );
+        assert!(
+            !prompt.contains("## Current Date\n"),
+            "compact system prompt must not inject a Current Date section: {prompt}"
         );
     }
 
@@ -1264,8 +1234,8 @@ mod tests {
             "full system prompt must retain the existing Channel Capabilities copy: {prompt}"
         );
         assert!(
-            prompt.contains("timestamp metadata added by the runtime"),
-            "full system prompt must carry the timestamp orientation too: {prompt}"
+            !prompt.contains("timestamp metadata added by the runtime"),
+            "full system prompt must not inject wall-clock orientation: {prompt}"
         );
     }
 
@@ -1321,9 +1291,6 @@ mod tests {
         ];
 
         for compact in [false, true] {
-            // A budget well below the assembled prompt length so truncation
-            // definitely runs, but large enough to hold the retained head plus
-            // the reserved orientation.
             let budget = 600;
             let prompt = prompt_with_finite_budget(compact, budget, &tools);
 
@@ -1333,70 +1300,52 @@ mod tests {
                 prompt.chars().count() == budget && !prompt.contains("System prompt truncated"),
                 "compact={compact}: expected truncation to fire at budget {budget}; prompt was:\n{prompt}"
             );
-            // The runtime-owned orientation must survive inside the budget.
+            // The prefix stays free of runtime wall-clock prose so provider
+            // prompt caching keeps hitting across turns.
             assert!(
-                prompt.contains("timestamp metadata added by the runtime"),
-                "compact={compact}: timestamp orientation must survive finite-budget truncation; prompt was:\n{prompt}"
-            );
-            assert!(
-                prompt.chars().count() <= budget,
-                "compact={compact}: prompt length {} exceeded budget {budget}",
-                prompt.chars().count()
+                !prompt.contains("timestamp metadata added by the runtime"),
+                "compact={compact}: truncated prompt must not re-append timestamp orientation; prompt was:\n{prompt}"
             );
         }
     }
 
     #[test]
-    fn timestamp_orientation_respects_budgets_at_and_below_reserved_tail() {
+    fn truncation_respects_budgets_at_and_below_the_limit() {
         let tools = [(
             "shell",
             "Run a shell command with enough description to overflow",
         )];
-        let reserved = TIMESTAMP_ORIENTATION.chars().count();
 
         for compact in [false, true] {
-            for budget in [
-                1,
-                TIMESTAMP_ORIENTATION.chars().count() - 1,
-                TIMESTAMP_ORIENTATION.chars().count(),
-                reserved - 1,
-                reserved,
-            ] {
+            for budget in [1, 2, 40, 600] {
                 let prompt = prompt_with_finite_budget(compact, budget, &tools);
                 assert!(
                     prompt.chars().count() <= budget,
                     "compact={compact}: prompt length {} exceeded budget {budget}",
                     prompt.chars().count()
                 );
-
-                if budget >= TIMESTAMP_ORIENTATION.chars().count() {
-                    assert!(
-                        prompt.ends_with(TIMESTAMP_ORIENTATION),
-                        "compact={compact}: full orientation must survive budget {budget}: {prompt}"
-                    );
-                } else {
-                    assert!(
-                        TIMESTAMP_ORIENTATION.starts_with(&prompt),
-                        "compact={compact}: tiny budget {budget} must retain a bounded orientation prefix: {prompt}"
-                    );
-                }
+                assert!(
+                    !prompt.contains("timestamp metadata added by the runtime"),
+                    "compact={compact}: budget {budget} must not inject orientation: {prompt}"
+                );
             }
         }
     }
 
     #[test]
     fn final_prompt_budget_counts_unicode_scalars_and_honors_exact_limit() {
-        let reserved = TIMESTAMP_ORIENTATION.chars().count();
-        let max_chars = reserved + 40;
-        let retained = "界".repeat(max_chars - reserved);
+        let max_chars = 40;
+        let retained = "界".repeat(max_chars);
         let prompt = format!("{}TAIL", "界".repeat(400));
         let finalized = super::finalize_system_prompt(prompt, max_chars);
 
         assert_eq!(finalized.chars().count(), max_chars);
-        assert!(finalized.starts_with(&retained));
-        assert!(!finalized.contains("System prompt truncated"));
-        assert!(finalized.ends_with(TIMESTAMP_ORIENTATION));
+        assert_eq!(finalized, retained, "truncation keeps the head verbatim");
         assert!(!finalized.contains("TAIL"));
+        assert!(
+            !finalized.contains("timestamp metadata added by the runtime"),
+            "finalization must not inject runtime wall-clock prose"
+        );
     }
 
     #[test]
@@ -1497,7 +1446,7 @@ mod tests {
         assert!(prompt.contains("## Safety"));
         assert!(prompt.contains("BOOTSTRAP_CONTRACT_REQUIRED"));
         assert!(!prompt.contains("System prompt truncated"));
-        assert!(prompt.ends_with(TIMESTAMP_ORIENTATION));
+        assert!(!prompt.contains("timestamp metadata added by the runtime"));
         assert!(!prompt.contains("LOW_PRIORITY_SKILL_METADATA"));
     }
 
@@ -1765,27 +1714,27 @@ mod tests {
     }
 
     #[test]
-    fn final_prompt_budget_preserves_orientation_priority_at_boundaries() {
+    fn final_prompt_budget_truncates_cleanly_at_boundaries() {
         let oversized = "界".repeat(400);
-        let orientation_chars = TIMESTAMP_ORIENTATION.chars().count();
-        let reserved = orientation_chars;
 
         assert_eq!(
-            super::finalize_system_prompt(oversized.clone(), reserved - 1),
-            TIMESTAMP_ORIENTATION
-                .chars()
-                .take(reserved - 1)
-                .collect::<String>()
+            super::finalize_system_prompt(oversized.clone(), 1),
+            "界".to_string()
         );
         assert_eq!(
-            super::finalize_system_prompt(oversized.clone(), orientation_chars),
-            TIMESTAMP_ORIENTATION
+            super::finalize_system_prompt(oversized.clone(), 3),
+            "界".repeat(3)
         );
         assert_eq!(
-            super::finalize_system_prompt(oversized, 3),
-            TIMESTAMP_ORIENTATION.chars().take(3).collect::<String>()
+            super::finalize_system_prompt(oversized, 40).chars().count(),
+            40
         );
+        // A zero budget disables truncation entirely.
         assert_eq!(super::finalize_system_prompt("界TAIL".into(), 0), "界TAIL");
+        assert_eq!(
+            super::finalize_system_prompt("界TAIL".into(), 1),
+            "界".to_string()
+        );
     }
 
     #[test]

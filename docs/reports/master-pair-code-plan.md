@@ -255,6 +255,12 @@ master-paired device revokes that device's token only — the master code keeps 
    revoking does not disable the master code.
 6. Backward compatible: configs without the key parse as `None`; all existing tests
    pass (`cargo test -p zeroclaw-config -p zeroclaw-gateway`).
+7. Every **production** guard constructor carries the configured master code. A guard
+   built by hand without it makes the pairing page reject a correct master code with
+   no hint that it was configured. Regression pinned by
+   `daemon::tests::the_published_pairing_authority_pairs_with_the_configured_master_code`
+   (the daemon-hosted gateway regressed in the v0.8.6 merge — see the regression note
+   above).
 
 ## Open questions for review
 
@@ -299,6 +305,53 @@ The only **production** `PairingGuard::new` is the gateway state builder
 `POST /admin/reload` reuses that builder, so a changed/added `master_pair_code` is
 picked up on reload with no restart. (The `PairingGuard::new` calls without
 `.with_master_code` are all `#[cfg(test)]` fixtures, not production code.)
+
+### Regression: the daemon-hosted gateway dropped the master code (v0.8.6 merge)
+
+The note above stopped being true when the upstream v0.8.6 merge
+(`1f379c6de`, 2026-10-19) added a **second** production guard constructor so a
+pairing change could reach both the RPC surface and the gateway at once:
+
+```rust
+// crates/zeroclaw-runtime/src/daemon/mod.rs  (before this fix)
+let pairing_guard = Arc::new(PairingGuard::new(
+    config.gateway.require_pairing,
+    &config.gateway.paired_tokens,
+    config.gateway.pairing_code,
+)); // ← no .with_master_code(..): master_pair_code is hardcoded None
+```
+
+`PairingGuard::new` sets `master_pair_code: None` unconditionally, and the gateway
+adopts the daemon's guard verbatim
+(`shared_pairing.unwrap_or_else(|| PairingGuard::from_gateway_config(..))`), so
+`from_gateway_config` — the constructor that *does* carry the code — never ran in a
+supervised run. `try_master` then hit its `?` and fell through to the one-time-code
+path, so the pairing page answered `Invalid or expired pairing code` for a
+configured, correct master code.
+
+**Why it looked like "the gateway path is fine":** a standalone
+`zeroclaw gateway start` has no daemon, so `shared_pairing` is `None` and
+`from_gateway_config` runs — the master code works there. Only a
+`zeroclaw service start` / `daemon` run regressed. The gateway-side tests all built
+their guard with `from_gateway_config`, so they kept passing while the daemon path
+was broken — a test/production drift, the same shape as the SSE test that passed on
+a hand-written fixture.
+
+**Fix:** the daemon builds its guard with `PairingGuard::from_gateway_config` (one
+production constructor again), and the gateway's choice is extracted as
+`resolve_pairing_guard(shared, gateway_config)` so both starts are pinned by tests.
+
+**Verified end to end** (docker, same config in both runs):
+
+| daemon guard constructor | banner | `POST /api/pair` with the master code |
+| --- | --- | --- |
+| `PairingGuard::new(..)` (before) | no master line | `400 Invalid or expired pairing code` |
+| `from_gateway_config(..)` (after) | `🔑 Master recovery code: configured` | `200 {"paired":true,"token":"zc_…"}` |
+
+Tests: `zeroclaw-runtime` `daemon::tests::the_published_pairing_authority_pairs_with_the_configured_master_code`
+(asserts the daemon-built authority actually mints a token) and `zeroclaw-gateway`
+`tests::a_standalone_gateway_adopts_the_configured_master_code` /
+`tests::a_supervised_gateway_serves_the_daemons_authority_verbatim`.
 
 ### B4 contract unification (post-review correction)
 

@@ -247,8 +247,8 @@ not affect trim correctness.
 ## The trim action: prefer keep-N, then cascade to send budget
 
 The token water-line above is the **only** trim trigger. When it fires, the
-action is a three-stage cascade (`history_trim::trim_to_budget` /
-`trim_conversation_to_budget`). Fit checks use **`send_budget`**, never
+action is a three-stage cascade (`history_trim::trim_to_fit` /
+`trim_conversation_to_fit`). Fit checks use **`send_budget`**, never
 `trim_threshold_percent` / the water-line.
 
 | Stage | Behavior | Stop when |
@@ -258,6 +258,45 @@ action is a three-stage cascade (`history_trim::trim_to_budget` /
 | 3. Hard fail | Floor (system/tools/skills prefix + newest turn) still over `send_budget` | Abort the turn with an **error message only** (no `HistoryTrimmed` notice); never drop below one turn |
 
 How stage 2 is decided does not matter to operators: the runtime may probe by decrementing keep, binary-search, or estimate turn sizes once. The contract is the outcome — maximal keep that fits, whole turns only, floor 1.
+
+### When the provider reports no usage
+
+The trigger above reads the **provider-reported** `input_tokens`, which is
+authoritative because it is what the provider actually billed. Not every
+endpoint reports it: OpenAI-compatible servers, local runtimes, and some
+streaming responses omit usage entirely.
+
+Without a reported count the runtime has no authoritative number, so the local
+estimate is **not** a substitute for it — it cannot see what the provider
+really charged. Trimming on the estimate would cut history away on a guess,
+and the breadcrumb that records the cut can itself push the retained set past
+the window. So with no reported usage the runtime:
+
+- **does not trim proactively** — the water-line trigger stays inactive, because
+  the estimate is not a measurement;
+- **only acts as an overflow guard** — when the local estimate says the request
+  could not fit the model's window at all, the runtime trims and retries;
+- **skips the guard when there is nothing to drop** — if only one whole turn
+  remains, trimming cannot make the request smaller, so the request is
+  dispatched rather than failed on a difference the trim cannot close.
+
+A provider that reports usage keeps the full behaviour: the water-line
+triggers the trim, and the send budget decides what still fits.
+
+**The floor is the model's capacity, not the send budget.** A retention that
+misses the send budget but still fits the model's window is a *soft floor*: the
+newest turn is dispatched rather than rejected. Only a population the model
+cannot take is an unsatisfiable floor.
+
+**Settlement.** Stage 2 selects by summing per-message estimates, which is only
+exact when the estimator is additive. A provider view that prices the whole
+slice higher than the sum of its messages — per-call framing, one-time tool
+schemas, attachment accounting — would otherwise keep more turns than actually
+fit and let the request overflow the window. After choosing a keep, the runtime
+therefore re-prices the **retained set as a whole** and drops one more turn
+until the whole-slice estimate fits `send_budget` or only the floor remains.
+`tokens_after` reports the larger of the two prices, so a settled retention is
+never reported as fitting when the whole-slice view disagrees.
 
 | | Value |
 |---|---|
@@ -295,6 +334,16 @@ correct fixes are operational — raise
 `[runtime_profiles.<name>].context.request_token_ceiling` (or the provider
 `context_window`), disable unused integrations to shrink the tool surface, or
 point the agent at a larger-window model.
+
+## Token estimation: script-aware, not bytes
+
+The local estimate that sizes the water-line and the cascade is **script-aware**:
+Latin text keeps the historical ~4 characters per token, while CJK, kana, and
+Hangul characters are charged one token each (they tokenize near 1:1 with common
+BPE families). A CJK caption therefore costs the same whether it rides inside an
+image carrier or stands alone — the text around image parts is priced with the
+same rule as any other message, and only the image parts themselves take the
+fixed per-image charge.
 
 ## Cache-economics feedback
 

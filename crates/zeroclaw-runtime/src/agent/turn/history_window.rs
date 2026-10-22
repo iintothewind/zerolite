@@ -1,7 +1,7 @@
 //! Pre-iteration history maintenance: orphaned tool-message removal and
 //! system-message normalization. No preemptive token-budget trimming runs
 //! here; context trimming is reactive and turn-bounded (see
-//! `trim_to_recent_turns`).
+//! `trim_to_fit`).
 
 use crate::agent::history::normalize_system_messages;
 use zeroclaw_providers::ChatMessage;

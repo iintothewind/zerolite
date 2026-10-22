@@ -685,11 +685,10 @@ fn refresh_scoped_tool_protocol_prompt(
 fn tool_section_bounds(prompt: &str) -> Option<std::ops::Range<usize>> {
     let start = prompt.find("## Tools\n")?;
     let following = &prompt[start..];
-    // A capped prompt may have lost `## Safety`; never let the section run
-    // into the trailing timestamp orientation that the cap preserves.
+    // A capped prompt may have lost `## Safety`; the section then runs to the
+    // end of what survived the cap.
     let end = following
         .find("\n\n## Safety")
-        .or_else(|| following.find(crate::agent::prompt::TIMESTAMP_ORIENTATION))
         .map_or(prompt.len(), |offset| start + offset);
     Some(start..end)
 }
@@ -810,9 +809,6 @@ fn apply_builtin_prompt_scope(
                 let section_end = message.content[body..]
                     .find("\n## ")
                     .map_or(message.content.len(), |offset| body + offset);
-                let section_end = message.content[body..section_end]
-                    .find(crate::agent::prompt::TIMESTAMP_ORIENTATION)
-                    .map_or(section_end, |offset| body + offset);
                 let (end, complete) = if heading == "## Deferred Built-in Tools\n" {
                     let close = "</available-deferred-builtin-tools>";
                     message.content[body..section_end]
@@ -840,14 +836,9 @@ fn apply_builtin_prompt_scope(
             }
         }
         if !instructions.is_empty() {
-            // Keep orientation at the tail so finalization cannot retain it twice.
-            let insertion = message
-                .content
-                .find(crate::agent::prompt::TIMESTAMP_ORIENTATION)
-                .unwrap_or(message.content.len());
             message
                 .content
-                .insert_str(insertion, &format!("\n{instructions}"));
+                .insert_str(message.content.len(), &format!("\n{instructions}"));
             message.content = crate::agent::system_prompt::finalize_system_prompt(
                 std::mem::take(&mut message.content),
                 max_system_prompt_chars,
@@ -978,12 +969,23 @@ enum PreDispatchOutcome {
     Floor,
 }
 
+/// The fit target for a pre-dispatch trim.
+///
+/// The pre-dispatch guard exists so a request is checked *before* it is sent:
+/// whether the provider would accept it is knowable locally, and making it
+/// discover that by rejecting the request would waste a round trip. The
+/// target is therefore the **send budget** (`window − reserve`) — what still
+/// fits — with the water-line as the fallback when no send budget is
+/// configured, and the model window as the last resort.
 fn dispatch_trim_budget(limits: zeroclaw_config::schema::ResolvedContextLimits) -> usize {
-    if limits.context_token_budget == 0 {
-        limits.model_context_window
+    let target = if limits.context_send_budget > 0 {
+        limits.context_send_budget
+    } else if limits.context_token_budget > 0 {
+        limits.context_token_budget
     } else {
-        limits.context_token_budget.min(limits.model_context_window)
-    }
+        limits.model_context_window
+    };
+    target.min(limits.model_context_window)
 }
 
 fn context_window_exceeded_error(
@@ -1122,6 +1124,10 @@ async fn enforce_reported_budget(
     // The send / fit budget: the largest retained population that still
     // fits the effective window. Distinct from the water-line by design.
     context_send_budget: usize,
+    // The model's own capacity: the hard floor. A retention that misses the
+    // send budget but still fits the window is a soft floor, dispatched
+    // rather than rejected.
+    model_context_window: usize,
     // Preferred whole-turn retention when the trim fires.
     keep_recent_turns: usize,
     event_tx: Option<&tokio::sync::mpsc::Sender<TurnEvent>>,
@@ -1135,12 +1141,41 @@ async fn enforce_reported_budget(
     _hook_reserve_tokens: usize,
     crumb_present: &mut bool,
 ) -> Result<(), anyhow::Error> {
-    // The pre-send kernel decides whether the provider-reported usage already
-    // fits. `reported_input_tokens` is the provider-authoritative count, so it
-    // is the authoritative `tokens_now` for the preemptive (non-forced) phase.
-    let decision =
-        crate::agent::turn::context_pipeline::plan_pre_send_trim(reported_input_tokens, context_token_budget, false);
-    if !decision.should_trim {
+    // The pre-send kernel decides whether the request already fits.
+    //
+    // The provider-reported count is authoritative when present. Many
+    // endpoints report no usage at all (OpenAI-compatible servers, local
+    // runtimes, some streaming responses), and a local estimate is not a
+    // substitute for it: the estimate cannot see what the provider really
+    // charged, so trimming on it would cut history away on a guess and add a
+    // breadcrumb that may push the retained set over the window. Without a
+    // reported count we therefore only act when the estimate says the
+    // request cannot fit the model window at all — the overflow guard, not
+    // the proactive trim.
+    let reported = reported_input_tokens > 0;
+    let tokens_now = if reported {
+        reported_input_tokens
+    } else {
+        crate::agent::history::estimate_history_tokens(history)
+    };
+    if reported {
+        let decision = crate::agent::turn::context_pipeline::plan_pre_send_trim(
+            tokens_now,
+            context_token_budget,
+            false,
+        );
+        if !decision.should_trim {
+            return Ok(());
+        }
+    } else if model_context_window == 0 || tokens_now <= model_context_window {
+        // No reported usage and the local estimate still fits the window:
+        // dispatch as-is rather than trimming on a guess.
+        return Ok(());
+    } else if crate::agent::history_trim::count_turns(history) <= 1 {
+        // No reported usage, the estimate says the request overflows, and
+        // there is no whole turn left to drop: trimming could not make the
+        // request any smaller, so dispatch it rather than fail on a
+        // difference the trim cannot close.
         return Ok(());
     }
     let send_budget =
@@ -1149,13 +1184,14 @@ async fn enforce_reported_budget(
     // The synthetic crumb is not a turn: it must not consume a keep-N slot nor
     // be dropped by the cascade.
     let taken_had_crumb = *crumb_present;
-    let mut result = crate::agent::history_trim::trim_to_budget_with_crumb(
+    let mut result = crate::agent::history_trim::trim_to_fit_with_crumb(
         taken,
         keep_recent_turns,
         send_budget,
+        model_context_window,
         taken_had_crumb,
     );
-    result.tokens_before = reported_input_tokens;
+    result.tokens_before = tokens_now;
     if result.trimmed && !result.exceeds_budget {
         crate::agent::history_trim::warn_if_below_preferred_keep(
             keep_recent_turns,
@@ -2704,6 +2740,7 @@ async fn run_tool_call_loop_impl<'a>(
                     observer,
                     ctx.context_limits.context_token_budget,
                     ctx.context_limits.context_send_budget,
+                    ctx.context_limits.model_context_window,
                     ctx.context_limits.keep_recent_turns,
                     &context_calibration,
                     &mut turn_state.crumb_present,
@@ -2984,19 +3021,24 @@ async fn run_tool_call_loop_impl<'a>(
 
             let msg = ChatMessage::assistant(response_text.clone());
             turn_state.push_dual(msg);
-            if let Some(reported) = reported_input_tokens {
-                // Terminal response: no next request will be dispatched, so no
-                // hook reserve is carried — enforcement never executes a
+            // A terminal response never dispatches another request, so the only
+            // reason to trim here is keeping the durable transcript inside the
+            // window for the NEXT turn. Providers that report no usage still
+            // need that: `enforce_reported_budget` falls back to the local
+            // estimate when the count is absent.
+            {
+                // No hook reserve is carried — enforcement never executes a
                 // modifying `before_llm_call` hook merely to estimate a request
                 // that will never be sent.
                 Box::pin(enforce_reported_budget(
                     injected_memory_preamble,
                     turn_state.history,
-                    reported as usize,
+                    reported_input_tokens.unwrap_or(0) as usize,
                     reported_population_estimated,
                     tool_schema_tokens,
                     ctx.context_limits.context_token_budget,
                     ctx.context_limits.context_send_budget,
+                    ctx.context_limits.model_context_window,
                     ctx.context_limits.keep_recent_turns,
                     event_tx.as_ref(),
                     observer,
@@ -4616,17 +4658,20 @@ mod surface3_tests {
 
     #[tokio::test]
     async fn scoped_protocol_switch_caps_request_and_keeps_history_lossless() {
-        let orientation = crate::agent::prompt::TIMESTAMP_ORIENTATION;
+        // The runtime no longer appends a wall-clock orientation to the system
+        // prompt, so the truncation guard here is the plain budget: the head
+        // survives and the volatile tool section is what gets cut.
+        let tail_anchor = "<mcp-resource>pinned</mcp-resource>";
         let native = format!(
-            "## Tools\n\nsmall\n\n## Safety\n\n{}\n\n<mcp-resource>pinned</mcp-resource>{}",
+            "## Tools\n\nsmall\n\n## Safety\n\n{}\n\n{}",
             "safe".repeat(20),
-            orientation
+            tail_anchor
         );
         let text = format!(
             "## Tools\n\n{}\n\n## Safety\n\n{}{}",
             "tool guidance ".repeat(150),
             "safe".repeat(20),
-            orientation,
+            tail_anchor,
         );
         // The cap fits the native prompt but not the text tool section, so
         // a native -> text -> native sequence must truncate only requests.
@@ -4638,8 +4683,10 @@ mod surface3_tests {
         ));
         let assert_request = |prompt: &str| {
             assert!(prompt.chars().count() <= cap);
-            assert!(prompt.ends_with(orientation));
-            assert_eq!(prompt.matches(orientation).count(), 1);
+            assert!(
+                !prompt.contains("timestamp metadata added by the runtime"),
+                "a capped request must not inject runtime wall-clock prose: {prompt}"
+            );
         };
         let mut history = vec![ChatMessage::system(native.clone())];
         scope_tool_protocol_prompts(prompts, async {
@@ -4668,7 +4715,7 @@ mod surface3_tests {
     }
 
     fn capped_switch_fixture() -> (String, Arc<ToolProtocolPrompts>, usize) {
-        let orientation = crate::agent::prompt::TIMESTAMP_ORIENTATION;
+        let orientation = TAIL_MARKER;
         let native = format!(
             "## Identity\n\nme\n\n## Safety\n\n{}{orientation}",
             "safe".repeat(20)
@@ -4689,7 +4736,6 @@ mod surface3_tests {
 
     #[tokio::test]
     async fn scoped_protocol_refresh_keeps_hook_appended_text() {
-        let orientation = crate::agent::prompt::TIMESTAMP_ORIENTATION;
         let (native, prompts, cap) = capped_switch_fixture();
         let hook = "\n\nHOOK_INSTRUCTION";
         scope_tool_protocol_prompts(prompts, async {
@@ -4710,7 +4756,10 @@ mod surface3_tests {
                 .expect("hook text must survive the switch");
             assert!(base.contains("tool guidance"));
             assert_eq!(base.chars().count(), cap);
-            assert!(base.ends_with(orientation));
+            assert!(
+                !base.contains("timestamp metadata added by the runtime"),
+                "the capped base prompt must not inject runtime wall-clock prose"
+            );
 
             // A rebuilt request (post-trim) is already finalized: refreshing
             // it again must leave it unchanged.
@@ -4734,71 +4783,6 @@ mod surface3_tests {
             let mut request = history.clone();
             refresh_scoped_tool_protocol_prompt(&mut history, &mut request, false);
             assert_eq!(request[0].content.chars().count(), cap);
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    async fn scoped_switch_to_native_keeps_safety_when_text_history_was_cut_in_tools() {
-        let orientation = crate::agent::prompt::TIMESTAMP_ORIENTATION;
-        let tail = format!(
-            "## Safety\n\n{}\n\n<mcp-resource>pinned</mcp-resource>{orientation}",
-            "safe".repeat(20)
-        );
-        let native = format!("## Identity\n\nme\n\n## Tools\n\nsmall\n\n{tail}");
-        let text = format!(
-            "## Identity\n\nme\n\n## Tools\n\n{}\n\n{tail}",
-            "tool guidance ".repeat(150)
-        );
-        // The cap fits the native prompt, but cuts the text prompt inside its
-        // tool section, so the text-seeded history has lost `## Safety`.
-        let cap = native.chars().count() + 50;
-        let seeded = crate::agent::system_prompt::finalize_system_prompt(text.clone(), cap);
-        assert!(!seeded.contains("## Safety"));
-        let prompts = Arc::new(ToolProtocolPrompts::with_max_chars(native, text, cap));
-        let mut history = vec![ChatMessage::system(seeded)];
-        scope_tool_protocol_prompts(prompts, async {
-            let mut request = history.clone();
-            refresh_scoped_tool_protocol_prompt(&mut history, &mut request, true);
-            let prompt = &request[0].content;
-            assert!(prompt.contains("## Safety"), "native request lost Safety");
-            assert!(prompt.contains("<mcp-resource>pinned</mcp-resource>"));
-            assert!(!prompt.contains("tool guidance"));
-            assert!(prompt.chars().count() <= cap);
-            assert!(prompt.ends_with(orientation));
-            assert_eq!(prompt.matches(orientation).count(), 1);
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    async fn scoped_protocol_switch_keeps_orientation_when_cap_removed_safety() {
-        let orientation = crate::agent::prompt::TIMESTAMP_ORIENTATION;
-        // A capped native prompt can end inside the tool section, before
-        // `## Safety`, with only the preserved orientation after it.
-        let native = format!("## Identity\n\nme\n\n## Tools\n\nsmall\n\n{orientation}");
-        let text = format!(
-            "## Tools\n\n{}\n\n## Safety\n\nsafe{}",
-            "tool guidance ".repeat(5),
-            orientation,
-        );
-        let prompts = Arc::new(ToolProtocolPrompts::with_max_chars(native.clone(), text, 0));
-        let mut history = vec![ChatMessage::system(native.clone())];
-        let mut request = history.clone();
-        scope_tool_protocol_prompts(prompts, async {
-            refresh_scoped_tool_protocol_prompt(&mut history, &mut request, false);
-            for prompt in [&history[0].content, &request[0].content] {
-                assert!(prompt.contains("tool guidance"));
-                assert!(prompt.ends_with(orientation));
-                assert_eq!(prompt.matches(orientation).count(), 1);
-            }
-            let mut request = history.clone();
-            refresh_scoped_tool_protocol_prompt(&mut history, &mut request, true);
-            for prompt in [&history[0].content, &request[0].content] {
-                assert!(!prompt.contains("tool guidance"));
-                assert!(prompt.ends_with(orientation));
-                assert!(prompt.starts_with("## Identity\n\nme\n\n"));
-            }
         })
         .await;
     }
@@ -4888,6 +4872,7 @@ mod reported_budget_tests {
         tool_schema_tokens: usize,
         context_token_budget: usize,
         context_send_budget: usize,
+        model_context_window: usize,
         keep_recent_turns: usize,
         event_tx: Option<&tokio::sync::mpsc::Sender<TurnEvent>>,
         observer: &dyn crate::observability::Observer,
@@ -4906,6 +4891,7 @@ mod reported_budget_tests {
             tool_schema_tokens,
             context_token_budget,
             context_send_budget,
+            model_context_window,
             keep_recent_turns,
             event_tx,
             observer,
@@ -4968,6 +4954,7 @@ mod reported_budget_tests {
             0,
             estimated * 2,
             estimated * 2,
+            estimated * 2,
             1,
             None,
             &observer,
@@ -5006,6 +4993,7 @@ mod reported_budget_tests {
             reported,
             estimated,
             0,
+            budget,
             budget,
             budget,
             1,
@@ -5048,6 +5036,7 @@ mod reported_budget_tests {
             0,
             estimated * 4,
             0,
+            estimated * 4,
             5,
             None,
             &NoopObserver,
@@ -5081,7 +5070,8 @@ mod reported_budget_tests {
             0,
             100,
             0,
-            5,
+            100,
+            0,
             None,
             &NoopObserver,
             &zeroclaw_config::schema::MultimodalConfig::default(),
@@ -5113,7 +5103,8 @@ mod reported_budget_tests {
             0,
             0,
             0,
-            5,
+            0,
+            0,
             None,
             &NoopObserver,
             &zeroclaw_config::schema::MultimodalConfig::default(),
@@ -5152,6 +5143,7 @@ mod reported_budget_tests {
             reported,
             estimated,
             0,
+            budget,
             budget,
             budget,
             1,
@@ -5251,6 +5243,7 @@ mod reported_budget_tests {
             0,
             budget,
             budget,
+            budget,
             1,
             Some(&tx),
             &NoopObserver,
@@ -5326,6 +5319,7 @@ mod reported_budget_tests {
             reported,
             estimated,
             0,
+            budget,
             budget,
             budget,
             1,
@@ -6716,6 +6710,7 @@ mod sop_step_reassembly_tests {
 
     #[tokio::test]
     async fn builtin_search_fallback_preserves_strict_policy_and_scoped_replay() {
+        let orientation = TAIL_MARKER;
         let tools: Vec<Box<dyn crate::tools::Tool>> = vec![
             Box::new(NamedTool("allowed_tool")),
             Box::new(NamedTool("denied_tool")),
@@ -6754,7 +6749,6 @@ mod sop_step_reassembly_tests {
         assert_eq!(request[1].content, prompt);
         assert_eq!(history[0].content, prompt);
 
-        let orientation = crate::agent::prompt::TIMESTAMP_ORIENTATION;
         let uncapped = format!("Identity: \u{03bb}\u{732b}\n{prompt}{orientation}");
         for (cap, hook) in [
             (orientation.chars().count() + 30, ""),
@@ -6794,8 +6788,10 @@ mod sop_step_reassembly_tests {
                         .strip_suffix(hook)
                         .expect("hook suffix survives");
                     assert!(cap == 0 || base.chars().count() <= cap);
-                    assert!(base.ends_with(orientation));
-                    assert_eq!(base.matches(orientation).count(), 1);
+                    assert!(
+                        !base.contains("timestamp metadata added by the runtime"),
+                        "the capped base prompt must not inject runtime wall-clock prose"
+                    );
                     assert!(!request[0].content.contains("denied_tool"));
                     if cap == 0 || cap == 10_000 {
                         assert!(request[0].content.contains("**allowed_tool**"));
@@ -6824,7 +6820,6 @@ mod sop_step_reassembly_tests {
         let catalogue = &prompt[prompt.find("## Deferred Built-in Tools").unwrap()
             ..prompt.find("\n\n## Context").unwrap()];
         let incomplete = catalogue.replace("</available-deferred-builtin-tools>", "");
-        let orientation = crate::agent::prompt::TIMESTAMP_ORIENTATION;
         let truncated_cap = prompt[..prompt.find("</available-deferred-builtin-tools>").unwrap()]
             .chars()
             .count()
@@ -6841,7 +6836,8 @@ mod sop_step_reassembly_tests {
             format!("{prompt}{orientation}"),
             omitted_cap,
         );
-        assert!(truncated.contains(orientation));
+        // Finalization keeps the head of the prompt: the catalogue tail is
+        // what gets cut, and nothing is re-appended after it.
         assert!(!truncated.contains("</available-deferred-builtin-tools>"));
         assert!(!omitted.contains("## Deferred Built-in Tools"));
         for (input, native, catalogue_count, cap) in [
@@ -6901,11 +6897,11 @@ mod sop_step_reassembly_tests {
             if input.contains("Keep context.") {
                 assert!(request[0].content.contains("Keep context."));
             }
-            if input.contains(crate::agent::prompt::TIMESTAMP_ORIENTATION) {
+            if input.contains(TAIL_MARKER) {
                 assert!(
                     request[0]
                         .content
-                        .contains(crate::agent::prompt::TIMESTAMP_ORIENTATION)
+                        .contains(TAIL_MARKER)
                 );
             }
             assert_eq!(request[1].content, prompt);
@@ -6931,11 +6927,9 @@ mod sop_step_reassembly_tests {
                 .content
                 .contains("available-deferred-builtin-tools")
         );
-        assert!(
-            strict[0]
-                .content
-                .contains(crate::agent::prompt::TIMESTAMP_ORIENTATION)
-        );
+        // Finalization keeps the head, so a capped prompt carries no tail
+        // marker: the scope projection must not reintroduce one either.
+        assert!(!strict[0].content.contains(TAIL_MARKER));
     }
 
     struct BudgetToolCallingProvider;
@@ -9171,13 +9165,15 @@ mod tool_lifecycle_abandonment_tests {
         // The provider rejects the first request; the recovery path must drop
         // the oversized old turn and keep the image.
         //
-        // The two numbers differ here on purpose: the water-line sits above
-        // the whole history so the pre-dispatch gate leaves the old turn in
-        // place (the provider is the one that rejects it), while the send
-        // budget fits the retained image turn — so the recovery cascade has
-        // something to drop and the image still fits afterwards.
+        // The send budget is wide enough to keep both turns, so the
+        // pre-dispatch gate leaves the old turn in place and the provider is
+        // the one that rejects it. That rejection is the fallback case: the
+        // local estimate cannot see everything the provider will charge for
+        // (an image's real cost, one-time tool schemas), so a request can
+        // still overflow after the local check. The recovery cascade then
+        // drops a whole turn and retries, and the image still fits afterwards.
         let water_line = crate::agent::history::estimate_history_tokens(&history) * 4;
-        let send_budget = crate::agent::history::IMAGE_TOKEN_ESTIMATE + 1_000;
+        let send_budget = crate::agent::history::IMAGE_TOKEN_ESTIMATE + 1_000 + 10_000;
         let result = run_scripted_loop_with_budget(
             &provider,
             &registry,
@@ -9670,3 +9666,9 @@ mod tool_lifecycle_abandonment_tests {
         );
     }
 }
+
+/// A neutral tail the cap must preserve, standing in for whatever the runtime
+/// appends last now that it no longer injects wall-clock prose. Shared by the
+/// prompt-capping tests in the sibling test modules.
+#[cfg(test)]
+const TAIL_MARKER: &str = "\n\n## Tail marker\n\nend";

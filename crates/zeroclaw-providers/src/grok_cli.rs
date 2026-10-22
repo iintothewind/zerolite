@@ -2229,7 +2229,29 @@ while IFS= read -r line; do :; done
             }
         }
 
+        /// Whether `pid` is still a live process.
+        ///
+        /// `kill(pid, 0)` succeeds for a zombie as well, so a process whose
+        /// parent already exited and was reparented to init can linger as an
+        /// unreaped zombie and look alive here forever. A zombie has already
+        /// finished — it only waits to be reaped — so the kernel's own view of
+        /// the process state is what decides.
         fn process_exists(pid: i32) -> bool {
+            let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+                // No proc entry: the process is gone for good.
+                return false;
+            };
+            // The state character follows the executable name, which may
+            // itself contain spaces and parentheses, so read it from the last
+            // ')' instead of splitting the whole line.
+            let Some(state) = stat.rsplit_once(')').and_then(|(_, rest)| {
+                rest.split_whitespace().next()
+            }) else {
+                return false;
+            };
+            if state == "Z" {
+                return false;
+            }
             nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
         }
 

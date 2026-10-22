@@ -10918,4 +10918,33 @@ mod tests {
             second_err
         );
     }
+
+    #[tokio::test]
+    async fn append_transcript_surfaces_persistence_failure() {
+        use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
+
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+
+        // `append_turn` errors for a session with no record. `append_transcript`
+        // must propagate that as `Err` so a failed/cancelled turn can surface the
+        // lost transcript instead of reporting a clean terminal result.
+        let failed = AcpServer::append_transcript(
+            Some(Arc::clone(&store)),
+            "no-such-session".to_string(),
+            vec![ConversationMessage::Chat(ChatMessage::user("hi"))],
+        )
+        .await;
+        assert!(
+            failed.is_err(),
+            "a failed store append must surface as Err, not a silent success"
+        );
+
+        // Nothing to persist stays a best-effort `Ok` no-op.
+        let empty =
+            AcpServer::append_transcript(Some(store), "no-such-session".to_string(), Vec::new())
+                .await;
+        assert!(empty.is_ok(), "an empty transcript is a no-op success");
+    }
 }

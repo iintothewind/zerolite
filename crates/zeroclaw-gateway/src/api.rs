@@ -1902,6 +1902,13 @@ pub async fn handle_api_session_messages(
             serde_json::json!({
                 "role": m.message.role,
                 "content": m.message.content,
+                // Machinery the runtime wrote into the transcript as a user
+                // message (tool rounds, trim breadcrumb). The dashboard must
+                // not render these as operator bubbles, and only the runtime
+                // can tell them apart — see `is_synthetic_user_message`.
+                "synthetic": zeroclaw_runtime::agent::history_trim::is_synthetic_user_message(
+                    &m.message,
+                ),
                 "created_at": m.created_at.map(|dt| dt.to_rfc3339()),
             })
         })
@@ -1968,6 +1975,20 @@ pub async fn handle_api_session_message_post(
                 .into_response();
         }
     };
+
+    // The existence check above ran before the permit, so a DELETE that held
+    // the permit in the meantime has already wiped the session. Re-check under
+    // the permit: `append` is a bare INSERT with no existence guard, so it
+    // would re-create the row the delete just removed — and because
+    // `session_exists` reads the metadata row `append` re-creates, the session
+    // would come back for every later caller too.
+    if !backend.session_exists(&session_key) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Session not found"})),
+        )
+            .into_response();
+    }
 
     let message = zeroclaw_providers::ChatMessage::assistant(&body.content);
     if let Err(e) = backend.append(&session_key, &message) {
@@ -6286,5 +6307,130 @@ pub(crate) mod tests {
                 .unwrap();
             assert_eq!(status_of(router, req).await, StatusCode::OK);
         }
+    }
+
+    #[tokio::test]
+    async fn session_message_post_does_not_resurrect_a_session_deleted_while_queued() {
+        // The pre-permit existence check cannot see a DELETE that wins the
+        // permit race, and `append` is a bare INSERT: without a re-check under
+        // the permit this POST re-creates the row the delete just wiped.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let backend: Arc<dyn SessionBackend> =
+            Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
+        backend
+            .append(
+                "gw_operator-1",
+                &zeroclaw_providers::ChatMessage::assistant("existing"),
+            )
+            .unwrap();
+        let state = test_state_with_session_backend(config, backend.clone());
+
+        // Stand in for the DELETE: hold the permit so the POST clears its
+        // pre-permit existence check and queues, then wipe the session out
+        // from under it before the permit is released.
+        let session_guard = state.session_queue.acquire("gw_operator-1").await.unwrap();
+        let response_fut = handle_api_session_message_post(
+            State(state),
+            HeaderMap::new(),
+            Path("operator-1".to_string()),
+            Json(
+                serde_json::from_value::<SessionMessagePostBody>(serde_json::json!({
+                    "content": "deploy finished"
+                }))
+                .expect("body should deserialize"),
+            ),
+        );
+        tokio::pin!(response_fut);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut response_fut)
+                .await
+                .is_err(),
+            "POST should wait behind the active session queue guard"
+        );
+        assert!(
+            backend.delete_session("gw_operator-1").unwrap(),
+            "the delete the POST queued behind removes the session"
+        );
+        drop(session_guard);
+
+        let response = tokio::time::timeout(Duration::from_secs(1), response_fut)
+            .await
+            .expect("queued POST should complete")
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let json = response_json(response).await;
+        assert_eq!(json["error"], "Session not found");
+        assert!(
+            backend.load("gw_operator-1").is_empty(),
+            "the queued POST must not re-create the deleted session"
+        );
+        assert!(
+            !backend.session_exists("gw_operator-1"),
+            "the deleted session must stay gone for later callers too"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_messages_flags_runtime_machinery_as_synthetic() {
+        // The dashboard drops these rows rather than rendering them as operator
+        // bubbles, and it cannot tell them apart on its own: both carriers are
+        // `user` rows, one of the two strings is localized, and either could
+        // change in the runtime without the web client noticing.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        for message in [
+            zeroclaw_providers::ChatMessage::user("read the build script"),
+            zeroclaw_providers::ChatMessage::assistant("calling"),
+            zeroclaw_providers::ChatMessage::user("[Tool results]\n<tool_result>ok</tool_result>"),
+            zeroclaw_runtime::agent::history_trim::breadcrumb(),
+        ] {
+            backend.append("gw_operator-1", &message).unwrap();
+        }
+        let state = test_state_with_session_backend(config, backend);
+
+        let response = handle_api_session_messages(
+            State(state),
+            HeaderMap::new(),
+            Path("operator-1".to_string()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        let messages = json["messages"].as_array().expect("messages is a list");
+        let flagged: Vec<(&str, bool)> = messages
+            .iter()
+            .map(|m| {
+                (
+                    m["role"].as_str().expect("role is a string"),
+                    m["synthetic"].as_bool().expect("synthetic is a bool"),
+                )
+            })
+            .collect();
+        assert_eq!(
+            flagged,
+            vec![
+                ("user", false),
+                ("assistant", false),
+                ("user", true),
+                ("user", true),
+            ],
+            "the tool round and the breadcrumb are machinery; the real turn is not"
+        );
     }
 }

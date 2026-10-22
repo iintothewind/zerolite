@@ -675,6 +675,18 @@ fn reap_and_remove_with(
     }
 }
 
+/// Remove an Edge TTS output artifact, whatever kind of entry it turned out
+/// to be. The provider asks the tool to write media to a path it owns, so the
+/// path can hold a regular file (the normal case) or, if something else
+/// claimed it first, a directory. Both are removed; the caller only needs the
+/// path to be gone.
+async fn remove_output_artifact(output_file: &std::path::Path) {
+    if tokio::fs::remove_file(output_file).await.is_ok() {
+        return;
+    }
+    let _ = tokio::fs::remove_dir_all(output_file).await;
+}
+
 impl EdgeTtsProvider {
     /// Allowed basenames for the Edge TTS binary.
     const ALLOWED_BINARIES: &[&str] = &["edge-tts", "edge-playback"];
@@ -902,9 +914,16 @@ impl TtsProvider for EdgeTtsProvider {
             bail!("edge-tts failed (exit {}): {}", status, stderr);
         }
 
-        let bytes = tokio::fs::read(&output_file)
-            .await
-            .context("Failed to read edge-tts output file")?;
+        let bytes = match tokio::fs::read(&output_file).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                // The artifact is a temporary file the provider owns: leaving
+                // it behind after a failed read fills the temp directory with
+                // orphaned media. Remove it before reporting the failure.
+                remove_output_artifact(&output_file).await;
+                return Err(error).context("Failed to read edge-tts output file");
+            }
+        };
 
         Ok(bytes)
     }
@@ -2115,8 +2134,18 @@ mod tests {
                    prev=\"$a\"\n\
                  done\n\
                  printf '%s' \"$out\" > \"{sidecar}\"\n\
-                 : > \"$out\"\n\
-                 chmod 000 \"$out\"\n\
+                 # A directory, not a file: reading it fails for every user, so
+\
+                 # the failure does not depend on permission bits the way
+\
+                 # `chmod 000` does (root ignores them). The provider creates
+\
+                 # the output file first, so it has to go before the
+\
+                 # directory can take its place.
+\
+                 rm -f \"$out\"\n\
+                 mkdir -p \"$out\"\n\
                  exit 0\n"
             ),
         );

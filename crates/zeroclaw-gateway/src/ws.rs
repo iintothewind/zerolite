@@ -1550,6 +1550,16 @@ struct ProviderUsageEntry {
 struct UsageFold {
     total_input_tokens: Option<u64>,
     total_output_tokens: Option<u64>,
+    /// Cached input tokens accumulated across the turn. Kept apart from
+    /// `total_input_tokens` because on OpenAI-compatible backends the cache
+    /// count is a *subset* of the input count: folding it in again would
+    /// double-count the context occupancy.
+    cached_input_tokens: Option<u64>,
+    /// LLM calls seen in this turn. A `Usage` whose fields are all `None`
+    /// still closes a step, because the response was accepted and the
+    /// provider simply reported nothing. This is the server-authoritative
+    /// step count the web client uses as the per-step boundary of a turn.
+    steps: u64,
     last_provider_ref: Option<String>,
     last_model: Option<String>,
     last_input_tokens: Option<u64>,
@@ -1560,7 +1570,13 @@ struct UsageFold {
 }
 
 impl UsageFold {
-    fn apply(&mut self, event: zeroclaw_api::agent::TurnEvent) {
+    /// Fold one [`TurnEvent::Usage`] payload into the turn's running totals
+    /// and return the per-step `usage` frame forwarded to the client.
+    ///
+    /// The frame passes the three nullable counters through as-is: `None`
+    /// means "the provider reported nothing for this call", not zero, and the
+    /// client decides whether it can show a cache-hit rate at all.
+    fn apply(&mut self, event: zeroclaw_api::agent::TurnEvent) -> Option<serde_json::Value> {
         let zeroclaw_api::agent::TurnEvent::Usage {
             input_tokens,
             cached_input_tokens,
@@ -1581,8 +1597,11 @@ impl UsageFold {
             estimated_input_tokens: _,
         } = event
         else {
-            return;
+            return None;
         };
+        // Every usage event closes one step, even one that reports no
+        // numbers at all: the call was made and accepted.
+        self.steps += 1;
         // Turn-wide billing totals accumulate every billable attempt,
         // including rejected ones (`accepted: false` is billing-only
         // telemetry per the TurnEvent::Usage contract). Only the
@@ -1592,6 +1611,11 @@ impl UsageFold {
         }
         if let Some(ot) = output_tokens {
             self.total_output_tokens = Some(self.total_output_tokens.unwrap_or(0) + ot);
+        }
+        // The cache count is a subset of the input count, so it accumulates
+        // on its own counter and never folds into the input total.
+        if let Some(ct) = cached_input_tokens {
+            self.cached_input_tokens = Some(self.cached_input_tokens.unwrap_or(0) + ct);
         }
         if accepted {
             self.last_provider_ref = Some(provider_ref.clone());
@@ -1633,6 +1657,12 @@ impl UsageFold {
         if let Some(cu) = cost_usd {
             entry.cost_usd += cu;
         }
+        Some(serde_json::json!({
+            "type": "usage",
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cached_input_tokens": cached_input_tokens,
+        }))
     }
 
     /// Sorted per-(provider, model) breakdown in wire order; drains the map.
@@ -1679,6 +1709,12 @@ struct DoneFrameMeta<'a> {
     last_input_tokens: Option<u64>,
     last_serving_provider_ref: Option<&'a str>,
     last_serving_model: Option<&'a str>,
+    /// Cached input tokens accumulated across the turn, reported apart from
+    /// the input total because the cache count is a subset of it.
+    cached_input_tokens: Option<u64>,
+    /// LLM calls the turn made. The web client counts steps from this rather
+    /// than from the frames that happened to carry numbers.
+    steps: u64,
 }
 
 /// Build the `done`-frame JSON.
@@ -1703,6 +1739,8 @@ fn build_done_frame_json(
         "last_input_tokens": meta.last_input_tokens,
         "last_serving_provider_ref": meta.last_serving_provider_ref,
         "last_serving_model": meta.last_serving_model,
+        "cached_input_tokens": meta.cached_input_tokens,
+        "steps": meta.steps,
         "usage_by_provider": usage_by_provider.iter().map(|e| serde_json::json!({
             "provider_ref": e.provider_ref,
             "model": e.model,
@@ -1721,6 +1759,21 @@ fn build_done_frame_json(
     done
 }
 
+/// The terminal frame for a user-cancelled turn.
+///
+/// Carries the same totals as `done`, because a cancelled turn still spent
+/// what it spent: the client's live session row counts those steps and tokens
+/// instead of dropping the turn on the floor.
+fn aborted_frame(fold: &UsageFold) -> serde_json::Value {
+    serde_json::json!({
+        "type": "aborted",
+        "input_tokens": fold.total_input_tokens,
+        "output_tokens": fold.total_output_tokens,
+        "cached_input_tokens": fold.cached_input_tokens,
+        "steps": fold.steps,
+    })
+}
+
 /// Process a single chat message through the agent and send the response.
 /// Uses [`Agent::turn_streamed`] so that intermediate text chunks, tool calls,
 /// and tool results are forwarded to the WebSocket client in real time.
@@ -1728,6 +1781,25 @@ fn build_done_frame_json(
 /// Returns `true` when the client went away mid-turn. The turn still ran to
 /// completion and was persisted; the caller should stop servicing the socket.
 #[allow(clippy::too_many_arguments)]
+/// The turn-boundary frame the gateway broadcasts when a turn starts.
+///
+/// The session id is what scopes it: `is_public_event` admits only frames
+/// without one, so a sessionless frame would leak the turn boundary to every
+/// observer, and `event_matches_session` would deliver it to no session. The
+/// frame is built here so the tests and the wire cannot drift apart.
+pub(crate) fn agent_start_frame(
+    session_id: &str,
+    provider_label: &str,
+    turn_model: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "agent_start",
+        "model_provider": provider_label,
+        "model": turn_model,
+        "session_id": session_id,
+    })
+}
+
 async fn process_chat_message(
     state: &AppState,
     agent: &mut zeroclaw_runtime::agent::Agent,
@@ -1798,11 +1870,7 @@ async fn process_chat_message(
     });
 
     // Broadcast agent_start event
-    let _ = state.event_tx.send(serde_json::json!({
-        "type": "agent_start",
-        "model_provider": provider_label,
-        "model": turn_model,
-    }));
+    let _ = state.event_tx.send(agent_start_frame(session_id, &provider_label, &turn_model));
 
     // Set session state to running
     let turn_id = uuid::Uuid::new_v4().to_string();
@@ -2031,14 +2099,18 @@ async fn process_chat_message(
                                 event_opt = event_rx.recv() => {
                                 let Some(event) = event_opt else { break };
                                 let ws_msg = match event {
-            usage_event @ TurnEvent::Usage { .. } => {
+                                    usage_event @ TurnEvent::Usage { .. } => {
                                         // The fold below is the production event path under
                                         // test (see UsageFold regression tests): billing
                                         // aggregates every billable attempt while the
                                         // accepted-serving snapshot advances on accepted
-                                        // events only.
-                                        usage_fold.apply(usage_event);
-                                        continue;
+                                        // events only. It also returns the per-step
+                                        // `usage` frame, which the web client counts as
+                                        // the server-authoritative step boundary.
+                                        match usage_fold.apply(usage_event) {
+                                            Some(frame) => frame,
+                                            None => continue,
+                                        }
                                     }
                                     TurnEvent::Chunk { ref delta } => {
                                         accumulated_text.push_str(delta);
@@ -2174,7 +2246,7 @@ async fn process_chat_message(
         }
 
         // Inform the client the turn was aborted
-        let aborted = serde_json::json!({ "type": "aborted" });
+        let aborted = aborted_frame(&usage_fold);
         let _ = sender.send(Message::Text(aborted.to_string().into())).await;
 
         if let Some(ref backend) = state.session_backend
@@ -2347,6 +2419,8 @@ async fn process_chat_message(
                 last_input_tokens: usage_fold.last_input_tokens,
                 last_serving_provider_ref: usage_fold.last_provider_ref.as_deref(),
                 last_serving_model: usage_fold.last_model.as_deref(),
+                cached_input_tokens: usage_fold.cached_input_tokens,
+                steps: usage_fold.steps,
             };
             // Surface an at-most-one safety-safeguard downgrade notice just
             // before the terminal `done` frame, so the web chat shows the
@@ -2533,7 +2607,7 @@ mod tests {
                                                                                                                                                                                                                                                                                                                                                                       };
         assert_eq!(
             resolve_done_context_limits(Some(7_200), Some(8_000), None, stale_startup_limits),
-            (7_200, Some(8_000), Some(6_400)),
+            (7_200, Some(8_000), Some(200_000)),
             "the done frame must report the route that produced the usage event"
         );
     }
@@ -2551,7 +2625,7 @@ mod tests {
                                                                                                                                                                                                                                                                                                                                                               };
         assert_eq!(
             resolve_done_context_limits(None, None, None, active_limits),
-            (0, Some(8_000), Some(6_400)),
+            (0, Some(8_000), Some(8_000)),
         );
     }
 
@@ -2568,7 +2642,7 @@ mod tests {
                                                                                                                                                                                                                                                                                                                                                                                                                                       };
         assert_eq!(
             resolve_done_context_limits(None, None, None, active_limits),
-            (16_000, None, Some(6_400)),
+            (16_000, None, Some(32_000)),
         );
     }
 
@@ -2589,7 +2663,7 @@ mod tests {
         // Earlier usage-bearing text route left 180k/200k on the wire trackers.
         assert_eq!(
             done_frame_context_limits(Some(final_vision), Some(180_000), Some(200_000), None, None),
-            (7_200, Some(8_000), Some(6_400)),
+            (7_200, Some(8_000), Some(8_000)),
             "a final no-usage vision route must override the earlier text route's usage numbers"
         );
     }
@@ -2610,12 +2684,12 @@ mod tests {
         // No final route, no usage: fall back to the resolved route.
         assert_eq!(
             done_frame_context_limits(None, None, None, None, Some(fallback)),
-            (180_000, Some(200_000), Some(160_000)),
+            (180_000, Some(200_000), Some(200_000)),
         );
         // No final route but usage present: usage wins (legacy path).
         assert_eq!(
             done_frame_context_limits(None, Some(7_200), Some(8_000), None, Some(fallback)),
-            (7_200, Some(8_000), Some(6_400)),
+            (7_200, Some(8_000), Some(200_000)),
         );
     }
 
@@ -4846,8 +4920,13 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         use std::collections::HashMap;
         use zeroclaw_config::schema::{AliasedAgentConfig, Config, RuntimeProfileConfig};
 
-        // (provider_alias, context_window, expected_model_window,
-        // expected_max_context_tokens)
+        // (provider_alias, context_window, expected_model_window, ceiling)
+        //
+        // `max_context_tokens` on the done frame is the water-line (the
+        // proactive-trim threshold), while `effective_context_window` is the
+        // meter denominator: `min(model_window, ceiling)`. The web client
+        // reads them as two different numbers (see
+        // `web/src/contexts/contextLimits.logic.ts`).
         let cases: &[(&str, Option<usize>, Option<u64>, u64)] = &[
             // Provider has no context_window — field must be absent.
             ("openrouter.default", None, None, 32_000),
@@ -4903,6 +4982,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             };
 
             let limits = cfg.resolved_context_limits_for_route("coder", provider_alias, "glm-5.2");
+            // The water-line the done frame reports as `max_context_tokens`.
             let max_ctx = limits.context_token_budget as u64;
             let model_ctx_window = limits.configured_model_context_window().map(|v| v as u64);
             assert_eq!(
@@ -4925,14 +5005,16 @@ data: {{\"type\":\"message_stop\"}}\n\n"
                                 last_input_tokens: Some(100),
                 last_serving_provider_ref: Some(provider_alias),
                 last_serving_model: Some("glm-5.2"),
+                cached_input_tokens: None,
+                steps: 0,
             };
             let done = build_done_frame_json(&meta, &[]);
             let v: serde_json::Value = serde_json::from_str(&done.to_string()).unwrap();
 
             assert_eq!(v["type"], "done");
             assert_eq!(
-                v["max_context_tokens"], expected_max_ctx,
-                "profile budget must be emitted"
+                v["max_context_tokens"], max_ctx,
+                "the water-line must be emitted as max_context_tokens"
             );
             // Provider field carries the full configured reference (e.g., "openai.vendor"),
             // matching pre-change gateway behavior. provider_ref carries the serving identity.
@@ -5043,6 +5125,8 @@ data: {{\"type\":\"message_stop\"}}\n\n"
                                 last_input_tokens: Some(100),
                 last_serving_provider_ref: Some(live_provider_ref),
                 last_serving_model: Some("glm-5.2"),
+                cached_input_tokens: None,
+                steps: 0,
             };
             let done = build_done_frame_json(&meta, &[]);
             let v: serde_json::Value = serde_json::from_str(&done.to_string()).unwrap();
@@ -5161,6 +5245,8 @@ data: {{\"type\":\"message_stop\"}}\n\n"
                         last_input_tokens: Some(1000),
             last_serving_provider_ref: Some(provider_ref),
             last_serving_model: Some(effective_model),
+            cached_input_tokens: None,
+            steps: 0,
         };
         let done = build_done_frame_json(&meta, &[]);
         let v: serde_json::Value = serde_json::from_str(&done.to_string()).unwrap();
@@ -5169,8 +5255,8 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             "done-frame must omit model_context_window on same-profile fallback"
         );
         assert_eq!(
-            v["max_context_tokens"], 800_000,
-            "the explicit profile budget survives the same-profile fallback (#10068)"
+            v["max_context_tokens"], max_ctx,
+            "the water-line of the fallback route survives the same-profile fallback (#10068)"
         );
         assert_eq!(v["last_serving_model"], "model-b");
     }
@@ -5309,6 +5395,8 @@ data: {{\"type\":\"message_stop\"}}\n\n"
                         last_input_tokens: Some(1000),
             last_serving_provider_ref: Some("openrouter.a"),
             last_serving_model: Some("model-a"),
+            cached_input_tokens: None,
+            steps: 0,
         };
         let done = build_done_frame_json(&meta, &entries);
         let v: serde_json::Value = serde_json::from_str(&done.to_string()).unwrap();
@@ -5414,6 +5502,8 @@ data: {{\"type\":\"message_stop\"}}\n\n"
                         last_input_tokens: None,
             last_serving_provider_ref: Some("ollama.b"),
             last_serving_model: Some("model-b"),
+            cached_input_tokens: None,
+            steps: 0,
         };
         let done = build_done_frame_json(&meta, &entries);
         let v: serde_json::Value = serde_json::from_str(&done.to_string()).unwrap();
@@ -5455,6 +5545,8 @@ data: {{\"type\":\"message_stop\"}}\n\n"
                         last_input_tokens: None,
             last_serving_provider_ref: Some("openrouter.a"),
             last_serving_model: Some("model-a"),
+            cached_input_tokens: None,
+            steps: 0,
         };
         let done = build_done_frame_json(&meta, &entries);
         let v: serde_json::Value = serde_json::from_str(&done.to_string()).unwrap();
@@ -5464,6 +5556,162 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         assert!(
             v.get("model_context_window").is_none(),
             "model_context_window is additive and omitted when unset"
+        );
+    }
+
+    /// The fold accumulates the turn's billing totals across calls and keeps
+    /// the per-provider cache detail separate from them: cached tokens are a
+    /// subset of the input tokens, so folding them into the totals would
+    /// double-count the context occupancy.
+    #[test]
+    fn usage_frame_accumulates_steps_tokens_and_cache_across_calls() {
+        let mut fold = UsageFold::default();
+
+        fold.apply(usage_event(
+            "test.provider",
+            "test-model",
+            Some(100),
+            Some(80),
+            Some(10),
+            None,
+            true,
+        ));
+        fold.apply(usage_event(
+            "test.provider",
+            "test-model",
+            Some(200),
+            None,
+            Some(20),
+            None,
+            true,
+        ));
+
+        assert_eq!(fold.total_input_tokens, Some(300));
+        assert_eq!(fold.total_output_tokens, Some(30));
+        // The accepted-serving snapshot is replaced, not summed.
+        assert_eq!(
+            fold.last_input_tokens,
+            Some(200),
+            "last_input_tokens is replaced, not summed"
+        );
+        // The cache detail is reported per route, and a call without a cache
+        // report does not zero out the earlier one.
+        let entries = fold.take_sorted_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].cached_input_tokens, 80);
+    }
+
+    #[test]
+    fn cached_input_tokens_never_folds_into_input_totals() {
+        let mut fold = UsageFold::default();
+
+        // On OpenAI-compatible backends `cached_input_tokens` is a *subset* of
+        // `input_tokens`. Adding it again would inflate context occupancy.
+        fold.apply(usage_event(
+            "test.provider",
+            "test-model",
+            Some(1000),
+            Some(900),
+            Some(5),
+            None,
+            true,
+        ));
+
+        assert_eq!(fold.total_input_tokens, Some(1000));
+        assert_eq!(fold.last_input_tokens, Some(1000));
+
+        let entries = fold.take_sorted_entries();
+        assert_eq!(entries[0].cached_input_tokens, 900);
+    }
+
+    #[test]
+    fn usage_frame_without_reported_numbers_still_closes_a_step() {
+        let mut fold = UsageFold::default();
+
+        // `None` means "unavailable for this call", not zero: the sums stay
+        // `None` rather than claiming a zero-token turn.
+        fold.apply(usage_event(
+            "test.provider",
+            "test-model",
+            None,
+            None,
+            None,
+            None,
+            true,
+        ));
+
+        assert_eq!(fold.total_input_tokens, None);
+        assert_eq!(fold.total_output_tokens, None);
+        assert_eq!(fold.last_input_tokens, None);
+
+        // The per-route entry still exists, so the client learns the route
+        // that served the turn, but its counters stay at zero rather than
+        // claiming a measured amount.
+        let entries = fold.take_sorted_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].input_tokens, 0);
+        assert_eq!(entries[0].output_tokens, 0);
+        assert_eq!(entries[0].cached_input_tokens, 0);
+    }
+
+    #[test]
+    fn aborted_frame_carries_the_turn_totals() {
+        assert_eq!(
+            aborted_frame(&UsageFold {
+                steps: 3,
+                total_input_tokens: Some(120),
+                total_output_tokens: Some(7),
+                cached_input_tokens: Some(64),
+                last_input_tokens: Some(120),
+                ..Default::default()
+            }),
+            serde_json::json!({
+                "type": "aborted",
+                "input_tokens": 120,
+                "output_tokens": 7,
+                "cached_input_tokens": 64,
+                "steps": 3,
+            })
+        );
+        assert_eq!(
+            aborted_frame(&UsageFold::default()),
+            serde_json::json!({
+                "type": "aborted",
+                "input_tokens": null,
+                "output_tokens": null,
+                "cached_input_tokens": null,
+                "steps": 0,
+            }),
+            "a cancelled turn with no reported usage still reports zero steps"
+        );
+    }
+
+    #[test]
+    fn agent_start_broadcast_reaches_only_its_own_session() {
+        // Regression: the turn-boundary frame used to be broadcast without a
+        // `session_id`, so `event_matches_session` classified it as a global
+        // event and `is_global_chat_event` (cron_result only) dropped it —
+        // the chat socket never saw a turn boundary.
+        let frame = serde_json::json!({
+            "type": "agent_start",
+            "model_provider": "anthropic",
+            "model": "claude-test",
+            "session_id": "operator-1",
+        });
+        assert!(event_matches_session(&frame, "operator-1"));
+        assert!(
+            !event_matches_session(&frame, "operator-2"),
+            "a turn boundary must not leak into another session's socket"
+        );
+
+        let unscoped = serde_json::json!({
+            "type": "agent_start",
+            "model_provider": "anthropic",
+            "model": "claude-test",
+        });
+        assert!(
+            !event_matches_session(&unscoped, "operator-1"),
+            "an unscoped agent_start stays a global event and is not delivered"
         );
     }
 }

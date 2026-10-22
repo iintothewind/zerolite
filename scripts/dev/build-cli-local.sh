@@ -13,13 +13,16 @@
 #   scripts/dev/build-cli-local.sh --target aarch64-unknown-linux-gnu
 #   scripts/dev/build-cli-local.sh --target x86_64-unknown-linux-gnu
 #   scripts/dev/build-cli-local.sh --skip-web   # ONLY when web/dist is already fresh
-#   scripts/dev/build-cli-local.sh --plugins-wasm  # add the WASM plugin host (zeroclaw plugin)
+#   scripts/dev/build-cli-local.sh --no-plugins-wasm  # drop the WASM plugin host (ARM32 only)
+#
+# Features are always --features embedded-web,plugins-wasm-cranelift: that is
+# the release shape. --plugins-wasm is accepted and is now the default.
 #
 # Pipeline (always, unless --skip-web):
 #   1. wipe web/dist (keep .gitkeep)
 #   2. cargo web build          → fresh web/dist
 #   3. cargo clean -p zeroclaw-gateway  → force include_dir! re-embed
-#   4. Docker cross-compile with --features embedded-web
+#   4. Docker cross-compile with --features embedded-web,plugins-wasm-cranelift
 #   5. assert the binary contains the current index-*.js fingerprint
 #   6. collect into dist/bin/<target>/zeroclaw
 #   7. reclaim compile/test residue (EXIT trap + success path)
@@ -107,10 +110,11 @@ set -euo pipefail
 
 TARGET="aarch64-unknown-linux-gnu"
 SKIP_WEB=0
-# Build the WASM plugin host into the binary: without it `zeroclaw plugin` is
-# absent, and .cwasm packages cannot load. Keep it optional so an ARM32 target
-# can still build (Cranelift is unavailable there).
-PLUGINS_WASM=0
+# Build the WASM plugin host into the binary. On by default because the
+# release binary ships it: without it `zeroclaw plugin` is absent and .cwasm
+# packages cannot load. `--no-plugins-wasm` opts out for targets where
+# Cranelift is unavailable (ARM32) — it is not a supported release shape.
+PLUGINS_WASM=1
 RUST_IMAGE="${ZEROCLAW_RUST_IMAGE:-rust:1-bookworm}"
 
 while [ $# -gt 0 ]; do
@@ -119,6 +123,7 @@ while [ $# -gt 0 ]; do
     --target=*) TARGET="${1#*=}"; shift ;;
     --skip-web) SKIP_WEB=1; shift ;;
     --plugins-wasm) PLUGINS_WASM=1; shift ;;
+    --no-plugins-wasm) PLUGINS_WASM=0; shift ;;
     --image)    RUST_IMAGE="${2:-}"; shift 2 ;;
     --image=*)  RUST_IMAGE="${1#*=}"; shift ;;
     -h|--help)

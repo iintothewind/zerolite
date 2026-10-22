@@ -32503,9 +32503,10 @@ mod tests {
 
         // The limit counts complete turns: keeping one turn retains the
         // newest exchange and drops the older tool-bearing turn whole.
-        let active = crate::agent::history_trim::trim_conversation_to_budget(
+        let active = crate::agent::history_trim::trim_conversation_to_fit(
             durable.clone(),
             1,
+            usize::MAX,
             usize::MAX,
         );
         assert!(active.trimmed);

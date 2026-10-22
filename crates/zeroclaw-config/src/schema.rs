@@ -4094,7 +4094,7 @@ impl ResolvedRuntime {
 
     /// Post-trim send / fit budget: `effective_context_window − reserve_tokens`
     /// when a reserve is set and below the window; otherwise the full effective
-    /// window. Cascade (`history_trim::trim_to_budget`) and hard-fail checks use
+    /// window. Cascade (`history_trim::trim_to_fit`) and hard-fail checks use
     /// this number; the water-line ([`Self::context_trim_budget`]) only decides
     /// *when* trimming engages.
     #[must_use]
@@ -7881,6 +7881,23 @@ pub struct GatewayConfig {
     /// Require pairing before accepting requests (default: true)
     #[serde(default = "default_true")]
     pub require_pairing: bool,
+    /// Optional static "master" pairing code — a reusable recovery credential.
+    ///
+    /// When set, submitting this exact value on the pairing page (or to
+    /// `POST /api/pair` / `POST /pair`) logs the device in and mints a bearer
+    /// token WITHOUT consuming the one-time startup/rotation code. Treat it as
+    /// a static secret that bypasses the one-time code: prefer a long,
+    /// high-entropy value and store it like a password. It is never printed to
+    /// the banner or the logs.
+    ///
+    /// Inert when `require_pairing = false` (pairing off means the gateway
+    /// already accepts every request, so a recovery credential has no gate to
+    /// bypass). Defaults to unset.
+    #[serde(default)]
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub master_pair_code: Option<String>,
     /// Allow binding to non-localhost without a tunnel (default: false)
     #[serde(default)]
     pub allow_public_bind: bool,
@@ -8074,6 +8091,7 @@ impl Default for GatewayConfig {
             port: default_gateway_port(),
             host: default_gateway_host(),
             require_pairing: true,
+            master_pair_code: None,
             allow_public_bind: false,
             allow_remote_admin: false,
             paired_tokens: Vec::new(),
@@ -28251,6 +28269,7 @@ impl HasPropKind for serde_json::Value {
 
 #[cfg(test)]
 mod tests {
+
     #[::core::prelude::v1::test]
     fn config_application_semantic_changed_paths_detects_unmasked_credentials() {
         let mut previous = Config::default();
@@ -36640,6 +36659,7 @@ allowed_numbers = ["+1", "+2"]
             port: 42617,
             host: "127.0.0.1".into(),
             require_pairing: true,
+            master_pair_code: None,
             allow_public_bind: false,
             allow_remote_admin: false,
             paired_tokens: vec!["zc_test_token".into()],
@@ -50876,5 +50896,212 @@ model_provider = \"ollama.default\"
         duplicate_route
             .validate()
             .expect("legacy duplicate route hints remain valid");
+    }
+}
+
+#[cfg(test)]
+mod context_budget_tests {
+    use super::*;
+    /// A resolved runtime under an explicit `[context]` block, for tests that
+    /// assert the budget arithmetic rather than config resolution.
+    fn runtime_with_context(
+        model_context_window: usize,
+        request_token_ceiling: Option<usize>,
+        trim_threshold_percent: usize,
+        reserve_tokens: Option<usize>,
+    ) -> ResolvedRuntime {
+        ResolvedRuntime {
+            model_context_window,
+            context: crate::scattered_types::ContextConfig {
+                request_token_ceiling,
+                trim_threshold_percent,
+                reserve_tokens,
+                keep_recent_turns: None,
+            },
+            ..Default::default()
+        }
+    }
+
+    fn runtime_with_keep_recent_turns(keep_recent_turns: Option<usize>) -> ResolvedRuntime {
+        ResolvedRuntime {
+            context: crate::scattered_types::ContextConfig {
+                keep_recent_turns,
+                ..crate::scattered_types::ContextConfig::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// A whole config whose single agent resolves through one runtime profile,
+    /// so `Config::validate` sees the `[context]` block's cross-field rules.
+    fn config_with_profile_context(ctx: crate::scattered_types::ContextConfig) -> Config {
+        let mut runtime_profiles = std::collections::HashMap::new();
+        runtime_profiles.insert(
+            "prof".to_string(),
+            RuntimeProfileConfig {
+                context: ctx,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        let mut agents = std::collections::HashMap::new();
+        agents.insert(
+            "a".to_string(),
+            AliasedAgentConfig {
+                runtime_profile: "prof".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        Config {
+            agents,
+            runtime_profiles,
+            ..Config::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn context_send_budget_is_full_window_without_reserve() {
+        let rt = runtime_with_context(100_000, None, 80, None);
+        assert_eq!(rt.context_trim_budget(), 80_000);
+        assert_eq!(rt.context_send_budget(), 100_000);
+    }
+
+    #[tokio::test]
+    async fn context_send_budget_respects_input_ceiling() {
+        let rt = runtime_with_context(131_072, Some(100_000), 80, Some(10_000));
+        assert_eq!(rt.effective_context_window(), 100_000);
+        assert_eq!(rt.context_send_budget(), 90_000);
+        assert_eq!(rt.context_trim_budget(), 80_000);
+    }
+
+    #[tokio::test]
+    async fn context_send_budget_subtracts_reserve() {
+        let rt = runtime_with_context(100_000, None, 80, Some(16_000));
+        // Water-line: min(80k, 84k) = 80k; send: 100k − 16k = 84k.
+        assert_eq!(rt.context_trim_budget(), 80_000);
+        assert_eq!(rt.context_send_budget(), 84_000);
+    }
+
+    #[tokio::test]
+    async fn effective_context_window_applies_input_ceiling() {
+        let rt = runtime_with_context(200_000, None, 80, None);
+        assert_eq!(rt.effective_context_window(), 200_000);
+        let rt = runtime_with_context(200_000, Some(64_000), 80, None);
+        assert_eq!(rt.effective_context_window(), 64_000);
+    }
+
+    #[tokio::test]
+    async fn keep_recent_turns_clamps_out_of_range_to_bounds() {
+        // Below the lower bound clamps up; above the upper bound clamps down.
+        assert_eq!(
+            runtime_with_keep_recent_turns(Some(0)).keep_recent_turns(),
+            1
+        );
+        assert_eq!(
+            runtime_with_keep_recent_turns(Some(100)).keep_recent_turns(),
+            10
+        );
+        // In-range values pass through unchanged.
+        for v in 1..=10 {
+            assert_eq!(
+                runtime_with_keep_recent_turns(Some(v)).keep_recent_turns(),
+                v
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn keep_recent_turns_defaults_when_unset() {
+        assert_eq!(
+            runtime_with_keep_recent_turns(None).keep_recent_turns(),
+            crate::scattered_types::DEFAULT_KEEP_RECENT_TURNS
+        );
+        assert_eq!(
+            crate::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
+            5,
+            "default is 5 by spec"
+        );
+    }
+
+    #[tokio::test]
+    async fn trim_threshold_has_no_silent_percentage_floor() {
+        // The legacy MIN_PRUNE_PERCENTAGE=70 clamp is gone: a low-but-legal
+        // 50% now trims at 50% (validate accepts 1..=100; only 0/>100 error).
+        let rt = runtime_with_context(131_072, None, 50, None);
+        assert_eq!(rt.trim_threshold_tokens(), 131_072 / 2);
+    }
+
+    #[tokio::test]
+    async fn trim_threshold_is_bounded_by_reserve_headroom() {
+        // A 16k reserve on a 131k window: min(80%, window-16k) = 80% here…
+        let rt = runtime_with_context(131_072, None, 90, Some(16_384));
+        assert_eq!(rt.trim_threshold_tokens(), 131_072 - 16_384);
+    }
+
+    #[tokio::test]
+    async fn trim_threshold_respects_input_ceiling_not_as_trigger() {
+        // The ceiling shrinks the window the percentage applies to — it is a
+        // ceiling, never an independent trim trigger.
+        let rt = runtime_with_context(131_072, Some(100_000), 80, None);
+        assert_eq!(rt.effective_context_window(), 100_000);
+        assert_eq!(rt.trim_threshold_tokens(), 100_000 * 80 / 100);
+    }
+
+    #[tokio::test]
+    async fn trim_threshold_uses_window_percentage() {
+        let rt = runtime_with_context(131_072, None, 80, None);
+        assert_eq!(rt.trim_threshold_tokens(), 131_072 * 80 / 100);
+        // One profile, many window sizes: 64k models trim at their own 80%.
+        let rt = runtime_with_context(65_536, None, 80, None);
+        assert_eq!(rt.trim_threshold_tokens(), 65_536 * 80 / 100);
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_out_of_range_trim_threshold() {
+        // Out-of-range is a hard config error, never a silent clamp: the old
+        // MIN_PRUNE_PERCENTAGE=70 floor silently REINTERPRETED such values.
+        for pct in [0usize, 101, 500] {
+            let cfg = config_with_profile_context(crate::scattered_types::ContextConfig {
+                trim_threshold_percent: pct,
+                ..Default::default()
+            });
+            let err = cfg
+                .validate()
+                .expect_err("out-of-range trim_threshold_percent must fail validation");
+            assert!(
+                err.to_string().contains("context.trim_threshold_percent"),
+                "error must name the offending field (pct={pct}); got: {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_reserve_exceeding_half_the_window() {
+        // With no provider window configured the model window resolves to the
+        // 32k fallback, so a 20k reserve crosses the 50% strand limit and must
+        // be a hard error rather than a silently-clamped threshold.
+        let cfg = config_with_profile_context(crate::scattered_types::ContextConfig {
+            reserve_tokens: Some(20_000),
+            ..Default::default()
+        });
+        let err = cfg
+            .validate()
+            .expect_err("reserve over 50% of the window must fail validation");
+        assert!(
+            err.to_string().contains("context.reserve_tokens"),
+            "error must name the offending field; got: {err}"
+        );
+        // A legal reserve under the limit is NOT flagged by the [context]
+        // block — assert only that, so we don't depend on the model_provider
+        // reference existing (a later validate stage would reject that).
+        let ok = config_with_profile_context(crate::scattered_types::ContextConfig {
+            reserve_tokens: Some(8_000),
+            ..Default::default()
+        });
+        if let Err(e) = ok.validate() {
+            assert!(
+                !e.to_string().contains("reserve_tokens"),
+                "a legal reserve must not be flagged by the [context] block; got: {e}"
+            );
+        }
     }
 }

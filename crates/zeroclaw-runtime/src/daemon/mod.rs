@@ -786,11 +786,7 @@ pub async fn run_with_authority(
     // gateway serves /pair, rotation, and revocation from THIS instance
     // and the RPC native auth provider verifies against it, so a pairing
     // change reaches both surfaces immediately (no boot-time snapshot).
-    let pairing_guard = std::sync::Arc::new(zeroclaw_config::pairing::PairingGuard::new(
-        config.gateway.require_pairing,
-        &config.gateway.paired_tokens,
-        config.gateway.pairing_code,
-    ));
+    let pairing_guard = daemon_pairing_guard(&config);
 
     // One inbound-auth state for this daemon generation. The RPC context
     // and the supervised gateway authenticate against the same accepted
@@ -3102,6 +3098,18 @@ fn has_supervised_channels(config: &Config) -> bool {
 // run_mqtt_sop_listener has been moved to zeroclaw-channels::orchestrator::mqtt.
 // The daemon now receives it as a starter via DaemonRegistry::register_mqtt.
 
+/// Build the pairing authority this daemon generation serves from.
+///
+/// The master recovery credential is configured on the gateway, so the guard
+/// is built from the gateway configuration here and nowhere else: a guard
+/// built without it silently disables the credential, and the pairing page
+/// then rejects the master code with no hint that it was configured.
+fn daemon_pairing_guard(config: &zeroclaw_config::schema::Config) -> std::sync::Arc<zeroclaw_config::pairing::PairingGuard> {
+    std::sync::Arc::new(zeroclaw_config::pairing::PairingGuard::from_gateway_config(
+        &config.gateway,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3109,6 +3117,57 @@ mod tests {
     use zeroclaw_config::schema::MattermostListenMode;
 
     const DAEMON_DEADLOCK_GUARD: Duration = Duration::from_secs(30);
+
+    /// The daemon publishes the pairing authority the gateway serves pairing
+    /// requests from. When the configuration carries a master recovery code,
+    /// that code must be on the published guard — otherwise the pairing page
+    /// rejects it with "Invalid or expired pairing code" and nothing says it
+    /// was configured.
+    #[test]
+    fn the_published_pairing_authority_carries_the_configured_master_code() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        assert!(
+            !daemon_pairing_guard(&config).has_master_code(),
+            "no configured master code means no master code"
+        );
+
+        config.gateway.require_pairing = true;
+        config.gateway.master_pair_code = Some("a-long-random-recovery-string".to_string());
+        let guard = daemon_pairing_guard(&config);
+        assert!(
+            guard.has_master_code(),
+            "the configured master code must reach the published pairing authority"
+        );
+    }
+
+    /// The daemon hosts the gateway, and the gateway serves the pairing
+    /// endpoints from the guard the daemon hands it. So this is the behaviour
+    /// the web pairing page sees: the configured recovery code must mint a
+    /// token through the published authority.
+    ///
+    /// Asserting the code merely "is present" would not catch the failure
+    /// this guards against — the guard was built by hand without the master
+    /// code, which left the field unset while every gateway-side test kept
+    /// passing because those build the guard from the configuration.
+    #[test]
+    fn the_published_pairing_authority_pairs_with_the_configured_master_code() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.gateway.require_pairing = true;
+        config.gateway.master_pair_code = Some("a-long-random-recovery-string".to_string());
+        let guard = daemon_pairing_guard(&config);
+
+        let token = guard
+            .try_master("a-long-random-recovery-string")
+            .expect("the configured master code must pair through the published authority");
+        assert!(
+            !token.trim().is_empty(),
+            "a successful master pairing must mint a bearer token"
+        );
+        assert!(
+            guard.try_master("not-the-master-code").is_none(),
+            "a wrong code must not be accepted as the master code"
+        );
+    }
 
     #[tokio::test]
     async fn retiring_channel_generation_clears_admission_and_joins_active_attempt() {

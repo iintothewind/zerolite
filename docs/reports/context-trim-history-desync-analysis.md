@@ -191,7 +191,7 @@ purged incompletely.
 | Fit target | `ResolvedRuntime::context_send_budget()`; cascade / hard-fail use it; trigger stays water-line |
 | Stage 2 | `below_preferred_keep` + `warn_if_below_preferred_keep` |
 | Stage 3 | Hard-fail = Err / error text only; no `HistoryTrimmed` / no `CompactingContext` on inevitable fail |
-| Token accounting | Durable pre-send via `trim_conversation_to_budget_with` + `to_provider_messages` |
+| Token accounting | Durable pre-send via `trim_conversation_to_fit_with` + `to_provider_messages` |
 | Orchestrator | `history_was_trimmed` + `replace_sender_history_after_trim` (LRU + `replace_messages`) |
 | WebUI | Re-fetch + functional merge; fallback purge by user-turn boundaries |
 | Zerocode | Purge by user-turn boundaries (not `drain` by message count) |

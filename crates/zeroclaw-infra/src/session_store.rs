@@ -61,6 +61,17 @@ impl SessionStore {
             .join(format!("{}.jsonl", sanitize_session_key(session_key)))
     }
 
+    /// The sidecar that records whether this session's transcript starts with
+    /// the synthetic trim breadcrumb. It lives next to the transcript so the
+    /// two can be read and written under the same mutation guard, and it holds
+    /// exactly one byte: `1` (present) or `0` (absent). Any other content is
+    /// corruption, not a value this store ever wrote, and is reported as an
+    /// error rather than silently read as "no record".
+    fn trim_breadcrumb_path(&self, session_key: &str) -> PathBuf {
+        self.sessions_dir
+            .join(format!("{}.trim_breadcrumb", sanitize_session_key(session_key)))
+    }
+
     /// Load all messages for a session from its JSONL file.
     /// Returns an empty vec if the path is not a regular JSONL session file or
     /// the file is unreadable.
@@ -367,6 +378,42 @@ impl SessionBackend for SessionStore {
         self.update_last(session_key, message)
     }
 
+    fn set_session_trim_breadcrumb(
+        &self,
+        session_key: &str,
+        present: bool,
+    ) -> std::io::Result<()> {
+        let _guard = self.mutation_guard()?;
+        let path = self.trim_breadcrumb_path(session_key);
+        // One byte, written atomically: a reader must never observe a
+        // half-written flag, and a crash must not leave a value this store
+        // could not have written.
+        let payload: &[u8] = if present { b"1" } else { b"0" };
+        let staging = path.with_extension("trim_breadcrumb.tmp");
+        std::fs::write(&staging, payload)?;
+        std::fs::rename(&staging, &path)?;
+        Ok(())
+    }
+
+    fn get_session_trim_breadcrumb(&self, session_key: &str) -> std::io::Result<Option<bool>> {
+        let path = self.trim_breadcrumb_path(session_key);
+        let contents = match std::fs::read(&path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        match contents.as_slice() {
+            b"1" => Ok(Some(true)),
+            b"0" => Ok(Some(false)),
+            other => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "corrupt trim-breadcrumb sidecar for {session_key:?}: {other:?} is not a value this store writes"
+                ),
+            )),
+        }
+    }
+
     fn list_sessions(&self) -> Vec<String> {
         self.list_sessions()
     }
@@ -422,6 +469,40 @@ mod tests {
     use std::sync::{Arc, mpsc};
     use std::time::Duration;
     use tempfile::TempDir;
+
+    #[test]
+    fn trim_breadcrumb_sidecar_round_trips_and_rejects_corruption() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let key = "sidecar_owner";
+
+        // No record yet.
+        assert_eq!(store.get_session_trim_breadcrumb(key).unwrap(), None);
+
+        store.set_session_trim_breadcrumb(key, true).unwrap();
+        assert_eq!(store.get_session_trim_breadcrumb(key).unwrap(), Some(true));
+
+        // The flag is rewritten in place, not appended to.
+        store.set_session_trim_breadcrumb(key, false).unwrap();
+        assert_eq!(store.get_session_trim_breadcrumb(key).unwrap(), Some(false));
+
+        // The sidecar holds exactly the bytes this store writes.
+        let path = tmp
+            .path()
+            .join("sessions")
+            .join(format!("{}.trim_breadcrumb", sanitize_session_key(key)));
+        assert_eq!(std::fs::read(&path).unwrap(), b"0");
+
+        // Anything else is corruption, not a value this store ever wrote, and
+        // must surface as an error rather than as "no record".
+        for corrupt in [b"".as_slice(), b"2".as_slice(), b"10".as_slice()] {
+            std::fs::write(&path, corrupt).unwrap();
+            assert!(
+                store.get_session_trim_breadcrumb(key).is_err(),
+                "corrupt sidecar {corrupt:?} must not read as a verified flag"
+            );
+        }
+    }
 
     #[cfg(unix)]
     fn symlink_file(original: &Path, link: &Path) -> std::io::Result<()> {

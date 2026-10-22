@@ -254,8 +254,6 @@ const MAX_CHANNEL_HISTORY: usize = 50;
 /// Messages shorter than this (e.g. "ok", "thanks") are not stored,
 /// reducing noise in memory recall.
 const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
-const CURRENT_DATE_HEADING: &str = "## Current Date\n\n";
-const LEGACY_CURRENT_DATE_TIME_HEADING: &str = "## Current Date & Time\n\n";
 const WHATSAPP_OBSERVED_GROUP_MESSAGE_LABEL: &str = "Observed WhatsApp group message";
 const WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL: &str = "Current WhatsApp group message";
 
@@ -2210,11 +2208,10 @@ fn build_channel_system_prompt(
 ) -> String {
     let mut prompt = base_prompt.to_string();
 
-    // Date refresh stays in the system prompt: the heading is date-only
-    // (no seconds), so within a single day the rendered value is stable and
-    // cache hits; it only changes once per day at midnight. Acceptable for
-    // a 99%+ intra-session cache-hit rate.
-    refresh_channel_prompt_date_section(&mut prompt);
+    // The runtime never refreshes or rewrites date sections in the base
+    // prompt: AGENTS.md / workspace prose owns wall-clock guidance, and a
+    // byte-stable prefix is what keeps provider prompt caching hitting
+    // across turns (see `docs/book/src/agents/context-management.md`).
 
     if let Some(instructions) = channel_delivery_instructions(channel_name) {
         if prompt.is_empty() {
@@ -2293,39 +2290,6 @@ fn build_channel_system_prompt_for_message_with_signal(
         // no-op. Preserves byte-stability for non-default startup prompts.
         prompt
     }
-}
-
-fn current_date_section() -> String {
-    let now = chrono::Local::now();
-    format!(
-        "{CURRENT_DATE_HEADING}{} ({})",
-        now.format("%Y-%m-%d"),
-        now.format("%:z")
-    )
-}
-
-fn refresh_channel_prompt_date_section(prompt: &mut String) {
-    let runtime_start = prompt
-        .find("\n## Runtime")
-        .map(|i| i + 1)
-        .unwrap_or(prompt.len());
-
-    if let Some((start, heading_len)) = find_latest_date_heading_before(prompt, runtime_start) {
-        let content_start = start + heading_len;
-        let section_end = prompt[content_start..]
-            .find("\n## ")
-            .map(|i| content_start + i)
-            .unwrap_or(prompt.len());
-        prompt.replace_range(start..section_end, &current_date_section());
-    }
-}
-
-fn find_latest_date_heading_before(prompt: &str, before: usize) -> Option<(usize, usize)> {
-    let prefix = &prompt[..before];
-    [CURRENT_DATE_HEADING, LEGACY_CURRENT_DATE_TIME_HEADING]
-        .iter()
-        .filter_map(|heading| prefix.rfind(heading).map(|start| (start, heading.len())))
-        .max_by_key(|(start, _)| *start)
 }
 
 /// Build the volatile per-turn context that the model needs but the cached
@@ -2423,11 +2387,6 @@ fn compose_outgoing_user_turn_with_context(preamble: &str, raw_user_content: &st
     parts.join("\n\n")
 }
 
-fn timestamp_channel_user_content(content: &str) -> String {
-    let now = chrono::Local::now();
-    format!("[{}] {}", now.format("%Y-%m-%d %H:%M:%S %Z"), content)
-}
-
 fn format_whatsapp_group_history_turn(label: &str, sender: &str, content: &str) -> String {
     let sender = sender.trim();
     if sender.is_empty() {
@@ -2478,12 +2437,13 @@ fn attributed_channel_user_turn(
     content.to_string()
 }
 
-fn timestamped_channel_user_history_content(
+/// Channel history user content without a runtime wall-clock prefix (prompt-cache
+/// hygiene; calendar guidance belongs in AGENTS.md / tools).
+fn channel_user_history_content(
     msg: &zeroclaw_api::channel::ChannelMessage,
     label: &str,
 ) -> String {
-    let timestamped_content = timestamp_channel_user_content(&msg.content);
-    attributed_channel_user_turn(msg, label, &timestamped_content)
+    attributed_channel_user_turn(msg, label, &msg.content)
 }
 
 /// Collapse only heavy inline `data:` image payloads in historical turns while
@@ -8887,7 +8847,7 @@ fn stamp_session_routing_context(
 
 fn record_passive_context(ctx: &ChannelRuntimeContext, msg: &ChannelMessage, history_key: &str) {
     let timestamped_content =
-        timestamped_channel_user_history_content(msg, WHATSAPP_OBSERVED_GROUP_MESSAGE_LABEL);
+        channel_user_history_content(msg, WHATSAPP_OBSERVED_GROUP_MESSAGE_LABEL);
     append_sender_turn(ctx, history_key, ChatMessage::user(&timestamped_content));
     ::zeroclaw_log::record!(
         INFO,
@@ -9408,7 +9368,7 @@ async fn process_channel_message_body(
     // requests keep the same temporal context as CLI turns. History stores the
     // full content for every marker type so a later turn can re-load it.
     let timestamped_content =
-        timestamped_channel_user_history_content(&msg, WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL);
+        channel_user_history_content(&msg, WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL);
     // The returned snapshot is exactly what this turn's own append produced
     // (including any race with a concurrent same-sender worker still in
     // flight), taken under the same lock as the append itself. A separate,
@@ -19372,7 +19332,7 @@ pub(crate) mod tests {
             ..ChannelMessage::new("1", "alice", "-100200300", "I'll deploy", "telegram", 0)
         };
 
-        let rendered = timestamped_channel_user_history_content(&msg, "Observed group message");
+        let rendered = channel_user_history_content(&msg, "Observed group message");
 
         assert!(
             rendered.contains("alice"),
@@ -23363,16 +23323,17 @@ api_key = "anthropic-key"
     }
 
     #[test]
-    fn timestamp_channel_user_content_adds_wall_clock_prefix() {
-        let stamped = timestamp_channel_user_content("hello");
-
+    fn channel_user_history_content_has_no_wall_clock_prefix() {
+        let msg = zeroclaw_api::channel::ChannelMessage {
+            channel: "telegram".into(),
+            content: "hello".into(),
+            ..Default::default()
+        };
+        let stamped = channel_user_history_content(&msg, "Current message");
+        assert_eq!(stamped, "hello");
         assert!(
-            stamped.starts_with('['),
-            "timestamped content should start with a bracketed timestamp: {stamped}"
-        );
-        assert!(
-            stamped.contains("] hello"),
-            "timestamped content should preserve the user message after the timestamp: {stamped}"
+            !stamped.starts_with('['),
+            "history content must not get a runtime wall-clock prefix: {stamped}"
         );
     }
 
@@ -37144,7 +37105,13 @@ BTC is currently around $65,000 based on latest tool output."#
             prompt.contains("## Project Context"),
             "missing Project Context"
         );
-        assert!(prompt.contains("## Current Date"), "missing Date section");
+        // No `## Current Date` section: the runtime never injects wall-clock
+        // prose, so the prompt prefix stays byte-stable for provider prompt
+        // caching (see `docs/book/src/agents/context-management.md`).
+        assert!(
+            !prompt.contains("## Current Date"),
+            "the runtime must not inject a Date section: {prompt}"
+        );
         assert!(
             !prompt.contains("## Current Date & Time"),
             "prompt should use date-only context"
@@ -38348,9 +38315,9 @@ BTC is currently around $65,000 based on latest tool output."#
         let bob = shared_topic_message("bob", "m2", "use v4 instead");
 
         let alice_turn =
-            timestamped_channel_user_history_content(&alice, WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL);
+            channel_user_history_content(&alice, WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL);
         let bob_turn =
-            timestamped_channel_user_history_content(&bob, WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL);
+            channel_user_history_content(&bob, WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL);
 
         assert!(
             alice_turn.starts_with("[Message from alice]\n"),
@@ -38368,7 +38335,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let mut solo = shared_topic_message("alice", "m3", "just me here");
         solo.conversation_scope = zeroclaw_api::channel::ChannelConversationScope::Sender;
         let solo_turn =
-            timestamped_channel_user_history_content(&solo, WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL);
+            channel_user_history_content(&solo, WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL);
         assert!(
             !solo_turn.contains("[Message from"),
             "sender-scoped turns must stay unlabelled: {solo_turn}"
@@ -38380,7 +38347,7 @@ BTC is currently around $65,000 based on latest tool output."#
         wa.reply_target = "12036302@g.us".into();
         wa.conversation_scope = zeroclaw_api::channel::ChannelConversationScope::Sender;
         let wa_turn =
-            timestamped_channel_user_history_content(&wa, WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL);
+            channel_user_history_content(&wa, WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL);
         assert!(
             wa_turn.starts_with("[Current WhatsApp group message from carol]\n"),
             "whatsapp group label must be unchanged: {wa_turn}"
@@ -38397,7 +38364,7 @@ BTC is currently around $65,000 based on latest tool output."#
         dm.reply_target = "user--user-1".into();
         dm.thread_ts = None;
         let dm_turn =
-            timestamped_channel_user_history_content(&dm, WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL);
+            channel_user_history_content(&dm, WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL);
         assert!(
             !dm_turn.contains("[Message from"),
             "a single-party WeCom chat must not gain attribution: {dm_turn}"
@@ -38409,7 +38376,7 @@ BTC is currently around $65,000 based on latest tool output."#
         group.reply_target = "group--room-9".into();
         group.thread_ts = None;
         let group_turn =
-            timestamped_channel_user_history_content(&group, WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL);
+            channel_user_history_content(&group, WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL);
         assert!(
             group_turn.starts_with("[Message from user-1]\n"),
             "a WeCom group room must keep speaker attribution: {group_turn}"
@@ -45154,166 +45121,6 @@ BTC is currently around $65,000 based on latest tool output."#
         );
     }
 
-    #[tokio::test]
-    async fn process_channel_message_restores_per_sender_history_on_follow_ups() {
-        let channel_impl = Arc::new(RecordingChannel::default());
-        let channel: Arc<dyn Channel> = channel_impl.clone();
-
-        let mut channels_by_name = HashMap::new();
-        channels_by_name.insert(channel.name().to_string(), channel);
-
-        let provider_impl = Arc::new(HistoryCaptureModelProvider::default());
-
-        let runtime_ctx = Arc::new(ChannelRuntimeContext {
-            channels_by_name: Arc::new(channels_by_name),
-            model_provider: provider_impl.clone(),
-            model_provider_ref: Arc::new("test-provider".to_string()),
-            agent_alias: Arc::new("test-agent".to_string()),
-            agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
-            memory: Arc::new(NoopMemory),
-            memory_strategy: Arc::new(
-                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
-                    Arc::new(NoopMemory),
-                    zeroclaw_config::schema::MemoryConfig::default(),
-                    std::path::PathBuf::new(),
-                ),
-            ),
-            tools_registry: Arc::new(
-                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
-            ),
-            observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
-            model: Arc::new("test-model".to_string()),
-            temperature: Some(0.0),
-            auto_save_memory: false,
-            max_tool_iterations: 5,
-            min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
-                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
-            ))),
-            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
-            history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
-                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
-                    .expect("MAX_CONVERSATION_SENDERS must be positive"),
-            ))),
-            provider_cache: Arc::new(Mutex::new(HashMap::new())),
-            route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
-            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
-            reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
-            provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
-            workspace_dir: Arc::new(std::env::temp_dir()),
-            prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
-            live_config: zeroclaw_config::live::LiveConfig::new(
-                zeroclaw_config::schema::Config::default(),
-            )
-            .handle(),
-            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            interrupt_on_new_message: InterruptOnNewMessageConfig {
-                telegram: false,
-                slack: false,
-                discord: false,
-                mattermost: false,
-                matrix: false,
-                whatsapp: false,
-            },
-            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
-            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
-            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
-            agent_transcription_provider: String::new(),
-            hooks: None,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
-            autonomy_level: AutonomyLevel::default(),
-            tool_call_dedup_exempt: Arc::new(Vec::new()),
-            model_routes: Arc::new(Vec::new()),
-            query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
-            ack_reactions: true,
-            show_tool_calls: true,
-            session_store: None,
-            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::RiskProfileConfig::default(),
-            )),
-            activated_tools: None,
-            cost_tracking: None,
-            pacing: zeroclaw_config::schema::PacingConfig::default(),
-            max_tool_result_chars: 0,
-            context_token_budget: 0,
-            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
-                Duration::ZERO,
-            )),
-            receipt_generator: None,
-            show_receipts_in_response: false,
-            last_applied_config_stamp: Arc::new(Mutex::new(None)),
-            runtime_defaults_override: Arc::new(Mutex::new(None)),
-            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            sop_engine: None,
-            sop_audit: None,
-            security: Arc::new(SecurityPolicy::default()),
-            sop_driver_sink: None,
-        });
-
-        process_channel_message(
-            runtime_ctx.clone(),
-            zeroclaw_api::channel::ChannelMessage {
-                id: "msg-a".to_string(),
-                sender: "alice".to_string(),
-                reply_target: "chat-1".to_string(),
-                content: "hello".to_string(),
-                channel: "test-channel".into(),
-                channel_alias: None,
-                timestamp: 1,
-                thread_ts: None,
-                interruption_scope_id: None,
-                attachments: vec![],
-                subject: None,
-
-                ..Default::default()
-            },
-            CancellationToken::new(),
-        )
-        .await;
-
-        process_channel_message(
-            runtime_ctx,
-            zeroclaw_api::channel::ChannelMessage {
-                id: "msg-b".to_string(),
-                sender: "alice".to_string(),
-                reply_target: "chat-1".to_string(),
-                content: "follow up".to_string(),
-                channel: "test-channel".into(),
-                channel_alias: None,
-                timestamp: 2,
-                thread_ts: None,
-                interruption_scope_id: None,
-                attachments: vec![],
-                subject: None,
-
-                ..Default::default()
-            },
-            CancellationToken::new(),
-        )
-        .await;
-
-        let calls = provider_impl
-            .calls
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].len(), 2);
-        assert_eq!(calls[0][0].0, "system");
-        assert_eq!(calls[0][1].0, "user");
-        assert_eq!(calls[1].len(), 4);
-        assert_eq!(calls[1][0].0, "system");
-        assert_eq!(calls[1][1].0, "user");
-        assert_eq!(calls[1][2].0, "assistant");
-        assert_eq!(calls[1][3].0, "user");
-        assert!(calls[1][1].1.starts_with('['));
-        assert!(calls[1][1].1.contains("hello"));
-        assert!(calls[1][2].1.contains("response-1"));
-        assert!(calls[1][3].1.starts_with('['));
-        assert!(calls[1][3].1.contains("follow up"));
-    }
-
     async fn assert_process_channel_message_refreshes_available_skills_after_new_session() {
         let workspace = make_workspace();
         let mut config = Config {
@@ -45700,177 +45507,6 @@ BTC is currently around $65,000 based on latest tool output."#
         run_channel_dispatch_test(|| {
             Box::pin(assert_process_channel_message_refreshes_available_skills_after_new_session())
         });
-    }
-
-    #[tokio::test]
-    async fn process_channel_message_enriches_current_turn_without_persisting_context() {
-        let channel_impl = Arc::new(RecordingChannel::default());
-        let channel: Arc<dyn Channel> = channel_impl.clone();
-
-        let mut channels_by_name = HashMap::new();
-        channels_by_name.insert(channel.name().to_string(), channel);
-
-        let provider_impl = Arc::new(HistoryCaptureModelProvider::default());
-        let mut prompt_config = zeroclaw_config::schema::Config::default();
-        prompt_config.agents.insert(
-            "test-agent".to_string(),
-            zeroclaw_config::schema::AliasedAgentConfig {
-                channels: vec![
-                    "test-channel.default".into(),
-                    "other-channel.default".into(),
-                ],
-                ..zeroclaw_config::schema::AliasedAgentConfig::default()
-            },
-        );
-        prompt_config.agents.insert(
-            "peer-agent".to_string(),
-            zeroclaw_config::schema::AliasedAgentConfig {
-                channels: vec!["test-channel.default".into()],
-                ..zeroclaw_config::schema::AliasedAgentConfig::default()
-            },
-        );
-        prompt_config.agents.insert(
-            "other-agent".to_string(),
-            zeroclaw_config::schema::AliasedAgentConfig {
-                channels: vec!["other-channel.default".into()],
-                ..zeroclaw_config::schema::AliasedAgentConfig::default()
-            },
-        );
-        prompt_config.peer_groups.insert(
-            "current-room".to_string(),
-            zeroclaw_config::multi_agent::PeerGroupConfig {
-                channel: "test-channel.default".into(),
-                agents: vec![
-                    zeroclaw_config::multi_agent::AgentAlias::new("test-agent"),
-                    zeroclaw_config::multi_agent::AgentAlias::new("peer-agent"),
-                ],
-                external_peers: vec![zeroclaw_config::multi_agent::PeerUsername::new("@Operator")],
-                ..zeroclaw_config::multi_agent::PeerGroupConfig::default()
-            },
-        );
-        prompt_config.peer_groups.insert(
-            "other-room".to_string(),
-            zeroclaw_config::multi_agent::PeerGroupConfig {
-                channel: "other-channel.default".into(),
-                agents: vec![
-                    zeroclaw_config::multi_agent::AgentAlias::new("test-agent"),
-                    zeroclaw_config::multi_agent::AgentAlias::new("other-agent"),
-                ],
-                ..zeroclaw_config::multi_agent::PeerGroupConfig::default()
-            },
-        );
-        let prompt_config = Arc::new(prompt_config);
-        let tools_registry: Arc<zeroclaw_runtime::tools::scoped::ScopedToolRegistry> = Arc::new(
-            zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
-                zeroclaw_runtime::tools::SendMessageToPeerTool::new(
-                    Arc::clone(&prompt_config),
-                    "test-agent",
-                ),
-            )]),
-        );
-        let runtime_ctx = peer_prompt_test_context(
-            channels_by_name,
-            provider_impl.clone(),
-            Arc::clone(&prompt_config),
-            tools_registry,
-        );
-
-        process_channel_message(
-            runtime_ctx.clone(),
-            zeroclaw_api::channel::ChannelMessage {
-                id: "msg-ctx-1".to_string(),
-                sender: "alice".to_string(),
-                reply_target: "chat-ctx".to_string(),
-                content: "hello".to_string(),
-                channel: "test-channel".into(),
-                channel_alias: None,
-                timestamp: 1,
-                thread_ts: None,
-                interruption_scope_id: None,
-                attachments: vec![],
-                subject: None,
-
-                ..Default::default()
-            },
-            CancellationToken::new(),
-        )
-        .await;
-
-        let calls = provider_impl
-            .calls
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].len(), 2);
-        // Peer map (from send_message_to_peer tool) stays in the system prompt.
-        // Memory context is no longer in the system prompt — it moved to the
-        // outgoing user-turn preamble so the system prefix can stay byte-stable
-        // for prompt caching.
-        assert_eq!(calls[0][0].0, "system");
-        assert!(
-            !calls[0][0].1.contains(MEMORY_CONTEXT_OPEN),
-            "system prompt must not include memory context (it now lives in the user turn): {}",
-            calls[0][0].1
-        );
-        assert!(
-            !calls[0][0].1.contains("Age is 45"),
-            "memory content must not bleed into the system prompt: {}",
-            calls[0][0].1
-        );
-        assert!(
-            calls[0][0]
-                .1
-                .contains("Current-channel peer map for agent \"test-agent\"")
-        );
-        assert!(calls[0][0].1.contains("peer groups: \"current-room\""));
-        assert!(
-            calls[0][0]
-                .1
-                .contains("use channel ref \"test-channel.default\"")
-        );
-        assert!(calls[0][0].1.contains("agent peers: \"peer-agent\""));
-        assert!(calls[0][0].1.contains("external peers: \"operator\""));
-        assert!(!calls[0][0].1.contains("\"other-room\""));
-        assert!(!calls[0][0].1.contains("\"other-agent\""));
-        assert_eq!(calls[0][1].0, "user");
-        // User turn now carries the volatile preamble (turn-context, memory
-        // context) followed by the timestamped user content.
-        assert!(calls[0][1].1.contains("[turn-context]"));
-        assert!(
-            calls[0][1].1.contains(MEMORY_CONTEXT_OPEN),
-            "memory context must be prepended into the outgoing user turn: {}",
-            calls[0][1].1
-        );
-        assert!(
-            calls[0][1].1.contains("Age is 45"),
-            "memory content must be visible to the model via the user turn: {}",
-            calls[0][1].1
-        );
-        assert!(calls[0][1].1.contains("hello"));
-
-        let histories = runtime_ctx
-            .conversation_histories
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let turns = histories
-            .peek("test-channel_chat-ctx_alice")
-            .expect("history should be stored for sender");
-        assert_eq!(turns[0].role, "user");
-        // Cached history must be the raw timestamped user content with NO
-        // [turn-context] preamble and NO memory context — those only live on
-        // the outgoing LLM call, not in the persisted session log.
-        assert!(turns[0].content.starts_with('['));
-        assert!(
-            turns[0].content.contains("] hello"),
-            "stored channel user turn should be timestamped: {}",
-            turns[0].content
-        );
-        assert!(
-            !turns[0].content.contains("[turn-context]"),
-            "cached history must not include the runtime preamble (would accumulate): {}",
-            turns[0].content
-        );
-        assert!(!turns[0].content.contains(MEMORY_CONTEXT_OPEN));
     }
 
     fn cache_stability_test_context(
@@ -50697,366 +50333,6 @@ This is an example JSON object for profile settings."#;
         );
     }
 
-    #[tokio::test]
-    async fn e2e_failed_vision_turn_does_not_poison_follow_up_text_turn() {
-        let channel_impl = Arc::new(RecordingChannel::default());
-        let channel: Arc<dyn Channel> = channel_impl.clone();
-
-        let mut channels_by_name = HashMap::new();
-        channels_by_name.insert(channel.name().to_string(), channel);
-
-        // The attachment must be a real file: the no-vision gate rejects only
-        // image markers that resolve, and treats a marker with nothing behind
-        // it as prose. Existence is all the gate checks.
-        let photo_dir = tempfile::tempdir().expect("temp dir");
-        let photo_path = photo_dir.path().join("photo_99_1.jpg");
-        std::fs::write(&photo_path, b"not a real jpeg, existence is enough").expect("write photo");
-
-        let runtime_ctx = Arc::new(ChannelRuntimeContext {
-            channels_by_name: Arc::new(channels_by_name),
-            model_provider: Arc::new(DummyModelProvider),
-            model_provider_ref: Arc::new("dummy".to_string()),
-            agent_alias: Arc::new("test-agent".to_string()),
-            agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
-            memory: Arc::new(NoopMemory),
-            memory_strategy: Arc::new(
-                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
-                    Arc::new(NoopMemory),
-                    zeroclaw_config::schema::MemoryConfig::default(),
-                    std::path::PathBuf::new(),
-                ),
-            ),
-            tools_registry: Arc::new(
-                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
-            ),
-            observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("You are a helpful assistant.".to_string()),
-            model: Arc::new("test-model".to_string()),
-            temperature: Some(0.0),
-            auto_save_memory: false,
-            max_tool_iterations: 5,
-            min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
-                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
-            ))),
-            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
-            history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
-                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
-                    .expect("MAX_CONVERSATION_SENDERS must be positive"),
-            ))),
-            provider_cache: Arc::new(Mutex::new(HashMap::new())),
-            route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
-            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
-            reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
-            provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
-            workspace_dir: Arc::new(std::env::temp_dir()),
-            prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
-            live_config: zeroclaw_config::live::LiveConfig::new(
-                zeroclaw_config::schema::Config::default(),
-            )
-            .handle(),
-            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            interrupt_on_new_message: InterruptOnNewMessageConfig {
-                telegram: false,
-                slack: false,
-                discord: false,
-                mattermost: false,
-                matrix: false,
-                whatsapp: false,
-            },
-            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
-            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
-            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
-            agent_transcription_provider: String::new(),
-            hooks: None,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
-            autonomy_level: AutonomyLevel::default(),
-            tool_call_dedup_exempt: Arc::new(Vec::new()),
-            model_routes: Arc::new(Vec::new()),
-            query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
-            ack_reactions: true,
-            show_tool_calls: true,
-            session_store: None,
-            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::RiskProfileConfig::default(),
-            )),
-            activated_tools: None,
-            cost_tracking: None,
-            pacing: zeroclaw_config::schema::PacingConfig::default(),
-            max_tool_result_chars: 0,
-            context_token_budget: 0,
-            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
-                Duration::ZERO,
-            )),
-            receipt_generator: None,
-            show_receipts_in_response: false,
-            last_applied_config_stamp: Arc::new(Mutex::new(None)),
-            runtime_defaults_override: Arc::new(Mutex::new(None)),
-            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            sop_engine: None,
-            sop_audit: None,
-            security: Arc::new(SecurityPolicy {
-                workspace_dir: photo_dir.path().to_path_buf(),
-                ..SecurityPolicy::default()
-            }),
-            sop_driver_sink: None,
-        });
-
-        process_channel_message(
-            Arc::clone(&runtime_ctx),
-            zeroclaw_api::channel::ChannelMessage {
-                id: "msg-photo-1".to_string(),
-                sender: "zeroclaw_user".to_string(),
-                reply_target: "chat-photo".to_string(),
-                content: format!("[IMAGE:{}]\n\nWhat is this?", photo_path.display()),
-                channel: "test-channel".into(),
-                channel_alias: None,
-                timestamp: 1,
-                thread_ts: None,
-                interruption_scope_id: None,
-                attachments: vec![],
-                subject: None,
-
-                ..Default::default()
-            },
-            CancellationToken::new(),
-        )
-        .await;
-
-        process_channel_message(
-            Arc::clone(&runtime_ctx),
-            zeroclaw_api::channel::ChannelMessage {
-                id: "msg-text-2".to_string(),
-                sender: "zeroclaw_user".to_string(),
-                reply_target: "chat-photo".to_string(),
-                content: "What is WAL?".to_string(),
-                channel: "test-channel".into(),
-                channel_alias: None,
-                timestamp: 2,
-                thread_ts: None,
-                interruption_scope_id: None,
-                attachments: vec![],
-                subject: None,
-
-                ..Default::default()
-            },
-            CancellationToken::new(),
-        )
-        .await;
-
-        let sent = channel_impl.sent_messages.lock().await;
-        assert_eq!(sent.len(), 2, "expected one error and one successful reply");
-        assert!(
-            sent[0].contains("⚠️ Error: "),
-            "first reply must be the localized error response, got: {}",
-            sent[0]
-        );
-        assert!(
-            sent[1].ends_with(":ok"),
-            "second reply should succeed for text-only turn, got: {}",
-            sent[1]
-        );
-        drop(sent);
-
-        let histories = runtime_ctx
-            .conversation_histories
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let turns = histories
-            .peek("test-channel_chat-photo_zeroclaw_user")
-            .expect("history should exist for sender");
-        assert_eq!(turns.len(), 2);
-        assert_eq!(turns[0].role, "user");
-        assert!(
-            turns[0].content.contains("] What is WAL?"),
-            "follow-up user turn should be timestamped: {}",
-            turns[0].content
-        );
-        assert_eq!(turns[1].role, "assistant");
-        assert_eq!(turns[1].content, "ok");
-        assert!(
-            turns.iter().all(|turn| !turn.content.contains("[IMAGE:")),
-            "failed vision turn must not persist image marker content"
-        );
-    }
-
-    #[tokio::test]
-    async fn e2e_failed_non_retryable_turn_does_not_poison_follow_up_text_turn() {
-        let channel_impl = Arc::new(RecordingChannel::default());
-        let channel: Arc<dyn Channel> = channel_impl.clone();
-
-        let mut channels_by_name = HashMap::new();
-        channels_by_name.insert(channel.name().to_string(), channel);
-
-        let runtime_ctx = Arc::new(ChannelRuntimeContext {
-            channels_by_name: Arc::new(channels_by_name),
-            model_provider: Arc::new(FormatErrorModelProvider),
-            model_provider_ref: Arc::new("dummy".to_string()),
-            agent_alias: Arc::new("test-agent".to_string()),
-            agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
-            memory: Arc::new(NoopMemory),
-            memory_strategy: Arc::new(
-                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
-                    Arc::new(NoopMemory),
-                    zeroclaw_config::schema::MemoryConfig::default(),
-                    std::path::PathBuf::new(),
-                ),
-            ),
-            tools_registry: Arc::new(
-                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
-            ),
-            observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("You are a helpful assistant.".to_string()),
-            model: Arc::new("test-model".to_string()),
-            temperature: Some(0.0),
-            auto_save_memory: false,
-            max_tool_iterations: 5,
-            min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
-                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
-            ))),
-            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
-            history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
-                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
-                    .expect("MAX_CONVERSATION_SENDERS must be positive"),
-            ))),
-            provider_cache: Arc::new(Mutex::new(HashMap::new())),
-            route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
-            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
-            reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
-            provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
-            workspace_dir: Arc::new(std::env::temp_dir()),
-            prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
-            live_config: zeroclaw_config::live::LiveConfig::new(
-                zeroclaw_config::schema::Config::default(),
-            )
-            .handle(),
-            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            interrupt_on_new_message: InterruptOnNewMessageConfig {
-                telegram: false,
-                slack: false,
-                discord: false,
-                mattermost: false,
-                matrix: false,
-                whatsapp: false,
-            },
-            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
-            hooks: None,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
-            autonomy_level: AutonomyLevel::default(),
-            tool_call_dedup_exempt: Arc::new(Vec::new()),
-            model_routes: Arc::new(Vec::new()),
-            query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
-            ack_reactions: true,
-            show_tool_calls: true,
-            session_store: None,
-            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::RiskProfileConfig::default(),
-            )),
-            activated_tools: None,
-            cost_tracking: None,
-            pacing: zeroclaw_config::schema::PacingConfig::default(),
-            max_tool_result_chars: 50000,
-            context_token_budget: 128_000,
-            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
-                std::time::Duration::ZERO,
-            )),
-            receipt_generator: None,
-            show_receipts_in_response: false,
-            last_applied_config_stamp: Arc::new(Mutex::new(None)),
-            runtime_defaults_override: Arc::new(Mutex::new(None)),
-            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            sop_engine: None,
-            sop_audit: None,
-            sop_driver_sink: None,
-            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
-            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
-            agent_transcription_provider: String::new(),
-            security: Arc::new(SecurityPolicy::default()),
-        });
-
-        process_channel_message(
-            Arc::clone(&runtime_ctx),
-            zeroclaw_api::channel::ChannelMessage {
-                id: "msg-bad-1".to_string(),
-                sender: "zeroclaw_user".to_string(),
-                reply_target: "chat-format".to_string(),
-                content: "trigger format error".to_string(),
-                channel: "test-channel".into(),
-                channel_alias: None,
-                timestamp: 1,
-                thread_ts: None,
-                interruption_scope_id: None,
-                attachments: vec![],
-                subject: None,
-
-                ..Default::default()
-            },
-            CancellationToken::new(),
-        )
-        .await;
-
-        process_channel_message(
-            Arc::clone(&runtime_ctx),
-            zeroclaw_api::channel::ChannelMessage {
-                id: "msg-text-2".to_string(),
-                sender: "zeroclaw_user".to_string(),
-                reply_target: "chat-format".to_string(),
-                content: "What is WAL?".to_string(),
-                channel: "test-channel".into(),
-                channel_alias: None,
-                timestamp: 2,
-                thread_ts: None,
-                interruption_scope_id: None,
-                attachments: vec![],
-                subject: None,
-
-                ..Default::default()
-            },
-            CancellationToken::new(),
-        )
-        .await;
-
-        let sent = channel_impl.sent_messages.lock().await;
-        assert_eq!(sent.len(), 2, "expected one error and one successful reply");
-        assert!(
-            sent[0].contains("Format Error"),
-            "first reply must mention the request format error, got: {}",
-            sent[0]
-        );
-        assert!(
-            sent[1].ends_with(":ok"),
-            "second reply should succeed for follow-up text, got: {}",
-            sent[1]
-        );
-        drop(sent);
-
-        let histories = runtime_ctx
-            .conversation_histories
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let turns = histories
-            .peek("test-channel_chat-format_zeroclaw_user")
-            .expect("history should exist for sender");
-        assert_eq!(turns.len(), 2);
-        assert_eq!(turns[0].role, "user");
-        assert!(
-            turns[0].content.contains("] What is WAL?"),
-            "follow-up user turn should be timestamped: {}",
-            turns[0].content
-        );
-        assert_eq!(turns[1].role, "assistant");
-        assert_eq!(turns[1].content, "ok");
-        assert!(
-            turns
-                .iter()
-                .all(|turn| turn.content != "trigger format error"),
-            "failed non-retryable turn must not persist in history"
-        );
-    }
-
     #[test]
     fn build_channel_by_id_unknown_channel_returns_error() {
         let config = Config::default();
@@ -55547,55 +54823,26 @@ Done."#;
     }
 
     #[test]
-    fn build_channel_system_prompt_refreshes_legacy_datetime_section_to_date_only() {
-        let prompt = build_channel_system_prompt(
-            "Base.\n\n## Current Date\n\nProject note, not generated date context.\n\n## Current Date & Time\n\n2026-01-01 01:02:03 (UTC)\n\n## Runtime\n\nHost: old\n",
-            "mattermost",
-            None,
-        );
+    fn build_channel_system_prompt_does_not_refresh_stale_date_section() {
+        let base = "Base.\n\n## Current Date\n\n2026-01-01 (+00:00)\n\n## Runtime\n\nHost: old\n";
+        let prompt = build_channel_system_prompt(base, "mattermost", None);
 
-        assert!(prompt.contains("## Current Date\n\n"));
-        assert!(prompt.contains("Project note, not generated date context."));
-        assert!(!prompt.contains("## Current Date & Time"));
-        assert!(!prompt.contains("01:02:03"));
-        let generated_section = prompt
-            .split("## Runtime")
-            .next()
-            .expect("prompt should contain runtime section before generated date assertion");
-        let date_line = generated_section
-            .rsplit("## Current Date\n\n")
-            .next()
-            .and_then(|rest| rest.lines().next())
-            .expect("current date section should have a date line");
-        assert_eq!(
-            &date_line[..10],
-            &chrono::Local::now().format("%Y-%m-%d").to_string()
-        );
         assert!(
-            date_line[10..].starts_with(" ("),
-            "date line should contain only date plus UTC offset: {date_line}"
+            prompt.contains("2026-01-01 (+00:00)"),
+            "stale workspace date prose must remain unchanged: {prompt}"
         );
     }
 
     #[test]
-    fn build_channel_system_prompt_refreshes_current_date_section() {
-        let prompt = build_channel_system_prompt(
-            "Base.\n\n## Current Date\n\n2026-01-01 (+00:00)\n\n## Runtime\n\nHost: old\n",
-            "mattermost",
-            None,
-        );
+    fn build_channel_system_prompt_leaves_user_date_headings_untouched() {
+        // Runtime no longer refreshes or rewrites date sections in the base
+        // prompt — AGENTS.md / workspace prose owns wall-clock guidance.
+        let base = "Base.\n\n## Current Date\n\nProject note, not generated date context.\n\n## Current Date & Time\n\n2026-01-01 01:02:03 (UTC)\n\n## Runtime\n\nHost: old\n";
+        let prompt = build_channel_system_prompt(base, "mattermost", None);
 
-        assert!(prompt.contains("## Current Date\n\n"));
-        assert!(!prompt.contains("2026-01-01 (+00:00)"));
-        let date_line = prompt
-            .split("## Current Date\n\n")
-            .nth(1)
-            .and_then(|rest| rest.lines().next())
-            .expect("current date section should have a date line");
-        assert_eq!(
-            &date_line[..10],
-            &chrono::Local::now().format("%Y-%m-%d").to_string()
-        );
+        assert!(prompt.contains("Project note, not generated date context."));
+        assert!(prompt.contains("## Current Date & Time\n\n2026-01-01 01:02:03 (UTC)"));
+        assert!(prompt.starts_with("Base."));
     }
 
     #[test]
