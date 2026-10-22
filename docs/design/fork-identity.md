@@ -2,7 +2,7 @@
 
 > **Status: specification.** This page records the decisions that make
 > ZeroLite a distinct release rather than an upstream build with patches.
-> For the merge rule, see `AGENTS.md` § upstream-merge-update. Decisions
+> For the merge rule, see `docs/merge_update_rules.md`. Decisions
 > here are precedent: cite them as `fork-identity #N` in merge reports.
 
 ## Decision record

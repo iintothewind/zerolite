@@ -3,8 +3,8 @@
 > **Status: specification.** This page defines ZeroLite's prefix-stability
 > rules: the parts of the prompt that must be byte-stable within a session
 > so provider prompt caching survives across turns. It is the mechanism
-> behind `context-management.md` R1. For the merge rule, see `AGENTS.md`
-> § upstream-merge-update. Decisions here are precedent: cite them as
+> behind `context-management.md` R1. For the merge rule, see `docs/merge_update_rules.md`.
+> Decisions here are precedent: cite them as
 > `prompt-cache-prefix #N` in merge reports.
 
 ## Decision record: why this shape

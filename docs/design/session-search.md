@@ -2,8 +2,8 @@
 
 > **Status: specification.** This page defines ZeroLite's agent-facing
 > session-history search semantics. The code conforms to this page. For the
-> merge rule (precedent lane vs. report lane), see `AGENTS.md`
-> § upstream-merge-update. Decisions here are precedent: cite them as
+> merge rule (precedent lane vs. report lane), see `docs/merge_update_rules.md`.
+> Decisions here are precedent: cite them as
 > `session-search #N` in merge reports.
 
 ## Decision record: why this shape

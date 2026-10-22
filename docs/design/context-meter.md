@@ -3,7 +3,7 @@
 > **Status: specification.** This page defines what the context meter
 > measures and what happens when the provider reports no usage. It is a
 > companion to `context-management.md`, which defines the trim semantics.
-> For the merge rule, see `AGENTS.md` § upstream-merge-update. Decisions
+> For the merge rule, see `docs/merge_update_rules.md`. Decisions
 > here are precedent: cite them as `context-meter #N` in merge reports.
 
 ## Decision record: why this shape

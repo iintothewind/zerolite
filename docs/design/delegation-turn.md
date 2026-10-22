@@ -1,8 +1,8 @@
 # Delegation and turn semantics
 
 > **Status: specification.** This page records ZeroLite's agent turn and
-> delegation behaviors. For the merge rule, see `AGENTS.md`
-> § upstream-merge-update. Decisions here are precedent: cite them as
+> delegation behaviors. For the merge rule, see `docs/merge_update_rules.md`.
+> Decisions here are precedent: cite them as
 > `delegation-turn #N` in merge reports.
 
 ## Decision record: why this shape

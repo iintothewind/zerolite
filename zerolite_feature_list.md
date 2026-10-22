@@ -4,7 +4,7 @@
 > upstream code. Every fork feature maps to exactly one design doc in
 > `docs/design/`. If a feature is not listed here, it has no recorded
 > decision — treat upstream changes to it as new semantics and report
-> (see `AGENTS.md` § upstream-merge-update).
+> (see `docs/merge_update_rules.md`).
 >
 > **Baseline.** Built from the `zerolite` branch at `1.2.2`
 > (`5f8567576`, 2026-10-22). Re-verify this list against the branch

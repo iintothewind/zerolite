@@ -2,7 +2,7 @@
 
 > **Status: specification.** This page records the web UI behaviors that
 > are ZeroLite's own and must survive upstream web changes. For the merge
-> rule, see `AGENTS.md` § upstream-merge-update. Decisions here are
+> rule, see `docs/merge_update_rules.md`. Decisions here are
 > precedent: cite them as `webui #N` in merge reports.
 
 ## Decision record: why this shape

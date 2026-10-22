@@ -3,8 +3,8 @@
 > **Status: specification.** This page records ZeroLite's provider
 > compatibility shims: small, provider-specific behaviors that upstream
 > changes must not silently drop. Each shim exists because a real provider
-> behaved differently from the spec. For the merge rule, see `AGENTS.md`
-> § upstream-merge-update. Decisions here are precedent: cite them as
+> behaved differently from the spec. For the merge rule, see `docs/merge_update_rules.md`.
+> Decisions here are precedent: cite them as
 > `provider-compat #N` in merge reports.
 
 ## Decision record: why shims are decisions, not hacks

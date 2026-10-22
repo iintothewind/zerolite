@@ -3,8 +3,8 @@
 > **Status: specification.** This page records ZeroLite's gateway session
 > behaviors that upstream gateway/session changes must not silently break.
 > These are behavioral fixes, not a single feature: each one was a real
-> failure first. For the merge rule, see `AGENTS.md`
-> § upstream-merge-update. Decisions here are precedent: cite them as
+> failure first. For the merge rule, see `docs/merge_update_rules.md`.
+> Decisions here are precedent: cite them as
 > `gateway-session #N` in merge reports.
 
 ## Decision record: why these behaviors are load-bearing

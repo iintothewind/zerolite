@@ -1,8 +1,8 @@
 # Master pair code (gateway recovery credential)
 
 > **Status: specification.** This page defines the `gateway.master_pair_code`
-> recovery credential. For the merge rule, see `AGENTS.md`
-> § upstream-merge-update. Decisions here are precedent: cite them as
+> recovery credential. For the merge rule, see `docs/merge_update_rules.md`.
+> Decisions here are precedent: cite them as
 > `master-pair-code #N` in merge reports.
 
 ## Decision record: why this shape
