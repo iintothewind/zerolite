@@ -46,7 +46,11 @@ case.
   the record: it destroys the byte-stable prefix (R1), inserts model-written
   text into history as if it were fact, costs an extra model call, and its
   errors compound invisibly. Dropping whole turns is lossy but honest, and
-  the surviving turns remain exactl| # | Upstream | ZeroLite (this page) | Grounded in |
+  the surviving turns remain exactly what the model produced.
+
+The divergences that follow from these reasons, decision by decision:
+
+| # | Upstream | ZeroLite (this page) | Grounded in |
 | --- | --- | --- | --- |
 | 1 | One resolved number, `context_token_budget`, serves as **both** the proactive-trim trigger and the fit target. It is absolute by default (`max_context_tokens`, else the 32k legacy default); `context_compact_ratio` can derive it from the window, but in every mode the same number does both jobs | Two different numbers derived from the effective window: the **water-line** (`min(window × trim_threshold_percent/100, window − reserve_tokens)`) decides when trimming engages; the **send / fit budget** (`window − reserve_tokens`) decides whether the retained set is small enough | R2, R3 — conflating the two roles makes "engage early, fit later" inexpressible |
 | 2 | No keep-N preference: `trim_to_recent_turns(budget)` keeps whatever fits the budget | `keep_recent_turns` is the **preferred** whole-turn retention; if those turns do not fit, the runtime **cascades** down to `kept_turns == 1` | The preference is the operator's (a stable working memory across models); the cascade is the runtime's. Budget-only retention makes retained history a pure function of the budget, so the same conversation keeps wildly different amounts of context on different models |
@@ -56,7 +60,7 @@ case.
 | 6 | No output-reserve concept in context policy | `reserve_tokens` bounds the water-line from above **and** defines the send budget | Without a reserve, a successful trim can leave no room for the model's own output, and the request fails immediately after |
 | 7 | No `ContextCalibration`. A reported-budget trim path exists (`trim_to_reported_budget`) that proportionally scales a local estimate by the reported/estimated ratio — but the proactive trigger is sized from the local estimate alone | `ContextCalibration` re-anchors on the provider-reported `usage.input_tokens`; only the unbilled tail is priced locally. The calibrated size feeds **both** the trigger measurement and the trim | R5 — proportional scaling preserves the local estimate's error; anchoring replaces it at the anchor point |
 | 8 | A trim that cannot fit is a silent no-op: even with only the floor remaining and still over budget, the trim returns the oversized history unchanged with `trimmed: false` and no error | A floor that cannot fit is a **hard failure**: an error to the caller, and **no** `HistoryTrimmed` notice | R4 |
-| 9 | `context_compression.*`: summarization-based compaction rewrites older history into a model-written summary | Removed entirely. There is no summarization anywhere in the retention path | R6, R1 | is no summarization anywhere in the retention path | R6, R1 |
+| 9 | `context_compression.*`: summarization-based compaction rewrites older history into a model-written summary | Removed entirely. There is no summarization anywhere in the retention path | R6, R1 |
 
 The practical consequence: **`[runtime_profiles.<alias>.context]` is the
 only place context policy is configured.** A knob that appears in upstream
