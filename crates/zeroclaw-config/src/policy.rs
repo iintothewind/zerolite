@@ -10580,4 +10580,39 @@ mod tests {
         assert_eq!(attached_short_option_value("-f"), None);
         assert_eq!(attached_short_option_value("--long"), None);
     }
+    #[test]
+    fn approved_read_root_honors_read_only_allowlist() {
+        let ws = tempfile::tempdir().unwrap();
+        let ro = tempfile::tempdir().unwrap();
+        let ro_canon = ro.path().canonicalize().unwrap();
+        let policy = SecurityPolicy {
+            workspace_dir: ws.path().to_path_buf(),
+            allowed_roots_read_only: vec![ro.path().to_path_buf()],
+            ..SecurityPolicy::default()
+        };
+        assert_eq!(
+            policy.approved_read_root(&ro_canon.join("doc.pdf")),
+            Some(ro_canon.clone())
+        );
+    }
+
+    #[test]
+    fn approved_read_root_returns_workspace_for_contained_paths() {
+        let ws = tempfile::tempdir().unwrap();
+        let ws_canon = ws.path().canonicalize().unwrap();
+        let policy = SecurityPolicy {
+            workspace_dir: ws.path().to_path_buf(),
+            ..SecurityPolicy::default()
+        };
+        // A path inside the workspace binds to the canonical workspace root.
+        assert_eq!(
+            policy.approved_read_root(&ws_canon.join("sub").join("a.txt")),
+            Some(ws_canon.clone())
+        );
+        // A path outside every allowlist has no bounded root.
+        let outside = tempfile::tempdir().unwrap();
+        let outside_canon = outside.path().canonicalize().unwrap();
+        assert_eq!(policy.approved_read_root(&outside_canon.join("x")), None);
+    }
+
 }

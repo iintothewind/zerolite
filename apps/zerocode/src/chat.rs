@@ -20379,17 +20379,11 @@ mod tests {
         let cached_a = chat
             .state_for_session("sess-a")
             .expect("focused session")
-            .transcript_layout
-            .view()
-            .cached_lines
-            .clone();
+            .transcript_layout.view().cached_lines.clone();
         let cached_b = chat
             .state_for_session("sess-b")
             .expect("background session")
-            .transcript_layout
-            .view()
-            .cached_lines
-            .clone();
+            .transcript_layout.view().cached_lines.clone();
 
         assert!(!chat.focus_session("nope").await, "unknown id is a no-op");
         assert!(chat.focus_session("sess-b").await);
@@ -32257,4 +32251,364 @@ mod tests {
             "the pane must not answer requests behind the app router"
         );
     }
+    #[tokio::test]
+    async fn restart_local_acp_session_sends_process_cwd() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let expected_cwd = std::env::current_dir()
+            .expect("process cwd")
+            .to_str()
+            .expect("utf-8 cwd")
+            .to_string();
+        let mut state = ChatState::new(
+            "sess-old".to_string(),
+            "alpha".to_string(),
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
+
+        let restart = tokio::spawn(async move {
+            Chat::restart_session_for_state(&client, PaneKind::Acp, &mut state, std::env::current_dir).await
+        });
+
+        let request = next_rpc_request(&mut rx, "restart should start a fresh ACP session").await;
+        assert_eq!(request["method"], method::SESSION_NEW);
+        let params = &request["params"];
+        assert_eq!(params["agent_alias"], "alpha");
+        assert!(params["session_id"].is_null());
+        assert_eq!(params["chat_mode"], "acp");
+        assert_eq!(params["cwd"], expected_cwd);
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({ "session_id": "sess-fresh", "workspace_dir": expected_cwd }),
+        );
+
+        let request = next_rpc_request(&mut rx, "restart should close the old session").await;
+        assert_eq!(request["method"], method::SESSION_CLOSE);
+        assert_eq!(request["params"]["session_id"], "sess-old");
+        respond_ok(&rpc, &request, serde_json::json!({}));
+
+        let request = next_rpc_request(&mut rx, "restart should refresh model identity").await;
+        assert_eq!(request["method"], method::CONFIG_LIST);
+        respond_ok(&rpc, &request, serde_json::json!([]));
+
+        let phase = tokio::time::timeout(Duration::from_secs(2), restart)
+            .await
+            .expect("restart should finish")
+            .unwrap();
+        assert!(phase.is_none());
+    }
+    #[tokio::test]
+    async fn fresh_local_acp_session_sends_process_cwd() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Acp);
+        let expected_cwd = std::env::current_dir()
+            .expect("process cwd")
+            .to_str()
+            .expect("utf-8 cwd")
+            .to_string();
+
+        let init = tokio::spawn(async move {
+            let _ = chat.init().await;
+            chat
+        });
+
+        let request = next_rpc_request(&mut rx, "init should request agents/status").await;
+        assert_eq!(request["method"], method::AGENTS_STATUS);
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({
+                "agents": [
+                    {"alias": "alpha", "enabled": true, "live_sessions": 0, "persisted_sessions": 0}
+                ]
+            }),
+        );
+
+        let request = next_rpc_request(&mut rx, "ACP init should list recent sessions").await;
+        assert_eq!(request["method"], method::SESSION_LIST_ACP);
+        respond_ok(&rpc, &request, serde_json::json!({ "sessions": [] }));
+
+        let mut chat = tokio::time::timeout(Duration::from_secs(2), init)
+            .await
+            .expect("init should finish")
+            .unwrap();
+        assert!(matches!(chat.phase, ChatPhase::PickAgent { .. }));
+
+        let start = tokio::spawn(async move {
+            chat.pick_or_start_session("alpha").await;
+            chat
+        });
+
+        let request = next_rpc_request(&mut rx, "fresh ACP should start a session").await;
+        assert_eq!(request["method"], method::SESSION_NEW);
+        let params = &request["params"];
+        assert_eq!(params["agent_alias"], "alpha");
+        assert!(params["session_id"].is_null());
+        assert_eq!(params["chat_mode"], "acp");
+        // Code sessions pin the directory zerocode was launched from so file
+        // and shell tools operate on that project, not the agent workspace.
+        assert_eq!(params["cwd"], expected_cwd);
+
+        start.abort();
+    }
+
+    #[tokio::test]
+    async fn fresh_local_chat_session_omits_cwd_so_agent_workspace_wins() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        // `with_rpc` defaults to Local transport — the path that used to leak
+        // the TUI's launch directory into `session/new`.
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+
+        let init = tokio::spawn(async move {
+            let _ = chat.init().await;
+            chat
+        });
+
+        let request = next_rpc_request(&mut rx, "init should request agents/status").await;
+        assert_eq!(request["method"], method::AGENTS_STATUS);
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({
+                "agents": [
+                    {"alias": "alpha", "enabled": true, "live_sessions": 0, "persisted_sessions": 0}
+                ]
+            }),
+        );
+
+        let request = next_rpc_request(&mut rx, "fresh chat should start a session").await;
+        assert_eq!(request["method"], method::SESSION_NEW);
+        let params = &request["params"];
+        assert_eq!(params["agent_alias"], "alpha");
+        assert!(params["session_id"].is_null());
+        // Regression guard: a fresh local session must not send the TUI's
+        // launch directory as cwd. Omitting it lets the daemon resolve the
+        // selected agent's configured workspace.
+        assert!(params["cwd"].is_null());
+
+        init.abort();
+    }
+    #[tokio::test]
+    async fn focus_session_swaps_states_and_preserves_transcripts() {
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = two_session_chat(&rpc);
+        if let ChatPhase::Active(a) = &mut chat.phase {
+            a.entries
+                .push(ChatEntry::SystemMessage(Arc::<str>::from("from-a")));
+            a.rebuild_lines(40);
+        }
+        if let Some(b) = chat.background.first_mut() {
+            b.entries
+                .push(ChatEntry::SystemMessage(Arc::<str>::from("from-b")));
+            b.rebuild_lines(40);
+        }
+
+        let cached_a = chat
+            .state_for_session("sess-a")
+            .expect("focused session")
+            .transcript_layout.view().cached_lines.clone();
+        let cached_b = chat
+            .state_for_session("sess-b")
+            .expect("background session")
+            .transcript_layout.view().cached_lines.clone();
+
+        assert!(!chat.focus_session("nope").await, "unknown id is a no-op");
+        assert!(chat.focus_session("sess-b").await);
+
+        assert_eq!(chat.current_session_id(), Some("sess-b"));
+        let ChatPhase::Active(b) = &chat.phase else {
+            panic!("focus must activate the picked session");
+        };
+        assert!(matches!(&b.entries[0], ChatEntry::SystemMessage(m) if m.as_ref() == "from-b"));
+        assert_eq!(b.transcript_layout.view().dirty, LinesDirty::Clean);
+        assert_eq!(b.transcript_layout.view().cached_lines, cached_b);
+        let a = chat
+            .background
+            .iter()
+            .find(|s| s.session_id == "sess-a")
+            .expect("previous session stays tracked");
+        assert!(matches!(&a.entries[0], ChatEntry::SystemMessage(m) if m.as_ref() == "from-a"));
+        assert_eq!(a.transcript_layout.view().dirty, LinesDirty::Clean);
+        assert_eq!(a.transcript_layout.view().cached_lines, cached_a);
+
+        assert!(chat.focus_session("sess-a").await);
+        let ChatPhase::Active(a) = &chat.phase else {
+            panic!("round-trip focus must reactivate the original session");
+        };
+        assert_eq!(a.transcript_layout.view().dirty, LinesDirty::Clean);
+        assert_eq!(a.transcript_layout.view().cached_lines, cached_a);
+        let b = chat
+            .background
+            .iter()
+            .find(|s| s.session_id == "sess-b")
+            .expect("second session stays tracked after round-trip focus");
+        assert_eq!(b.transcript_layout.view().dirty, LinesDirty::Clean);
+        assert_eq!(b.transcript_layout.view().cached_lines, cached_b);
+
+        // Sidebar order is stable across focus changes.
+        let ids: Vec<_> = chat
+            .session_summaries()
+            .into_iter()
+            .map(|s| (s.session_id, s.focused))
+            .collect();
+        assert_eq!(
+            ids,
+            vec![("sess-a".to_string(), true), ("sess-b".to_string(), false)]
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_todo_settings_preserves_fallback_on_zero_width_from_env() {
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::set(dir.path());
+
+        let _v = crate::test_support::EnvVarGuard::set("ZEROCODE_todotracker__width", "0");
+
+        let current = crate::todo_tracker::TodoTrackerSettings {
+            enabled: true,
+            enabled_at_start: true,
+            location: crate::todo_tracker::TodoLocation::Bottom,
+            width: 44,
+            max_height: 7,
+        };
+
+        let resolved = Chat::resolve_todo_settings(current);
+        assert_eq!(
+            resolved, current,
+            "ZEROCODE_todotracker__width=0 must keep current settings, not normalize to 1"
+        );
+        assert_ne!(resolved.width, 1, "the zero must not be normalized to 1");
+    }
+
+    #[tokio::test]
+    async fn resolve_todo_settings_preserves_fallback_on_zero_width_from_file() {
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::set(dir.path());
+
+        std::fs::write(
+            crate::config::config_path(dir.path()),
+            "[todotracker]\nwidth = 0\nmax_height = 5\n",
+        )
+        .unwrap();
+
+        let current = crate::todo_tracker::TodoTrackerSettings {
+            enabled: true,
+            enabled_at_start: true,
+            location: crate::todo_tracker::TodoLocation::Bottom,
+            width: 44,
+            max_height: 7,
+        };
+
+        let resolved = Chat::resolve_todo_settings(current);
+        assert_eq!(
+            resolved, current,
+            "an explicit width = 0 must keep current settings, never resolve to a 1-cell tracker"
+        );
+        assert_ne!(resolved.width, 1, "the zero must not be normalized to 1");
+    }
+
+    #[test]
+    fn context_usage_client_prefers_model_window_then_falls_back() {
+        let mut s = state();
+        s.context_max_tokens = None;
+        s.context_input_tokens = None;
+
+        s.apply_update(SessionUpdate::ContextUsage {
+            session_id: "sess-1".into(),
+            input_tokens: Some(100),
+            input_tokens_source: Some("provider".to_string()),
+            max_context_tokens: Some(800_000),
+            model_context_window: Some(1_000_000),
+        });
+        assert_eq!(
+            s.context_max_tokens,
+            Some(1_000_000),
+            "client must prefer model_context_window (provider capacity) for the meter ceiling"
+        );
+        assert_eq!(
+            s.context_input_tokens,
+            Some(100),
+            "input_tokens must be reported as-is"
+        );
+
+        s.context_max_tokens = None;
+        s.apply_update(SessionUpdate::ContextUsage {
+            session_id: "sess-1".into(),
+            input_tokens: Some(250),
+            input_tokens_source: None,
+            max_context_tokens: Some(800_000),
+            model_context_window: None,
+        });
+        assert_eq!(
+            s.context_max_tokens,
+            Some(800_000),
+            "legacy payload (no model_context_window) must fall back to max_context_tokens"
+        );
+        assert_eq!(
+            s.context_input_tokens,
+            Some(250),
+            "input_tokens must be updated on the legacy payload too"
+        );
+        assert_eq!(
+            s.context_input_tokens_source, None,
+            "a count with no provenance must not keep a previous label"
+        );
+    }
+
+    #[test]
+    fn transcript_selection_clears_on_scroll_and_session_reset() {
+        let mut state = state();
+        state.transcript_snapshot = Some(transcript_snapshot(Rect::new(0, 0, 5, 1), &["hello"]));
+        assert!(state.begin_transcript_drag(0, 0));
+        assert!(state.update_transcript_drag(1, 0));
+        state.finish_transcript_drag();
+        state.set_overlay_copy_feedback(Rect::new(0, 0, 5, 1));
+
+        state.scroll_up(1);
+        assert_eq!(state.transcript_selection, None);
+        assert_eq!(state.copy_feedback, None);
+        assert!(state.copy_hit_regions.is_empty());
+
+        assert!(state.begin_transcript_drag(0, 0));
+        assert!(state.update_transcript_drag(1, 0));
+        state.finish_transcript_drag();
+        state.scroll_to_top();
+        assert_eq!(state.transcript_selection, None);
+
+        assert!(state.begin_transcript_drag(0, 0));
+        assert!(state.update_transcript_drag(1, 0));
+        state.finish_transcript_drag();
+        state.last_total_rows = 10;
+        state.last_inner_height = 1;
+        state.scroll_to_bottom();
+        assert_eq!(state.transcript_selection, None);
+
+        assert!(state.begin_transcript_drag(0, 0));
+        assert!(state.update_transcript_drag(1, 0));
+        state.finish_transcript_drag();
+        state.enter_browse_mode();
+        assert_eq!(state.transcript_selection, None);
+
+        state.exit_browse_mode();
+        assert!(state.begin_transcript_drag(0, 0));
+        assert!(state.update_transcript_drag(1, 0));
+        state.finish_transcript_drag();
+        state.reset_for_session(
+            "sess-2".to_string(),
+            None,
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
+        assert_eq!(state.transcript_selection, None);
+        assert!(state.transcript_snapshot.is_none());
+    }
+
 }

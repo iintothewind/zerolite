@@ -7098,4 +7098,25 @@ mod tests {
             "the flag must be explicitly clearable and not re-inferred from history text"
         );
     }
+    #[test]
+    fn new_creates_all_four_tables() {
+        let (_tmp, store) = open_store();
+        let conn = store.conn.lock();
+        for table in [
+            "acp_sessions",
+            "acp_messages",
+            "acp_tool_calls",
+            "acp_session_events",
+        ] {
+            let name: String = conn
+                .query_row(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name = ?1",
+                    [table],
+                    |r| r.get(0),
+                )
+                .unwrap_or_else(|_| panic!("table {table} should exist"));
+            assert_eq!(name, table);
+        }
+    }
+
 }

@@ -123,6 +123,7 @@ fn is_public_sse_event(event: &serde_json::Value) -> bool {
 mod tests {
     use super::*;
     use std::sync::Arc;
+    use zeroclaw_runtime::observability::{Observer, ObserverEvent};
 
     #[test]
     fn session_scoped_events_are_not_public_sse_events() {
@@ -474,4 +475,332 @@ mod tests {
         );
         assert!(is_public_sse_event(&observability_bracket));
     }
+    fn make_broadcast() -> (
+        Arc<BroadcastObserver>,
+        tokio::sync::broadcast::Receiver<serde_json::Value>,
+        Arc<EventBuffer>,
+    ) {
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        let buffer = Arc::new(EventBuffer::new(16));
+        let obs = Arc::new(BroadcastObserver::new(tx, buffer.clone()));
+        (obs, rx, buffer)
+    }
+
+    static HOOK_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    #[test]
+    fn agent_lifecycle_events_reach_history_payload_via_broadcast_hook() {
+        let _guard = HOOK_TEST_LOCK.lock();
+
+        zeroclaw_runtime::observability::clear_broadcast_hook();
+
+        let (tx, _rx) = tokio::sync::broadcast::channel(16);
+        let buffer = Arc::new(EventBuffer::new(16));
+        let bo: Arc<dyn Observer> = Arc::new(BroadcastObserver::new(tx, buffer.clone()));
+        zeroclaw_runtime::observability::set_broadcast_hook(bo);
+
+        // Same factory call site as the channel orchestrator and agent loop.
+        let cfg = zeroclaw_config::schema::ObservabilityConfig {
+            backend: zeroclaw_config::schema::ObservabilityBackend::None,
+            ..Default::default()
+        };
+        let observer = zeroclaw_runtime::observability::create_observer(&cfg);
+
+        observer.record_event(&ObserverEvent::AgentStart {
+            model_provider: "p".into(),
+            model: "m".into(),
+            channel: Some("telegram".into()),
+            agent_alias: Some("default".into()),
+            turn_id: Some("turn-1".into()),
+        });
+        observer.record_event(&ObserverEvent::AgentEnd {
+            model_provider: "p".into(),
+            model: "m".into(),
+            duration: std::time::Duration::from_millis(5),
+            tokens_used: None,
+            cost_usd: None,
+            channel: Some("telegram".into()),
+            agent_alias: Some("default".into()),
+            turn_id: Some("turn-1".into()),
+        });
+
+        let payload = history_events_payload(&buffer);
+        let events = payload["events"].as_array().expect("events array");
+        assert_eq!(
+            events.len(),
+            2,
+            "both brackets must be retained: {events:?}"
+        );
+        assert_eq!(events[0]["type"], "agent_start");
+        assert_eq!(events[1]["type"], "agent_end");
+        for event in events {
+            assert_eq!(event["source"], "observability");
+            assert!(
+                event["timestamp"].is_string(),
+                "history frames must carry a timestamp: {event}"
+            );
+            assert_eq!(event["turn_id"], "turn-1");
+            assert_eq!(event["channel"], "telegram");
+        }
+
+        zeroclaw_runtime::observability::clear_broadcast_hook();
+    }
+
+    #[test]
+    fn factory_observer_events_reach_broadcast_hook() {
+        let _guard = HOOK_TEST_LOCK.lock();
+
+        zeroclaw_runtime::observability::clear_broadcast_hook();
+
+        let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+        let buffer = Arc::new(EventBuffer::new(16));
+        let bo: Arc<dyn Observer> = Arc::new(BroadcastObserver::new(tx, buffer.clone()));
+        zeroclaw_runtime::observability::set_broadcast_hook(bo);
+
+        // Same factory call site as `process_message` in the agent loop.
+        let cfg = zeroclaw_config::schema::ObservabilityConfig {
+            backend: zeroclaw_config::schema::ObservabilityBackend::None,
+            ..Default::default()
+        };
+        let observer = zeroclaw_runtime::observability::create_observer(&cfg);
+
+        observer.record_event(&ObserverEvent::ToolCall {
+            parent_agent_alias: None,
+            tool: "shell".into(),
+            tool_call_id: None,
+            duration: std::time::Duration::from_millis(7),
+            success: true,
+            arguments: None,
+            result: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
+        });
+
+        let value = rx
+            .try_recv()
+            .expect("factory-built observer event must reach the SSE broadcast channel");
+        assert_eq!(value["type"], "tool_call");
+        assert_eq!(value["tool"], "shell");
+        assert_eq!(value["success"], true);
+
+        let snap = buffer.snapshot();
+        assert_eq!(
+            snap.len(),
+            1,
+            "broadcast events must also land in the buffer"
+        );
+
+        zeroclaw_runtime::observability::clear_broadcast_hook();
+    }
+
+    #[test]
+    fn broadcast_observer_tags_every_event_with_observability_source() {
+        // The chat-WS filter relies on this tag as a defense-in-depth check
+        // (any future emitter that forgets to set session_id still gets
+        // routed correctly). Cover every variant the observer broadcasts.
+        let (obs, mut rx, _buffer) = make_broadcast();
+
+        let cases: Vec<ObserverEvent> = vec![
+            ObserverEvent::LlmRequest {
+                parent_agent_alias: None,
+                model_provider: "p".into(),
+                model: "m".into(),
+                messages_count: 0,
+                channel: None,
+                agent_alias: None,
+                turn_id: None,
+            },
+            ObserverEvent::ToolCall {
+                parent_agent_alias: None,
+                tool: "shell".into(),
+                tool_call_id: None,
+                duration: std::time::Duration::from_millis(1),
+                success: true,
+                arguments: None,
+                result: None,
+                channel: None,
+                agent_alias: None,
+                turn_id: None,
+            },
+            ObserverEvent::ToolCallStart {
+                parent_agent_alias: None,
+                tool: "shell".into(),
+                tool_call_id: None,
+                arguments: None,
+                channel: None,
+                agent_alias: None,
+                turn_id: None,
+            },
+            ObserverEvent::Error {
+                component: "any".into(),
+                message: "boom".into(),
+            },
+            ObserverEvent::AgentStart {
+                model_provider: "p".into(),
+                model: "m".into(),
+                channel: None,
+                agent_alias: None,
+                turn_id: None,
+            },
+            ObserverEvent::AgentEnd {
+                model_provider: "p".into(),
+                model: "m".into(),
+                duration: std::time::Duration::from_millis(1),
+                tokens_used: None,
+                cost_usd: None,
+                channel: None,
+                agent_alias: None,
+                turn_id: None,
+            },
+        ];
+        for ev in cases {
+            obs.record_event(&ev);
+            let v = rx.try_recv().expect("event must broadcast");
+            assert_eq!(
+                v["source"], "observability",
+                "every BroadcastObserver event must be tagged source=observability: {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn broadcast_agent_end_includes_turn_metadata_and_token_total() {
+        let (obs, mut rx, _buffer) = make_broadcast();
+
+        obs.record_event(&ObserverEvent::AgentEnd {
+            model_provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            duration: std::time::Duration::from_millis(42),
+            tokens_used: Some(zeroclaw_api::observability_traits::TurnTokenUsage {
+                input_tokens: 12,
+                output_tokens: 34,
+            }),
+            cost_usd: Some(0.001),
+            channel: Some("wss".into()),
+            agent_alias: Some("default".into()),
+            turn_id: Some("turn-1".into()),
+        });
+
+        let value = rx.try_recv().expect("event should be broadcast");
+        assert_eq!(value["type"], "agent_end");
+        assert_eq!(value["source"], "observability");
+        assert_eq!(value["tokens_used"], 46);
+        assert_eq!(value["input_tokens"], 12);
+        assert_eq!(value["output_tokens"], 34);
+        assert_eq!(value["channel"], "wss");
+        assert_eq!(value["agent_alias"], "default");
+        assert_eq!(value["turn_id"], "turn-1");
+    }
+
+    #[test]
+    fn unmapped_events_are_skipped() {
+        let (obs, mut rx, buffer) = make_broadcast();
+
+        obs.record_event(&ObserverEvent::HeartbeatTick);
+
+        assert!(rx.try_recv().is_err(), "heartbeat should not broadcast");
+        assert!(buffer.snapshot().is_empty());
+    }
+
+    #[test]
+    fn history_trimmed_event_is_broadcast_with_cut_accounting() {
+        let (obs, mut rx, _buffer) = make_broadcast();
+
+        obs.record_event(&ObserverEvent::HistoryTrimmed {
+            dropped_messages: 12,
+            kept_turns: 1,
+            reason: "context token budget exceeded".into(),
+            channel: Some("wss".into()),
+            agent_alias: Some("trimtest".into()),
+            turn_id: Some("turn-1".into()),
+            // Token accounting is optional; this fixture exercises the cut
+            // accounting that is always on the frame.
+            token_budget: None,
+            tokens_before: None,
+            tokens_after: None,
+            tokens_before_source: None,
+            tokens_after_source: None,
+            unsatisfiable_floor: None,
+        });
+
+        let value = rx.try_recv().expect("history_trimmed must broadcast");
+        assert_eq!(value["type"], "history_trimmed");
+        assert_eq!(value["source"], "observability");
+        assert_eq!(value["dropped_messages"], 12);
+        assert_eq!(value["kept_turns"], 1);
+        assert_eq!(value["reason"], "context token budget exceeded");
+        assert_eq!(value["channel"], "wss");
+        assert_eq!(value["agent_alias"], "trimtest");
+        assert_eq!(value["turn_id"], "turn-1");
+        assert!(is_public_sse_event(&value));
+    }
+
+    #[test]
+    fn tool_call_start_event_is_broadcast() {
+        let (obs, mut rx, _buffer) = make_broadcast();
+
+        obs.record_event(&ObserverEvent::ToolCallStart {
+            parent_agent_alias: None,
+            tool: "mcp_filesystem__read_file".into(),
+            tool_call_id: None,
+            arguments: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
+        });
+
+        let value = rx.try_recv().expect("event should be broadcast");
+        assert_eq!(value["type"], "tool_call_start");
+        assert_eq!(value["tool"], "mcp_filesystem__read_file");
+    }
+
+    #[test]
+    fn tool_call_event_is_broadcast_and_buffered() {
+        let (obs, mut rx, buffer) = make_broadcast();
+
+        obs.record_event(&ObserverEvent::ToolCall {
+            parent_agent_alias: None,
+            tool: "shell".into(),
+            tool_call_id: None,
+            duration: std::time::Duration::from_millis(42),
+            success: true,
+            arguments: None,
+            result: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
+        });
+
+        let value = rx.try_recv().expect("event should be broadcast");
+        assert_eq!(value["type"], "tool_call");
+        assert_eq!(value["tool"], "shell");
+        assert_eq!(value["success"], true);
+
+        let snap = buffer.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0]["type"], "tool_call");
+    }
+
+    #[test]
+    fn event_buffer_recovers_after_a_poisoned_writer() {
+        let buffer = Arc::new(EventBuffer::new(4));
+        let poisoned = buffer.clone();
+        let result = std::thread::spawn(move || {
+            // Panic while the buffer's lock is held, poisoning it.
+            poisoned.with_locked_queue(|queue| {
+                queue.push_back(serde_json::json!({"sequence": 1}));
+                panic!("poison event buffer");
+            });
+        })
+        .join();
+        assert!(result.is_err());
+
+        buffer.push(serde_json::json!({"sequence": 2}));
+        let snapshot = buffer.snapshot();
+        assert_eq!(snapshot.len(), 2);
+        assert_eq!(snapshot[0]["sequence"], 1);
+        assert_eq!(snapshot[1]["sequence"], 2);
+    }
+
 }

@@ -5714,4 +5714,300 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             "an unscoped agent_start stays a global event and is not delivered"
         );
     }
+
+    async fn websocket_turn_forwards_usage_and_agent_start_frames_inner() {
+        // One text block, `end_turn`, with `cache_read_input_tokens` set — the
+        // shape that exercises the `usage` frame's cache field.
+        let sse = "event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-test\",\"usage\":{\"input_tokens\":314,\"cache_read_input_tokens\":42}}}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":27}}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+        let mock_app = Router::new().route(
+            "/v1/messages",
+            post(move |Json(request): Json<serde_json::Value>| async move {
+                if request["stream"].as_bool() == Some(true) {
+                    ([(header::CONTENT_TYPE, "text/event-stream")], sse).into_response()
+                } else {
+                    Json(serde_json::json!({
+                        "id": "msg_1",
+                        "type": "message",
+                        "role": "assistant",
+                        "model": "claude-test",
+                        "content": [{"type": "text", "text": "hi"}],
+                        "stop_reason": "end_turn",
+                        "usage": {"input_tokens": 314, "output_tokens": 27}
+                    }))
+                    .into_response()
+                }
+            }),
+        );
+        let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local Anthropic fixture");
+        let mock_addr = mock_listener.local_addr().expect("fixture address");
+        let mock_server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(mock_listener, mock_app)
+                .await
+                .expect("local Anthropic fixture serves");
+        });
+
+        let tmp = tempfile::tempdir().expect("temporary gateway workspace");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("gateway workspace");
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: workspace.clone(),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        config.memory.backend = "none".to_string();
+        config.reliability.provider_retries = 0;
+        config.providers.models.anthropic.insert(
+            "fixture".to_string(),
+            zeroclaw_config::schema::AnthropicModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    api_key: Some("test-key".to_string()),
+                    uri: Some(format!("http://{mock_addr}")),
+                    model: Some("claude-test".to_string()),
+                    ..Default::default()
+                },
+                server_fallback_models: Vec::new(),
+            },
+        );
+        config.risk_profiles.insert(
+            "fixture".to_string(),
+            zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+        config.runtime_profiles.insert(
+            "fixture".to_string(),
+            zeroclaw_config::schema::RuntimeProfileConfig::default(),
+        );
+        config.agents.insert(
+            "web".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                model_provider: "anthropic.fixture".into(),
+                risk_profile: "fixture".into(),
+                runtime_profile: "fixture".into(),
+                workspace: zeroclaw_config::multi_agent::AgentWorkspaceConfig {
+                    path: Some(workspace),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let state = crate::api::tests::test_state(config);
+        let gateway_app = Router::new()
+            .route("/ws/chat", get(handle_ws_chat))
+            .with_state(state);
+        let gateway_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local WebSocket gateway");
+        let gateway_addr = gateway_listener.local_addr().expect("gateway address");
+        let gateway_server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(gateway_listener, gateway_app)
+                .await
+                .expect("local WebSocket gateway serves");
+        });
+
+        let (mut client, _) = connect_async(format!("ws://{gateway_addr}/ws/chat?agent=web"))
+            .await
+            .expect("WebSocket upgrade");
+        let first = client
+            .next()
+            .await
+            .expect("session_start frame")
+            .expect("session_start");
+        assert!(
+            first
+                .into_text()
+                .expect("text session_start")
+                .contains("session_start")
+        );
+        client
+            .send(ClientMessage::Text(r#"{"type":"connect"}"#.into()))
+            .await
+            .expect("connect frame");
+        let _ = client
+            .next()
+            .await
+            .expect("connected frame")
+            .expect("connected");
+        client
+            .send(ClientMessage::Text(
+                r#"{"type":"message","content":"test"}"#.into(),
+            ))
+            .await
+            .expect("chat message");
+
+        // Read until the turn terminates, then keep reading: `agent_start` is
+        // published on the shared event bus, and this socket's broadcast
+        // receiver is not polled while `process_chat_message` owns the loop, so
+        // it is delivered once the turn has handed control back.
+        let mut frames: Vec<serde_json::Value> = Vec::new();
+        loop {
+            let frame = tokio::time::timeout(Duration::from_secs(10), client.next())
+                .await
+                .expect("gateway response deadline")
+                .expect("gateway stays connected")
+                .expect("gateway frame");
+            let json: serde_json::Value =
+                serde_json::from_str(&frame.into_text().expect("text gateway frame"))
+                    .expect("JSON gateway frame");
+            let terminal = json["type"] == "done" || json["type"] == "error";
+            frames.push(json);
+            if terminal {
+                break;
+            }
+        }
+        let mut agent_start = None;
+        for _ in 0..4 {
+            let Ok(Some(Ok(frame))) =
+                tokio::time::timeout(Duration::from_secs(2), client.next()).await
+            else {
+                break;
+            };
+            let json: serde_json::Value =
+                serde_json::from_str(&frame.into_text().expect("text gateway frame"))
+                    .expect("JSON gateway frame");
+            if json["type"] == "agent_start" {
+                agent_start = Some(json);
+                break;
+            }
+        }
+
+        let kinds: Vec<&str> = frames.iter().filter_map(|f| f["type"].as_str()).collect();
+        let done = frames
+            .iter()
+            .find(|f| f["type"] == "done")
+            .unwrap_or_else(|| panic!("turn must complete, got frames {kinds:?}"));
+        let usage = frames
+            .iter()
+            .find(|f| f["type"] == "usage")
+            .unwrap_or_else(|| panic!("usage frame must be forwarded, got frames {kinds:?}"));
+
+        // The per-step frame is the client's only step boundary and its only
+        // source of the cache-hit rate. Anthropic reports `input_tokens`
+        // *excluding* cache reads, so the provider normalizes the prompt to
+        // `uncached + cache_read + cache_create` — which is why 314 + 42 = 356
+        // here, and why the client must never add `cached_input_tokens` again.
+        assert_eq!(usage["input_tokens"], 356);
+        assert_eq!(usage["output_tokens"], 27);
+        assert_eq!(usage["cached_input_tokens"], 42);
+        assert!(
+            !frames.iter().any(|f| f["type"] == "chunk_reset"),
+            "chunk_reset is a dead frame and must stay dead"
+        );
+
+        // `done` reconciles the turn for a client that missed earlier frames.
+        assert_eq!(done["input_tokens"], 356);
+        assert_eq!(done["output_tokens"], 27);
+        assert_eq!(done["steps"], 1, "one LLM call, one step");
+        assert_eq!(done["cached_input_tokens"], 42);
+
+        // And the turn boundary reaches the chat socket, session-scoped.
+        let start = agent_start.unwrap_or_else(|| {
+            panic!("agent_start must reach the chat socket, got frames {kinds:?}")
+        });
+        assert_eq!(start["type"], "agent_start");
+        assert!(
+            start["session_id"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty()),
+            "the turn boundary must be session-scoped or the socket filters it out"
+        );
+
+        gateway_server.abort();
+        mock_server.abort();
+    }
+
+    #[tokio::test]
+    async fn cancel_plus_grace_force_tears_down_hung_join() {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let cancel_for_select = cancel.clone();
+        let grace = std::time::Duration::from_millis(40);
+        let started = std::time::Instant::now();
+
+        let join_handle = zeroclaw_spawn::spawn!(async move {
+            let turn = futures_util::future::pending::<()>();
+            let forward = futures_util::future::pending::<()>();
+            tokio::select! {
+                biased;
+                _ = async { tokio::join!(turn, forward) } => unreachable!("hung join must not complete"),
+                _ = async {
+                    cancel_for_select.cancelled().await;
+                    tokio::time::sleep(grace).await;
+                } => {}
+            }
+        });
+
+        cancel.cancel();
+        tokio::time::timeout(std::time::Duration::from_millis(500), join_handle)
+            .await
+            .expect("force teardown must finish within grace")
+            .expect("join task must not panic");
+        assert!(
+            started.elapsed() >= grace,
+            "force path must wait for turn_cancel_after grace"
+        );
+    }
+
+    #[tokio::test]
+    async fn websocket_turn_forwards_usage_and_agent_start_frames() {
+        // Production-shaped fixture: isolate on its own thread with a larger
+        // stack, same as the empty-terminal regression above.
+        std::thread::Builder::new()
+            .name("ws-usage-frame-regression".to_string())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("test runtime")
+                    .block_on(websocket_turn_forwards_usage_and_agent_start_frames_inner());
+            })
+            .expect("spawn WebSocket regression thread")
+            .join()
+            .expect("WebSocket regression thread must not panic");
+    }
+
+    #[test]
+    fn usage_fold_does_not_bill_estimated_input_tokens() {
+        let mut fold = UsageFold::default();
+        let frame = fold
+            .apply(zeroclaw_api::agent::TurnEvent::Usage {
+                input_tokens: None,
+                cached_input_tokens: None,
+                output_tokens: None,
+                cost_usd: None,
+                context_token_budget: None,
+                model_context_window: None,
+                effective_context_window: None,
+                provider_ref: "llamacpp.default".into(),
+                model: "local-model".into(),
+                accepted: true,
+                estimated_input_tokens: Some(4_200),
+            })
+            .expect("a usage event yields a frame");
+        assert!(
+            frame["input_tokens"].is_null(),
+            "the usage frame must not present the estimate as measured input"
+        );
+        assert!(
+            frame.get("estimated_input_tokens").is_none(),
+            "billing frames do not carry the display estimate"
+        );
+        assert_eq!(fold.total_input_tokens, None);
+        assert_eq!(fold.last_input_tokens, None);
+        let entries = fold.take_sorted_entries();
+        assert_eq!(entries[0].input_tokens, 0);
+        assert_eq!(UsageFold::total_cost_usd(&entries), None);
+    }
+
 }

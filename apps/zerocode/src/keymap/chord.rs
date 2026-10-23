@@ -617,4 +617,10 @@ mod tests {
         let back: Chord = serde_json::from_str(&json).unwrap();
         assert_eq!(c, back);
     }
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn display_ctrl_on_non_darwin() {
+        assert_eq!(Chord::ctrl('k').display(), "Ctrl+k");
+    }
+
 }

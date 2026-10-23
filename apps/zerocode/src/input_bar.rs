@@ -4812,4 +4812,25 @@ mod tests {
         let visible = content_rows.min(MAX_INPUT_ROWS);
         assert_eq!(visible + 2, 7); // 5 content rows + 2 borders
     }
+    #[test]
+    fn derived_slash_command_set_matches_expected_twelve_entries() {
+        let expected: Vec<&str> = vec![
+            "/attach",
+            "/attachments",
+            "/browse",
+            "/clear-queue",
+            "/detach",
+            "/help",
+            "/model",
+            "/model-provider",
+            "/new",
+            "/new-session",
+            "/restart-session",
+            "/toggle-thinking",
+        ];
+        let registry = command_registry();
+        let derived: Vec<&str> = registry.command_names().collect();
+        assert_eq!(derived, expected);
+    }
+
 }

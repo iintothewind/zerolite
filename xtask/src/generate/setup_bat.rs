@@ -409,4 +409,21 @@ mod tests {
         assert!(once.contains("generated:post-install"));
         assert_eq!(once, twice, "render must be idempotent");
     }
+
+    #[test]
+    fn dist_preset_ships_lean_release_channels() {
+        let presets = render_presets(&root()).unwrap();
+        let (_, dist_and_rest) = presets.split_once(":build_dist").unwrap();
+        let (dist, _) = dist_and_rest.split_once("goto :do_build").unwrap();
+        for feature in spec::resolve_feature_list(&root(), &Selection::Dist).unwrap() {
+            assert!(
+                dist.contains(&feature),
+                "dist feature {feature} not rendered"
+            );
+        }
+        for feature in spec::features_outside_dist(&root()).unwrap() {
+            assert!(!dist.contains(&feature), "{feature} leaked into lean dist");
+        }
+    }
+
 }

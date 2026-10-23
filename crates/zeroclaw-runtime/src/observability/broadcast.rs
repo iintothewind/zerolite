@@ -54,6 +54,23 @@ impl EventBuffer {
         };
         buf.iter().cloned().collect()
     }
+
+    /// Run `f` while holding the buffer's write lock.
+    ///
+    /// `push` and `snapshot` both recover from a poisoned lock
+    /// (`Err(poisoned) => poisoned.into_inner()`), and that recovery is only
+    /// observable by panicking *inside* the critical section. The field is
+    /// deliberately private, so callers in other crates get this seam instead
+    /// of the queue itself — the lock is still taken and released here, and the
+    /// caller only gets a borrow of the queue for the duration of `f`.
+    #[doc(hidden)]
+    pub fn with_locked_queue<R>(
+        &self,
+        f: impl FnOnce(&mut VecDeque<serde_json::Value>) -> R,
+    ) -> R {
+        let mut guard = self.inner.lock().expect("fresh buffer must lock");
+        f(&mut guard)
+    }
 }
 
 pub struct BroadcastObserver {

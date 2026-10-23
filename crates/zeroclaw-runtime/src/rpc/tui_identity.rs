@@ -698,4 +698,55 @@ mod tests {
         );
         assert!(!live.contains_key("SENTINEL_SOCK"));
     }
+    #[test]
+    fn get_env_returns_none_after_unregister() {
+        let registry = TuiRegistry::new_unsigned();
+        let mut env = HashMap::new();
+        env.insert("SOME_VAR".to_string(), "val".to_string());
+        let epoch = registry.register(TuiEntry {
+            tui_id: "tui_gone0001".to_string(),
+            connected_at: Utc::now(),
+            peer_label: "test".to_string(),
+            transport: "unix".to_string(),
+            env,
+        });
+        assert!(registry.env_for_registration("tui_gone0001", epoch).is_some());
+        registry.unregister("tui_gone0001", epoch);
+        assert!(registry.env_for_registration("tui_gone0001", epoch).is_none());
+    }
+
+    #[test]
+    fn get_env_returns_none_for_unknown_tui() {
+        let registry = TuiRegistry::new_unsigned();
+        assert!(registry.env_for_registration("tui_nothere", 0).is_none());
+    }
+
+    #[test]
+    fn get_env_returns_env_for_connected_tui() {
+        let registry = TuiRegistry::new_unsigned();
+        let mut env = HashMap::new();
+        env.insert("PATH".to_string(), "/usr/bin:/usr/local/bin".to_string());
+        env.insert("SSH_AUTH_SOCK".to_string(), "/tmp/ssh.sock".to_string());
+
+        let epoch = registry.register(TuiEntry {
+            tui_id: "tui_getenv01".to_string(),
+            connected_at: Utc::now(),
+            peer_label: "test".to_string(),
+            transport: "unix".to_string(),
+            env,
+        });
+
+        let got = registry
+            .env_for_registration("tui_getenv01", epoch)
+            .expect("should find env");
+        assert_eq!(
+            got.get("PATH").map(|s| s.as_str()),
+            Some("/usr/bin:/usr/local/bin")
+        );
+        assert_eq!(
+            got.get("SSH_AUTH_SOCK").map(|s| s.as_str()),
+            Some("/tmp/ssh.sock")
+        );
+    }
+
 }

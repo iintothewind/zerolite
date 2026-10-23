@@ -3036,6 +3036,52 @@ fn needs_quickstart_channel_reply() -> String {
     i18n::get_required_cli_string("channel-needs-quickstart-reply")
 }
 
+/// Abort/disconnect grace before force-dropping a stuck chat turn.
+/// `turn_cancel_after = 0` falls back to the typed default (5) with a warning.
+pub fn gateway_turn_cancel_after(cfg: &zeroclaw_config::schema::GatewayConfig) -> u64 {
+    if cfg.turn_cancel_after == 0 {
+        let fallback = cfg.effective_turn_cancel_after();
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "path": "gateway.turn_cancel_after",
+                    "configured": 0,
+                    "using": fallback,
+                })
+            ),
+            "gateway.turn_cancel_after <= 0; using default"
+        );
+        fallback
+    } else {
+        cfg.turn_cancel_after
+    }
+}
+
+
+/// Application-level SSE idle for OpenAI-compatible streams.
+/// `sse_app_idle_secs = 0` falls back to the typed default (60) with a warning.
+pub fn gateway_sse_app_idle_secs(cfg: &zeroclaw_config::schema::GatewayConfig) -> u64 {
+    if cfg.sse_app_idle_secs == 0 {
+        let fallback = cfg.effective_sse_app_idle_secs();
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "path": "gateway.sse_app_idle_secs",
+                    "configured": 0,
+                    "using": fallback,
+                })
+            ),
+            "gateway.sse_app_idle_secs <= 0; using default"
+        );
+        fallback
+    } else {
+        cfg.sse_app_idle_secs
+    }
+}
+
+
 #[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct GatewayChatDispatchCapture {
@@ -13694,6 +13740,38 @@ data: [DONE]\n\n";
         assert!(token.starts_with("zc_"));
         assert!(state.pairing.is_authenticated(token));
     }
+    #[test]
+    fn gateway_turn_cancel_and_sse_idle_toml_roundtrip() {
+        let parsed: zeroclaw_config::schema::GatewayConfig = toml::from_str(
+            r#"
+turn_cancel_after = 7
+sse_app_idle_secs = 45
+"#,
+        )
+        .expect("gateway knobs should deserialize");
+        assert_eq!(parsed.turn_cancel_after, 7);
+        assert_eq!(parsed.sse_app_idle_secs, 45);
+        assert_eq!(gateway_turn_cancel_after(&parsed), 7);
+        assert_eq!(gateway_sse_app_idle_secs(&parsed), 45);
+    }
+
+    #[test]
+    fn gateway_turn_cancel_and_sse_idle_defaults_and_zero_fallback() {
+        let cfg = zeroclaw_config::schema::GatewayConfig::default();
+        assert_eq!(cfg.turn_cancel_after, 5);
+        assert_eq!(cfg.sse_app_idle_secs, 60);
+        assert_eq!(gateway_turn_cancel_after(&cfg), 5);
+        assert_eq!(gateway_sse_app_idle_secs(&cfg), 60);
+
+        let mut zeroed = cfg.clone();
+        zeroed.turn_cancel_after = 0;
+        zeroed.sse_app_idle_secs = 0;
+        assert_eq!(zeroed.effective_turn_cancel_after(), 5);
+        assert_eq!(zeroed.effective_sse_app_idle_secs(), 60);
+        assert_eq!(gateway_turn_cancel_after(&zeroed), 5);
+        assert_eq!(gateway_sse_app_idle_secs(&zeroed), 60);
+    }
+
 }
 
 #[cfg(test)]

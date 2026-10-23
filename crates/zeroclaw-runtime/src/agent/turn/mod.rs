@@ -4864,6 +4864,63 @@ mod surface3_tests {
         refresh_prompt_anchor(&mut history, false);
         // Just verifying no panic.
     }
+    #[tokio::test]
+    async fn scoped_protocol_switch_caps_the_request_and_keeps_history() {
+        let preamble = "p".repeat(300);
+        let tools = format!("## Tools\n{}\n", "t".repeat(200));
+        let safety = "## Safety\nkeep the safety section";
+        let text = format!("{preamble}\n\n{tools}\n{safety}");
+        let native = format!("{preamble}\n\n{tools}\n{safety}");
+        let cap = 120usize;
+        let prompts = Arc::new(ToolProtocolPrompts::with_max_chars(
+            native,
+            text.clone(),
+            cap,
+        ));
+        let mut history = vec![ChatMessage::system(text.clone())];
+        let mut request = vec![ChatMessage::system(format!("{text}\nHOOK"))];
+
+        scope_tool_protocol_prompts(prompts, async {
+            refresh_scoped_tool_protocol_prompt(&mut history, &mut request, true);
+        })
+        .await;
+
+        assert!(
+            history[0].content.chars().count() > cap,
+            "history keeps the swapped prompt past the provider cap"
+        );
+        assert!(
+            history[0].content.contains("## Safety"),
+            "native history drops the tool section and keeps what follows"
+        );
+        assert!(
+            !history[0].content.contains("## Tools\n"),
+            "native history must not keep the text tool listing"
+        );
+        assert!(
+            request[0].content.chars().count() > cap,
+            "hook text is re-appended after the capped base"
+        );
+        assert!(
+            request[0].content.ends_with("\nHOOK"),
+            "hook suffix must survive the cap; got: {}",
+            request[0].content
+        );
+        let base_len = request[0]
+            .content
+            .trim_end_matches("\nHOOK")
+            .chars()
+            .count();
+        assert!(
+            base_len <= cap,
+            "provider base must respect max_system_prompt_chars, got {base_len}"
+        );
+        assert!(
+            !request[0].content.contains("timestamp"),
+            "the cap must not inject a clock envelope"
+        );
+    }
+
 }
 
 #[cfg(test)]
@@ -5433,7 +5490,6 @@ mod reported_budget_tests {
             history.len()
         );
     }
-
 }
 
 #[cfg(test)]

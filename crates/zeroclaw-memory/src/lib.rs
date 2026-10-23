@@ -3078,4 +3078,25 @@ url = "http://localhost:6333"
             "a handle must see its own writes even with the cache on"
         );
     }
+    #[test]
+    fn builder_only_factory_rejects_qdrant_instead_of_markdown_fallback() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.memory.backend = "qdrant".into();
+        config.data_dir = tmp.path().to_path_buf();
+        let error = create_memory_for_migration(&config)
+            .err()
+            .expect("backend=qdrant must be rejected by the builder-only factory");
+        let message = error.to_string();
+        assert!(
+            message.contains("qdrant") && message.contains("storage.qdrant"),
+            "error should name the backend it refused and the table that would \
+             configure it: {message}"
+        );
+        assert!(
+            !message.contains("markdown"),
+            "a builder-only factory must not fall back to markdown: {message}"
+        );
+    }
+
 }

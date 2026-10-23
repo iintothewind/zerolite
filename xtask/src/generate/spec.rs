@@ -2102,4 +2102,23 @@ mod tests {
         let unix = web_data_dir_expr(Platform::Unix);
         assert!(unix.contains("XDG_DATA_HOME") && unix.ends_with("zeroclaw/web/dist"));
     }
+    #[test]
+    fn dist_matches_lean_release_contract() {
+        let features = resolve_feature_list(&root(), &Selection::Dist).unwrap();
+        assert!(features.contains(&"channel-git".to_string()));
+        let mut expected = resolve_feature_list(&root(), &Selection::Full).unwrap();
+        expected.extend(
+            [
+                "channel-matrix",
+                "channel-lark",
+                "channel-git",
+                "whatsapp-web",
+            ]
+            .map(str::to_owned),
+        );
+        expected.sort();
+        expected.dedup();
+        assert_eq!(features, expected);
+    }
+
 }

@@ -10540,6 +10540,53 @@ mod tests {
             );
         }
 
+        #[test]
+        fn build_system_prompt_respects_max_system_prompt_chars() {
+            let workspace = tempfile::TempDir::new().expect("temp dir");
+            let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+                backend: "none".into(),
+                ..zeroclaw_config::schema::MemoryConfig::default()
+            };
+            let mem: Arc<dyn Memory> = Arc::from(
+                zeroclaw_memory::create_memory(&memory_cfg, workspace.path(), None)
+                    .expect("memory creation should succeed"),
+            );
+            let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+            let mut agent = Agent::builder()
+                .model_provider(Box::new(MockModelProvider {
+                    responses: Mutex::new(vec![]),
+                }))
+                .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    vec![Box::new(MockTool)],
+                ))
+                .memory(mem)
+                .observer(observer)
+                .tool_dispatcher(Box::new(NativeToolDispatcher))
+                .workspace_dir(workspace.path().to_path_buf())
+                .build()
+                .expect("agent builder should succeed");
+
+            let uncapped = agent
+                .build_system_prompt_with_dispatcher(&NativeToolDispatcher as &dyn ToolDispatcher)
+                .unwrap();
+            assert!(
+                uncapped.chars().count() > 80,
+                "fixture prompt should exceed the test cap"
+            );
+            assert_eq!(agent.config.resolved.max_system_prompt_chars, 0);
+
+            agent.config.resolved.max_system_prompt_chars = 80;
+            let capped = agent
+                .build_system_prompt_with_dispatcher(&NativeToolDispatcher as &dyn ToolDispatcher)
+                .unwrap();
+            assert_eq!(capped.chars().count(), 80);
+            assert!(uncapped.starts_with(&capped));
+            assert!(
+                !capped.contains("timestamp metadata added by the runtime"),
+                "the char cap must not add wall-clock orientation"
+            );
+        }
+
     }
 
     #[tokio::test]
@@ -20803,4 +20850,5 @@ mod approval_route_tests {
         );
         assert!(out.decided_by.is_none());
     }
+
 }

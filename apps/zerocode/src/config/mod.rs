@@ -2868,4 +2868,70 @@ mod tests {
             "the env-injected width must not be written to disk"
         );
     }
+    #[test]
+    fn resolve_todo_tracker_checked_rejects_zero_max_height_from_env() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _v = EnvVarGuard::set("ZEROCODE_todotracker__max_height", "0");
+
+        assert!(
+            resolve_todo_tracker_checked(dir.path()).is_err(),
+            "ZEROCODE_todotracker__max_height=0 must fail visibly, not normalize to 1"
+        );
+    }
+
+    #[test]
+    fn resolve_todo_tracker_checked_rejects_zero_width_from_env() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        // File is valid; only the canonical env override carries the zero, so
+        // this pins that validation happens *after* overrides are applied.
+        std::fs::write(
+            config_path(dir.path()),
+            "[todotracker]\nwidth = 32\nmax_height = 5\n",
+        )
+        .unwrap();
+        let _v = EnvVarGuard::set("ZEROCODE_todotracker__width", "0");
+
+        assert!(
+            resolve_todo_tracker_checked(dir.path()).is_err(),
+            "ZEROCODE_todotracker__width=0 must fail visibly, not normalize to 1"
+        );
+    }
+
+    #[test]
+    fn resolve_todo_tracker_checked_rejects_zero_max_height_from_file() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            config_path(dir.path()),
+            "[todotracker]\nwidth = 32\nmax_height = 0\n",
+        )
+        .unwrap();
+
+        assert!(
+            resolve_todo_tracker_checked(dir.path()).is_err(),
+            "an explicit max_height = 0 in the file must fail, not normalize to 1"
+        );
+    }
+
+    #[test]
+    fn resolve_todo_tracker_checked_rejects_zero_width_from_file() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            config_path(dir.path()),
+            "[todotracker]\nwidth = 0\nmax_height = 5\n",
+        )
+        .unwrap();
+
+        let err = resolve_todo_tracker_checked(dir.path())
+            .expect_err("an explicit width = 0 in the file must fail, not normalize to 1");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("todotracker"),
+            "error must name the offending section, got: {msg}"
+        );
+    }
+
 }

@@ -121,4 +121,17 @@ mod tests {
         let out = splice(&cur, "z1", "NEW").unwrap();
         assert!(out.contains("NEW") && !out.contains("OLD"));
     }
+    #[test]
+    fn dist_renders_lean_release_channels() {
+        let b = render_features(&root(), &Selection::Dist, "        ").unwrap();
+        for feature in
+            crate::generate::spec::resolve_feature_list(&root(), &Selection::Dist).unwrap()
+        {
+            assert!(b.contains(&feature), "dist feature {feature} not rendered");
+        }
+        for feature in crate::generate::spec::features_outside_dist(&root()).unwrap() {
+            assert!(!b.contains(&feature), "{feature} leaked into lean dist");
+        }
+    }
+
 }

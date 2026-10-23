@@ -7961,6 +7961,14 @@ pub struct GatewayConfig {
     /// existing connections.
     #[serde(default = "default_gateway_websocket_ping_interval_secs")]
     pub websocket_ping_interval_secs: u64,
+    /// Abort/disconnect grace before force-tearing down a stuck chat turn,
+    /// in seconds. `0` falls back to the typed default (5).
+    #[serde(default = "default_gateway_turn_cancel_after")]
+    pub turn_cancel_after: u64,
+    /// Application-level SSE idle timeout for OpenAI-compatible streams, in
+    /// seconds. `0` falls back to the typed default (60).
+    #[serde(default = "default_gateway_sse_app_idle_secs")]
+    pub sse_app_idle_secs: u64,
 
     /// Pairing-code generation policy (`[gateway.pairing_code]`). The one
     /// source of truth for the length and character family of every code
@@ -8028,6 +8036,14 @@ fn default_gateway_websocket_ping_interval_secs() -> u64 {
     30
 }
 
+fn default_gateway_turn_cancel_after() -> u64 {
+    5
+}
+
+fn default_gateway_sse_app_idle_secs() -> u64 {
+    60
+}
+
 fn default_gateway_host() -> String {
     "127.0.0.1".into()
 }
@@ -8089,6 +8105,8 @@ impl Default for GatewayConfig {
             session_persistence: true,
             session_ttl_hours: 0,
             websocket_ping_interval_secs: default_gateway_websocket_ping_interval_secs(),
+            turn_cancel_after: default_gateway_turn_cancel_after(),
+            sse_app_idle_secs: default_gateway_sse_app_idle_secs(),
             pairing_code: PairingCodePolicy::default(),
             pairing_dashboard: PairingDashboardConfig::default(),
             web_dist_dir: None,
@@ -8097,6 +8115,27 @@ impl Default for GatewayConfig {
             long_running_request_timeout_secs: default_gateway_long_running_request_timeout_secs(),
             check_updates: true,
             allow_self_upgrade: false,
+        }
+    }
+}
+
+impl GatewayConfig {
+    /// Abort/disconnect grace before force-teardown. `0` falls back to the
+    /// typed default (5) so a zeroed config still bounds a stuck turn.
+    pub fn effective_turn_cancel_after(&self) -> u64 {
+        if self.turn_cancel_after == 0 {
+            default_gateway_turn_cancel_after()
+        } else {
+            self.turn_cancel_after
+        }
+    }
+
+    /// SSE application idle seconds. `0` falls back to the typed default (60).
+    pub fn effective_sse_app_idle_secs(&self) -> u64 {
+        if self.sse_app_idle_secs == 0 {
+            default_gateway_sse_app_idle_secs()
+        } else {
+            self.sse_app_idle_secs
         }
     }
 }
@@ -28254,6 +28293,21 @@ impl HasPropKind for serde_json::Value {
 mod tests {
 
     #[::core::prelude::v1::test]
+    fn gateway_turn_cancel_and_sse_idle_zero_fall_back_to_defaults() {
+        let mut g = super::GatewayConfig::default();
+        assert_eq!(g.effective_turn_cancel_after(), 5);
+        assert_eq!(g.effective_sse_app_idle_secs(), 60);
+        g.turn_cancel_after = 0;
+        g.sse_app_idle_secs = 0;
+        assert_eq!(g.effective_turn_cancel_after(), 5);
+        assert_eq!(g.effective_sse_app_idle_secs(), 60);
+        g.turn_cancel_after = 9;
+        g.sse_app_idle_secs = 12;
+        assert_eq!(g.effective_turn_cancel_after(), 9);
+        assert_eq!(g.effective_sse_app_idle_secs(), 12);
+    }
+
+    #[::core::prelude::v1::test]
     fn config_application_semantic_changed_paths_detects_unmasked_credentials() {
         let mut previous = Config::default();
         previous.providers.models.openai.insert(
@@ -36567,6 +36621,8 @@ allowed_numbers = ["+1", "+2"]
             session_persistence: true,
             session_ttl_hours: 0,
             websocket_ping_interval_secs: 30,
+            turn_cancel_after: 5,
+            sse_app_idle_secs: 60,
             pairing_code: PairingCodePolicy::default(),
             pairing_dashboard: PairingDashboardConfig::default(),
             web_dist_dir: None,

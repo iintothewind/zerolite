@@ -5673,4 +5673,93 @@ mod tests {
             "the canonical English boundary diagnostic must remain distinct from the not-in-repository message"
         );
     }
+    #[tokio::test]
+    async fn git_worktree_list_works() {
+        let tmp = TempDir::new().unwrap();
+        git_init_no_sign(tmp.path(), &[]);
+
+        let tool = test_tool(tmp.path());
+
+        let result = tool
+            .execute(json!({"operation": "worktree", "subcommand": "list"}))
+            .await
+            .unwrap();
+        assert!(result.success, "Expected success, got: {:?}", result.error);
+
+        let parsed: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        let worktrees = parsed["worktrees"]
+            .as_array()
+            .expect("worktrees must be an array");
+        assert!(
+            !worktrees.is_empty(),
+            "Expected at least the main worktree in the list"
+        );
+        assert!(
+            worktrees[0]["path"].as_str().is_some_and(|p| !p.is_empty()),
+            "Main worktree must have a non-empty path"
+        );
+    }
+
+    #[test]
+    fn branch_is_not_write_gated() {
+        let tmp = TempDir::new().unwrap();
+        let tool = test_tool(tmp.path());
+
+        // Branch listing is read-only; it must not require write access
+        let no_args = serde_json::json!({});
+        assert!(!tool.requires_write_access("branch", &no_args));
+        assert!(!tool.requires_write_access("branch", &no_args));
+    }
+    #[test]
+    fn worktree_remove_target_must_stay_inside_workspace() {
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        std::fs::create_dir(workspace.path().join("old-worktree")).unwrap();
+        std::fs::create_dir(outside.path().join("old-worktree")).unwrap();
+        let tool = test_tool(workspace.path());
+
+        assert!(
+            tool.ensure_worktree_remove_target_allowed("old-worktree")
+                .is_ok()
+        );
+        assert!(
+            tool.ensure_worktree_remove_target_allowed(
+                outside.path().join("old-worktree").to_str().unwrap()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn worktree_add_target_allows_configured_allowed_root() {
+        let workspace = TempDir::new().unwrap();
+        let allowed = TempDir::new().unwrap();
+        let tool = test_tool_with_allowed_root(workspace.path(), allowed.path().to_path_buf());
+
+        assert!(
+            tool.ensure_worktree_add_target_allowed(
+                allowed.path().join("new-worktree").to_str().unwrap()
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn worktree_add_target_must_stay_inside_workspace_or_allowed_root() {
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let tool = test_tool(workspace.path());
+
+        assert!(
+            tool.ensure_worktree_add_target_allowed("new-worktree")
+                .is_ok()
+        );
+        assert!(
+            tool.ensure_worktree_add_target_allowed(
+                outside.path().join("new-worktree").to_str().unwrap()
+            )
+            .is_err()
+        );
+    }
+
 }

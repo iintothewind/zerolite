@@ -1114,4 +1114,18 @@ mod tests {
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::remove_var("ZC_IMAGE_GEN_TEST_KEY") };
     }
+    #[test]
+    fn image_output_emits_matching_file_line_and_image_marker() {
+        let path = "/ws/images/generated_image_42.png";
+        let out = format_image_tool_output(path, 12, "fal-ai/flux", "a cat");
+        assert!(
+            out.contains(&format!("File: {path}")),
+            "output must carry a durable File: line: {out}"
+        );
+        assert!(
+            out.contains(&format!("[IMAGE:{path}]")),
+            "output must carry a matching [IMAGE:<path>] marker: {out}"
+        );
+    }
+
 }

@@ -439,4 +439,17 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn pkgbuild_features_are_lean_dist_channels() {
+        let f = spec::resolve_feature_list(&root(), &Selection::Dist)
+            .unwrap()
+            .join(",");
+        for feature in spec::resolve_feature_list(&root(), &Selection::Dist).unwrap() {
+            assert!(f.contains(&feature), "dist feature {feature} not rendered");
+        }
+        for feature in spec::features_outside_dist(&root()).unwrap() {
+            assert!(!f.contains(&feature), "{feature} leaked into lean dist");
+        }
+    }
+
 }

@@ -229,4 +229,35 @@ mod tests {
         }
         assert!(all["features"].as_str().unwrap().contains("hardware"));
     }
+    #[test]
+    fn dist_tag_is_lean_while_all_tag_is_kitchen_sink() {
+        let s = render(&root()).unwrap();
+        let v: toml::Value = toml::from_str(&s).unwrap();
+        let tags = v["tags"].as_array().unwrap();
+        let dist = tags
+            .iter()
+            .find(|t| t["stem"].as_str() == Some("dist"))
+            .unwrap();
+        let all = tags
+            .iter()
+            .find(|t| t["stem"].as_str() == Some("all-features"))
+            .unwrap();
+        let dist_features = dist["features"].as_str().unwrap();
+        for feature in
+            crate::generate::spec::resolve_feature_list(&root(), &Selection::Dist).unwrap()
+        {
+            assert!(
+                dist_features.contains(&feature),
+                "dist feature {feature} not rendered"
+            );
+        }
+        for feature in crate::generate::spec::features_outside_dist(&root()).unwrap() {
+            assert!(
+                !dist_features.contains(&feature),
+                "{feature} leaked into lean dist"
+            );
+        }
+        assert!(all["features"].as_str().unwrap().contains("hardware"));
+    }
+
 }

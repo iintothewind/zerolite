@@ -1324,4 +1324,24 @@ mod tests {
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert_eq!(stdout.trim(), "quoted safe value");
     }
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn native_default_and_with_shell_are_different() {
+        let default = NativeRuntime::new();
+        let configured = NativeRuntime::with_shell("bash".into());
+        let cwd = std::env::temp_dir();
+        let default_debug = format!(
+            "{:?}",
+            default.build_shell_command("echo hi", &cwd).unwrap()
+        );
+        let configured_debug = format!(
+            "{:?}",
+            configured.build_shell_command("echo hi", &cwd).unwrap()
+        );
+        assert_ne!(
+            default_debug, configured_debug,
+            "default shell and configured shell should produce different commands"
+        );
+    }
+
 }

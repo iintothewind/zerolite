@@ -3675,4 +3675,33 @@ mod tests {
         let info: BotInfo = serde_json::from_value(json).unwrap();
         assert!(info.picture_url.is_none());
     }
+    #[tokio::test]
+    async fn webhook_group_open_forwards_any_message() {
+        let ch = LineChannel::new(
+            "tok".into(),
+            "mysecret".into(),
+            LineDmPolicy::Open,
+            LineGroupPolicy::Open,
+            "line_test_alias",
+            empty_resolver(),
+            0,
+        );
+        let (port, mut rx, abort) = spawn_webhook(ch, "Ubot").await;
+
+        post_signed(
+            port,
+            "mysecret",
+            &group_event("Uuser", "Ggroup1", "anyone home?", "rt1"),
+        )
+        .await;
+
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(msg.content, "anyone home?");
+        assert_eq!(msg.reply_target, "Ggroup1");
+        abort.abort();
+    }
+
 }

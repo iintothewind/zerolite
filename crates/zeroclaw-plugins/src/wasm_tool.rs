@@ -319,4 +319,17 @@ mod tests {
 
         assert!(error.to_string().contains("invalid-before-execute"));
     }
+    #[test]
+    fn from_wasm_rejects_a_missing_component() {
+        let result = WasmTool::from_wasm(
+            PathBuf::from("/path/that/must/not/exist.wasm"),
+            tool_scope(),
+            crate::services::test_host_services(),
+            crate::component::test_limits(0),
+            None,
+        );
+
+        assert!(result.is_err());
+    }
+
 }

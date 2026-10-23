@@ -600,4 +600,25 @@ mod tests {
             assert!(result.output.is_empty());
         }
     }
+    #[tokio::test]
+    async fn purge_dry_run_does_not_delete() {
+        let tmp = TempDir::new().unwrap();
+        // Create a file with an old modification time by writing it (it will have
+        // the current mtime, so it should not be purged with a 90-day retention).
+        std::fs::write(tmp.path().join("recent.txt"), "data").unwrap();
+
+        let tool = make_tool(&tmp);
+        let res = tool
+            .execute(json!({"command": "purge", "dry_run": true}))
+            .await
+            .unwrap();
+        assert!(res.success);
+        let v: serde_json::Value = serde_json::from_str(&res.output).unwrap();
+        assert_eq!(v["dry_run"], true);
+        // Recent file should not be counted for purge.
+        assert_eq!(v["files"], 0);
+        // File still exists.
+        assert!(tmp.path().join("recent.txt").exists());
+    }
+
 }

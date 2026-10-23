@@ -1814,4 +1814,103 @@ mod tests {
             "must not claim Full unconditionally removes prompts"
         );
     }
+    #[test]
+    fn truncation_respects_small_unicode_budgets() {
+        let tools = [(
+            "shell",
+            "Run a shell command with enough description to overflow",
+        )];
+
+        for compact in [false, true] {
+            for budget in [1, 3, 16, 64, 128] {
+                let prompt = prompt_with_finite_budget(compact, budget, &tools);
+                assert!(
+                    prompt.chars().count() <= budget,
+                    "compact={compact}: prompt length {} exceeded budget {budget}",
+                    prompt.chars().count()
+                );
+                assert!(
+                    !prompt.contains("System prompt truncated"),
+                    "compact={compact}: must not emit truncation marker at budget {budget}: {prompt}"
+                );
+                assert!(
+                    !prompt.contains("timestamp metadata added by the runtime"),
+                    "compact={compact}: must not inject wall-clock orientation at budget {budget}: {prompt}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn truncation_hits_exact_unicode_budget_without_markers() {
+        // Finite `max_system_prompt_chars` is a supported production config;
+        // truncation must keep a UTF-8-safe head at the exact Unicode ceiling
+        // without truncation markers or wall-clock orientation.
+        let tools: [(&str, &str); 12] = [
+            (
+                "shell",
+                "Run a shell command with a long description to add bulk",
+            ),
+            (
+                "file_read",
+                "Read a file with a long description to add bulk",
+            ),
+            (
+                "file_write",
+                "Write a file with a long description to add bulk",
+            ),
+            (
+                "file_edit",
+                "Edit a file with a long description to add bulk",
+            ),
+            (
+                "http_request",
+                "Make an HTTP request with a long description to add bulk",
+            ),
+            (
+                "web_search",
+                "Search the web with a long description to add bulk",
+            ),
+            (
+                "web_fetch",
+                "Fetch a page with a long description to add bulk",
+            ),
+            ("calculator", "Do math with a long description to add bulk"),
+            ("weather", "Get weather with a long description to add bulk"),
+            (
+                "memory_store",
+                "Store memory with a long description to add bulk",
+            ),
+            (
+                "memory_recall",
+                "Recall memory with a long description to add bulk",
+            ),
+            (
+                "canvas",
+                "Render to a canvas with a long description to add bulk",
+            ),
+        ];
+
+        for compact in [false, true] {
+            let budget = 600;
+            let prompt = prompt_with_finite_budget(compact, budget, &tools);
+
+            // Hitting the exact ceiling proves truncation ran without adding
+            // model-visible implementation metadata.
+            assert!(
+                prompt.chars().count() == budget && !prompt.contains("System prompt truncated"),
+                "compact={compact}: expected truncation to fire at budget {budget}; prompt was:\n{prompt}"
+            );
+            assert!(
+                !prompt.contains("timestamp metadata added by the runtime"),
+                "compact={compact}: truncated prompt must not re-append timestamp orientation; prompt was:\n{prompt}"
+            );
+            assert!(
+                prompt.chars().count() <= budget,
+                "compact={compact}: prompt length {} exceeded budget {budget}",
+                prompt.chars().count()
+            );
+        }
+    }
+
 }
