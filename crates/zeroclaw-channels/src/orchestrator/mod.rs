@@ -2307,9 +2307,9 @@ fn build_channel_system_prompt_for_message_with_signal(
 /// `reply_target` / `sender` / delivery hint; this helper removes that
 /// regression.)
 ///
-/// Carries: channel/reply_target/sender/message_id, the wall-clock datetime,
-/// the `cron_add` delivery hint (with the webhook `delivery.thread_id`
-/// contract preserved), and (if set) the bot_mention handle.
+/// Carries: channel/reply_target/sender/message_id, the `cron_add` delivery
+/// hint (with the webhook `delivery.thread_id` contract preserved), and
+/// (if set) the bot_mention handle. Wall-clock time is not injected here.
 fn build_channel_turn_context_preamble(
     msg: &zeroclaw_api::channel::ChannelMessage,
     target_channel: Option<&Arc<dyn Channel>>,
@@ -2320,7 +2320,6 @@ fn build_channel_turn_context_preamble(
         return String::new();
     }
 
-    let now = chrono::Local::now();
     let channel_name = msg.channel.as_str();
     let reply_target = msg.reply_target.as_str();
     let sender = msg.sender.as_str();
@@ -2343,8 +2342,7 @@ fn build_channel_turn_context_preamble(
     };
 
     let mut preamble = format!(
-        "[turn-context] time={time} date={date} weekday={weekday} tz={tz} \
-         channel={channel} reply_target={reply_target} sender={sender} \
+        "[turn-context] channel={channel} reply_target={reply_target} sender={sender} \
          message_id={message_id}. The sender field is the platform-specific \
          user ID of the person who sent this message. Use it to distinguish \
          between different users. The message_id field identifies this \
@@ -2352,10 +2350,6 @@ fn build_channel_turn_context_preamble(
          the `reaction` tool. When scheduling delayed messages or reminders \
          via cron_add for this conversation, use {delivery_hint} so the \
          message reaches the user.\n\n",
-        time = now.format("%H:%M:%S"),
-        date = now.format("%Y-%m-%d"),
-        weekday = now.format("%A"),
-        tz = now.format("%Z"),
         channel = channel_name,
         reply_target = reply_target,
         sender = sender,
@@ -54836,9 +54830,12 @@ Done."#;
 
     #[test]
     fn build_channel_turn_context_preamble_carries_volatile_fields() {
-        // Every per-turn field the system prompt used to carry lives in the
-        // preamble now. Pin the comma-separated tuple so a refactor that
-        // splits or rewords it fails loudly.
+        // Every per-turn *routing* field the system prompt used to carry lives
+        // in the preamble now. Pin the comma-separated tuple so a refactor
+        // that splits or rewords it fails loudly. Wall-clock fields are
+        // deliberately excluded: a per-turn timestamp would invalidate the
+        // provider prompt cache on every turn, so the preamble carries none
+        // of them.
         let msg = zeroclaw_api::channel::ChannelMessage {
             channel: "telegram".into(),
             reply_target: "chat:42".into(),
@@ -54865,12 +54862,24 @@ Done."#;
             "preamble must carry sender (for disambiguation): {preamble}"
         );
         assert!(
-            preamble.contains("weekday="),
-            "preamble must carry the weekday (pins the fix/channels weekday field): {preamble}"
+            !preamble.contains("weekday="),
+            "preamble must not inject wall-clock weekday=: {preamble}"
         );
         assert!(
             preamble.contains("message_id=msg-xyz789"),
             "preamble must carry message_id (for the reaction tool): {preamble}"
+        );
+        assert!(
+            !preamble.contains("time="),
+            "preamble must not inject wall-clock time=: {preamble}"
+        );
+        assert!(
+            !preamble.contains("date="),
+            "preamble must not inject wall-clock date=: {preamble}"
+        );
+        assert!(
+            !preamble.contains("tz="),
+            "preamble must not inject wall-clock tz=: {preamble}"
         );
         assert!(
             preamble.contains("\"to\":\"chat:42\""),

@@ -4,7 +4,7 @@ use crate::security::AutonomyLevel;
 use crate::skills::Skill;
 use crate::tools::Tool;
 use anyhow::Result;
-use chrono::{Datelike, Local};
+
 use std::fmt::Write;
 use std::path::Path;
 use zeroclaw_config::schema::IdentityConfig;
@@ -186,14 +186,12 @@ pub struct SystemPromptBuilder {
 }
 
 impl SystemPromptBuilder {
-    /// Sections every long-lived agent session shares. `DateTimeSection` is
-    /// deliberately absent: it renders `Local::now()`, so the system block's
-    /// content (and with it every provider prompt-cache entry hashed behind
-    /// it) would change once a day per session. The per-turn
-    /// `[CURRENT DATE & TIME]` user-message prefix is the authoritative
-    /// clock, so the cached system prefix stays byte-stable. Builders for
-    /// paths without that prefix (e.g. the delegate sub-agent prompt) opt in
-    /// by adding the section explicitly.
+    /// Sections every long-lived agent session shares. There is no datetime
+    /// section: any wall-clock rendering re-reads the clock on every render,
+    /// so the system block's content (and with it every provider prompt-cache
+    /// entry hashed behind it) would change once a day per session. A caller
+    /// who needs the time has the agent run `date`; see the locked decision
+    /// "No runtime wall-clock injection" in `docs/design/context-management.md`.
     pub fn with_defaults() -> Self {
         Self {
             sections: vec![
@@ -250,12 +248,6 @@ pub struct SkillsSection;
 pub struct WorkspaceSection;
 pub struct RuntimeSection;
 pub struct ShellSection;
-/// Renders the current local date. Opt-in only: it re-reads the clock on
-/// every render, so including it in a cached system prompt invalidates the
-/// prompt-cache prefix for every session once a day. Long-lived sessions get
-/// the date from the per-turn user-message prefix instead; see
-/// `SystemPromptBuilder::with_defaults`.
-pub struct DateTimeSection;
 pub struct ChannelMediaSection;
 
 impl PromptSection for InteractionSection {
@@ -551,27 +543,6 @@ impl PromptSection for ShellSection {
             .as_ref()
             .map(zeroclaw_api::runtime_traits::ShellProfile::prompt_section)
             .unwrap_or_default())
-    }
-}
-
-impl PromptSection for DateTimeSection {
-    fn name(&self) -> &str {
-        "datetime"
-    }
-
-    fn build(&self, _ctx: &PromptContext<'_>) -> Result<String> {
-        let now = Local::now();
-        // Force Gregorian year to avoid confusion with local calendars (e.g. Buddhist calendar).
-        let (year, month, day) = (now.year(), now.month(), now.day());
-
-        Ok(format!(
-            "## CRITICAL CONTEXT: CURRENT DATE\n\n\
-             The following is the ABSOLUTE TRUTH regarding the current date. \
-             Use this for all relative time calculations (e.g. \"last 7 days\").\n\n\
-             Date: {year:04}-{month:02}-{day:02}\n\
-             UTC offset: {}",
-            now.format("%:z")
-        ))
     }
 }
 
@@ -1231,45 +1202,6 @@ mod tests {
         // Tools are still listed as in any other skill.
         assert!(output.contains("<callable_tools"));
         assert!(output.contains("<name>security-policy__release_checklist</name>"));
-    }
-
-    #[test]
-    fn datetime_section_includes_date_and_offset_without_wall_clock_time() {
-        let tools: Vec<Box<dyn Tool>> = vec![];
-        let ctx = PromptContext {
-            workspace_dir: Path::new("/tmp"),
-            agent_workspace_dir: Path::new("/tmp"),
-            model_name: "test-model",
-            tools: &tools,
-            skills: &[],
-            skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
-            identity_config: None,
-            interaction: None,
-            dispatcher_instructions: "instr",
-            hidden_builtin_names: None,
-            sends_native_tool_specs: false,
-
-            security_summary: None,
-            autonomy_level: AutonomyLevel::Supervised,
-            inject_memory: true,
-            shell_profile: None,
-        };
-
-        // The section is opt-in: it must still render when a builder adds it
-        // explicitly (the delegate sub-agent path does exactly that).
-        let rendered = SystemPromptBuilder::default()
-            .add_section(Box::new(DateTimeSection))
-            .build(&ctx)
-            .unwrap();
-        assert!(rendered.starts_with("## CRITICAL CONTEXT: CURRENT DATE\n\n"));
-        assert!(!rendered.contains("CURRENT DATE & TIME"));
-
-        let payload = rendered.trim_start_matches("## CRITICAL CONTEXT: CURRENT DATE\n\n");
-        assert!(payload.chars().any(|c| c.is_ascii_digit()));
-        assert!(payload.contains("Date:"));
-        assert!(payload.contains("UTC offset:"));
-        assert!(!payload.contains("Time:"));
-        assert!(!payload.contains("ISO 8601:"));
     }
 
     #[test]

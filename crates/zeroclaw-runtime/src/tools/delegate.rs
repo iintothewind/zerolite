@@ -4616,8 +4616,7 @@ impl DelegateTool {
             .add_section(Box::new(crate::agent::prompt::ShellSection))
             .add_section(Box::new(crate::agent::prompt::SkillsSection))
             .add_section(Box::new(crate::agent::prompt::WorkspaceSection))
-            .add_section(Box::new(crate::agent::prompt::RuntimeSection))
-            .add_section(Box::new(crate::agent::prompt::DateTimeSection));
+            .add_section(Box::new(crate::agent::prompt::RuntimeSection));
 
         let mut enriched = builder
             .build_with_approval_policy(&ctx, &always_ask_values)
@@ -12066,12 +12065,13 @@ mod tests {
             "should contain workspace path"
         );
         assert!(
-            prompt.contains("## CRITICAL CONTEXT: CURRENT DATE"),
-            "should contain date section"
+            !prompt.contains("CRITICAL CONTEXT: CURRENT DATE"),
+            "the delegate sub-agent prompt must not render a wall-clock date section: {prompt}"
         );
-        assert!(!prompt.contains("CURRENT DATE & TIME"));
-        assert!(!prompt.contains("Time:"));
-        assert!(!prompt.contains("ISO 8601:"));
+        assert!(
+            !prompt.contains("CURRENT DATE & TIME"),
+            "the delegate sub-agent prompt must not inject a wall-clock envelope: {prompt}"
+        );
 
         let _ = std::fs::remove_dir_all(workspace);
     }

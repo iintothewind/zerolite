@@ -2294,11 +2294,12 @@ pub async fn run(
                 })
                 .unwrap_or_default();
             let context = hw_context;
-            let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
+            // No wall-clock prefix: the runtime must not stamp a user turn,
+            // so the replayed prefix stays byte-stable for provider caching.
             let enriched = if context.is_empty() {
-                format!("[{now}] {effective_msg}")
+                effective_msg.clone()
             } else {
-                format!("{context}[{now}] {effective_msg}")
+                format!("{context}{effective_msg}")
             };
 
             let mut history = vec![
@@ -2927,11 +2928,12 @@ pub async fn run(
                     })
                     .unwrap_or_default();
                 let context = hw_context;
-                let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
+                // No wall-clock prefix: the runtime must not stamp a user turn,
+                // so the replayed prefix stays byte-stable for provider caching.
                 let enriched = if context.is_empty() {
-                    format!("[{now}] {effective_input}")
+                    effective_input.clone()
                 } else {
-                    format!("{context}[{now}] {effective_input}")
+                    format!("{context}{effective_input}")
                 };
 
                 history.push(ChatMessage::user(&enriched));
@@ -4177,11 +4179,12 @@ async fn process_message_inner(
             })
             .unwrap_or_default();
         let context = hw_context;
-        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
+        // No wall-clock prefix: the runtime must not stamp a user turn,
+        // so the replayed prefix stays byte-stable for provider caching.
         let enriched = if context.is_empty() {
-            format!("[{now}] {effective_message}")
+            effective_message.clone()
         } else {
-            format!("{context}[{now}] {effective_message}")
+            format!("{context}{effective_message}")
         };
 
         let mut history = vec![

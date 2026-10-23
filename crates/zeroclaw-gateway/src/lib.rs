@@ -4206,8 +4206,6 @@ async fn dispatch_gateway_turn_streaming_with_agent(
             Some(state.canvas_store.clone()),
         )
         .await?;
-    #[cfg(test)]
-    agent.set_turn_datetime_for_test(gateway_fixture_turn_datetime);
     if let Some(session) = session_id {
         agent.set_memory_session_id(Some(zeroclaw_api::session_keys::sanitize_session_key(
             session,
@@ -4241,12 +4239,6 @@ async fn dispatch_gateway_turn_streaming_with_agent(
 }
 
 #[cfg(test)]
-fn gateway_fixture_turn_datetime() -> chrono::DateTime<chrono::Local> {
-    chrono::DateTime::parse_from_rfc3339("2026-06-25T12:00:00+00:00")
-        .expect("fixed gateway fixture timestamp")
-        .with_timezone(&chrono::Local)
-}
-
 /// `WhatsApp` verification query params
 #[derive(serde::Deserialize)]
 pub struct WhatsAppVerifyQuery {
