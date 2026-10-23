@@ -1406,6 +1406,35 @@ impl Agent {
         user_message.to_string()
     }
 
+    /// Token cost of the tool definitions the provider receives with every
+    /// request under `dispatcher`.
+    ///
+    /// The request body is `messages + tools`, so a budget test that prices
+    /// only messages is short by exactly this amount. Omitting it in the three
+    /// places below is what made the meter drop mid-turn: `context_usage`
+    /// reported the message estimate, the provider reported the real request,
+    /// and the difference was the tool catalog.
+    ///
+    /// Zero when the dispatcher does not send native specs — the XML dispatcher
+    /// describes the tools in the system prompt instead, and that prose is
+    /// already inside the message estimate.
+    ///
+    /// Prices the scoped registry, the same catalog the system prompt is built
+    /// from. A turn that filters MCP tools out of the request is over-counted
+    /// here, and a turn that activates deferred ones is under-counted; both err
+    /// toward trimming earlier, which is the safe direction for a guard.
+    fn dispatched_tool_schema_tokens(
+        &self,
+        dispatcher: &dyn crate::agent::dispatcher::ToolDispatcher,
+    ) -> usize {
+        if !dispatcher.should_send_tool_specs() {
+            return 0;
+        }
+        crate::agent::history::estimate_tool_schema_tokens(
+            &crate::agent::dispatcher::XmlToolDispatcher::tool_specs(&self.tools),
+        )
+    }
+
     /// Trim durable `ConversationMessage` history when the water-line is
     /// exceeded — the only pre-send trigger.
     ///
@@ -1425,7 +1454,10 @@ impl Agent {
         let estimate = |h: &[zeroclaw_providers::ConversationMessage]| {
             crate::agent::history::estimate_history_tokens(&dispatcher.to_provider_messages(h))
         };
-        let tokens_now = estimate(&self.history);
+        // Measure the population the provider is actually billed for. Pricing
+        // messages alone put the effective trigger a whole tool catalog above
+        // the configured percentage.
+        let tokens_now = estimate(&self.history) + self.dispatched_tool_schema_tokens(dispatcher);
         let decision =
             crate::agent::turn::context_pipeline::plan_pre_send_trim(tokens_now, water_line, false);
         if !decision.should_trim {
@@ -1478,6 +1510,18 @@ impl Agent {
         // keep-N preference still applies, and `trim_conversation_to_fit_with`
         // treats a zero budget exactly that way.
         let send_budget = self.config.resolved.context_send_budget();
+        // The cascade prices messages, while `send_budget` bounds the whole
+        // request — messages plus the tool definitions it carries. Handing the
+        // cascade the full budget would let a post-trim request exceed it by
+        // the schema size. The `.max(1)` keeps a real constraint real when the
+        // schemas alone fill the budget: passing zero would read as "no
+        // constraint" and the oversized turn would be sent instead of failing.
+        let schema_tokens = self.dispatched_tool_schema_tokens(dispatcher);
+        let history_budget = if send_budget == 0 {
+            0
+        } else {
+            send_budget.saturating_sub(schema_tokens).max(1)
+        };
         let estimate = |h: &[zeroclaw_providers::ConversationMessage]| {
             crate::agent::history::estimate_history_tokens(&dispatcher.to_provider_messages(h))
         };
@@ -1485,7 +1529,7 @@ impl Agent {
         let mut result = crate::agent::history_trim::trim_conversation_to_fit_with(
             taken,
             keep,
-            send_budget,
+            history_budget,
             self.config.resolved.effective_context_window(),
             estimate,
         );
@@ -1496,7 +1540,7 @@ impl Agent {
             result.tokens_after = estimate(&result.history);
             crate::agent::history_trim::warn_if_conversation_below_preferred_keep(
                 keep,
-                send_budget,
+                history_budget,
                 &result,
             );
             let reason = crate::i18n::get_required_cli_string("history-trim-reason-budget");
@@ -1505,8 +1549,11 @@ impl Agent {
                     result.dropped_messages,
                     result.kept_turns,
                     reason.clone(),
-                    Some(result.tokens_after),
-                    Some(result.tokens_before),
+                    // Reported as provider-facing sizes: the request the next
+                    // dispatch sends is messages plus tool definitions, and a
+                    // count that omits them is not comparable to `usage`.
+                    Some(result.tokens_after + schema_tokens),
+                    Some(result.tokens_before + schema_tokens),
                     Some(result.dropped_turns),
                 ),
             );
@@ -1520,9 +1567,10 @@ impl Agent {
                 // `tokens_after` was re-priced above, after the breadcrumb was
                 // inserted: the breadcrumb is part of what the next request
                 // carries, so reporting the pre-breadcrumb figure would
-                // understate the meter.
-                tokens_before: result.tokens_before as u64,
-                tokens_after: result.tokens_after as u64,
+                // understate the meter. Both counts add the tool definitions
+                // for the same reason.
+                tokens_before: (result.tokens_before + schema_tokens) as u64,
+                tokens_after: (result.tokens_after + schema_tokens) as u64,
                 token_budget: (send_budget > 0).then_some(send_budget as u64),
             }));
         }
@@ -1530,7 +1578,7 @@ impl Agent {
         if result.exceeds_budget {
             let system_floor = crate::agent::history::estimate_system_floor_tokens(
                 &dispatcher.to_provider_messages(&self.history),
-            );
+            ) + schema_tokens;
             let msg = if system_floor >= send_budget {
                 crate::agent::history::context_floor_remediation(system_floor, send_budget)
             } else {
@@ -4636,8 +4684,14 @@ impl Agent {
         // adapters — it is the local estimator, not a measurement — and it is
         // a separate event from `Usage` precisely so clients do not fold it
         // into their step boundary.
-        let assembled_tokens =
-            crate::agent::history::estimate_history_tokens(&provider_messages) as u64;
+        //
+        // The provider is billed for `messages + tools`, so this prices both.
+        // Messages alone made the meter drop by the size of the tool catalog
+        // the moment a turn started, then climb back when `usage` reported the
+        // real number.
+        let assembled_tokens = (crate::agent::history::estimate_history_tokens(&provider_messages)
+            + self.dispatched_tool_schema_tokens(active_dispatcher.as_ref()))
+            as u64;
         let _ = event_tx.try_send(TurnEvent::ContextEstimate {
             input_tokens: assembled_tokens,
             context_token_budget: Some(self.config.resolved.context_trim_budget() as u64),
@@ -13184,6 +13238,111 @@ mod tests {
             Some(zeroclaw_api::agent::TokenCountSource::Estimated),
             "a pre-send trim can only report an estimate, never a measurement"
         );
+    }
+
+    /// A tool whose description is large enough to dominate a small history, so
+    /// a water-line fixture can cross the line with the schema alone.
+    struct FatSchemaTool(String);
+
+    #[async_trait]
+    impl crate::tools::Tool for FatSchemaTool {
+        fn name(&self) -> &str {
+            "fat"
+        }
+        fn description(&self) -> &str {
+            &self.0
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+        async fn execute(&self, _args: serde_json::Value) -> Result<crate::tools::ToolResult> {
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: String::new().into(),
+                error: None,
+            })
+        }
+    }
+    zeroclaw_api::mock_tool_attribution!(FatSchemaTool);
+
+    /// The water-line and the assembled size are measured against the
+    /// population the provider is billed for: messages **plus** the tool
+    /// definitions the request carries.
+    ///
+    /// The fixture is built so the line can only be crossed by the schema. The
+    /// history is a handful of tokens, the tool's description is ~5k tokens, and
+    /// the line sits at 10% of a 20k ceiling. Pricing messages alone left
+    /// `tokens_now` near zero, so no trim fired — and the meter reported the
+    /// message estimate, which is what made it drop mid-turn and climb back
+    /// when `usage` arrived with the real number.
+    #[tokio::test]
+    async fn the_water_line_counts_the_tool_schemas_the_request_carries() {
+        let fat = FatSchemaTool("d".repeat(20_000));
+        let schema_tokens = crate::agent::history::estimate_tool_schema_tokens(&[fat.spec()]);
+        assert!(
+            schema_tokens > 4_000,
+            "the fixture's schema must dominate the history, got {schema_tokens}"
+        );
+
+        let mut resolved = zeroclaw_config::schema::ResolvedRuntime::default();
+        resolved.context.keep_recent_turns = Some(1);
+        resolved.context.trim_threshold_percent = 10;
+        resolved.context.request_token_ceiling = Some(20_000);
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = trim_test_agent_with_resolved(resolved, observer);
+        // Swap the registry after construction. With native specs the system
+        // prompt does not list the tools, so the prompt stays byte-identical and
+        // the only difference the estimate can see is the schema.
+        agent.tools =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(fat)]);
+        agent.history = vec![
+            ConversationMessage::Chat(ChatMessage::system("system")),
+            ConversationMessage::Chat(ChatMessage::user("old user")),
+            ConversationMessage::Chat(ChatMessage::assistant("old assistant")),
+        ];
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        agent
+            .turn_streamed("new user", tx, None)
+            .await
+            .expect("the turn must not abort on the trim");
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+
+        let estimate = events
+            .iter()
+            .find_map(|event| match event {
+                TurnEvent::ContextEstimate { input_tokens, .. } => Some(*input_tokens),
+                _ => None,
+            })
+            .expect("the turn publishes its assembled size");
+        assert!(
+            estimate >= schema_tokens as u64,
+            "the assembled size must cover the tool definitions the request carries: \
+             {estimate} < {schema_tokens}"
+        );
+
+        let (tokens_after, token_budget) = events
+            .iter()
+            .find_map(|event| match event {
+                TurnEvent::HistoryTrimmed {
+                    tokens_after: Some(tokens_after),
+                    token_budget,
+                    ..
+                } => Some((*tokens_after, *token_budget)),
+                _ => None,
+            })
+            .expect("a request that only crosses the line through its schemas still trims");
+        if let Some(budget) = token_budget {
+            assert!(
+                tokens_after <= budget,
+                "the post-trim request must fit the budget the same frame advertises: \
+                 {tokens_after} > {budget}"
+            );
+        }
     }
 
     /// The regression behind "only 5 turns survive": a trim that fires on the

@@ -145,7 +145,10 @@ engaged by a single token water-line: when replayed context exceeds
 `trim_threshold`, the runtime prefers the most recent `keep_recent_turns`
 whole turns, then cascades down to `kept_turns == 1` until under the fit
 budget (or hard-fails). The trigger is token-based; the action is
-turn-count-first with a token fit check. See the upstream book's *History management* page.
+turn-count-first with a token fit check. "Replayed context" is the request the
+provider receives — the messages **plus the tool definitions** — not the
+messages alone; pricing only the messages put the effective trigger a whole
+tool catalog above the configured percentage. See the upstream book's *History management* page.
 
 This page is the reference for the knobs and the arithmetic. For how whole-turn
 trimming physically drops messages, see the upstream book's *History management* page;
@@ -431,6 +434,14 @@ The water-line is never absent in practice — `trim_threshold_percent` is
 validated to `1..=100` and `context_trim_budget()` takes `.max(1)`, so there is
 no "trimming disabled" state that could make it `None`. The field is `Option`
 only because it shares the `ContextUsage` wire shape.
+
+Every number in that table prices the same population: the messages **plus the
+tool definitions the request carries**. A provider bills `input_tokens` for
+both, so a count that omits the schemas is short by the whole tool catalog. That
+omission is not cosmetic — it made the meter drop mid-turn and it put the
+effective water-line a catalog above the configured percentage, because the
+trigger compared a messages-only estimate against a threshold derived from the
+full window.
 
 Two rules follow from this and are not negotiable:
 
