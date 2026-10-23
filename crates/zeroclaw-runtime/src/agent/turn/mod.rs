@@ -1125,6 +1125,14 @@ async fn enforce_reported_budget(
     _injected_memory_preamble: &mut Option<MemoryPreamble>,
     history: &mut Vec<ChatMessage>,
     reported_input_tokens: usize,
+    // Size of the tool definitions the provider receives alongside `history`.
+    //
+    // The request body is `messages + tools`, so every count this function
+    // reports prices both. Pricing only messages made the notice advertise a
+    // post-trim size the next request does not actually have — the same
+    // omission, in the same direction, that let the context meter drop by the
+    // size of the tool catalog the moment a turn started.
+    tool_schema_tokens: usize,
     // The water-line: the token count at which proactive trimming engages.
     context_token_budget: usize,
     // The send / fit budget: the largest retained population that still
@@ -1157,7 +1165,17 @@ async fn enforce_reported_budget(
     let tokens_now = if reported {
         reported_input_tokens
     } else {
-        crate::agent::history::estimate_history_tokens(history)
+        // No provider sample for this population, so price it locally — and
+        // price the whole request, not just its messages.
+        crate::agent::history::estimate_history_tokens(history) + tool_schema_tokens
+    };
+    // A reported count is the provider's measurement of a request it accepted.
+    // The fallback above is a local estimate, and the notice renders this label
+    // verbatim, so it must not claim otherwise.
+    let tokens_before_source = if reported {
+        zeroclaw_api::agent::TokenCountSource::Provider
+    } else {
+        zeroclaw_api::agent::TokenCountSource::Estimated
     };
     let send_budget =
         crate::agent::history_trim::resolve_send_budget(context_send_budget, context_token_budget);
@@ -1210,8 +1228,10 @@ async fn enforce_reported_budget(
         crate::agent::history_trim::insert_breadcrumb_deduped(&mut trimmed, taken_had_crumb);
         *crumb_present = true;
         // The crumb is part of the population that will actually be
-        // dispatched next, so the reported post-trim size must include it.
-        result.tokens_after = crate::agent::history::estimate_history_tokens(&trimmed);
+        // dispatched next, so the reported post-trim size must include it —
+        // and the tool definitions the next request carries with it.
+        result.tokens_after =
+            crate::agent::history::estimate_history_tokens(&trimmed) + tool_schema_tokens;
         *history = trimmed;
         let reason = crate::i18n::get_required_cli_string("history-trim-reason-budget");
         if let Some(tx) = event_tx {
@@ -1224,8 +1244,12 @@ async fn enforce_reported_budget(
                     token_budget: Some(context_token_budget as u64),
                     tokens_before: Some(result.tokens_before as u64),
                     tokens_after: Some(result.tokens_after as u64),
-                    tokens_before_source: Some(zeroclaw_api::agent::TokenCountSource::Provider),
-                    tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
+                    // `tokens_after` is always a local estimate — no provider
+                    // has seen the trimmed population yet — and claiming a
+                    // calibration it never received is the label lie the meter
+                    // already paid for once.
+                    tokens_before_source: Some(tokens_before_source),
+                    tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
                     unsatisfiable_floor: None,
                     retained_context: Some(retained_context_snapshot(
                         _injected_memory_preamble,
@@ -1246,8 +1270,8 @@ async fn enforce_reported_budget(
                 token_budget: Some(context_token_budget as u64),
                 tokens_before: Some(result.tokens_before as u64),
                 tokens_after: Some(result.tokens_after as u64),
-                tokens_before_source: Some(zeroclaw_api::agent::TokenCountSource::Provider),
-                tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
+                tokens_before_source: Some(tokens_before_source),
+                tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
                 unsatisfiable_floor: None,
             },
         );
@@ -1257,7 +1281,13 @@ async fn enforce_reported_budget(
     if result.exceeds_budget {
         // The floor cannot fit: hard failure, no `HistoryTrimmed` notice
         // (spec row 8 — a trim that did not fit must not look like one that did).
-        let system_floor = crate::agent::history::estimate_system_floor_tokens(history);
+        //
+        // The floor is what the request cannot shed, so it prices the tool
+        // definitions too: comparing a messages-only floor against a send
+        // budget derived from the full window understates the overflow by the
+        // whole tool catalog and reports the wrong remediation.
+        let system_floor =
+            crate::agent::history::estimate_system_floor_tokens(history) + tool_schema_tokens;
         let msg = if system_floor >= send_budget {
             crate::agent::history::context_floor_remediation(system_floor, send_budget)
         } else {
@@ -3051,6 +3081,10 @@ async fn run_tool_call_loop_impl<'a>(
                     injected_memory_preamble,
                     turn_state.history,
                     reported_input_tokens.unwrap_or(0) as usize,
+                    // This trim exists to keep the durable transcript inside
+                    // the window for the NEXT turn, which will carry the same
+                    // tool catalog this one did.
+                    tool_schema_tokens,
                     ctx.context_limits.context_token_budget,
                     ctx.context_limits.context_send_budget,
                     ctx.context_limits.effective_context_window(),
@@ -4947,6 +4981,11 @@ mod reported_budget_tests {
             injected_memory_preamble,
             history,
             reported_input_tokens,
+            // These tests exercise the trim decision and the count wording, not
+            // the tool catalog: a zero schema cost keeps every expectation
+            // reading as "messages only". The schema accounting has its own
+            // test, which calls the production function directly.
+            0,
             context_token_budget,
             context_send_budget,
             effective_context_window,
@@ -5003,6 +5042,7 @@ mod reported_budget_tests {
             &mut None,
             &mut history,
             estimated * 4,
+            0,
             estimated * 2,
             estimated * 2,
             estimated * 2,
@@ -5055,6 +5095,131 @@ mod reported_budget_tests {
         assert!(
             history.iter().any(|m| m.content.contains("final answer")),
             "the most recent turn survives the trim"
+        );
+    }
+
+    /// The post-response trim runs after the final `Usage` of the turn, so the
+    /// size it reports is the one the NEXT request will carry. That population
+    /// is `messages + tools`: a messages-only count advertises a post-trim size
+    /// roughly one tool catalog smaller than reality, and the context meter
+    /// renders that number verbatim once the terminal frame stops resurrecting
+    /// the pre-trim one.
+    #[tokio::test]
+    async fn a_post_response_trim_reports_the_size_the_next_request_carries() {
+        let mut history = big_history();
+        let estimated = crate::agent::history::estimate_history_tokens(&history);
+        let schema = 5_000usize;
+        let reported = estimated * 4;
+        let budget = reported / 2;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<TurnEvent>(8);
+        super::enforce_reported_budget(
+            &mut None,
+            &mut history,
+            reported,
+            schema,
+            budget,
+            budget,
+            budget,
+            1,
+            Some(&tx),
+            &NoopObserver,
+            None,
+            "turn-schema",
+            &mut false,
+        )
+        .await
+        .expect("budget enforcement succeeds");
+        drop(tx);
+
+        let mut accounting = None;
+        while let Ok(event) = rx.try_recv() {
+            if let TurnEvent::HistoryTrimmed {
+                tokens_before,
+                tokens_after,
+                tokens_before_source,
+                tokens_after_source,
+                ..
+            } = event
+            {
+                accounting = Some((
+                    tokens_before,
+                    tokens_after,
+                    tokens_before_source,
+                    tokens_after_source,
+                ));
+            }
+        }
+        let (tokens_before, tokens_after, before_source, after_source) =
+            accounting.expect("an over-budget trim must publish its accounting");
+
+        assert_eq!(
+            tokens_before,
+            Some(reported as u64),
+            "a reported count already prices the whole request; adding the schema again \
+             would double-charge the tool catalog"
+        );
+        assert_eq!(
+            before_source,
+            Some(zeroclaw_api::agent::TokenCountSource::Provider)
+        );
+        assert_eq!(
+            tokens_after,
+            Some((crate::agent::history::estimate_history_tokens(&history) + schema) as u64),
+            "the advertised post-trim size must be the request the next turn carries"
+        );
+        assert_eq!(
+            after_source,
+            Some(zeroclaw_api::agent::TokenCountSource::Estimated),
+            "no provider has seen the trimmed population, so its size is an estimate"
+        );
+    }
+
+    /// Without a provider report the "before" count is a local estimate. The
+    /// notice renders this label verbatim, so claiming `provider` there would
+    /// present a guess as a measurement.
+    #[tokio::test]
+    async fn a_trim_without_a_provider_report_labels_both_counts_as_estimates() {
+        let mut history = big_history();
+        let estimated = crate::agent::history::estimate_history_tokens(&history);
+        let window = estimated / 2;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<TurnEvent>(8);
+        super::enforce_reported_budget(
+            &mut None,
+            &mut history,
+            0,
+            0,
+            window,
+            window,
+            window,
+            1,
+            Some(&tx),
+            &NoopObserver,
+            None,
+            "turn-estimate",
+            &mut false,
+        )
+        .await
+        .expect("the overflow guard must trim rather than fail");
+        drop(tx);
+
+        let mut sources = None;
+        while let Ok(event) = rx.try_recv() {
+            if let TurnEvent::HistoryTrimmed {
+                tokens_before_source,
+                tokens_after_source,
+                ..
+            } = event
+            {
+                sources = Some((tokens_before_source, tokens_after_source));
+            }
+        }
+        assert_eq!(
+            sources,
+            Some((
+                Some(zeroclaw_api::agent::TokenCountSource::Estimated),
+                Some(zeroclaw_api::agent::TokenCountSource::Estimated)
+            )),
+            "a count with no provider sample behind it must say so on the wire"
         );
     }
 

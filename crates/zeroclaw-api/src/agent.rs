@@ -134,13 +134,23 @@ pub enum TurnEvent {
         dropped_turns: usize,
         kept_turns: usize,
         reason: String,
-        /// The **send budget** in effect at trim time:
-        /// `effective_context_window − reserve_tokens`, the size the trim was
-        /// asked to reach. Deliberately not the water-line that triggered it —
-        /// that is a different number, reported as `context_token_budget` on
-        /// [`Self::Usage`] and [`Self::ContextEstimate`]. `None` for
-        /// message-limit trims (no token accounting) and when no fit
-        /// constraint applies.
+        /// The budget this trim was measured against — the number the notice
+        /// quotes as the "configured token budget". It is **not** one
+        /// well-known quantity, so a client must not treat it as a fit target
+        /// it can reason about on its own; which budget it is depends on the
+        /// guard that fired:
+        ///
+        /// - the post-response guard quotes the **water-line**
+        ///   (`context_token_budget`): that is what the operator configured and
+        ///   therefore what the notice should name;
+        /// - overflow recovery and the durable water-line trim quote the
+        ///   **send budget** (`effective_context_window − reserve_tokens`), the
+        ///   size the trim was asked to reach;
+        /// - the hard-limit and max-iteration paths quote the model window or
+        ///   their own event budget.
+        ///
+        /// `None` for message-limit trims (no token accounting) and when no
+        /// budget applied.
         token_budget: Option<u64>,
         /// Token count before trimming.
         tokens_before: Option<u64>,
@@ -182,8 +192,10 @@ pub enum TurnEvent {
         /// `ContextUsage` wire shape with older daemons.
         ///
         /// A client must not read the value as "how much may be sent" — that is
-        /// [`Self::HistoryTrimmed::token_budget`], a different number computed
-        /// from `reserve_tokens`.
+        /// the send budget, `effective_context_window − reserve_tokens`. It
+        /// reaches the wire as [`Self::HistoryTrimmed::token_budget`] only on
+        /// the guards that trim against it; the post-response guard quotes the
+        /// water-line in that same field, so the two are not interchangeable.
         context_token_budget: Option<u64>,
         /// Configured model capacity for the route, when authoritative.
         model_context_window: Option<u64>,

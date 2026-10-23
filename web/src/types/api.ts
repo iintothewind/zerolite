@@ -305,6 +305,12 @@ export interface WsMessage {
   output_tokens?: number;
   // Emitted as JSON null when the accepted call reports no usage (stale
   // route protection); consumers must branch on null, not undefined.
+  //
+  // This is the size of the context the turn ENDED with, not necessarily the
+  // size the provider last measured: when a trim lands after the final call,
+  // the gateway publishes the trim's post-trim estimate here instead, because
+  // the measured request no longer exists. A call accepted after the trim
+  // replaces it with a real measurement again.
   last_input_tokens?: number | null;
   /** Prompt-cache hits for the step/turn. A *subset* of `input_tokens`, never
    * additive — the rate is `cached ÷ input`. Absent when the provider is

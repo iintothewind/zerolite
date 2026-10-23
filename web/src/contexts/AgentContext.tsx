@@ -458,7 +458,7 @@ export function AgentProvider({
         setTokenStats((s) => applyUsage(s, msg));
         // The provider just reported the real input size for this call, so the
         // meter can stop showing the pre-dispatch estimate. `done` still wins
-        // at turn end (`last_input_tokens` is the turn's authoritative number),
+        // at turn end (`last_input_tokens` is the size the turn ended with),
         // but a multi-call turn would otherwise sit on the estimate until then.
         if (typeof msg.input_tokens === 'number') {
           setContextInputTokens(msg.input_tokens);
@@ -547,11 +547,16 @@ export function AgentProvider({
             setContextEffectiveWindow(limits.effectiveWindow);
             setContextWaterlineTokens(limits.waterlineTokens);
           }
-          // Prefer last_input_tokens (accurate per-turn prompt size) over
+          // Prefer last_input_tokens (the size the turn ended with) over
           // accumulated input_tokens for context-bar rendering.
           // When last_input_tokens is explicitly null, the accepted route has no
           // usage data; clear the input state and do NOT fall back to the
           // accumulated input_tokens (which would be stale from a previous route).
+          //
+          // A trim that landed after the final call already replaced this
+          // value server-side (see `UsageFold::note_trim`), so the terminal
+          // frame agrees with the `history_trimmed` frame instead of undoing
+          // it. There is nothing to reconcile here.
           if (msg.last_input_tokens === null) {
             setContextInputTokens(null);
           } else if (typeof msg.last_input_tokens === 'number') {

@@ -1567,7 +1567,10 @@ struct ProviderUsageEntry {
 /// The accepted-serving snapshot (`last_provider_ref` / `last_model` /
 /// `last_input_tokens`) advances only on `accepted: true` events, so a later
 /// billed rejected attempt cannot re-point the terminal identity or the
-/// context-meter ceiling (see the `TurnEvent::Usage` contract).
+/// context-meter ceiling (see the `TurnEvent::Usage` contract). It also
+/// advances on a `HistoryTrimmed` that carries `tokens_after`, because a trim
+/// replaces the population the last accepted call measured — see
+/// [`UsageFold::note_trim`].
 #[derive(Debug, Default)]
 struct UsageFold {
     total_input_tokens: Option<u64>,
@@ -1592,6 +1595,30 @@ struct UsageFold {
 }
 
 impl UsageFold {
+    /// Record that a trim replaced the population the last accepted call
+    /// measured, so the terminal frame stops naming a request that no longer
+    /// exists.
+    ///
+    /// The post-response guard trims *after* the turn's final `Usage` event —
+    /// it needs that provider count to decide the trim is warranted — and then
+    /// the `done` frame publishes `last_input_tokens` last. Without this the
+    /// trim's own `tokens_after` would move the meter for one frame and the
+    /// terminal frame would snap it back to the pre-trim number, which is what
+    /// made a completed trim look like it had not happened.
+    ///
+    /// A later accepted `Usage` overwrites this with a provider measurement of
+    /// a request sent *after* the trim. That is newer information about the
+    /// same population, so it wins — the same ordering rule that keeps a
+    /// pre-send estimate from outliving the measurement it preceded.
+    ///
+    /// A trim with no token accounting (the message-limit path) leaves the
+    /// snapshot alone: it never described a token population to begin with.
+    fn note_trim(&mut self, tokens_after: Option<u64>) {
+        if let Some(tokens_after) = tokens_after {
+            self.last_input_tokens = Some(tokens_after);
+        }
+    }
+
     /// Fold one [`TurnEvent::Usage`] payload into the turn's running totals
     /// and return the per-step `usage` frame forwarded to the client.
     ///
@@ -2181,18 +2208,24 @@ async fn process_chat_message(
                             tokens_after_source,
                             unsatisfiable_floor,
                             retained_context: _,
-                        } => history_trimmed_ws_frame(
-                            dropped_messages,
-                            dropped_turns,
-                            kept_turns,
-                            &reason,
-                            token_budget,
-                            tokens_before,
-                            tokens_after,
-                            tokens_before_source.map(|s| s.as_str()),
-                            tokens_after_source.map(|s| s.as_str()),
-                            unsatisfiable_floor,
-                        ),
+                        } => {
+                            // The trim replaced the population the last accepted
+                            // call measured; the terminal frame must not
+                            // re-publish that stale size over the post-trim one.
+                            usage_fold.note_trim(tokens_after);
+                            history_trimmed_ws_frame(
+                                dropped_messages,
+                                dropped_turns,
+                                kept_turns,
+                                &reason,
+                                token_budget,
+                                tokens_before,
+                                tokens_after,
+                                tokens_before_source.map(|s| s.as_str()),
+                                tokens_after_source.map(|s| s.as_str()),
+                                unsatisfiable_floor,
+                            )
+                        }
                         TurnEvent::ContextEstimate {
                             input_tokens,
                             context_token_budget,
@@ -4003,8 +4036,8 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             dropped_turns: 8,
             kept_turns: 1,
             reason: "water-line exceeded".into(),
-            // The send budget the trim was asked to reach — not the water-line
-            // that triggered it.
+            // Whichever budget the guard measured against — quoted, not
+            // interpreted: the notice prints it as the configured budget.
             token_budget: Some(8_000),
             tokens_before: Some(9_400),
             tokens_after: Some(1_200),
@@ -4027,7 +4060,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         );
         assert_eq!(
             frame["token_budget"], 8_000,
-            "the advertised budget is the send target, not the water-line"
+            "the quoted budget must survive the mapping so the notice can name it"
         );
         assert!(
             frame["tokens_after"].as_u64() <= frame["token_budget"].as_u64(),
@@ -5428,6 +5461,71 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             accepted,
             estimated_input_tokens: None,
         }
+    }
+
+    /// A trim that lands after the turn's final `Usage` replaces the population
+    /// that event measured. The terminal frame is the last writer, so leaving
+    /// the provider number in place made a completed trim invisible: the meter
+    /// moved on the `history_trimmed` frame and snapped straight back on `done`.
+    #[test]
+    fn a_post_response_trim_survives_the_terminal_frame() {
+        let mut fold = UsageFold::default();
+        // The turn's final call was billed for the whole pre-trim request.
+        fold.apply(usage_event(
+            "openrouter.a",
+            "model-a",
+            Some(112_146),
+            None,
+            Some(500),
+            None,
+            true,
+        ));
+        // The post-response guard then dropped 15 older turns and reported the
+        // retained request's size.
+        fold.note_trim(Some(71_966));
+
+        assert_eq!(
+            fold.last_input_tokens,
+            Some(71_966),
+            "the terminal frame must publish the post-trim size, not the size of a \
+             request the trim already replaced"
+        );
+        assert_eq!(
+            fold.total_input_tokens,
+            Some(112_146),
+            "billing still records what the provider actually charged"
+        );
+
+        // A call accepted *after* the trim measured the new population for
+        // real, so that measurement wins.
+        fold.apply(usage_event(
+            "openrouter.a",
+            "model-a",
+            Some(90_004),
+            None,
+            Some(200),
+            None,
+            true,
+        ));
+        assert_eq!(fold.last_input_tokens, Some(90_004));
+    }
+
+    /// A trim with no token accounting never described a token population, so
+    /// it must not blank the number the meter is showing.
+    #[test]
+    fn a_count_only_trim_leaves_the_meter_snapshot_alone() {
+        let mut fold = UsageFold::default();
+        fold.apply(usage_event(
+            "openrouter.a",
+            "model-a",
+            Some(42_000),
+            None,
+            Some(100),
+            None,
+            true,
+        ));
+        fold.note_trim(None);
+        assert_eq!(fold.last_input_tokens, Some(42_000));
     }
 
     /// Blocking regression (note9 blocker 1): an accepted Usage event followed

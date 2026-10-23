@@ -420,7 +420,7 @@ overwrites an earlier one:
 | A turn starts — after the water-line decision, before dispatch | `context_usage` | `estimate` | The assembled request exists and no provider has seen it yet. Without this, the meter keeps showing the previous turn's number for the whole turn. |
 | A trim fires mid-turn | `history_trimmed` → `tokens_after` | `estimate` | The history just got smaller. Waiting for the next `done` leaves the meter above 100% of what will actually be sent. |
 | A provider call returns | `usage` → `input_tokens` | `provider`, or `estimate` when the provider is silent | The only measured number on the path. It replaces the assembled estimate. |
-| The turn ends | `done` → `last_input_tokens` | `provider` | Authoritative for the turn, and it clears the numerator when the accepted route reported no usage. |
+| The turn ends | `done` → `last_input_tokens` | `provider`, or the trim's own post-trim estimate when a trim followed the last call | The size the turn *ends* with. Authoritative for the turn, and it clears the numerator when the accepted route reported no usage. |
 
 Two different budgets appear in these events. Reading one as the other is the
 easy mistake, because both are "the context budget" in conversation:
@@ -428,7 +428,7 @@ easy mistake, because both are "the context budget" in conversation:
 | Field | On | Is |
 |---|---|---|
 | `context_token_budget` (RPC) / `max_context_tokens` (WS) | `context_usage`, `usage`, `done` | The **water-line**: `trim_threshold_tokens().max(1)`. It answers *when* a trim engages. |
-| `token_budget` | `history_trimmed` | The **send budget**: `effective_context_window − reserve_tokens`. It answers *how small* the trim was asked to make the request. |
+| `token_budget` | `history_trimmed` | **Whichever budget the guard that fired measured against**: the water-line for the post-response guard (it is what the operator configured, so it is what the notice should name), the send budget (`effective_context_window − reserve_tokens`) for overflow recovery and the durable water-line trim, the model window for the hard-limit path. It is a quoted figure, not a fit target a client can reason about on its own. |
 
 The water-line is never absent in practice — `trim_threshold_percent` is
 validated to `1..=100` and `context_trim_budget()` takes `.max(1)`, so there is
@@ -443,7 +443,7 @@ effective water-line a catalog above the configured percentage, because the
 trigger compared a messages-only estimate against a threshold derived from the
 full window.
 
-Two rules follow from this and are not negotiable:
+Three rules follow from this and are not negotiable:
 
 - **`context_usage` is not `usage`.** Clients fold `usage` into their step
   boundary — it means "a call completed". The assembled estimate means "a
@@ -464,6 +464,18 @@ Two rules follow from this and are not negotiable:
   a per-turn monotonic guard on the client **before** they can be allowed.
   Until then the guarantee is "serialized turns, one connection, in order" and
   nothing stronger.
+- **A trim invalidates the measured size, and the terminal frame must not
+  resurrect it.** The post-response guard trims *after* the turn's final
+  `usage` event — it needs that provider count to decide the trim is warranted
+  — and `done` is written after both. Emitted in order, the trim's
+  `tokens_after` moved the meter and `done` then put the pre-trim number back,
+  so a completed trim looked like it had not happened at all. The gateway's
+  `UsageFold::note_trim` replaces the accepted-input snapshot with
+  `tokens_after`; a later accepted `usage` overwrites it with a measurement of
+  a request sent *after* the trim, which is newer information about the same
+  population and therefore wins. The ordering rule above is unchanged — what
+  changed is that "`done` wins" is no longer true when a trim landed between
+  the measurement and the terminal frame.
 
 The local estimator over-counts CJK-heavy text (measured 0.44–0.95 tokens per
 character against the flat 1.0 charge, depending on the BPE merges). That is
