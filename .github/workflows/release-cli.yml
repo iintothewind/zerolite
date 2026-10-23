@@ -31,7 +31,7 @@ jobs:
       version: ${{ steps.v.outputs.version }}
       tag: ${{ steps.v.outputs.tag }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Resolve version
         id: v
         shell: bash
@@ -44,7 +44,7 @@ jobs:
           echo "version=$v" >> "$GITHUB_OUTPUT"
           echo "tag=v$v"    >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version-file: '.nvmrc'
           cache: npm
@@ -52,7 +52,7 @@ jobs:
       # The gateway embeds web/dist at compile time, so this must exist first.
       - name: Build web dashboard
         run: cargo web build
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: web-dist
           path: web/dist/
@@ -86,7 +86,7 @@ jobs:
             linker_env: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER
             linker: aarch64-linux-gnu-gcc
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -94,7 +94,7 @@ jobs:
         with:
           prefix-key: ${{ matrix.target }}
           cache-targets: false
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: web-dist
           path: web/dist/
@@ -132,14 +132,14 @@ jobs:
       # target-independent (wasm32-wasip2), so build them once per runner.
       # The aarch64 leg runs the smoke under qemu-user because the archive
       # targets a foreign architecture.
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.11'
       # The aarch64 leg runs the plugin smoke inside a `linux/arm64`
       # container on an x86_64 runner, so the kernel needs a binfmt handler to
       # exec the foreign-architecture image. Without this the container starts
       # and dies with "exec /usr/bin/bash: exec format error".
-      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-qemu-action@v4
         if: matrix.cross_compiler
         with:
           platforms: arm64
@@ -189,7 +189,7 @@ jobs:
             tar -C "$(dirname "$src")" -czf "dist/${out}.tar.gz" "$(basename "$src")"
           fi
           ls -lh dist/
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.target }}
           path: dist/
@@ -203,8 +203,8 @@ jobs:
     steps:
       # checkout first: `clean: true` deletes the workspace, so it would wipe
       # artifacts downloaded before it.
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           pattern: release-*
           path: assets/
@@ -228,7 +228,7 @@ jobs:
           fi
       - name: Create release (notes file)
         if: steps.notes.outputs.path != ''
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.web.outputs.tag }}
           name: "ZeroLite ${{ needs.web.outputs.version }}"
@@ -238,7 +238,7 @@ jobs:
             assets/*.tar.gz
       - name: Create release (generated notes)
         if: steps.notes.outputs.path == ''
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.web.outputs.tag }}
           name: "ZeroLite ${{ needs.web.outputs.version }}"
