@@ -406,6 +406,35 @@ report the field include Anthropic, OpenAI, OpenRouter, compatible, and
 OpenAI-Codex; providers that do not (Bedrock, Gemini, Azure, Copilot, Ollama)
 report `None` and the metric simply stays at zero for them.
 
+## Updating the meter
+
+The meter's numerator is a *display* value, and it has exactly three update
+points. They are ordered by increasing authority, and a later point always
+overwrites an earlier one:
+
+| When | Event | Source label | Why |
+|---|---|---|---|
+| A turn starts — after the water-line decision, before dispatch | `context_usage` | `estimate` | The assembled request exists and no provider has seen it yet. Without this, the meter keeps showing the previous turn's number for the whole turn. |
+| A trim fires mid-turn | `history_trimmed` → `tokens_after` | `estimate` | The history just got smaller. Waiting for the next `done` leaves the meter above 100% of what will actually be sent. |
+| A provider call returns | `usage` → `input_tokens` | `provider`, or `estimate` when the provider is silent | The only measured number on the path. It replaces the assembled estimate. |
+| The turn ends | `done` → `last_input_tokens` | `provider` | Authoritative for the turn, and it clears the numerator when the accepted route reported no usage. |
+
+Two rules follow from this and are not negotiable:
+
+- **`context_usage` is not `usage`.** Clients fold `usage` into their step
+  boundary — it means "a call completed". The assembled estimate means "a
+  request is about to go out", so folding it would invent a step that never
+  happened. They are separate events for exactly that reason, even though both
+  end up as a `ContextUsage` notification on the RPC surface.
+- **A stale estimate never overwrites a newer provider value.** Frames carry
+  the turn's identity and arrive in order on a single connection; the client
+  applies them as they arrive and lets `done` win at the end of the turn.
+
+The local estimator over-counts CJK-heavy text (measured 0.44–0.95 tokens per
+character against the flat 1.0 charge, depending on the BPE merges). That is
+why every estimate carries a source label, and why the meter must keep showing
+it: the number is a trigger and a progress indicator, never a bill.
+
 ## Troubleshooting the meter
 
 - **The denominator looks wrong (too small).** The agent's `request_token_ceiling` is

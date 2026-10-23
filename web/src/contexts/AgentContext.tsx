@@ -25,6 +25,7 @@ import {
 import { primeModelProviderCatalog, modelProviderDisplayName } from '@/lib/modelProviders';
 import { resolveAvailableModels } from './modelPicker.logic';
 import { contextLimitsFromDoneFrame } from './contextLimits.logic';
+import { buildHistoryTrimmedNotice } from './historyTrimNotices.logic';
 import type { ToolCall } from '@/lib/toolCall';
 import { emptyLiveTurn, type LiveTurn, type TurnSegments } from '@/lib/turnSegments';
 import { resolveToolResultIndex } from '@/lib/toolCardMatch';
@@ -455,6 +456,22 @@ export function AgentProvider({
         // several calls arriving together one step rather than several.
         foldTurnStream({ type: 'usage' });
         setTokenStats((s) => applyUsage(s, msg));
+        // The provider just reported the real input size for this call, so the
+        // meter can stop showing the pre-dispatch estimate. `done` still wins
+        // at turn end (`last_input_tokens` is the turn's authoritative number),
+        // but a multi-call turn would otherwise sit on the estimate until then.
+        if (typeof msg.input_tokens === 'number') {
+          setContextInputTokens(msg.input_tokens);
+        }
+        break;
+
+      case 'context_usage':
+        // Pre-dispatch assembled size, published once per turn. Deliberately
+        // not folded as a step: the fold only listens to `usage`, because this
+        // frame means "a request is about to go out", not "a call completed".
+        if (typeof msg.input_tokens === 'number') {
+          setContextInputTokens(msg.input_tokens);
+        }
         break;
 
       case 'thinking':
@@ -658,11 +675,11 @@ export function AgentProvider({
       }
 
       case 'history_trimmed': {
-        const reason = msg.reason || t('agent.history_trimmed_unknown_reason');
-        const content = t('agent.history_trimmed')
-          .replace('{reason}', reason)
-          .replace('{dropped}', String(msg.dropped_messages ?? 0))
-          .replace('{kept}', String(msg.kept_turns ?? 0));
+        // Token-rich when the daemon sent `tokens_before`/`tokens_after`;
+        // falls back to the count-only wording for older daemons and
+        // message-limit trims. Rendering lives in `historyTrimNotices.logic.ts`
+        // so the wording is unit-testable without a React harness.
+        const content = buildHistoryTrimmedNotice(msg, t);
         const notice = {
           id: generateUUID(),
           role: 'agent' as const,

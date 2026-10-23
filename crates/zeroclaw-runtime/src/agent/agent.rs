@@ -426,6 +426,17 @@ struct HistoryTrimNotice {
     kept_turns: usize,
     reason: String,
     retained_context: zeroclaw_api::agent::RetainedContextSnapshot,
+    /// Estimated provider-facing size before the trim.
+    tokens_before: u64,
+    /// Estimated provider-facing size after the trim and after the breadcrumb
+    /// was re-priced. Clients use this to refresh the context meter without
+    /// waiting for the next `done` frame.
+    tokens_after: u64,
+    /// Send budget in effect at trim time. `None` when the window is
+    /// unbounded (`context_send_budget() == 0` means "no fit constraint", not
+    /// "budget of zero"), so a client never reads a zero budget as a demand to
+    /// trim to nothing.
+    token_budget: Option<u64>,
 }
 
 impl HistoryTrimNotice {
@@ -435,12 +446,16 @@ impl HistoryTrimNotice {
             dropped_turns: self.dropped_turns,
             kept_turns: self.kept_turns,
             reason: self.reason,
-            // Message-limit trims carry no token accounting.
-            token_budget: None,
-            tokens_before: None,
-            tokens_after: None,
-            tokens_before_source: None,
-            tokens_after_source: None,
+            token_budget: self.token_budget,
+            tokens_before: Some(self.tokens_before),
+            tokens_after: Some(self.tokens_after),
+            // Both counts come from the local estimator: the water-line fires
+            // before the request is sent, so no provider usage exists yet.
+            // Labelling them `Provider` would claim a precision this path
+            // cannot have — the estimator over-counts CJK-heavy text, and the
+            // label is how a client knows to show it as an estimate.
+            tokens_before_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
+            tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
             unsatisfiable_floor: None,
             retained_context: Some(self.retained_context),
         }
@@ -1502,6 +1517,13 @@ impl Agent {
                 kept_turns: result.kept_turns,
                 reason,
                 retained_context: self.retained_context_snapshot(),
+                // `tokens_after` was re-priced above, after the breadcrumb was
+                // inserted: the breadcrumb is part of what the next request
+                // carries, so reporting the pre-breadcrumb figure would
+                // understate the meter.
+                tokens_before: result.tokens_before as u64,
+                tokens_after: result.tokens_after as u64,
+                token_budget: (send_budget > 0).then_some(send_budget as u64),
             }));
         }
         self.history = result.history;
@@ -4033,6 +4055,16 @@ impl Agent {
         // provider view so session/UI and the model share one transcript. The
         // water-line is the only pre-send trigger; the action it opens is
         // keep-N.
+        //
+        // `None` is deliberate, not an oversight: this non-streaming path has
+        // no event bus. Its callers are `run_single`/`run_interactive` (a
+        // terminal with no context meter) and the eval runner (a score, not a
+        // UI), so there is no consumer for a `HistoryTrimmed` event and
+        // inventing a channel here would only produce a receiver nobody reads.
+        // The trim is still observable — `trim_durable_history` records the
+        // `ObserverEvent::HistoryTrimmed` before returning. Anything that
+        // shows a meter goes through `turn_streamed`, which passes a real
+        // sender and therefore carries `tokens_after` to the client.
         if let Err(error) =
             self.trim_durable_history_at_water_line(active_dispatcher.as_ref(), None)
         {
@@ -4596,6 +4628,22 @@ impl Agent {
         }
 
         let provider_messages = active_dispatcher.to_provider_messages(&self.history);
+
+        // Publish the assembled size before dispatch. This is the only moment
+        // the exact request body exists while no provider has answered yet, so
+        // the meter can move when the turn starts instead of idling on the
+        // previous turn's number until `done`. Labelled `estimate` by the
+        // adapters — it is the local estimator, not a measurement — and it is
+        // a separate event from `Usage` precisely so clients do not fold it
+        // into their step boundary.
+        let assembled_tokens =
+            crate::agent::history::estimate_history_tokens(&provider_messages) as u64;
+        let _ = event_tx.try_send(TurnEvent::ContextEstimate {
+            input_tokens: assembled_tokens,
+            context_token_budget: Some(self.config.resolved.context_trim_budget() as u64),
+            model_context_window: Some(self.config.resolved.model_context_window as u64),
+            effective_context_window: Some(self.config.resolved.effective_context_window() as u64),
+        });
         let cache_key = self.response_cache_key_for_messages(&provider_messages, &effective_model);
 
         if let (Some(cache), Some(key)) = (&self.response_cache, &cache_key) {
@@ -12931,6 +12979,74 @@ mod tests {
         );
     }
 
+    /// The meter-refresh contract: a durable trim must hand the client a
+    /// number, not `None`. `HistoryTrimmed` carries `tokens_before`/`after`
+    /// plus a source label, and the WS adapter turns those into the frame the
+    /// web client uses to move the meter without waiting for `done`. Before
+    /// this, `into_turn_event` hardcoded `None` for all three, so the browser
+    /// kept showing the pre-trim figure until the turn's final frame.
+    #[test]
+    fn durable_trim_notice_carries_estimated_token_accounting() {
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = trim_test_agent_with_resolved(keep_one_turn_resolved(), observer);
+        // Long enough that the trim actually shrinks the estimate. With a
+        // three-message fixture the breadcrumb the trim inserts is *longer*
+        // than what it dropped, so `after < before` would fail on a fixture
+        // artefact rather than on the accounting being wrong.
+        let mut history = vec![ConversationMessage::Chat(ChatMessage::system("system"))];
+        for index in 0..8 {
+            history.push(ConversationMessage::Chat(ChatMessage::user(&format!(
+                "old user {index}, long enough that dropping it saves real tokens"
+            ))));
+            history.push(ConversationMessage::Chat(ChatMessage::assistant(&format!(
+                "old assistant {index}, answering at a comparable length"
+            ))));
+        }
+        history.push(ConversationMessage::Chat(ChatMessage::user("new user")));
+        history.push(ConversationMessage::Chat(ChatMessage::assistant(
+            "new assistant",
+        )));
+        agent.history = history;
+
+        let notice = trim_durable_history_for_test(&mut agent).expect("trim must fire");
+        let TurnEvent::HistoryTrimmed {
+            tokens_before,
+            tokens_after,
+            tokens_before_source,
+            tokens_after_source,
+            token_budget,
+            ..
+        } = notice.into_turn_event()
+        else {
+            panic!("a durable trim must map to HistoryTrimmed");
+        };
+
+        let before = tokens_before.expect("durable trims report tokens_before");
+        let after = tokens_after.expect("durable trims report tokens_after");
+        assert!(
+            after < before,
+            "the trim must shrink the estimate: {after} !< {before}"
+        );
+        // Both counts are pre-send local estimates. Claiming `Provider` would
+        // make a client render an estimate as a measurement.
+        assert_eq!(
+            tokens_before_source,
+            Some(zeroclaw_api::agent::TokenCountSource::Estimated)
+        );
+        assert_eq!(
+            tokens_after_source,
+            Some(zeroclaw_api::agent::TokenCountSource::Estimated)
+        );
+        // The retained history must fit the budget the notice advertises, or
+        // the meter would render a value above its own denominator.
+        if let Some(budget) = token_budget {
+            assert!(
+                after <= budget,
+                "tokens_after {after} must fit the advertised budget {budget}"
+            );
+        }
+    }
+
     /// The regression this whole change exists for. `service start` reported a
     /// trim on every single turn because the upstream `trim_history` cut the
     /// transcript back to keep-N on the turn's success path. The water-line is
@@ -16230,11 +16346,18 @@ mod tests {
                 .await
         });
 
-        assert!(
-            matches!(
-                event_rx.recv().await,
-                Some(TurnEvent::Chunk { delta }) if delta == "draft"
-            ),
+        // The turn publishes its assembled size before dispatch, so the first
+        // event on the channel is the estimate, not the first token. Skip to
+        // the chunk this test is about rather than pinning the event order.
+        let first_chunk = loop {
+            match event_rx.recv().await {
+                Some(TurnEvent::Chunk { delta }) => break delta,
+                Some(_) => continue,
+                None => panic!("the turn ended before streaming any text"),
+            }
+        };
+        assert_eq!(
+            first_chunk, "draft",
             "the client should see the streamed text before the provider error"
         );
 

@@ -1560,6 +1560,46 @@ test('a trim cuts the transcript locally, so committed turns stay folded', async
   await unmount(mounted.renderer);
 });
 
+test('the meter follows the assembled estimate, then the provider measurement', async () => {
+  const { mounted, socket } = await mountLiveChat();
+  await act(async () => {
+    mounted.context().sendMessage('hello');
+  });
+
+  // Pre-dispatch: the assembled request size moves the meter before any call
+  // returns, so a long turn does not sit on the previous turn's number.
+  await act(async () => {
+    socket.emitMessage({
+      type: 'context_usage',
+      input_tokens: 9000,
+      input_tokens_source: 'estimate',
+      max_context_tokens: 8000,
+      effective_context_window: 10000,
+    });
+  });
+  await settle();
+  assert.equal(mounted.context().contextInputTokens, 9000, 'the assembled estimate lands');
+
+  // The provider's own count replaces it mid-turn, without waiting for `done`.
+  await act(async () => {
+    socket.emitMessage({ type: 'usage', input_tokens: 8123, output_tokens: 12 });
+  });
+  await settle();
+  assert.equal(
+    mounted.context().contextInputTokens,
+    8123,
+    'a provider measurement supersedes the estimate',
+  );
+
+  // `done` stays authoritative for the turn and reports the same number here.
+  await act(async () => {
+    socket.emitMessage({ type: 'done', full_response: 'ok', last_input_tokens: 8123 });
+  });
+  await settle();
+  assert.equal(mounted.context().contextInputTokens, 8123);
+  await unmount(mounted.renderer);
+});
+
 test('a live turn renders one group holding its trajectory, answer outside it', async () => {
   const { mounted, socket } = await mountLiveChat({ toolActivity: true });
   await act(async () => {

@@ -157,6 +157,26 @@ pub enum TurnEvent {
         /// ignore this field; it is never serialized as a turn event.
         retained_context: Option<RetainedContextSnapshot>,
     },
+    /// The assembled request size, published once per turn after the
+    /// water-line decision and before dispatch.
+    ///
+    /// Deliberately **not** [`TurnEvent::Usage`]: `Usage` means the provider
+    /// answered and billed the call, and clients fold it into their step
+    /// boundary. This is a pre-send local estimate — no provider has seen the
+    /// request yet — so folding it as usage would invent a step that does not
+    /// exist. Its only consumer is the context meter, which would otherwise
+    /// keep showing the previous turn's number until the response arrives.
+    ContextEstimate {
+        /// Locally estimated size of the assembled provider request.
+        input_tokens: u64,
+        /// Water-line in effect at assembly time; `None` when trimming is
+        /// disabled, so a client never reads a zero as "budget exhausted".
+        context_token_budget: Option<u64>,
+        /// Configured model capacity for the route, when authoritative.
+        model_context_window: Option<u64>,
+        /// The meter denominator: capacity clamped by the input ceiling.
+        effective_context_window: Option<u64>,
+    },
     /// Per-LLM-call token usage and cost; a turn may emit several, one per
     /// model call. `None` means "unavailable for this call", not zero.
     /// The `provider_ref` and `model` identify the provider and model used

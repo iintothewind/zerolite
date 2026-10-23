@@ -13790,6 +13790,23 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<St
                 effective_context_window: *effective_context_window,
             }
         }
+        TurnEvent::ContextEstimate {
+            input_tokens,
+            context_token_budget,
+            model_context_window,
+            effective_context_window,
+        } => SessionUpdateEvent::ContextUsage {
+            session_id: session_id.to_string(),
+            input_tokens: Some(*input_tokens),
+            // Always `estimate`: this event is published before dispatch, so
+            // no provider-reported count can exist for it. Claiming otherwise
+            // would tell the client to stop labelling the meter as an
+            // estimate.
+            input_tokens_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
+            max_context_tokens: *context_token_budget,
+            model_context_window: *model_context_window,
+            effective_context_window: *effective_context_window,
+        },
         TurnEvent::Plan { entries } => SessionUpdateEvent::Plan {
             session_id: session_id.to_string(),
             entries: entries.clone(),

@@ -1391,6 +1391,29 @@ fn history_trimmed_ws_frame(
     frame
 }
 
+/// Build the pre-dispatch `context_usage` WS frame from a
+/// [`TurnEvent::ContextEstimate`].
+///
+/// The source is always `estimate`: this frame is emitted before the request
+/// is sent, so no provider-reported count can exist for it. It is a separate
+/// frame type from `usage` because the web client folds `usage` into its step
+/// boundary — "a call completed" — and a pre-send estimate is not a call.
+fn context_estimate_ws_frame(
+    input_tokens: u64,
+    context_token_budget: Option<u64>,
+    model_context_window: Option<u64>,
+    effective_context_window: Option<u64>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "context_usage",
+        "input_tokens": input_tokens,
+        "input_tokens_source": "estimate",
+        "max_context_tokens": context_token_budget,
+        "model_context_window": model_context_window,
+        "effective_context_window": effective_context_window,
+    })
+}
+
 /// Build the display-only `safeguard_fallback` WS frame from a drained
 /// [`zeroclaw_providers::SafeguardFallbackNotice`], or `None` when no notice
 /// was recorded this turn (so "no notice → no frame" is enforced here).
@@ -2170,6 +2193,17 @@ async fn process_chat_message(
                             tokens_after_source.map(|s| s.as_str()),
                             unsatisfiable_floor,
                         ),
+                        TurnEvent::ContextEstimate {
+                            input_tokens,
+                            context_token_budget,
+                            model_context_window,
+                            effective_context_window,
+                        } => context_estimate_ws_frame(
+                            input_tokens,
+                            context_token_budget,
+                            model_context_window,
+                            effective_context_window,
+                        ),
                         TurnEvent::Plan { entries } => serde_json::json!({
                             "type": "plan",
                             "entries": entries,
@@ -2907,17 +2941,16 @@ data: {\"type\":\"message_stop\"}\n\n",
         mock_server.abort();
     }
 
+    /// Restore does **not** cap the transcript. `seed_conversation_history_with_event`
+    /// deliberately leaves the restored rows alone — the water-line trim inside
+    /// the turn is what bounds context, and capping at seed time would cut every
+    /// restored session back to `keep_recent_turns` on load. Pinning the
+    /// opposite (the upstream behaviour this fork deleted) made the test demand
+    /// a trim that no longer happens. Runs on a larger-stack thread for the same
+    /// reason as the sibling WebSocket regression above: real agent
+    /// construction exceeds the default test harness stack.
     #[test]
-    fn websocket_connect_persists_a_restore_time_trim_before_going_live() {
-        // Same contract as the ACP/RPC restore-persistence regressions: an
-        // over-cap restored transcript trims in memory as soon as the socket
-        // upgrade seeds it, before the session ever goes live. That retained
-        // projection and its corrected breadcrumb must already be durable at
-        // that point, so a reconnect that never sends a `message` frame does
-        // not reload the untrimmed prefix and repeat the trim. Runs on a
-        // larger-stack thread for the same reason as the sibling WebSocket
-        // regression above: real agent construction exceeds the default test
-        // harness stack.
+    fn websocket_connect_leaves_the_restored_transcript_uncapped() {
         std::thread::Builder::new()
             .name("ws-restore-trim-regression".to_string())
             .stack_size(8 * 1024 * 1024)
@@ -2926,16 +2959,14 @@ data: {\"type\":\"message_stop\"}\n\n",
                     .enable_all()
                     .build()
                     .expect("test runtime")
-                    .block_on(
-                        websocket_connect_persists_a_restore_time_trim_before_going_live_inner(),
-                    );
+                    .block_on(websocket_connect_leaves_the_restored_transcript_uncapped_inner());
             })
             .expect("spawn WebSocket regression thread")
             .join()
             .expect("WebSocket regression thread must not panic");
     }
 
-    async fn websocket_connect_persists_a_restore_time_trim_before_going_live_inner() {
+    async fn websocket_connect_leaves_the_restored_transcript_uncapped_inner() {
         use zeroclaw_infra::session_backend::SessionBackend;
 
         let tmp = tempfile::tempdir().expect("temporary gateway workspace");
@@ -3061,27 +3092,26 @@ data: {\"type\":\"message_stop\"}\n\n",
         );
         drop(client);
 
-        // Give the server task a moment to finish the restore-time
-        // persistence that runs before it starts waiting on the socket for
-        // more frames.
+        // Give the server task a moment to finish seeding the session before
+        // reading the store back.
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         let stored = backend.load(&session_key);
-        assert!(
-            stored.len() < over_cap.len(),
-            "restore-time trim must persist the retained (capped) transcript, not the \
-             untrimmed rows it was seeded from: {stored:?}"
+        assert_eq!(
+            stored.len(),
+            over_cap.len(),
+            "restore must not cap the transcript at seed time: {stored:?}"
         );
         assert!(
-            !stored
+            stored
                 .iter()
                 .any(|message| message.content == "turn one request"),
-            "the oldest trimmed turn must not survive in the durable store: {stored:?}"
+            "the oldest restored turn must survive an uncapped restore: {stored:?}"
         );
         assert_eq!(
             backend.get_session_trim_breadcrumb(&session_key).unwrap(),
-            Some(true),
-            "restore-time trim must persist the corrected breadcrumb"
+            Some(false),
+            "no trim happened, so the breadcrumb flag must still be false"
         );
 
         gateway_server.abort();
@@ -3958,6 +3988,30 @@ data: {{\"type\":\"message_stop\"}}\n\n"
                 "kept_turns": 3,
                 "reason": "message limit",
             })
+        );
+    }
+
+    #[test]
+    fn context_estimate_frame_is_a_pre_send_estimate_not_a_usage_step() {
+        let frame = context_estimate_ws_frame(9_000, Some(8_000), Some(10_000), Some(10_000));
+
+        assert_eq!(
+            frame,
+            serde_json::json!({
+                "type": "context_usage",
+                "input_tokens": 9_000,
+                // Never `provider`: nothing has been sent yet, and the web
+                // client renders the label so an estimate is not read as a
+                // measurement.
+                "input_tokens_source": "estimate",
+                "max_context_tokens": 8_000,
+                "model_context_window": 10_000,
+                "effective_context_window": 10_000,
+            })
+        );
+        assert_ne!(
+            frame["type"], "usage",
+            "the assembled estimate must not be foldable as a step boundary"
         );
     }
 

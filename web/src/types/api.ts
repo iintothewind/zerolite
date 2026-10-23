@@ -238,6 +238,7 @@ export interface WsMessage {
     | "cron_result"
     | "approval_request"
     | "history_trimmed"
+    | "context_usage"
     | "agent_start"
     | "safeguard_fallback"
     | "aborted";
@@ -296,6 +297,11 @@ export interface WsMessage {
   model_context_window?: number | null;
   effective_context_window?: number | null;
   input_tokens?: number;
+  /** Provenance of `input_tokens` on `context_usage` frames: `provider` when
+   * the provider reported it, `estimate` for the pre-dispatch assembled size,
+   * `calibrated` when a provider sample has corrected the local estimator.
+   * Absent on older daemons. */
+  input_tokens_source?: string;
   output_tokens?: number;
   // Emitted as JSON null when the accepted call reports no usage (stale
   // route protection); consumers must branch on null, not undefined.
