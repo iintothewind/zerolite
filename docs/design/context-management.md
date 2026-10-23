@@ -10,7 +10,7 @@
 ZeroLite's context management is an independent design, not a modified copy
 of upstream's. The two diverged from a common ancestor and evolved
 separately; neither is a bug-fixed version of the other.
-The semantics on this page rest on six reasons. They are the actual grounds
+The semantics on this page rest on seven reasons. They are the actual grounds
 for the decisions — a future change that cannot answer them has not made its
 case.
 
@@ -47,6 +47,17 @@ case.
   text into history as if it were fact, costs an extra model call, and its
   errors compound invisibly. Dropping whole turns is lossy but honest, and
   the surviving turns remain exactly what the model produced.
+- **R7 — There is no context compaction in this system.** Compaction is a
+  distinct mechanism, not a stronger trim: a model call that rewrites history
+  into a smaller surrogate and stores the surrogate as history. This system
+  implements it in no form — no summarization pass, no mid-turn compaction,
+  no provider-side compaction hook, and no config key that turns one on. R6
+  forbids the rewriting; R7 records that the mechanism is *absent*, not
+  merely switched off, so an upstream change that brings one in is adding a
+  subsystem rather than restoring a lost default. The vocabulary follows the
+  same decision: a shrinking history is a **trim**, its action is **dropping
+  whole turns**, and no `compact_*` name exists for context retention — in the
+  code, the config surface, or the log.
 
 The divergences that follow from these reasons, decision by decision:
 
@@ -60,12 +71,12 @@ The divergences that follow from these reasons, decision by decision:
 | 6 | No output-reserve concept in context policy | `reserve_tokens` bounds the water-line from above **and** defines the send budget | Without a reserve, a successful trim can leave no room for the model's own output, and the request fails immediately after |
 | 7 | No `ContextCalibration`. A reported-budget trim path exists (`trim_to_reported_budget`) that proportionally scales a local estimate by the reported/estimated ratio — but the proactive trigger is sized from the local estimate alone | `ContextCalibration` re-anchors on the provider-reported `usage.input_tokens`; only the unbilled tail is priced locally. The calibrated size feeds **both** the trigger measurement and the trim | R5 — proportional scaling preserves the local estimate's error; anchoring replaces it at the anchor point |
 | 8 | A trim that cannot fit is a silent no-op: even with only the floor remaining and still over budget, the trim returns the oversized history unchanged with `trimmed: false` and no error | A floor that cannot fit is a **hard failure**: an error to the caller, and **no** `HistoryTrimmed` notice | R4 |
-| 9 | `context_compression.*`: summarization-based compaction rewrites older history into a model-written summary | Removed entirely. There is no summarization anywhere in the retention path | R6, R1 |
+| 9 | `context_compression.*`: summarization-based compaction rewrites older history into a model-written summary | Removed entirely. There is no summarization anywhere in the retention path, and no compaction subsystem to disable | R6, R7, R1 |
 
 The practical consequence: **`[runtime_profiles.<alias>.context]` is the
 only place context policy is configured.** A knob that appears in upstream
 and not here was not overlooked; absent a new decision record that answers
-R1–R6, it was rejected.
+R1–R7, it was rejected.
 
 ## 2. Merge guideline
 
@@ -266,7 +277,7 @@ action is a three-stage cascade (`history_trim::trim_to_fit` /
 | Stage | Behavior | Stop when |
 |-------|----------|-----------|
 | 1. Turns first | Keep the newest `keep_recent_turns` whole turns (default `5`, clamped `1..=10`) plus leading system (tools/skills live in that non-droppable prefix) | Estimated / calibrated tokens **≤ `send_budget`** |
-| 2. Budget cascade | Still over → choose the **largest** `kept_turns` in `1..=preferred` whose estimate fits `send_budget` (drop the oldest whole turns in one compaction; never keep a gap in the middle). **Warn** when the chosen keep is below preferred | A fitting `kept_turns` exists, **or** only `kept_turns == 1` remains to try |
+| 2. Budget cascade | Still over → choose the **largest** `kept_turns` in `1..=preferred` whose estimate fits `send_budget` (drop the oldest whole turns in one pass; never keep a gap in the middle). **Warn** when the chosen keep is below preferred | A fitting `kept_turns` exists, **or** only `kept_turns == 1` remains to try |
 | 3. Hard fail | Floor (system/tools/skills prefix + newest turn) still over `send_budget` | Abort the turn with an **error message only** (no `HistoryTrimmed` notice); never drop below one turn |
 
 How stage 2 is decided does not matter to operators: the runtime may probe by decrementing keep, binary-search, or estimate turn sizes once. The contract is the outcome — maximal keep that fits, whole turns only, floor 1.
