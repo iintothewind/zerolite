@@ -155,9 +155,38 @@ unset CARGO_TARGET_DIR
 die() { echo "error: $*" >&2; exit 1; }
 step() { echo; echo "==> $*"; }
 
+# Two runs share $REPO_ROOT/target, and each one's EXIT reclaim does
+# `rm -rf target/`. When they overlap, the first to finish deletes the other's
+# in-flight object files and rustc reports `couldn't create a temp dir: … at
+# path target/<triple>/release/deps/rmetaw*` — an error that points at nothing
+# in the source. Refuse to start while another run is alive.
+_ZC_LOCK_DIR="${TMPDIR:-/tmp}/zeroclaw-build-cli-$(printf '%s' "$REPO_ROOT" | cksum | cut -d' ' -f1).lock"
+
+_zc_acquire_lock() {
+  local stale_retry=0 owner
+  while :; do
+    if mkdir "$_ZC_LOCK_DIR" 2>/dev/null; then
+      printf '%s\n' "$$" > "$_ZC_LOCK_DIR/pid"
+      return 0
+    fi
+    owner="$(cat "$_ZC_LOCK_DIR/pid" 2>/dev/null || true)"
+    if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then
+      die "another build-cli-local run is in progress (pid $owner). Both runs share target/ and each one's EXIT reclaim deletes the other's object files. Wait for it, or stop it first."
+    fi
+    [ "$stale_retry" -eq 0 ] \
+      || die "lock $_ZC_LOCK_DIR is held by a run that is gone (pid ${owner:-unknown}); remove that directory and retry"
+    rm -rf "$_ZC_LOCK_DIR" 2>/dev/null || true
+    stale_retry=1
+  done
+}
+
 # Always reclaim bulky cargo intermediates — success, failure, or Ctrl-C.
 # Keeps only dist/bin/<target>/zeroclaw. See scripts/dev/reclaim-cargo-disk.sh.
 _zc_reclaim_on_exit() {
+  # Release the lock first: the success path below returns early.
+  if [ -n "${_ZC_LOCK_DIR:-}" ] && [ -d "$_ZC_LOCK_DIR" ]; then
+    rm -rf "$_ZC_LOCK_DIR" 2>/dev/null || true
+  fi
   # Avoid double-printing when the success path already reclaimed.
   if [ "${_ZC_RECLAIMED:-0}" = "1" ]; then
     return 0
@@ -173,6 +202,8 @@ _zc_reclaim_on_exit() {
   _ZC_RECLAIMED=1
 }
 trap '_zc_reclaim_on_exit' EXIT INT TERM
+
+_zc_acquire_lock
 
 need_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
@@ -207,6 +238,18 @@ if [ "$SKIP_WEB" -eq 0 ]; then
   touch web/dist/.gitkeep
 
   step "cargo web build (OpenAPI + openapi-typescript + vite → web/dist)"
+  # Agent shells (WorkBuddy, Cursor, …) export NODE_OPTIONS with a `--require`
+  # shim that wraps `fs.rmSync` in a bulk-delete guard. Vite's `emptyOutDir`
+  # clears web/dist through `rmSync`, and that guard needs a lock directory the
+  # sandbox forbids — the web build then dies with
+  # `SAFE_DELETE_BULK_GUARD_ERROR` before writing a single asset, which looks
+  # like a vite bug and is not one. Nothing in this build needs NODE_OPTIONS, so
+  # drop it here instead of making every caller remember to.
+  if [ -n "${NODE_OPTIONS:-}" ]; then
+    step "clear NODE_OPTIONS for the web build (sandbox fs shims break vite's emptyOutDir)"
+    echo "    was: $NODE_OPTIONS"
+    unset NODE_OPTIONS
+  fi
   cargo web build
   [ -f web/dist/index.html ] || die "web/dist/index.html missing after cargo web build"
 
@@ -257,9 +300,17 @@ docker run --rm \
   "$RUST_IMAGE" \
   bash -c "
     set -e
-    apt-get update -qq
+    # Docker Desktop's DNS proxy (192.168.65.7) sometimes answers with AAAA
+    # only — e.g. deb.debian.org resolving to 2a04:4e42:96::644 — while the
+    # container has no IPv6 route. apt then burns its attempts on v6, falls
+    # back to v4, and reports the v4 connect as 'Connection refused (111)',
+    # which reads like a firewall and is really an address-family mismatch.
+    # These containers only ever have IPv4 egress, so pin apt to it and retry:
+    # a transient refusal then costs one retry instead of the whole build.
+    APT_OPTS='-o Acquire::ForceIPv4=true -o Acquire::Retries=3'
+    apt-get \$APT_OPTS update -qq
     if [ -n \"$APT_PKGS\" ]; then
-      apt-get install -y -qq $APT_PKGS
+      apt-get \$APT_OPTS install -y -qq $APT_PKGS
     fi
     rustup target add \"$TARGET\"
     # embedded-web asserts web/dist/index.html exists at build-script time.

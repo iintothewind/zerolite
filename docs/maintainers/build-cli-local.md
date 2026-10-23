@@ -19,6 +19,14 @@ scripts\dev\build-cli-local.cmd
 Features are always `--features embedded-web,plugins-wasm-cranelift`: that is
 the release shape, so a plain invocation needs no flags.
 
+The script clears `NODE_OPTIONS` before the web build. Agent shells
+(WorkBuddy, Cursor, …) export a `--require` shim there that wraps
+`fs.rmSync` in a bulk-delete guard; vite's `emptyOutDir` clears `web/dist`
+through `rmSync`, the guard cannot create its lock directory inside the
+sandbox, and the build dies with `SAFE_DELETE_BULK_GUARD_ERROR` before writing
+anything. That is an environment artifact, not a vite bug — if you invoke
+`npm run build` in `web/` yourself, clear `NODE_OPTIONS` first.
+
 `--plugins-wasm` is accepted and is now the **default**; it adds
 `plugins-wasm-cranelift`, which gives the binary `zeroclaw plugin`
 (search / install / update / …) and lets it JIT-compile registry `.wasm`
