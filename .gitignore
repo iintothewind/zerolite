@@ -163,3 +163,6 @@ target/openapi.json
 
 # WorkBuddy AI workspace (machine-local agent state: memory, reports, caches)
 /.workbuddy-ai/
+
+# Local scratch workspace
+/.work/
