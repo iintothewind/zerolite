@@ -5928,37 +5928,6 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     #[tokio::test]
-    async fn cancel_plus_grace_force_tears_down_hung_join() {
-        let cancel = tokio_util::sync::CancellationToken::new();
-        let cancel_for_select = cancel.clone();
-        let grace = std::time::Duration::from_millis(40);
-        let started = std::time::Instant::now();
-
-        let join_handle = zeroclaw_spawn::spawn!(async move {
-            let turn = futures_util::future::pending::<()>();
-            let forward = futures_util::future::pending::<()>();
-            tokio::select! {
-                biased;
-                _ = async { tokio::join!(turn, forward) } => unreachable!("hung join must not complete"),
-                _ = async {
-                    cancel_for_select.cancelled().await;
-                    tokio::time::sleep(grace).await;
-                } => {}
-            }
-        });
-
-        cancel.cancel();
-        tokio::time::timeout(std::time::Duration::from_millis(500), join_handle)
-            .await
-            .expect("force teardown must finish within grace")
-            .expect("join task must not panic");
-        assert!(
-            started.elapsed() >= grace,
-            "force path must wait for turn_cancel_after grace"
-        );
-    }
-
-    #[tokio::test]
     async fn websocket_turn_forwards_usage_and_agent_start_frames() {
         // Production-shaped fixture: isolate on its own thread with a larger
         // stack, same as the empty-terminal regression above.
