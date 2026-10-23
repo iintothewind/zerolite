@@ -10,12 +10,11 @@
 //!   state's fingerprint changes or [`StablePrefix::invalidate`] is called
 //!   (MCP tool-set change, model switch).
 //! - [`AppendOnlyLog`] grows a message sequence and never rewrites it except
-//!   through the two sanctioned paths ([`replace_tail`] or a [`sync`] that
-//!   preserves the longest byte-stable prefix). Compaction and in-place
-//!   pruning go through [`AppendOnlyLog::sync`], which trims only back to the
-//!   divergence point — the earlier bytes stay cacheable.
+//!   through [`AppendOnlyLog::sync`], which preserves the longest byte-stable
+//!   prefix. Shrinking (a trim that dropped whole turns) and in-place pruning
+//!   both go through the same call, which trims only back to the divergence
+//!   point — the earlier bytes stay cacheable.
 //!
-//! [`replace_tail`]: AppendOnlyLog::replace_tail
 //! [`sync`]: AppendOnlyLog::sync
 //!
 //! Portable and dependency-light: generic over any `serde::Serialize` prefix

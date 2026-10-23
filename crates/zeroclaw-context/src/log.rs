@@ -1,8 +1,7 @@
 //! Append-only message log with divergence-aware sync.
 //!
-//! Messages are appended and never rewritten in place. The two sanctioned
-//! mutation paths are [`AppendOnlyLog::replace_tail`] (compaction of the newest
-//! entry) and [`AppendOnlyLog::sync`] (reconciling the log with a freshly
+//! Messages are appended and never rewritten in place. The one sanctioned
+//! mutation path is [`AppendOnlyLog::sync`] (reconciling the log with a freshly
 //! normalized message list). `sync` preserves the **longest byte-stable
 //! prefix**: when a caller prunes, re-renders, or image-strips earlier messages
 //! in place, only bytes from the first changed message on are dropped and
@@ -71,19 +70,6 @@ impl<M: serde::Serialize + Clone> AppendOnlyLog<M> {
         }
     }
 
-    /// Replace the newest entry — the only legal in-place mutation outside
-    /// [`sync`]. Used by compaction to swap the trailing turn for its summary.
-    /// No-op on an empty log.
-    pub fn replace_tail(&mut self, replacement: M) {
-        let last = self.entries.len().wrapping_sub(1);
-        if self.entries.is_empty() {
-            return;
-        }
-        let digest = crate::digest(&replacement);
-        self.entries[last] = replacement;
-        self.digests[last] = digest;
-    }
-
     /// Reconcile the log with `messages` (the freshly normalized, provider-level
     /// list) while preserving the longest byte-stable prefix.
     ///
@@ -91,14 +77,14 @@ impl<M: serde::Serialize + Clone> AppendOnlyLog<M> {
     /// - **Append** (prefix unchanged, longer tail): push the new entries.
     /// - **In-place rewrite / prune** (some earlier message changed bytes):
     ///   truncate back to the first divergence, then re-append from there.
-    /// - **Compaction** (the list got shorter): every earlier byte may be gone,
-    ///   so the log is rebuilt from scratch.
+    /// - **Shrink** (the list got shorter, e.g. a trim dropped whole turns):
+    ///   every earlier byte may be gone, so the log is rebuilt from scratch.
     ///
     /// Returns the number of entries whose bytes are unchanged from the prior
     /// sync — the cacheable prefix length — so the caller can log a cache-hit
     /// ratio.
     pub fn sync(&mut self, messages: &[M]) -> usize {
-        // Compaction: the provider-visible list shrank, so bytes carried
+        // Shrink: the provider-visible list got shorter, so bytes carried
         // forward are not guaranteed. Rebuild cleanly.
         if messages.len() < self.entries.len() {
             self.clear();
@@ -138,7 +124,7 @@ impl<M: serde::Serialize + Clone> AppendOnlyLog<M> {
         self.digests.truncate(count);
     }
 
-    /// Remove every entry (used by sync's compaction case and by explicit
+    /// Remove every entry (used by `sync`'s shrink case and by explicit
     /// resets, e.g. a model switch).
     pub fn clear(&mut self) {
         self.entries.clear();
@@ -218,27 +204,14 @@ mod tests {
     }
 
     #[test]
-    fn sync_rebuilds_on_compaction() {
+    fn sync_rebuilds_when_the_list_shrinks() {
         let mut log = AppendOnlyLog::new();
         log.sync(&[msg("user", "a"), msg("assistant", "b"), msg("user", "c")]);
-        // Compaction replaced 3 messages with a 2-message summary.
-        let stable = log.sync(&[msg("system", "summary"), msg("user", "c")]);
+        // A trim dropped the two oldest whole turns and led with its breadcrumb.
+        let stable = log.sync(&[msg("system", "breadcrumb"), msg("user", "c")]);
         assert_eq!(stable, 0, "a shorter list carries no guaranteed prefix");
         assert_eq!(log.len(), 2);
-        assert_eq!(log.entries()[0].content, "summary");
-    }
-
-    #[test]
-    fn replace_tail_swaps_only_the_newest() {
-        let mut log = AppendOnlyLog::new();
-        log.append(msg("user", "a"));
-        log.append(msg("assistant", "old"));
-        log.replace_tail(msg("assistant", "new"));
-        assert_eq!(log.len(), 2);
-        assert_eq!(log.entries()[1].content, "new");
-        // The replaced tail must not read as stable against its old digest.
-        let stable = log.sync(&[msg("user", "a"), msg("assistant", "new"), msg("user", "z")]);
-        assert_eq!(stable, 2, "replaced tail is tracked, prefix still stable");
+        assert_eq!(log.entries()[0].content, "breadcrumb");
     }
 
     #[test]

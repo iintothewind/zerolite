@@ -17774,7 +17774,7 @@ Let me check the result."#;
         assert_eq!(delegate_tools[0].name(), "files__list");
     }
 
-    // ── Token-based compaction tests ──────────────────────────
+    // ── Token-based trimming tests ────────────────────────────
 
     #[test]
     fn estimate_history_tokens_empty() {
