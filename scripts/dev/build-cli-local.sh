@@ -14,6 +14,10 @@
 #   scripts/dev/build-cli-local.sh --target x86_64-unknown-linux-gnu
 #   scripts/dev/build-cli-local.sh --skip-web   # ONLY when web/dist is already fresh
 #   scripts/dev/build-cli-local.sh --no-plugins-wasm  # drop the WASM plugin host (ARM32 only)
+#   scripts/dev/build-cli-local.sh --image ghcr.io/iintothewind/zeroclaw-cross-aarch64:bookworm
+#       # prebuilt cross toolchain: the apt step is skipped entirely. Rebuild
+#       # or read the recipe at dev/cross/Dockerfile. ZEROCLAW_RUST_IMAGE= does
+#       # the same thing without repeating the flag.
 #
 # Features are always --features embedded-web,plugins-wasm-cranelift: that is
 # the release shape. --plugins-wasm is accepted and is now the default.

@@ -1,0 +1,58 @@
+name: Cross image
+
+# Publishes the cross-compile host image that
+# `scripts/dev/build-cli-local.sh --image …` pulls.
+#
+# Rebuilding here instead of pushing from a laptop is the point: the image is
+# reproducible from dev/cross/Dockerfile, and GITHUB_TOKEN already carries
+# `packages: write` for this repository's namespace. No personal token with
+# package scope, and no 3.4 GB upload from a developer's uplink.
+
+on:
+  push:
+    branches:
+      - zerolite
+    paths:
+      - "dev/cross/Dockerfile"
+      - ".github/workflows/cross-image.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/zeroclaw-cross-aarch64
+
+concurrency:
+  group: cross-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # amd64 only, deliberately: this is a build host that emits aarch64
+      # binaries. `bookworm` is the floating tag the script documents;
+      # `rust-1.99.1` pins the toolchain for anyone who needs the exact image
+      # the release was built against.
+      - uses: docker/build-push-action@v7
+        with:
+          context: dev/cross
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:bookworm
+            ${{ env.IMAGE }}:rust-1.99.1
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

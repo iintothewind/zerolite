@@ -112,10 +112,13 @@ session and know it is current. Prefer the full pipeline.
 |---|---|
 | Docker (Desktop or Engine) | `docker info` |
 | `rust:1-bookworm` image | `docker pull rust:1-bookworm` — Bookworm glibc → `GLIBC_2.34` floor |
+| *Optional:* prebuilt cross image | `docker pull ghcr.io/iintothewind/zeroclaw-cross-aarch64:bookworm`, then pass `--image …`. Skips the apt step entirely; recipe in `dev/cross/Dockerfile` |
 | Node.js on the host | For `cargo web build`; pin to `.nvmrc` (currently `24`) |
 | Host `cargo` / `npm` | Script runs the web step on the host |
 
-Cross gcc + Rust target are installed **inside** the container.
+Cross gcc + Rust target are installed **inside** the container — from apt on a
+stock image, or not at all when the image already carries them (the script
+probes for `aarch64-linux-gnu-gcc` and drops the apt step when it is present).
 
 ### Git Bash on Windows
 
@@ -258,6 +261,7 @@ see `crates/zeroclaw-gateway/src/static_files.rs`).
 | `build dir not found: …\cursor-sandbox-cache\…\cargo-target` | Host `CARGO_TARGET_DIR` ≠ Docker's `$REPO_ROOT/target` | Script unsets it; `collect-dist` also falls back to repo `target/` |
 | `cargo web build` fails | OpenAPI / `openapi-typescript` | Never substitute `cd web && npm run build` |
 | `GLIBC_x.y not found` on device | Target glibc older than floor | Lower container base glibc; never raise it for Pi |
+| Container: apt `Connection refused (111)` fetching `deb.debian.org` | Docker Desktop's network stack refuses the v4 connect, often after an AAAA-only DNS answer with no IPv6 route to use. The host fetching the same URL in 200 ms makes it look like a firewall | The script pins IPv4 and retries; if it still bites, skip apt with `--image ghcr.io/iintothewind/zeroclaw-cross-aarch64:bookworm` |
 | Hand-edited `dist/bin/…` ≠ `target/…` | Forgot `collect-dist` / ran an old copy | Re-run the script; trust the printed sha256 |
 
 ---
@@ -265,6 +269,7 @@ see `crates/zeroclaw-gateway/src/static_files.rs`).
 ## Related
 
 - `scripts/dev/build-cli-local.sh` — canonical local builder (this runbook).
+- `dev/cross/Dockerfile` — recipe for the prebuilt cross image, published to GHCR by `.github/workflows/cross-image.yml`.
 - `scripts/dev/build-cli-local.cmd` — Windows entrypoint that always uses Git Bash.
 - `scripts/dev/collect-dist.sh` — copies `target/<triple>/release/*` → `dist/bin/<triple>/`.
 - `scripts/dev/reclaim-cargo-disk.sh` / `.cmd` — wipe compile/test residue (`target/`, `%TEMP%\zc-*`, …) after builds/tests.
