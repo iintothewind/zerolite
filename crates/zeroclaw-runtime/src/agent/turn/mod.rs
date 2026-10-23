@@ -985,15 +985,36 @@ enum PreDispatchOutcome {
 /// target is therefore the **send budget** (`window − reserve`) — what still
 /// fits — with the water-line as the fallback when no send budget is
 /// configured, and the model window as the last resort.
+///
+/// The **water-line caps it**, and that cap is what keeps a turn alive. The
+/// send budget answers "does this still fit"; it does not answer "is there
+/// room left for the model to answer in". With no `reserve_tokens` configured
+/// the send budget *is* the whole window, so the two answers collapse into
+/// one: a request that fits while leaving the model nowhere to write.
+///
+/// The water-line is where the operator declared the prompt must stop. It is
+/// evaluated once at turn start, so everything after that check depends on
+/// this budget. Tool results accumulate inside a single turn, long after the
+/// turn-start check — without the cap the population climbs toward the window
+/// with nothing firing, the provider accepts the request, the model runs out
+/// of space mid-reply, and the stream never terminates: no `finish_reason`,
+/// no error, just an idle connection until the client's read bound expires.
+///
+/// `min`, not "water-line first": a `reserve_tokens` tight enough to put the
+/// send budget below the water-line is the operator asking for the stricter
+/// of the two, and it wins.
 fn dispatch_trim_budget(limits: zeroclaw_config::schema::ResolvedContextLimits) -> usize {
-    let target = if limits.context_send_budget > 0 {
+    let fit = if limits.context_send_budget > 0 {
         limits.context_send_budget
-    } else if limits.context_token_budget > 0 {
-        limits.context_token_budget
     } else {
         limits.model_context_window
     };
-    target.min(limits.model_context_window)
+    let fit = if limits.context_token_budget > 0 {
+        fit.min(limits.context_token_budget)
+    } else {
+        fit
+    };
+    fit.min(limits.model_context_window)
 }
 
 fn context_window_exceeded_error(
@@ -5747,6 +5768,63 @@ mod trim_budget_tests {
             "final history must include the model-visible breadcrumb"
         );
     }
+
+    fn dispatch_limits(
+        water_line: usize,
+        send_budget: usize,
+        window: usize,
+    ) -> zeroclaw_config::schema::ResolvedContextLimits {
+        let mut limits = zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0);
+        limits.model_context_window = window;
+        limits.context_token_budget = water_line;
+        limits.context_send_budget = send_budget;
+        limits
+    }
+
+    /// The water-line is evaluated once, at turn start. Every dispatch after
+    /// that is guarded by this budget alone, so it must be the water-line and
+    /// not the send budget: with no `reserve_tokens` the send budget is the
+    /// whole window, and a turn that grows past the line — tool results land
+    /// long after the turn-start check — then reaches the window with nothing
+    /// firing. That is the shape of the stall where the provider accepts the
+    /// request, the model runs out of room mid-reply, and no `finish_reason`
+    /// ever arrives.
+    #[test]
+    fn the_in_turn_trim_budget_is_the_water_line_when_no_reserve_is_set() {
+        let limits = dispatch_limits(96_000, 120_000, 120_000);
+        assert_eq!(
+            dispatch_trim_budget(limits),
+            96_000,
+            "the send budget alone is the whole window here; the water-line must still bound \
+             the in-turn guard"
+        );
+    }
+
+    /// `min`, not "water-line first": a reserve tight enough to put the send
+    /// budget under the water-line is the operator asking for the stricter of
+    /// the two, and it wins.
+    #[test]
+    fn the_in_turn_trim_budget_takes_the_tighter_of_the_two_budgets() {
+        let limits = dispatch_limits(96_000, 80_000, 120_000);
+        assert_eq!(dispatch_trim_budget(limits), 80_000);
+    }
+
+    /// A zero water-line means proactive trimming is off; the model's capacity
+    /// is then the only ceiling, which is the pre-existing behaviour.
+    #[test]
+    fn the_in_turn_trim_budget_falls_back_to_the_window_when_trimming_is_off() {
+        let limits = dispatch_limits(0, 0, 120_000);
+        assert_eq!(dispatch_trim_budget(limits), 120_000);
+    }
+
+    /// The cap cannot raise the budget: a water-line above the model window
+    /// (a misconfiguration the resolver clamps, but this function must not
+    /// trust that) still resolves to the window.
+    #[test]
+    fn the_in_turn_trim_budget_never_exceeds_the_model_window() {
+        let limits = dispatch_limits(200_000, 200_000, 120_000);
+        assert_eq!(dispatch_trim_budget(limits), 120_000);
+    }
 }
 
 #[cfg(test)]
@@ -9091,6 +9169,97 @@ mod tool_lifecycle_abandonment_tests {
         }
     }
 
+    /// Returns a fixed payload. The way a turn grows between two dispatches is
+    /// a tool result landing in the transcript, so a tool that returns a known
+    /// number of tokens is how a test puts a turn past a chosen budget.
+    struct PayloadTool {
+        name: String,
+        payload: String,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for PayloadTool {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Tool(zeroclaw_api::attribution::ToolKind::Plugin)
+        }
+        fn alias(&self) -> &str {
+            &self.name
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for PayloadTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn description(&self) -> &str {
+            "returns a fixed payload"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            Ok(crate::tools::ToolResult::ok(self.payload.clone()))
+        }
+    }
+
+    /// Hands out scripted responses in order and records the messages every
+    /// request carried, so a test can assert what a later dispatch of the same
+    /// turn actually sent.
+    struct RecordingScriptedProvider {
+        responses: Mutex<Vec<ChatResponse>>,
+        requests: Mutex<Vec<Vec<ChatMessage>>>,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for RecordingScriptedProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "RecordingScriptedProvider"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for RecordingScriptedProvider {
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("done".into())
+        }
+
+        async fn chat(
+            &self,
+            request: zeroclaw_api::model_provider::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            self.requests
+                .lock()
+                .expect("request log lock")
+                .push(request.messages.to_vec());
+            let mut queue = self.responses.lock().expect("script queue lock");
+            if queue.is_empty() {
+                return Ok(text_response());
+            }
+            Ok(queue.remove(0))
+        }
+    }
+
     /// Succeeds, but first cancels the turn token: the executor's select!
     /// deterministically reports the cancellation instead of the tool's own
     /// result, simulating an operator interrupt landing mid-execution.
@@ -9343,6 +9512,84 @@ mod tool_lifecycle_abandonment_tests {
             }
             Ok(text_response())
         }
+    }
+
+    /// A turn grows between dispatches, and the water-line is only evaluated
+    /// once — before the first one. Everything after that is
+    /// `dispatch_trim_budget`, so this is the test that decides whether a
+    /// growing turn has an in-turn guard at all.
+    ///
+    /// The budgets are chosen so the second dispatch is over the water-line
+    /// (8k) and under the send budget (32k, which is also the model window
+    /// here because no reserve is configured). Before the water-line capped
+    /// that budget, nothing fired in this band: the request went out, and in
+    /// production the same shape reached 99% of the window and stalled with no
+    /// `finish_reason`.
+    ///
+    /// The assertion is the old turn's absence rather than a token count — a
+    /// count would pass for the wrong reason if the trim had dropped something
+    /// else.
+    #[tokio::test]
+    async fn a_turn_that_grows_past_the_water_line_trims_before_the_next_dispatch() {
+        let provider = RecordingScriptedProvider {
+            responses: Mutex::new(vec![ChatResponse {
+                text: None,
+                tool_calls: vec![tool_call("call-1", "payload_tool", serde_json::json!({}))],
+                usage: None,
+                reasoning_content: None,
+            }]),
+            requests: Mutex::new(Vec::new()),
+        };
+        let registry = registry_with(vec![Box::new(PayloadTool {
+            name: "payload_tool".to_string(),
+            // ~20k tokens: past the 8k water-line, nowhere near the 32k send
+            // budget.
+            payload: "p".repeat(80_000),
+        })]);
+        let mut history = vec![
+            ChatMessage::system("s"),
+            ChatMessage::user(format!("old-turn-marker {}", "o".repeat(8_000))),
+            ChatMessage::assistant("old answer"),
+            ChatMessage::user("run the payload tool"),
+        ];
+
+        run_scripted_loop_with_budget(
+            &provider,
+            &registry,
+            &NoopObserver,
+            None,
+            &zeroclaw_config::schema::PacingConfig::default(),
+            "turn-water-line",
+            false,
+            None,
+            &mut history,
+            8_000,
+            32_000,
+            None,
+        )
+        .await
+        .expect("the turn completes");
+
+        let requests = provider.requests.lock().expect("request log lock");
+        assert_eq!(
+            requests.len(),
+            2,
+            "the tool call must produce a second dispatch"
+        );
+        assert!(
+            requests[0]
+                .iter()
+                .any(|m| m.content.contains("old-turn-marker")),
+            "the first dispatch must carry the old turn, or this test proves nothing"
+        );
+        assert!(
+            requests[1]
+                .iter()
+                .all(|m| !m.content.contains("old-turn-marker")),
+            "the second dispatch is over the water-line and must have dropped the old turn \
+             before sending; it sent {} messages",
+            requests[1].len()
+        );
     }
 
     #[tokio::test]

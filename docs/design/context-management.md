@@ -243,6 +243,28 @@ working copy): see the upstream book's *History management* page.
 `HistoryTrimmed` carries optional `tokens_after` so clients can refresh the
 context meter immediately after a **successful** trim.
 
+### The water-line bounds the in-turn guard too
+
+The water-line is evaluated **once per turn**, before the first dispatch. Every
+dispatch after that — a tool loop re-sending after each result — is guarded by
+one budget, `dispatch_trim_budget`, and that budget is the **smaller of the
+water-line and the send budget**.
+
+That cap is not an optimisation. The send budget answers *does this still fit*,
+and with no `reserve_tokens` configured the answer is the whole window: a
+request that fits while leaving the model nowhere to write. A turn grows between
+dispatches — every tool result lands in the transcript — so a guard that only
+compares against the window fires after the prompt has already consumed it. The
+provider accepts the request, the model runs out of space mid-reply, and the
+stream never terminates: no `finish_reason`, no error, just an idle connection
+until the client's read bound expires. Holding the prompt at the water-line
+keeps the headroom the water-line was chosen to keep.
+
+`min` rather than "water-line first": a `reserve_tokens` tight enough to put the
+send budget *below* the water-line is the operator asking for the stricter of
+the two, and it wins. A water-line of `0` disables proactive trimming and leaves
+the fit budget to the model window.
+
 ### How size is measured
 
 Context size for the water-line and cascade uses two layers:
@@ -350,6 +372,7 @@ never reported as fitting when the whole-slice view disagrees.
 | | Value |
 |---|---|
 | Trigger | replayed context tokens `> trim_threshold` (water-line; default 80%) |
+| In-turn trigger | the same water-line, re-measured before every dispatch after the first; that guard's budget is `min(water-line, send_budget)` |
 | Fit target | `send_budget = window − reserve` (full window if no reserve) |
 | Preferred retain | `keep_recent_turns` newest whole turns |
 | Floor | `kept_turns >= 1` (newest whole turn always retained; system never dropped) |
