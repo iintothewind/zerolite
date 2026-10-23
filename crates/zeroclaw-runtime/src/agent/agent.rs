@@ -13290,6 +13290,11 @@ mod tests {
         resolved.context.request_token_ceiling = Some(20_000);
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = trim_test_agent_with_resolved(resolved, observer);
+        // The fixture's default provider does not advertise native tool calling,
+        // which would put the descriptions in the system prompt instead of the
+        // request's `tools` field — and then the estimate covers them for a
+        // reason this test is not about. Swap in a native one first.
+        agent.model_provider = Box::new(ReportedInputProvider(None));
         // Swap the registry after construction. With native specs the system
         // prompt does not list the tools, so the prompt stays byte-identical and
         // the only difference the estimate can see is the schema.
@@ -13343,6 +13348,201 @@ mod tests {
                  {tokens_after} > {budget}"
             );
         }
+    }
+
+    /// A provider that advertises native tool calling and reports a fixed input
+    /// count for the request it accepted (`None` reports nothing).
+    ///
+    /// Both properties are load-bearing for these fixtures. Native tool calling
+    /// is what moves the tool definitions out of the system prompt and into the
+    /// request's `tools` field — without it the prompt carries the descriptions
+    /// and every count already covers them, so a test asserting "the schema is
+    /// priced" passes without the schema accounting doing anything. And the
+    /// post-response guard only fires on a *reported* count.
+    struct ReportedInputProvider(Option<u64>);
+
+    #[async_trait]
+    impl ModelProvider for ReportedInputProvider {
+        fn has_stable_request_identity(&self, _model: &str) -> bool {
+            true
+        }
+
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            Ok("done".into())
+        }
+
+        async fn chat(
+            &self,
+            _request: zeroclaw_providers::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<zeroclaw_providers::ChatResponse> {
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some("done".into()),
+                tool_calls: Vec::new(),
+                usage: self
+                    .0
+                    .map(|input_tokens| zeroclaw_providers::traits::TokenUsage {
+                        input_tokens: Some(input_tokens),
+                        cached_input_tokens: None,
+                        cache_creation_input_tokens: None,
+                        output_tokens: Some(1),
+                    }),
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ReportedInputProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "reported-input"
+        }
+    }
+
+    /// Run one turn whose provider reports `reported` input tokens, and return
+    /// the trim's `(tokens_before, tokens_before_source, tokens_after)`.
+    ///
+    /// Sized so only the post-response guard can fire: three old turns stay
+    /// under the water-line on their own, and the reported count clears it. The
+    /// fixture asserts that by checking `tokens_before`, so a sizing mistake
+    /// fails loudly instead of quietly testing the other guard.
+    async fn post_response_trim_under(
+        tool: Option<Box<dyn crate::tools::Tool>>,
+        reported: u64,
+    ) -> (
+        Option<u64>,
+        Option<zeroclaw_api::agent::TokenCountSource>,
+        Option<u64>,
+    ) {
+        let mut resolved = zeroclaw_config::schema::ResolvedRuntime::default();
+        resolved.context.keep_recent_turns = Some(1);
+        // The fixture's provider declares no context window, so the effective
+        // window is the 32k compatibility fallback and the water-line is 50% of
+        // it. That has to clear `messages + schema` (~5.6k) or the pre-send
+        // guard trims first and this test never reaches the post-response one.
+        resolved.context.trim_threshold_percent = 50;
+        resolved.context.request_token_ceiling = Some(100_000);
+        let agent_config = zeroclaw_config::schema::AliasedAgentConfig {
+            resolved,
+            ..zeroclaw_config::schema::AliasedAgentConfig::default()
+        };
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(ReportedInputProvider(Some(reported))))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
+            .memory(mem)
+            .observer(Arc::from(crate::observability::NoopObserver {}))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .config(agent_config)
+            .build()
+            .expect("agent builder should succeed with valid config");
+        if let Some(tool) = tool {
+            agent.tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![tool]);
+        }
+        agent.history = vec![
+            ConversationMessage::Chat(ChatMessage::system("system")),
+            ConversationMessage::Chat(ChatMessage::user("old user one")),
+            ConversationMessage::Chat(ChatMessage::assistant("old answer one")),
+            ConversationMessage::Chat(ChatMessage::user("old user two")),
+            ConversationMessage::Chat(ChatMessage::assistant("old answer two")),
+            ConversationMessage::Chat(ChatMessage::user("old user three")),
+            ConversationMessage::Chat(ChatMessage::assistant("old answer three")),
+        ];
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        agent
+            .turn_streamed("new user", tx, None)
+            .await
+            .expect("the turn must not abort on the trim");
+
+        let mut found = None;
+        while let Ok(event) = rx.try_recv() {
+            if let TurnEvent::HistoryTrimmed {
+                tokens_before,
+                tokens_before_source,
+                tokens_after,
+                ..
+            } = event
+            {
+                found = Some((tokens_before, tokens_before_source, tokens_after));
+            }
+        }
+        found.expect("a reported count over the water-line must trim the durable history")
+    }
+
+    /// The post-response guard reports the size the NEXT request carries, and
+    /// that request is `messages + tools`.
+    ///
+    /// Asserted as a delta against the same turn with the same tool carrying an
+    /// empty description: the tool name is identical, so the system prompt and
+    /// every retained message are byte-identical, and the only term that can
+    /// move is the schema. A call site that passed zero here would report a
+    /// post-trim size one catalog smaller than reality — and the context meter
+    /// renders that number for the whole of the next turn, which is the shape
+    /// of the bug this guards.
+    #[tokio::test]
+    async fn the_post_response_trim_prices_the_tool_schemas() {
+        const REPORTED: u64 = 30_000;
+        let fat = FatSchemaTool("d".repeat(20_000));
+        let baseline = FatSchemaTool(String::new());
+        let schema_tokens = crate::agent::history::estimate_tool_schema_tokens(&[fat.spec()]);
+        let baseline_tokens =
+            crate::agent::history::estimate_tool_schema_tokens(&[baseline.spec()]);
+        assert!(
+            schema_tokens > 4_000,
+            "the fixture's schema must dominate the history, got {schema_tokens}"
+        );
+
+        let (before_with, source_with, after_with) =
+            post_response_trim_under(Some(Box::new(FatSchemaTool("d".repeat(20_000)))), REPORTED)
+                .await;
+        let (_, _, after_without) =
+            post_response_trim_under(Some(Box::new(FatSchemaTool(String::new()))), REPORTED).await;
+
+        assert_eq!(
+            before_with,
+            Some(REPORTED),
+            "the fixture must reach the post-response guard, whose before-count is the \
+             provider's own number"
+        );
+        assert_eq!(
+            source_with,
+            Some(zeroclaw_api::agent::TokenCountSource::Provider)
+        );
+        assert_eq!(
+            after_with.unwrap() - after_without.unwrap(),
+            (schema_tokens - baseline_tokens) as u64,
+            "the advertised post-trim size must include the tool definitions the next \
+             request carries"
+        );
     }
 
     /// The regression behind "only 5 turns survive": a trim that fires on the

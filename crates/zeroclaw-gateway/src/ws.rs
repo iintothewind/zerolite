@@ -1301,6 +1301,26 @@ fn history_trimmed_frame_for(event: zeroclaw_api::agent::TurnEvent) -> Option<se
     ))
 }
 
+/// Fold one `HistoryTrimmed` event into the turn's meter state and return the
+/// frame to send.
+///
+/// The two halves have to move together. The frame tells the client the
+/// post-trim size; the fold records that same size as the one the turn will end
+/// with, so the terminal `done` frame agrees instead of re-publishing the
+/// pre-trim number. They live in one function, and are tested through it,
+/// because the `select!` loop that calls it is not reachable from a unit test:
+/// a dropped `note_trim` there would leave every frame correct and the meter
+/// stuck, which is exactly the bug this fixes.
+fn history_trimmed_frame_and_note(
+    fold: &mut UsageFold,
+    event: zeroclaw_api::agent::TurnEvent,
+) -> Option<serde_json::Value> {
+    if let zeroclaw_api::agent::TurnEvent::HistoryTrimmed { tokens_after, .. } = &event {
+        fold.note_trim(*tokens_after);
+    }
+    history_trimmed_frame_for(event)
+}
+
 /// One frame from the client socket, as seen by the mid-turn forward loop.
 enum ClientFrame {
     Text(axum::extract::ws::Utf8Bytes),
@@ -2196,35 +2216,11 @@ async fn process_chat_message(
                                 "timeout_secs": timeout_secs,
                             })
                         }
-                        TurnEvent::HistoryTrimmed {
-                            dropped_messages,
-                            dropped_turns,
-                            kept_turns,
-                            reason,
-                            token_budget,
-                            tokens_before,
-                            tokens_after,
-                            tokens_before_source,
-                            tokens_after_source,
-                            unsatisfiable_floor,
-                            retained_context: _,
-                        } => {
-                            // The trim replaced the population the last accepted
-                            // call measured; the terminal frame must not
-                            // re-publish that stale size over the post-trim one.
-                            usage_fold.note_trim(tokens_after);
-                            history_trimmed_ws_frame(
-                                dropped_messages,
-                                dropped_turns,
-                                kept_turns,
-                                &reason,
-                                token_budget,
-                                tokens_before,
-                                tokens_after,
-                                tokens_before_source.map(|s| s.as_str()),
-                                tokens_after_source.map(|s| s.as_str()),
-                                unsatisfiable_floor,
-                            )
+                        trim_event @ TurnEvent::HistoryTrimmed { .. } => {
+                            match history_trimmed_frame_and_note(&mut usage_fold, trim_event) {
+                                Some(frame) => frame,
+                                None => continue,
+                            }
                         }
                         TurnEvent::ContextEstimate {
                             input_tokens,
@@ -5526,6 +5522,52 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         ));
         fold.note_trim(None);
         assert_eq!(fold.last_input_tokens, Some(42_000));
+    }
+
+    /// The `select!` loop that receives turn events is not reachable from a
+    /// unit test, so the trim arm is exercised through the one function it
+    /// calls. Either half going missing fails here: the frame without the fold
+    /// leaves the meter to be undone by `done`, and the fold without the frame
+    /// never reaches the client at all.
+    #[test]
+    fn a_trim_event_moves_the_frame_and_the_meter_together() {
+        let mut fold = UsageFold::default();
+        fold.apply(usage_event(
+            "openrouter.a",
+            "model-a",
+            Some(112_146),
+            None,
+            Some(500),
+            None,
+            true,
+        ));
+
+        let frame = history_trimmed_frame_and_note(
+            &mut fold,
+            zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
+                dropped_messages: 30,
+                dropped_turns: 15,
+                kept_turns: 5,
+                reason: "context token budget exceeded".into(),
+                token_budget: Some(104_857),
+                tokens_before: Some(112_146),
+                tokens_after: Some(90_004),
+                tokens_before_source: Some(zeroclaw_api::agent::TokenCountSource::Provider),
+                tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
+                unsatisfiable_floor: None,
+                retained_context: None,
+            },
+        )
+        .expect("a trim event must produce a frame");
+
+        assert_eq!(frame["type"], "history_trimmed");
+        assert_eq!(frame["tokens_after"], 90_004);
+        assert_eq!(
+            fold.last_input_tokens,
+            Some(90_004),
+            "the frame and the fold must carry the same number, or the terminal \
+             frame undoes the trim the client was just told about"
+        );
     }
 
     /// Blocking regression (note9 blocker 1): an accepted Usage event followed

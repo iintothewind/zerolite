@@ -5174,20 +5174,25 @@ mod reported_budget_tests {
         );
     }
 
-    /// Without a provider report the "before" count is a local estimate. The
-    /// notice renders this label verbatim, so claiming `provider` there would
-    /// present a guess as a measurement.
+    /// Without a provider report both counts are local estimates. The notice
+    /// renders these labels verbatim, so claiming `provider` there would
+    /// present a guess as a measurement — and the estimate has to price the
+    /// whole request, tool definitions included, or the guard fires late by
+    /// exactly the catalog.
     #[tokio::test]
     async fn a_trim_without_a_provider_report_labels_both_counts_as_estimates() {
         let mut history = big_history();
         let estimated = crate::agent::history::estimate_history_tokens(&history);
-        let window = estimated / 2;
+        let schema = 3_000usize;
+        // The window sits between the messages alone and messages + schemas:
+        // only a count that prices the catalog crosses it.
+        let window = (estimated + schema) / 2;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<TurnEvent>(8);
         super::enforce_reported_budget(
             &mut None,
             &mut history,
             0,
-            0,
+            schema,
             window,
             window,
             window,
@@ -5202,24 +5207,45 @@ mod reported_budget_tests {
         .expect("the overflow guard must trim rather than fail");
         drop(tx);
 
-        let mut sources = None;
+        let mut accounting = None;
         while let Ok(event) = rx.try_recv() {
             if let TurnEvent::HistoryTrimmed {
+                tokens_before,
+                tokens_after,
                 tokens_before_source,
                 tokens_after_source,
                 ..
             } = event
             {
-                sources = Some((tokens_before_source, tokens_after_source));
+                accounting = Some((
+                    tokens_before,
+                    tokens_after,
+                    tokens_before_source,
+                    tokens_after_source,
+                ));
             }
         }
+        let (tokens_before, tokens_after, before_source, after_source) =
+            accounting.expect("an over-window estimate must trim without a report");
+
         assert_eq!(
-            sources,
-            Some((
-                Some(zeroclaw_api::agent::TokenCountSource::Estimated),
-                Some(zeroclaw_api::agent::TokenCountSource::Estimated)
-            )),
+            before_source,
+            Some(zeroclaw_api::agent::TokenCountSource::Estimated),
             "a count with no provider sample behind it must say so on the wire"
+        );
+        assert_eq!(
+            tokens_before,
+            Some((estimated + schema) as u64),
+            "the pre-trim count must price the tool definitions the request carries"
+        );
+        assert_eq!(
+            after_source,
+            Some(zeroclaw_api::agent::TokenCountSource::Estimated)
+        );
+        assert_eq!(
+            tokens_after,
+            Some((crate::agent::history::estimate_history_tokens(&history) + schema) as u64),
+            "the post-trim count must price them too"
         );
     }
 
