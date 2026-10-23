@@ -2211,7 +2211,7 @@ fn build_channel_system_prompt(
     // The runtime never refreshes or rewrites date sections in the base
     // prompt: AGENTS.md / workspace prose owns wall-clock guidance, and a
     // byte-stable prefix is what keeps provider prompt caching hitting
-    // across turns (see `docs/book/src/agents/context-management.md`).
+    // across turns (see `docs/design/context-management.md`).
 
     if let Some(instructions) = channel_delivery_instructions(channel_name) {
         if prompt.is_empty() {
@@ -37077,7 +37077,7 @@ BTC is currently around $65,000 based on latest tool output."#
         );
         // No `## Current Date` section: the runtime never injects wall-clock
         // prose, so the prompt prefix stays byte-stable for provider prompt
-        // caching (see `docs/book/src/agents/context-management.md`).
+        // caching (see `docs/design/context-management.md`).
         assert!(
             !prompt.contains("## Current Date"),
             "the runtime must not inject a Date section: {prompt}"

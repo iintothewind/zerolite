@@ -35,7 +35,7 @@ keep_recent_turns = 5           # default, clamped 1–10
 - Sends keep the longest byte-stable prefix. Cache hits are `zeroclaw_tokens_cached_input_total` and the composer's cache-hit percent. A child's context budget cannot exceed its parent's.
 - Stable prefix: no dates or clocks in the system prompt, channel turn context, or history. `HEARTBEAT.md` loads only for heartbeat. Skill and deferred catalogs are frozen for the session and sorted by name.
 
-[Context management](docs/book/src/agents/context-management.md).
+[Context management](docs/design/context-management.md).
 
 ### Web chat
 

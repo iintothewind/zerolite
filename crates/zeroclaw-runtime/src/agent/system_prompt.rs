@@ -510,7 +510,7 @@ pub fn build_system_prompt_with_mode_and_effective_tools(
     // ── 6. Runtime ──────────────────────────────────────────────
     // No date section: the system prefix must stay byte-stable so provider
     // prompt caching keeps hitting across turns (see
-    // `docs/book/src/agents/context-management.md`). Calendar guidance
+    // `docs/design/context-management.md`). Calendar guidance
     // belongs in AGENTS.md / tools, not in runtime-injected prose.
     let host =
         hostname::get().map_or_else(|_| "unknown".into(), |h| h.to_string_lossy().to_string());
@@ -581,7 +581,7 @@ pub fn build_system_prompt_with_mode_and_effective_tools(
 /// Truncation keeps the head (identity + safety) and never injects a
 /// runtime wall-clock section: the system prefix must stay byte-stable so
 /// provider prompt caching keeps hitting (see
-/// `docs/book/src/agents/context-management.md`).
+/// `docs/design/context-management.md`).
 pub fn finalize_system_prompt(mut prompt: String, max_chars: usize) -> String {
     if max_chars > 0 && prompt.chars().count() > max_chars {
         let byte_end = prompt

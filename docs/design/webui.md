@@ -41,9 +41,6 @@
   bar, or branding assets are semantic changes here.** The web test
   files (`*.test.ts` beside each logic file) are fork tests; they must
   survive the merge.
-- **Plans that record web work:** `docs/reports/webui-*-plan.md` are
-  working plans, not decision records. When a plan and this page disagree,
-  this page wins.
 
 ## Sources
 

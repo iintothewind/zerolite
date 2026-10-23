@@ -113,7 +113,7 @@ close the feature.
 ## 5. Post-merge docs — part of the merge, not follow-up
 
 After merge tests pass, update every design doc and the feature list touched
-by a conflict, plus mirrors (`docs/book/.../context-management.md`). Record
+by a conflict. Record
 each new decision in the design doc it belongs to; once written back, it is
 precedent for the next merge.
 

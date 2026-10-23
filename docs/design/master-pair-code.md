@@ -53,4 +53,3 @@
 - Fork commits `1e884d2e2` (master_pair_code + paircode box fix),
   `5f8567576` (carry the configured master code into the daemon-hosted
   gateway).
-- Plan: `docs/reports/master-pair-code-plan.md`.

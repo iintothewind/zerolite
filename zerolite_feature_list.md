@@ -10,10 +10,10 @@
 > (`5f8567576`, 2026-10-22). Re-verify this list against the branch
 > before the first merge-update run if the branch has moved since.
 >
-> **Canonical location.** `docs/design/` is the decision source. The
-> copy of `context-management.md` under `docs/book/` is a published
-> mirror: when a design doc changes, the mirror changes in the same
-> post-merge doc pass. On any disagreement, `docs/design/` wins.
+> **Canonical location.** `docs/design/` is the only home for design
+> decisions. There is no published mirror: the former copy under
+> `docs/book/` was deleted, so a design doc is the single place a decision
+> is written and read.
 
 ## Features
 
@@ -57,7 +57,6 @@ their presence as approval. If a future merge touches them, report it.
   commit does not prove a surviving behavior (see the
   `ContextConfig`-orphan case in `context-management.md` §2).
 - Post-merge docs: after merge tests pass, update every design doc and
-  this list touched by a conflict, plus mirrors
-  (`docs/book/.../context-management.md`). A merge is not complete
+  this list touched by a conflict. A merge is not complete
   until its docs are updated; a new decision written back here becomes
   precedent for the next merge.
