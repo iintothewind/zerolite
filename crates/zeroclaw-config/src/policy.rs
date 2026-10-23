@@ -10614,5 +10614,4 @@ mod tests {
         let outside_canon = outside.path().canonicalize().unwrap();
         assert_eq!(policy.approved_read_root(&outside_canon.join("x")), None);
     }
-
 }

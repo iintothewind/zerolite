@@ -1813,5 +1813,4 @@ mod tests {
         let unix = web_data_dir_expr(Platform::Unix);
         assert!(unix.contains("XDG_DATA_HOME") && unix.ends_with("zeroclaw/web/dist"));
     }
-
 }

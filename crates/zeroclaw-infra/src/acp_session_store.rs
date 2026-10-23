@@ -6971,7 +6971,9 @@ mod tests {
             .append_turn(
                 "sess-legacy-marker",
                 &[
-                    ConversationMessage::Chat(ChatMessage::user("[earlier turns omitted to fit the context window]")),
+                    ConversationMessage::Chat(ChatMessage::user(
+                        "[earlier turns omitted to fit the context window]",
+                    )),
                     ConversationMessage::Chat(ChatMessage::user("real turn")),
                 ],
             )
@@ -7118,5 +7120,4 @@ mod tests {
             assert_eq!(name, table);
         }
     }
-
 }

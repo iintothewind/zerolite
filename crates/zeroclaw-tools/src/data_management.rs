@@ -620,5 +620,4 @@ mod tests {
         // File still exists.
         assert!(tmp.path().join("recent.txt").exists());
     }
-
 }

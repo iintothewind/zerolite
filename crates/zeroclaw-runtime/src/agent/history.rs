@@ -398,7 +398,6 @@ pub fn load_interactive_session_history(
     Ok(history)
 }
 
-
 /// Load interactive history plus the persisted breadcrumb provenance.
 /// Provenance is only ever the persisted record: v2 files carry an explicit
 /// `history_has_trim_breadcrumb` (true or false) so a genuine user message
@@ -506,7 +505,10 @@ mod tests {
         let (_, has_crumb) =
             load_interactive_session_history_with_crumb(&path, "sys").expect("load session");
 
-        assert!(!has_crumb, "an explicit false must not be re-derived from text");
+        assert!(
+            !has_crumb,
+            "an explicit false must not be re-derived from text"
+        );
     }
 
     /// Verifies the exported compatibility wrapper retains the legacy UTF-8 boundary contract.
@@ -689,8 +691,7 @@ mod tests {
 
         // The marker scan rewrites the placeholder away, so the charged text
         // is the padding that remains around it.
-        let (cleaned, refs) =
-            zeroclaw_providers::multimodal::parse_image_markers(padded);
+        let (cleaned, refs) = zeroclaw_providers::multimodal::parse_image_markers(padded);
         assert_eq!(refs.len(), 0, "a placeholder is not loadable");
         assert_eq!(
             estimate_history_tokens(&[message]),
@@ -726,11 +727,14 @@ mod tests {
         // fixture strings, not by a second estimate call.
         let body = "see [IMAGE:/x.png] and [IMAGE:/y.png]";
         let tool = native_image_carrier(body, &["/tmp/declared.png"]);
-        let history = vec![ChatMessage::user("u"), ChatMessage::assistant("c"), tool.clone()];
+        let history = vec![
+            ChatMessage::user("u"),
+            ChatMessage::assistant("c"),
+            tool.clone(),
+        ];
         // A declared carrier is never body-scanned: its images are the
         // declared attachments, so the quoted marker syntax is plain text.
-        let (carrier_text, refs) =
-            zeroclaw_providers::multimodal::message_image_text(&tool);
+        let (carrier_text, refs) = zeroclaw_providers::multimodal::message_image_text(&tool);
         assert_eq!(refs, 1, "only the declared attachment is an image");
         assert_eq!(carrier_text, body, "the body is delivered verbatim");
         let expected = estimate_text_tokens("u")

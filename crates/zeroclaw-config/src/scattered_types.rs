@@ -1030,4 +1030,3 @@ mod tests {
         assert_eq!(ThinkingLevel::default(), ThinkingLevel::Medium);
     }
 }
-

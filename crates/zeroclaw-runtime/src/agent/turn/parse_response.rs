@@ -924,7 +924,7 @@ mod cost_usd_regression_tests {
                 context_send_budget: 0,
                 keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
                 request_token_ceiling: None,
-                                                                                                                                                                                                                                                                                                                                                                                            },
+            },
             temperature: None,
             approval: None,
             channel_name: "",

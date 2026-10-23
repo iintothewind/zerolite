@@ -3104,7 +3104,9 @@ fn has_supervised_channels(config: &Config) -> bool {
 /// is built from the gateway configuration here and nowhere else: a guard
 /// built without it silently disables the credential, and the pairing page
 /// then rejects the master code with no hint that it was configured.
-fn daemon_pairing_guard(config: &zeroclaw_config::schema::Config) -> std::sync::Arc<zeroclaw_config::pairing::PairingGuard> {
+fn daemon_pairing_guard(
+    config: &zeroclaw_config::schema::Config,
+) -> std::sync::Arc<zeroclaw_config::pairing::PairingGuard> {
     std::sync::Arc::new(zeroclaw_config::pairing::PairingGuard::from_gateway_config(
         &config.gateway,
     ))

@@ -4832,5 +4832,4 @@ mod tests {
         let derived: Vec<&str> = registry.command_names().collect();
         assert_eq!(derived, expected);
     }
-
 }

@@ -331,7 +331,6 @@ mod tests {
     }
 }
 
-
 /// Create a runtime, optionally resolving host launchers against an injected
 /// PATH before the runtime's child workspace is applied.
 pub fn create_runtime_with_path(

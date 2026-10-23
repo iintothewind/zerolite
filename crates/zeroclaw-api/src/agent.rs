@@ -303,7 +303,6 @@ mod tool_artifact_tests {
     }
 }
 
-
 /// Provider-facing context captured at a trim boundary. This remains attached
 /// to the internal turn event so the serial RPC consumer can persist it before
 /// forwarding the public trim notice without borrowing the live agent again.

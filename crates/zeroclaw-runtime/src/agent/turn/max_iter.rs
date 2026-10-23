@@ -1052,10 +1052,11 @@ mod graceful_summary_metering_tests {
                     ResolvedContextLimits {
                         model_context_window: budget,
                         context_send_budget: 0,
-                        keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
+                        keep_recent_turns:
+                            zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
                         request_token_ceiling: None,
                         ..ResolvedContextLimits::legacy_fallback(budget)
-                                                                                                                                                                                                                                                                                                               }
+                    }
                 },
                 &mut crumb_present,
                 None,
@@ -1204,10 +1205,11 @@ mod graceful_summary_metering_tests {
                     ResolvedContextLimits {
                         model_context_window: budget,
                         context_send_budget: 0,
-                        keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
+                        keep_recent_turns:
+                            zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
                         request_token_ceiling: None,
                         ..ResolvedContextLimits::legacy_fallback(budget)
-                                                                                                                                                                                                                                                                                                               }
+                    }
                 },
                 &mut crumb_present,
                 None,

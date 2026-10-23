@@ -1343,5 +1343,4 @@ mod tests {
             "default shell and configured shell should produce different commands"
         );
     }
-
 }

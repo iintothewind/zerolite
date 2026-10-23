@@ -524,19 +524,19 @@ impl TurnUsageFold {
             (None, None) => None,
             (i, o) => Some(i.unwrap_or(0).saturating_add(o.unwrap_or(0))),
         };
-        let (max_context_tokens, model_context_window, effective_context_window) = match final_limits
-        {
-            Some(limits) => (
-                Some(limits.context_token_budget as u64),
-                limits.configured_model_context_window().map(|w| w as u64),
-                Some(limits.effective_context_window() as u64),
-            ),
-            None => (
-                self.last_context_token_budget,
-                self.last_model_context_window,
-                self.last_effective_context_window,
-            ),
-        };
+        let (max_context_tokens, model_context_window, effective_context_window) =
+            match final_limits {
+                Some(limits) => (
+                    Some(limits.context_token_budget as u64),
+                    limits.configured_model_context_window().map(|w| w as u64),
+                    Some(limits.effective_context_window() as u64),
+                ),
+                None => (
+                    self.last_context_token_budget,
+                    self.last_model_context_window,
+                    self.last_effective_context_window,
+                ),
+            };
         Some(TurnUsageTotals {
             input_tokens: self.input_tokens,
             output_tokens: self.output_tokens,
@@ -579,7 +579,7 @@ mod tests {
             model_context_window: Some(4000),
 
             effective_context_window: None,
-                        provider_ref: provider_ref.into(),
+            provider_ref: provider_ref.into(),
             model: model.into(),
             accepted,
             estimated_input_tokens: None,
@@ -639,7 +639,7 @@ mod tests {
             context_send_budget: 0,
             keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
             request_token_ceiling: None,
-                                                                                                                                                                                                                                                                                                                                                                      };
+        };
         let mut fold = TurnUsageFold::default();
         fold.apply(&usage("a.primary", "m1", None, None, None, true));
         let totals = fold.totals(Some(limits)).expect("a route served the turn");
@@ -661,7 +661,7 @@ mod tests {
             model_context_window: Some(200_000),
 
             effective_context_window: None,
-                        provider_ref: "llamacpp.default".into(),
+            provider_ref: "llamacpp.default".into(),
             model: "local-model".into(),
             accepted: true,
             estimated_input_tokens: Some(4_200),

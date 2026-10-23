@@ -1478,8 +1478,7 @@ fn resolve_done_context_limits(
                 .configured_model_context_window()
                 .map(|tokens| tokens as u64)
         }),
-        usage_effective_window
-            .or_else(|| Some(active_limits.effective_context_window() as u64)),
+        usage_effective_window.or_else(|| Some(active_limits.effective_context_window() as u64)),
     )
 }
 
@@ -1517,7 +1516,7 @@ fn done_frame_context_limits(
                 context_send_budget: 0,
                 keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
                 request_token_ceiling: None,
-                                                                                                                                                                                                                                                                                                                                                                                                                                                         }),
+            }),
         ),
     }
 }
@@ -1870,7 +1869,9 @@ async fn process_chat_message(
     });
 
     // Broadcast agent_start event
-    let _ = state.event_tx.send(agent_start_frame(session_id, &provider_label, &turn_model));
+    let _ = state
+        .event_tx
+        .send(agent_start_frame(session_id, &provider_label, &turn_model));
 
     // Set session state to running
     let turn_id = uuid::Uuid::new_v4().to_string();
@@ -1959,231 +1960,231 @@ async fn process_chat_message(
         let mut client_gone = false;
         loop {
             tokio::select! {
-                            biased;
-                            _ = cancel_token.cancelled(), if !cancel_drained => {
-                                let drained: Vec<_> = pending_approvals.lock().drain().collect();
-                                drop(drained);
-                                cancel_drained = true;
-                                // Fall through; the agent loop will now wake from the
-                                // approval await, see the cancel token, and propagate
-                                // a ToolLoopCancelled error which closes event_rx and
-                                // breaks this loop on the `event_rx.recv()` arm below.
+                biased;
+                _ = cancel_token.cancelled(), if !cancel_drained => {
+                    let drained: Vec<_> = pending_approvals.lock().drain().collect();
+                    drop(drained);
+                    cancel_drained = true;
+                    // Fall through; the agent loop will now wake from the
+                    // approval await, see the cancel token, and propagate
+                    // a ToolLoopCancelled error which closes event_rx and
+                    // breaks this loop on the `event_rx.recv()` arm below.
+                }
+                client_msg = receiver.next(), if !client_gone => {
+                    let text = match classify_client_frame(client_msg) {
+                        ClientFrame::Text(text) => text,
+                        ClientFrame::Ping(payload) => {
+                            if sender.send(Message::Pong(payload)).await.is_err() {
+                                detach_mid_turn(session_key, &turn_id, pending_approvals);
+                                client_gone = true;
                             }
-                            client_msg = receiver.next(), if !client_gone => {
-                                let text = match classify_client_frame(client_msg) {
-                                    ClientFrame::Text(text) => text,
-                                    ClientFrame::Ping(payload) => {
-                                        if sender.send(Message::Pong(payload)).await.is_err() {
-                                            detach_mid_turn(session_key, &turn_id, pending_approvals);
-                                            client_gone = true;
-                                        }
-                                        continue;
-                                    }
-                                    ClientFrame::Ignore => continue,
-                                    ClientFrame::Gone => {
-                                        detach_mid_turn(session_key, &turn_id, pending_approvals);
-                                        client_gone = true;
-                                        continue;
-                                    }
-                                };
-                                let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text) else {
+                            continue;
+                        }
+                        ClientFrame::Ignore => continue,
+                        ClientFrame::Gone => {
+                            detach_mid_turn(session_key, &turn_id, pending_approvals);
+                            client_gone = true;
+                            continue;
+                        }
+                    };
+                    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text) else {
+                        let err = serde_json::json!({
+                            "type": "error",
+                            "message": "Invalid JSON. Send {\"type\":\"message\",\"content\":\"your text\"}",
+                            "code": "INVALID_JSON"
+                        });
+                        let _ = sender.send(Message::Text(err.to_string().into())).await;
+                        continue;
+                    };
+                    match parsed["type"].as_str() {
+                        Some("approval_response") => {
+                            // A SOP-kind frame is a gate resolution (keyed by run_id),
+                            // not a tool-prompt response (keyed by request_id). Resolve
+                            // it here too so it is answered mid-turn instead of being
+                            // silently dropped on the request_id path below.
+                            if handle_ws_sop_frame(
+                                &parsed,
+                                state,
+                                session_id,
+                                auth_subject,
+                                &mut *sender,
+                            )
+                            .await
+                            {
+                                continue;
+                            }
+                            let request_id = parsed["request_id"].as_str().unwrap_or("");
+                            let decision = match parsed["decision"].as_str().unwrap_or("") {
+                                "approve" => Some(ChannelApprovalResponse::Approve),
+                                "always" => Some(ChannelApprovalResponse::AlwaysApprove),
+                                "deny" => Some(ChannelApprovalResponse::Deny),
+                                _ => None,
+                            };
+                            if request_id.is_empty() || decision.is_none() {
+                                continue;
+                            }
+                            if let Some(tx) = pending_approvals.lock().remove(request_id) {
+                                let _ = tx.send(decision.expect("checked above"));
+                            } else {
+                                ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"request_id": request_id})), "approval_response with no matching pending request (mid-turn)");
+                            }
+                        }
+                        Some("message") => {
+                            let content = parsed["content"].as_str().unwrap_or("").to_string();
+                            if content.is_empty() {
+                                let err = serde_json::json!({
+                                    "type": "error",
+                                    "message": "Message content cannot be empty",
+                                    "code": "EMPTY_CONTENT"
+                                });
+                                let _ = sender.send(Message::Text(err.to_string().into())).await;
+                                continue;
+                            }
+                            match steering_tx.try_send(gateway_steering_input(content)) {
+                                Ok(()) => {}
+                                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                                     let err = serde_json::json!({
                                         "type": "error",
-                                        "message": "Invalid JSON. Send {\"type\":\"message\",\"content\":\"your text\"}",
-                                        "code": "INVALID_JSON"
+                                        "message": "Steering queue is full for the running turn",
+                                        "code": "STEERING_QUEUE_FULL"
                                     });
                                     let _ = sender.send(Message::Text(err.to_string().into())).await;
-                                    continue;
-                                };
-                                match parsed["type"].as_str() {
-                                    Some("approval_response") => {
-                                        // A SOP-kind frame is a gate resolution (keyed by run_id),
-                                        // not a tool-prompt response (keyed by request_id). Resolve
-                                        // it here too so it is answered mid-turn instead of being
-                                        // silently dropped on the request_id path below.
-                                        if handle_ws_sop_frame(
-                                            &parsed,
-                                            state,
-                                            session_id,
-                                            auth_subject,
-                                            &mut *sender,
-                                        )
-                                        .await
-                                        {
-                                            continue;
-                                        }
-                                        let request_id = parsed["request_id"].as_str().unwrap_or("");
-                                        let decision = match parsed["decision"].as_str().unwrap_or("") {
-                                            "approve" => Some(ChannelApprovalResponse::Approve),
-                                            "always" => Some(ChannelApprovalResponse::AlwaysApprove),
-                                            "deny" => Some(ChannelApprovalResponse::Deny),
-                                            _ => None,
-                                        };
-                                        if request_id.is_empty() || decision.is_none() {
-                                            continue;
-                                        }
-                                        if let Some(tx) = pending_approvals.lock().remove(request_id) {
-                                            let _ = tx.send(decision.expect("checked above"));
-                                        } else {
-                                            ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"request_id": request_id})), "approval_response with no matching pending request (mid-turn)");
-                                        }
-                                    }
-                                    Some("message") => {
-                                        let content = parsed["content"].as_str().unwrap_or("").to_string();
-                                        if content.is_empty() {
-                                            let err = serde_json::json!({
-                                                "type": "error",
-                                                "message": "Message content cannot be empty",
-                                                "code": "EMPTY_CONTENT"
-                                            });
-                                            let _ = sender.send(Message::Text(err.to_string().into())).await;
-                                            continue;
-                                        }
-                                        match steering_tx.try_send(gateway_steering_input(content)) {
-                                            Ok(()) => {}
-                                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                                let err = serde_json::json!({
-                                                    "type": "error",
-                                                    "message": "Steering queue is full for the running turn",
-                                                    "code": "STEERING_QUEUE_FULL"
-                                                });
-                                                let _ = sender.send(Message::Text(err.to_string().into())).await;
-                                            }
-                                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                                                let err = serde_json::json!({
-                                                    "type": "error",
-                                                    "message": "Running turn is no longer accepting steering messages",
-                                                    "code": "STEERING_CLOSED"
-                                                });
-                                                let _ = sender.send(Message::Text(err.to_string().into())).await;
-                                            }
-                                        }
-                                    }
-                                    _ => {}
                                 }
-                            }
-                            approval = approval_event_rx.recv() => {
-                                let Some(event) = approval else { continue };
-                                if let TurnEvent::ApprovalRequest {
-                                    request_id,
-                                    tool_name,
-                                    arguments_summary,
-                                    timeout_secs,
-                                } = event {
-                                    if client_gone {
-                                        // Nobody is attached to answer: drop the parked
-                                        // oneshot so the approval channel resolves it as an
-                                        // unreachable-operator deny now, not at the timeout.
-                                        drop(pending_approvals.lock().remove(&request_id));
-                                        continue;
-                                    }
-                                    let frame = serde_json::json!({
-                                        "type": "approval_request",
-                                        "request_id": request_id,
-                                        "tool": tool_name,
-                                        "arguments_summary": arguments_summary,
-                                        "timeout_secs": timeout_secs,
+                                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                    let err = serde_json::json!({
+                                        "type": "error",
+                                        "message": "Running turn is no longer accepting steering messages",
+                                        "code": "STEERING_CLOSED"
                                     });
-                                    if sender.send(Message::Text(frame.to_string().into())).await.is_err() {
-                                        detach_mid_turn(session_key, &turn_id, pending_approvals);
-                                        client_gone = true;
-                                    }
-                                }
-                            }
-                            _ = tick_websocket_ping(ping_interval), if !client_gone => {
-                                if sender.send(Message::Ping(Vec::new().into())).await.is_err() {
-                                    detach_mid_turn(session_key, &turn_id, pending_approvals);
-                                    client_gone = true;
-                                }
-                            }
-                                event_opt = event_rx.recv() => {
-                                let Some(event) = event_opt else { break };
-                                let ws_msg = match event {
-                                    usage_event @ TurnEvent::Usage { .. } => {
-                                        // The fold below is the production event path under
-                                        // test (see UsageFold regression tests): billing
-                                        // aggregates every billable attempt while the
-                                        // accepted-serving snapshot advances on accepted
-                                        // events only. It also returns the per-step
-                                        // `usage` frame, which the web client counts as
-                                        // the server-authoritative step boundary.
-                                        match usage_fold.apply(usage_event) {
-                                            Some(frame) => frame,
-                                            None => continue,
-                                        }
-                                    }
-                                    TurnEvent::Chunk { ref delta } => {
-                                        accumulated_text.push_str(delta);
-                                        serde_json::json!({ "type": "chunk", "content": delta })
-                                    }
-                                    TurnEvent::Thinking { delta } => {
-                                        serde_json::json!({ "type": "thinking", "content": delta })
-                                    }
-                                    TurnEvent::ToolCall { id, name, args } => {
-                                        serde_json::json!({ "type": "tool_call", "id": id, "name": name, "args": args })
-                                    }
-                                    TurnEvent::ToolResult {
-                                        id, name, output, ..
-                                    } => {
-                                        serde_json::json!({ "type": "tool_result", "id": id, "name": name, "output": output })
-                                    }
-                                    TurnEvent::ApprovalRequest {
-                                        request_id,
-                                        tool_name,
-                                        arguments_summary,
-                                        timeout_secs,
-                                    } => {
-                                        if client_gone {
-                                            drop(pending_approvals.lock().remove(&request_id));
-                                            continue;
-                                        }
-                                        serde_json::json!({
-                                            "type": "approval_request",
-                                            "request_id": request_id,
-                                            "tool": tool_name,
-                                            "arguments_summary": arguments_summary,
-                                            "timeout_secs": timeout_secs,
-                                        })
-                                    }
-                                    TurnEvent::HistoryTrimmed {
-                                        dropped_messages,
-                                        dropped_turns,
-                                        kept_turns,
-                                        reason,
-                                        token_budget,
-                                        tokens_before,
-                                        tokens_after,
-                                        tokens_before_source,
-                                        tokens_after_source,
-                                        unsatisfiable_floor,
-                                        retained_context: _,
-                                    } => history_trimmed_ws_frame(
-                                        dropped_messages,
-                                        dropped_turns,
-                                        kept_turns,
-                                        &reason,
-                                        token_budget,
-                                        tokens_before,
-                                        tokens_after,
-                                        tokens_before_source.map(|s| s.as_str()),
-                                        tokens_after_source.map(|s| s.as_str()),
-                                        unsatisfiable_floor,
-                                    ),
-                                    TurnEvent::Plan { entries } => serde_json::json!({
-                                        "type": "plan",
-                                        "entries": entries,
-                                    }),
-                                    _ => continue,
-                                };
-                                if client_gone {
-                                    continue;
-                                }
-                                if sender.send(Message::Text(ws_msg.to_string().into())).await.is_err() {
-                                    detach_mid_turn(session_key, &turn_id, pending_approvals);
-                                    client_gone = true;
+                                    let _ = sender.send(Message::Text(err.to_string().into())).await;
                                 }
                             }
                         }
+                        _ => {}
+                    }
+                }
+                approval = approval_event_rx.recv() => {
+                    let Some(event) = approval else { continue };
+                    if let TurnEvent::ApprovalRequest {
+                        request_id,
+                        tool_name,
+                        arguments_summary,
+                        timeout_secs,
+                    } = event {
+                        if client_gone {
+                            // Nobody is attached to answer: drop the parked
+                            // oneshot so the approval channel resolves it as an
+                            // unreachable-operator deny now, not at the timeout.
+                            drop(pending_approvals.lock().remove(&request_id));
+                            continue;
+                        }
+                        let frame = serde_json::json!({
+                            "type": "approval_request",
+                            "request_id": request_id,
+                            "tool": tool_name,
+                            "arguments_summary": arguments_summary,
+                            "timeout_secs": timeout_secs,
+                        });
+                        if sender.send(Message::Text(frame.to_string().into())).await.is_err() {
+                            detach_mid_turn(session_key, &turn_id, pending_approvals);
+                            client_gone = true;
+                        }
+                    }
+                }
+                _ = tick_websocket_ping(ping_interval), if !client_gone => {
+                    if sender.send(Message::Ping(Vec::new().into())).await.is_err() {
+                        detach_mid_turn(session_key, &turn_id, pending_approvals);
+                        client_gone = true;
+                    }
+                }
+                    event_opt = event_rx.recv() => {
+                    let Some(event) = event_opt else { break };
+                    let ws_msg = match event {
+                        usage_event @ TurnEvent::Usage { .. } => {
+                            // The fold below is the production event path under
+                            // test (see UsageFold regression tests): billing
+                            // aggregates every billable attempt while the
+                            // accepted-serving snapshot advances on accepted
+                            // events only. It also returns the per-step
+                            // `usage` frame, which the web client counts as
+                            // the server-authoritative step boundary.
+                            match usage_fold.apply(usage_event) {
+                                Some(frame) => frame,
+                                None => continue,
+                            }
+                        }
+                        TurnEvent::Chunk { ref delta } => {
+                            accumulated_text.push_str(delta);
+                            serde_json::json!({ "type": "chunk", "content": delta })
+                        }
+                        TurnEvent::Thinking { delta } => {
+                            serde_json::json!({ "type": "thinking", "content": delta })
+                        }
+                        TurnEvent::ToolCall { id, name, args } => {
+                            serde_json::json!({ "type": "tool_call", "id": id, "name": name, "args": args })
+                        }
+                        TurnEvent::ToolResult {
+                            id, name, output, ..
+                        } => {
+                            serde_json::json!({ "type": "tool_result", "id": id, "name": name, "output": output })
+                        }
+                        TurnEvent::ApprovalRequest {
+                            request_id,
+                            tool_name,
+                            arguments_summary,
+                            timeout_secs,
+                        } => {
+                            if client_gone {
+                                drop(pending_approvals.lock().remove(&request_id));
+                                continue;
+                            }
+                            serde_json::json!({
+                                "type": "approval_request",
+                                "request_id": request_id,
+                                "tool": tool_name,
+                                "arguments_summary": arguments_summary,
+                                "timeout_secs": timeout_secs,
+                            })
+                        }
+                        TurnEvent::HistoryTrimmed {
+                            dropped_messages,
+                            dropped_turns,
+                            kept_turns,
+                            reason,
+                            token_budget,
+                            tokens_before,
+                            tokens_after,
+                            tokens_before_source,
+                            tokens_after_source,
+                            unsatisfiable_floor,
+                            retained_context: _,
+                        } => history_trimmed_ws_frame(
+                            dropped_messages,
+                            dropped_turns,
+                            kept_turns,
+                            &reason,
+                            token_budget,
+                            tokens_before,
+                            tokens_after,
+                            tokens_before_source.map(|s| s.as_str()),
+                            tokens_after_source.map(|s| s.as_str()),
+                            unsatisfiable_floor,
+                        ),
+                        TurnEvent::Plan { entries } => serde_json::json!({
+                            "type": "plan",
+                            "entries": entries,
+                        }),
+                        _ => continue,
+                    };
+                    if client_gone {
+                        continue;
+                    }
+                    if sender.send(Message::Text(ws_msg.to_string().into())).await.is_err() {
+                        detach_mid_turn(session_key, &turn_id, pending_approvals);
+                        client_gone = true;
+                    }
+                }
+            }
         }
         client_gone
     };
@@ -2604,7 +2605,7 @@ mod tests {
             context_send_budget: 0,
             keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
             request_token_ceiling: None,
-                                                                                                                                                                                                                                                                                                                                                                      };
+        };
         assert_eq!(
             resolve_done_context_limits(Some(7_200), Some(8_000), None, stale_startup_limits),
             (7_200, Some(8_000), Some(200_000)),
@@ -2622,7 +2623,7 @@ mod tests {
             context_send_budget: 0,
             keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
             request_token_ceiling: None,
-                                                                                                                                                                                                                                                                                                                                                              };
+        };
         assert_eq!(
             resolve_done_context_limits(None, None, None, active_limits),
             (0, Some(8_000), Some(8_000)),
@@ -2639,7 +2640,7 @@ mod tests {
             context_send_budget: 0,
             keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
             request_token_ceiling: None,
-                                                                                                                                                                                                                                                                                                                                                                                                                                      };
+        };
         assert_eq!(
             resolve_done_context_limits(None, None, None, active_limits),
             (16_000, None, Some(32_000)),
@@ -2659,7 +2660,7 @@ mod tests {
             context_send_budget: 0,
             keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
             request_token_ceiling: None,
-                                                                                                                                                                                                                                                                                                                                                                  };
+        };
         // Earlier usage-bearing text route left 180k/200k on the wire trackers.
         assert_eq!(
             done_frame_context_limits(Some(final_vision), Some(180_000), Some(200_000), None, None),
@@ -2680,7 +2681,7 @@ mod tests {
             context_send_budget: 0,
             keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
             request_token_ceiling: None,
-                                                                                                                                                                                                                                                                                                                                                                      };
+        };
         // No final route, no usage: fall back to the resolved route.
         assert_eq!(
             done_frame_context_limits(None, None, None, None, Some(fallback)),
@@ -5002,7 +5003,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
                 max_context_tokens: max_ctx,
                 model_context_window: model_ctx_window,
                 effective_context_window: None,
-                                last_input_tokens: Some(100),
+                last_input_tokens: Some(100),
                 last_serving_provider_ref: Some(provider_alias),
                 last_serving_model: Some("glm-5.2"),
                 cached_input_tokens: None,
@@ -5060,10 +5061,10 @@ data: {{\"type\":\"message_stop\"}}\n\n"
                 "coding".to_string(),
                 RuntimeProfileConfig {
                     context: zeroclaw_config::scattered_types::ContextConfig {
-                    request_token_ceiling: Some(800_000),
-                    ..Default::default()
-                },
-                ..RuntimeProfileConfig::default()
+                        request_token_ceiling: Some(800_000),
+                        ..Default::default()
+                    },
+                    ..RuntimeProfileConfig::default()
                 },
             );
 
@@ -5122,7 +5123,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
                 max_context_tokens: max_ctx,
                 model_context_window: model_ctx_window,
                 effective_context_window: None,
-                                last_input_tokens: Some(100),
+                last_input_tokens: Some(100),
                 last_serving_provider_ref: Some(live_provider_ref),
                 last_serving_model: Some("glm-5.2"),
                 cached_input_tokens: None,
@@ -5163,7 +5164,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
                     request_token_ceiling: Some(800_000),
                     ..Default::default()
                 },
-            ..RuntimeProfileConfig::default()
+                ..RuntimeProfileConfig::default()
             },
         );
 
@@ -5242,7 +5243,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             max_context_tokens: max_ctx,
             model_context_window: model_ctx_window,
             effective_context_window: None,
-                        last_input_tokens: Some(1000),
+            last_input_tokens: Some(1000),
             last_serving_provider_ref: Some(provider_ref),
             last_serving_model: Some(effective_model),
             cached_input_tokens: None,
@@ -5392,7 +5393,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             max_context_tokens: 800_000,
             model_context_window: Some(1_000_000),
             effective_context_window: None,
-                        last_input_tokens: Some(1000),
+            last_input_tokens: Some(1000),
             last_serving_provider_ref: Some("openrouter.a"),
             last_serving_model: Some("model-a"),
             cached_input_tokens: None,
@@ -5499,7 +5500,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             max_context_tokens: 800_000,
             model_context_window: Some(1_000_000),
             effective_context_window: None,
-                        last_input_tokens: None,
+            last_input_tokens: None,
             last_serving_provider_ref: Some("ollama.b"),
             last_serving_model: Some("model-b"),
             cached_input_tokens: None,
@@ -5542,7 +5543,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             max_context_tokens: 800_000,
             model_context_window: None,
             effective_context_window: None,
-                        last_input_tokens: None,
+            last_input_tokens: None,
             last_serving_provider_ref: Some("openrouter.a"),
             last_serving_model: Some("model-a"),
             cached_input_tokens: None,
@@ -5978,5 +5979,4 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(entries[0].input_tokens, 0);
         assert_eq!(UsageFold::total_cost_usd(&entries), None);
     }
-
 }

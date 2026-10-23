@@ -128,9 +128,7 @@ mod tests {
         // the reusable publish workflow this asserts against is absent. Skip
         // with a reason rather than unwrapping a NotFound.
         if !root().join(".github/workflows/docker-publish.yml").exists() {
-            eprintln!(
-                "skipping: .github/workflows/docker-publish.yml is absent on this branch"
-            );
+            eprintln!("skipping: .github/workflows/docker-publish.yml is absent on this branch");
             return;
         }
         let wf =
@@ -259,5 +257,4 @@ mod tests {
         }
         assert!(all["features"].as_str().unwrap().contains("hardware"));
     }
-
 }

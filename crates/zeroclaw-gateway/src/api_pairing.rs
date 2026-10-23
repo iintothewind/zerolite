@@ -1209,7 +1209,10 @@ mod tests {
         let token = body["token"]
             .as_str()
             .expect("success body must include the plaintext token");
-        assert!(token.starts_with("zc_"), "issued token has the standard prefix");
+        assert!(
+            token.starts_with("zc_"),
+            "issued token has the standard prefix"
+        );
         assert!(
             state.pairing.is_authenticated(token),
             "the freshly minted master token must authenticate"

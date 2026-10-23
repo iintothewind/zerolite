@@ -27484,10 +27484,10 @@ mod tests {
         // The water-line is `min(model window, input ceiling) × percent / 100`,
         // so a ceiling and an unknown capacity both bound it.
         let cases: &[(Option<usize>, Option<usize>, u64)] = &[
-            (Some(128_000), None, 25_600),  // unknown capacity (32k stub) × 80%
+            (Some(128_000), None, 25_600), // unknown capacity (32k stub) × 80%
             (Some(128_000), Some(200_000), 102_400), // ceiling 128k × 80%
             (None, Some(200_000), 160_000), // model window 200k × 80%
-            (None, None, 25_600),           // hard stub 32k × 80%
+            (None, None, 25_600),          // hard stub 32k × 80%
         ];
 
         for (profile, window, expected) in cases {
@@ -27604,7 +27604,7 @@ mod tests {
             model_context_window: None,
 
             effective_context_window: None,
-                        input_tokens: Some(100),
+            input_tokens: Some(100),
             cached_input_tokens: None,
             output_tokens: Some(50),
             cost_usd: Some(0.01),
@@ -27700,7 +27700,7 @@ mod tests {
             model_context_window: None,
 
             effective_context_window: None,
-                        input_tokens: Some(100),
+            input_tokens: Some(100),
             cached_input_tokens: None,
             output_tokens: Some(50),
             cost_usd: None,
@@ -27860,7 +27860,7 @@ mod tests {
             model_context_window: None,
 
             effective_context_window: None,
-                        input_tokens: Some(100),
+            input_tokens: Some(100),
             cached_input_tokens: None,
             output_tokens: Some(50),
             cost_usd: None,
@@ -27956,7 +27956,7 @@ mod tests {
             model_context_window: None,
 
             effective_context_window: None,
-                        input_tokens: Some(1000),
+            input_tokens: Some(1000),
             cached_input_tokens: None,
             output_tokens: Some(500),
             cost_usd: Some(0.01),
@@ -28015,7 +28015,7 @@ mod tests {
             model_context_window: Some(200_000),
 
             effective_context_window: None,
-                        provider_ref: "openai.default".to_string(),
+            provider_ref: "openai.default".to_string(),
             model: "model-a".to_string(),
             accepted: true,
             estimated_input_tokens: None,
@@ -28050,7 +28050,7 @@ mod tests {
             model_context_window: Some(200_000),
 
             effective_context_window: None,
-                        provider_ref: "llamacpp.default".to_string(),
+            provider_ref: "llamacpp.default".to_string(),
             model: "local-model".to_string(),
             accepted: true,
             estimated_input_tokens: Some(4_200),
@@ -28082,7 +28082,7 @@ mod tests {
             model_context_window: Some(200_000),
 
             effective_context_window: None,
-                        provider_ref: "openai.default".to_string(),
+            provider_ref: "openai.default".to_string(),
             model: "model-a".to_string(),
             accepted: true,
             estimated_input_tokens: None,
@@ -28108,7 +28108,7 @@ mod tests {
             model_context_window: Some(200_000),
 
             effective_context_window: None,
-                        provider_ref: "anthropic.default".to_string(),
+            provider_ref: "anthropic.default".to_string(),
             model: "model-c".to_string(),
             accepted: true,
             // What `record_accepted_chat_response` actually produces for this
@@ -28141,7 +28141,7 @@ mod tests {
             model_context_window: Some(200_000),
 
             effective_context_window: None,
-                        provider_ref: "anthropic.default".to_string(),
+            provider_ref: "anthropic.default".to_string(),
             model: "model-c".to_string(),
             accepted: true,
             estimated_input_tokens: None,
@@ -28169,7 +28169,7 @@ mod tests {
             model_context_window: Some(200_000),
 
             effective_context_window: None,
-                        provider_ref: "openai.fallback".to_string(),
+            provider_ref: "openai.fallback".to_string(),
             model: "model-b".to_string(),
             accepted: false,
             estimated_input_tokens: None,
@@ -28334,7 +28334,7 @@ mod tests {
             model_context_window: Some(model_win),
 
             effective_context_window: None,
-                        provider_ref: "custom.default".to_string(),
+            provider_ref: "custom.default".to_string(),
             model: "model-a".to_string(),
             accepted: true,
             estimated_input_tokens: None,
@@ -28364,7 +28364,7 @@ mod tests {
             model_context_window: None,
 
             effective_context_window: None,
-                        provider_ref: "openai.default".to_string(),
+            provider_ref: "openai.default".to_string(),
             model: "model-a".to_string(),
             accepted: true,
             estimated_input_tokens: None,
@@ -28390,7 +28390,7 @@ mod tests {
             model_context_window: None,
 
             effective_context_window: None,
-                        provider_ref: "openai.default".to_string(),
+            provider_ref: "openai.default".to_string(),
             model: "model-a".to_string(),
             accepted: true,
             estimated_input_tokens: None,
@@ -28417,7 +28417,7 @@ mod tests {
             model_context_window: None,
 
             effective_context_window: None,
-                        provider_ref: "openai.default".to_string(),
+            provider_ref: "openai.default".to_string(),
             model: "model-a".to_string(),
             accepted: true,
             estimated_input_tokens: None,

@@ -20379,11 +20379,17 @@ mod tests {
         let cached_a = chat
             .state_for_session("sess-a")
             .expect("focused session")
-            .transcript_layout.view().cached_lines.clone();
+            .transcript_layout
+            .view()
+            .cached_lines
+            .clone();
         let cached_b = chat
             .state_for_session("sess-b")
             .expect("background session")
-            .transcript_layout.view().cached_lines.clone();
+            .transcript_layout
+            .view()
+            .cached_lines
+            .clone();
 
         assert!(!chat.focus_session("nope").await, "unknown id is a no-op");
         assert!(chat.focus_session("sess-b").await);
@@ -32268,7 +32274,13 @@ mod tests {
         );
 
         let restart = tokio::spawn(async move {
-            Chat::restart_session_for_state(&client, PaneKind::Acp, &mut state, std::env::current_dir).await
+            Chat::restart_session_for_state(
+                &client,
+                PaneKind::Acp,
+                &mut state,
+                std::env::current_dir,
+            )
+            .await
         });
 
         let request = next_rpc_request(&mut rx, "restart should start a fresh ACP session").await;
@@ -32413,11 +32425,17 @@ mod tests {
         let cached_a = chat
             .state_for_session("sess-a")
             .expect("focused session")
-            .transcript_layout.view().cached_lines.clone();
+            .transcript_layout
+            .view()
+            .cached_lines
+            .clone();
         let cached_b = chat
             .state_for_session("sess-b")
             .expect("background session")
-            .transcript_layout.view().cached_lines.clone();
+            .transcript_layout
+            .view()
+            .cached_lines
+            .clone();
 
         assert!(!chat.focus_session("nope").await, "unknown id is a no-op");
         assert!(chat.focus_session("sess-b").await);
@@ -32610,5 +32628,4 @@ mod tests {
         assert_eq!(state.transcript_selection, None);
         assert!(state.transcript_snapshot.is_none());
     }
-
 }

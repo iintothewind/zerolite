@@ -39,11 +39,15 @@ fn profile_context_round_trips_to_the_same_toml_shape() {
     let serialized = toml::to_string(&cfg).expect("the config serializes");
     let reparsed: Config = toml::from_str(&serialized).expect("the serialized config parses back");
     assert_eq!(
-        reparsed.runtime_profiles["coder"].context.request_token_ceiling,
+        reparsed.runtime_profiles["coder"]
+            .context
+            .request_token_ceiling,
         Some(100_000)
     );
     assert_eq!(
-        reparsed.runtime_profiles["coder"].context.trim_threshold_percent,
+        reparsed.runtime_profiles["coder"]
+            .context
+            .trim_threshold_percent,
         80
     );
     assert_eq!(
@@ -169,7 +173,10 @@ fn the_water_line_is_the_min_of_the_percentage_and_the_reserve() {
     assert_eq!(resolved.context_trim_budget(), expected);
     assert_eq!(resolved.context_send_budget(), window - 16_384);
     // In this profile the reserve binds, so the two numbers coincide.
-    assert_eq!(resolved.context_trim_budget(), resolved.context_send_budget());
+    assert_eq!(
+        resolved.context_trim_budget(),
+        resolved.context_send_budget()
+    );
 
     // With a non-binding reserve they are distinct: engage at 80%, fit under
     // the full window minus a small output reserve.
@@ -236,10 +243,8 @@ fn the_removed_upstream_knobs_do_not_change_resolution() {
         "context_compact_ratio = 0.5",
         "max_history_messages = 10",
     ] {
-        let raw = PROFILE_CONTEXT_TOML.replace(
-            "[agents.coder]",
-            &format!("{removed}\n\n[agents.coder]"),
-        );
+        let raw =
+            PROFILE_CONTEXT_TOML.replace("[agents.coder]", &format!("{removed}\n\n[agents.coder]"));
         let parsed: Config =
             toml::from_str(&raw).expect("an unknown profile key does not fail deserialization");
         let resolved = parsed

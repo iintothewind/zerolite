@@ -963,10 +963,7 @@ fn resolve_pairing_guard(
     shared_pairing: Option<PairingGuard>,
     gateway_config: &zeroclaw_config::schema::GatewayConfig,
 ) -> Arc<PairingGuard> {
-    Arc::new(
-        shared_pairing
-            .unwrap_or_else(|| PairingGuard::from_gateway_config(gateway_config)),
-    )
+    Arc::new(shared_pairing.unwrap_or_else(|| PairingGuard::from_gateway_config(gateway_config)))
 }
 
 pub async fn run_gateway(
@@ -1090,7 +1087,7 @@ pub async fn run_gateway_with_plugin_webhooks(
         ),
         None => (None, None, None),
     };
-// ── Security: warn on public bind without tunnel or explicit opt-in ──
+    // ── Security: warn on public bind without tunnel or explicit opt-in ──
     if is_public_bind(host)
         && config.tunnel.tunnel_provider == "none"
         && !config.gateway.allow_public_bind

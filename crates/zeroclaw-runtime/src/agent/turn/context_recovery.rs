@@ -106,12 +106,9 @@ pub(crate) async fn try_recover_context_overflow(
         // budget. The forced-shrink target is a fraction of the CURRENT size,
         // so the cascade has somewhere to go even when the preferred count
         // still fits the budget.
-        let target_budget = crate::agent::turn::context_pipeline::plan_pre_send_trim(
-            tokens_now,
-            send_budget,
-            true,
-        )
-        .target_budget;
+        let target_budget =
+            crate::agent::turn::context_pipeline::plan_pre_send_trim(tokens_now, send_budget, true)
+                .target_budget;
         let result = crate::agent::history_trim::trim_to_fit_with_crumb(
             owned,
             keep_recent_turns,
@@ -169,8 +166,12 @@ pub(crate) async fn try_recover_context_overflow(
                         token_budget: Some(send_budget as u64),
                         tokens_before: Some(tokens_now as u64),
                         tokens_after: Some(tokens_after as u64),
-                        tokens_before_source: Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
-                        tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
+                        tokens_before_source: Some(
+                            zeroclaw_api::agent::TokenCountSource::Calibrated,
+                        ),
+                        tokens_after_source: Some(
+                            zeroclaw_api::agent::TokenCountSource::Calibrated,
+                        ),
                         unsatisfiable_floor: None,
                         // The durable snapshot travels with the notice: the
                         // session store records the retained population so a

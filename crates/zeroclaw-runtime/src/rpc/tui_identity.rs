@@ -710,9 +710,17 @@ mod tests {
             transport: "unix".to_string(),
             env,
         });
-        assert!(registry.env_for_registration("tui_gone0001", epoch).is_some());
+        assert!(
+            registry
+                .env_for_registration("tui_gone0001", epoch)
+                .is_some()
+        );
         registry.unregister("tui_gone0001", epoch);
-        assert!(registry.env_for_registration("tui_gone0001", epoch).is_none());
+        assert!(
+            registry
+                .env_for_registration("tui_gone0001", epoch)
+                .is_none()
+        );
     }
 
     #[test]
@@ -748,5 +756,4 @@ mod tests {
             Some("/tmp/ssh.sock")
         );
     }
-
 }

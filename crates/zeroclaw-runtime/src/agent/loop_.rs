@@ -6404,7 +6404,10 @@ mod tests {
 
         let mut history_has_trim_breadcrumb = false;
         let mut injected_memory_preamble: Option<crate::agent::turn::MemoryPreamble> = None;
-        let _ = (&mut history_has_trim_breadcrumb, &mut injected_memory_preamble);
+        let _ = (
+            &mut history_has_trim_breadcrumb,
+            &mut injected_memory_preamble,
+        );
         let _ = run_tool_call_loop(ToolLoop {
             history_was_trimmed: None,
             parent_agent_alias: None,
@@ -8935,7 +8938,10 @@ mod tests {
         let knobs = LoopKnobs::default();
         let mut history_has_trim_breadcrumb = false;
         let mut injected_memory_preamble: Option<crate::agent::turn::MemoryPreamble> = None;
-        let _ = (&mut history_has_trim_breadcrumb, &mut injected_memory_preamble);
+        let _ = (
+            &mut history_has_trim_breadcrumb,
+            &mut injected_memory_preamble,
+        );
 
         let run = run_tool_call_loop(ToolLoop {
             history_was_trimmed: None,
@@ -9274,7 +9280,10 @@ mod tests {
 
         let mut history_has_trim_breadcrumb = false;
         let mut injected_memory_preamble: Option<crate::agent::turn::MemoryPreamble> = None;
-        let _ = (&mut history_has_trim_breadcrumb, &mut injected_memory_preamble);
+        let _ = (
+            &mut history_has_trim_breadcrumb,
+            &mut injected_memory_preamble,
+        );
         let _ = run_tool_call_loop(ToolLoop {
             history_was_trimmed: None,
             parent_agent_alias: None,
@@ -10005,7 +10014,10 @@ mod tests {
 
         let mut history_has_trim_breadcrumb = false;
         let mut injected_memory_preamble: Option<crate::agent::turn::MemoryPreamble> = None;
-        let _ = (&mut history_has_trim_breadcrumb, &mut injected_memory_preamble);
+        let _ = (
+            &mut history_has_trim_breadcrumb,
+            &mut injected_memory_preamble,
+        );
         let _ = run_tool_call_loop(ToolLoop {
             history_was_trimmed: None,
             parent_agent_alias: None,
@@ -17790,7 +17802,6 @@ Let me check the result."#;
 
     #[test]
     fn cli_outer_recovery_uses_the_send_budget() {
-
         let context_limits = zeroclaw_config::schema::ResolvedContextLimits {
             model_context_window: 32_000,
             model_context_window_source:
@@ -17799,7 +17810,7 @@ Let me check the result."#;
             context_send_budget: 28_800,
             keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
             request_token_ceiling: None,
-                                                                                                                                                                                                                                                                                                                                                                        };
+        };
         let recovery_budget = interactive_context_recovery_budget(context_limits);
         assert_eq!(
             recovery_budget, 28_800,
@@ -18451,9 +18462,10 @@ Let me check the result."#;
                             model_context_window_source:
                                 zeroclaw_config::schema::ModelContextWindowSource::Configured,
                             context_send_budget: 0,
-                            keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
+                            keep_recent_turns:
+                                zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
                             request_token_ceiling: None,
-                                                                                                                                                                                                                                                                                                                                                                                                                                                              },
+                        },
                         context_limits_resolver: None,
                         receipt_generator: None,
                         knobs: &LoopKnobs::default(),
@@ -18859,7 +18871,10 @@ Let me check the result."#;
 
         let mut history_has_trim_breadcrumb = false;
         let mut injected_memory_preamble: Option<crate::agent::turn::MemoryPreamble> = None;
-        let _ = (&mut history_has_trim_breadcrumb, &mut injected_memory_preamble);
+        let _ = (
+            &mut history_has_trim_breadcrumb,
+            &mut injected_memory_preamble,
+        );
         let _ = run_tool_call_loop(ToolLoop {
             history_was_trimmed: None,
             parent_agent_alias: None,
@@ -21439,10 +21454,11 @@ Let me check the result."#;
                                 32_768
                             },
                             context_send_budget: 0,
-                            keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
+                            keep_recent_turns:
+                                zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
                             request_token_ceiling: None,
                             ..test_context_limits(budget)
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     }
+                        }
                     })),
                     receipt_generator: None,
                     knobs: &LoopKnobs::default(),
@@ -21828,10 +21844,11 @@ Let me check the result."#;
                     context_limits: zeroclaw_config::schema::ResolvedContextLimits {
                         model_context_window: 2_000,
                         context_send_budget: 0,
-                        keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
+                        keep_recent_turns:
+                            zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
                         request_token_ceiling: None,
                         ..test_context_limits(2_000)
-                                                                                                                                                                                                                                                                                          },
+                    },
                     context_limits_resolver: None,
                     receipt_generator: None,
                     knobs: &LoopKnobs::default(),
@@ -21958,10 +21975,11 @@ Let me check the result."#;
                     context_limits: zeroclaw_config::schema::ResolvedContextLimits {
                         model_context_window,
                         context_send_budget: 0,
-                        keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
+                        keep_recent_turns:
+                            zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
                         request_token_ceiling: None,
                         ..test_context_limits(context_token_budget)
-                                                                                                                                                                                                                                                                                                  },
+                    },
                     context_limits_resolver: None,
                     receipt_generator: None,
                     knobs: &LoopKnobs::default(),
@@ -22236,10 +22254,11 @@ Let me check the result."#;
                     context_limits: zeroclaw_config::schema::ResolvedContextLimits {
                         model_context_window: 500,
                         context_send_budget: 0,
-                        keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
+                        keep_recent_turns:
+                            zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
                         request_token_ceiling: None,
                         ..test_context_limits(0)
-                                                                                                                                                                                                                                                                                    },
+                    },
                     context_limits_resolver: None,
                     receipt_generator: None,
                     knobs: &LoopKnobs::default(),
@@ -23762,7 +23781,10 @@ Pin 13: LED
 
         let mut history_has_trim_breadcrumb = false;
         let mut injected_memory_preamble: Option<crate::agent::turn::MemoryPreamble> = None;
-        let _ = (&mut history_has_trim_breadcrumb, &mut injected_memory_preamble);
+        let _ = (
+            &mut history_has_trim_breadcrumb,
+            &mut injected_memory_preamble,
+        );
         let _ = run_tool_call_loop(ToolLoop {
             history_was_trimmed: None,
             parent_agent_alias: None,
@@ -24171,5 +24193,4 @@ Pin 13: LED
         assert_eq!(run.step_results.len(), 1);
         assert_eq!(run.step_results[0].output, "step recovered");
     }
-
 }

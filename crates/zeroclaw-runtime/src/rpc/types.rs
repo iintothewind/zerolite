@@ -2323,7 +2323,7 @@ mod tests {
                 model_context_window: Some(128_000),
 
                 effective_context_window: None,
-                                usage_by_provider: vec![ProviderUsageTotals {
+                usage_by_provider: vec![ProviderUsageTotals {
                     provider_ref: "openai.default".into(),
                     model: "small".into(),
                     input_tokens: 10,

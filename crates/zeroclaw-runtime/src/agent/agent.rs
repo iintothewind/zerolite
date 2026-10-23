@@ -1,9 +1,7 @@
 use crate::agent::dispatcher::{NativeToolDispatcher, ToolDispatcher, XmlToolDispatcher};
 use crate::agent::eval::AutoClassifyExt;
 use crate::agent::execution_tree_budget::ExecutionTreeBudget;
-use crate::agent::prompt::{
-    InteractionContext, PromptContext, SystemPromptBuilder,
-};
+use crate::agent::prompt::{InteractionContext, PromptContext, SystemPromptBuilder};
 use crate::approval::ApprovalManager;
 use crate::live_config_authority::AgentExecutionCapability;
 use crate::observability::{self, Observer, ObserverEvent};
@@ -3308,7 +3306,6 @@ impl Agent {
         self.forwarded_environment.clone()
     }
 
-
     fn append_receipts_block(
         &self,
         response: String,
@@ -4054,7 +4051,8 @@ impl Agent {
                 self.history
                     .push(ConversationMessage::Chat(ChatMessage::assistant(
                         cached.clone(),
-                    )));return Ok(cached);
+                    )));
+                return Ok(cached);
             }
             self.observer.record_event(&ObserverEvent::CacheMiss {
                 cache_type: "response".into(),
@@ -10586,7 +10584,6 @@ mod tests {
                 "the char cap must not add wall-clock orientation"
             );
         }
-
     }
 
     #[tokio::test]
@@ -10721,7 +10718,7 @@ mod tests {
                 context_send_budget: 0,
                 keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
                 request_token_ceiling: None,
-                                                                                                                                                                                                                                                                                                                                                                                              }
+            }
         }));
 
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
@@ -11848,7 +11845,6 @@ mod tests {
         assert!(!agent.history_has_trim_breadcrumb);
     }
 
-
     /// Mock provider that captures whether tool specs were passed to `stream_chat`
     /// and returns a tool call followed by a text response through the stream.
     struct StreamToolCaptureModelProvider {
@@ -12745,7 +12741,6 @@ mod tests {
         resolved
     }
 
-
     /// Reach the durable trim action the way the turn paths reach it — with the
     /// agent's own keep-N retention — without going through a trigger. Tests
     /// that pin the *action* (breadcrumb provenance, tool rows, dropped turns)
@@ -13039,7 +13034,6 @@ mod tests {
         }
     }
 
-
     /// The other half of the pre-send trigger. Above the water-line the trim
     /// fires *before* the request is built, so the durable transcript — not
     /// just the disposable provider view — is what shrinks.
@@ -13067,9 +13061,11 @@ mod tests {
                 .push(ConversationMessage::Chat(ChatMessage::user(format!(
                     "old user {index} {padding}"
                 ))));
-            agent.history.push(ConversationMessage::Chat(ChatMessage::assistant(
-                format!("old assistant {index} {padding}"),
-            )));
+            agent
+                .history
+                .push(ConversationMessage::Chat(ChatMessage::assistant(format!(
+                    "old assistant {index} {padding}"
+                ))));
         }
         let before = crate::agent::history::estimate_history_tokens(
             &agent.tool_dispatcher.to_provider_messages(&agent.history),
@@ -13114,7 +13110,6 @@ mod tests {
         );
     }
 
-
     /// When the loop drops turns, the durable transcript must follow: the
     /// session store and the UI read `Agent.history`, so a restart that
     /// replayed it would resurrect turns the loop already dropped. The gate is
@@ -13141,9 +13136,11 @@ mod tests {
                 .push(ConversationMessage::Chat(ChatMessage::user(format!(
                     "old user {index} {padding}"
                 ))));
-            agent.history.push(ConversationMessage::Chat(ChatMessage::assistant(
-                format!("old assistant {index} {padding}"),
-            )));
+            agent
+                .history
+                .push(ConversationMessage::Chat(ChatMessage::assistant(format!(
+                    "old assistant {index} {padding}"
+                ))));
         }
         let before = crate::agent::history::estimate_history_tokens(
             &agent.tool_dispatcher.to_provider_messages(&agent.history),
@@ -17907,7 +17904,7 @@ mod tests {
                 context_send_budget: 0,
                 keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
                 request_token_ceiling: None,
-                                                                                                                                                                                                                                                                                                                                                                                              }
+            }
         }));
 
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
@@ -19561,7 +19558,7 @@ model_provider = "custom.only"
                     context_send_budget: 0,
                     keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
                     request_token_ceiling: None,
-                                                                                                                                                                                                                                                                                                                                                                                                                      },
+                },
                 ("ollama.small", "small") => zeroclaw_config::schema::ResolvedContextLimits {
                     model_context_window: 8_000,
                     context_token_budget: 7_200,
@@ -19570,7 +19567,7 @@ model_provider = "custom.only"
                     context_send_budget: 0,
                     keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
                     request_token_ceiling: None,
-                                                                                                                                                                                                                                                                                                                                                                                                                  },
+                },
                 _ => zeroclaw_config::schema::ResolvedContextLimits {
                     model_context_window: 32_000,
                     context_token_budget: 32_000,
@@ -19579,7 +19576,7 @@ model_provider = "custom.only"
                     context_send_budget: 0,
                     keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
                     request_token_ceiling: None,
-                                                                                                                                                                                                                                                                                                                                                                                                                               },
+                },
             }
         }));
 
@@ -19601,7 +19598,7 @@ model_provider = "custom.only"
                 context_send_budget: 0,
                 keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
                 request_token_ceiling: None,
-                                                                                                                                                                                                                                                                                                                                                                                          },
+            },
             "provider/model and their limits must change as one session state transition"
         );
     }
@@ -20309,7 +20306,6 @@ model_provider = "custom.only"
         );
         assert_eq!(streamed_content, "same message");
     }
-
 }
 
 #[cfg(test)]
@@ -20850,5 +20846,4 @@ mod approval_route_tests {
         );
         assert!(out.decided_by.is_none());
     }
-
 }

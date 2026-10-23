@@ -622,5 +622,4 @@ mod tests {
     fn display_ctrl_on_non_darwin() {
         assert_eq!(Chord::ctrl('k').display(), "Ctrl+k");
     }
-
 }

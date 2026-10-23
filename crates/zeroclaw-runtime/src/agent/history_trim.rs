@@ -23,7 +23,6 @@ pub struct TrimResult {
     pub below_preferred_keep: bool,
 }
 
-
 fn is_conversation_system(msg: &ConversationMessage) -> bool {
     matches!(msg, ConversationMessage::Chat(chat) if chat.role == "system")
 }
@@ -348,8 +347,7 @@ pub fn trim_to_fit_with_crumb(
 
     let mut keep = chosen_keep;
     let mut result = loop {
-        let mut candidate =
-            keep_recent_whole_turns(history.clone(), keep, has_leading_breadcrumb);
+        let mut candidate = keep_recent_whole_turns(history.clone(), keep, has_leading_breadcrumb);
         candidate.tokens_before = tokens_before;
         // The fit check must use the same estimator the selection used (the
         // per-message sum), not a re-estimate of the retained set: the two can
@@ -393,8 +391,6 @@ pub fn trim_to_fit(
 ) -> TrimResult {
     trim_to_fit_with_crumb(history, preferred_keep, send_budget, model_window, false)
 }
-
-
 
 /// Outcome of trimming durable [`ConversationMessage`] history. Mirrors
 /// [`TrimResult`] accounting so Agent / session / UI stay aligned with the
@@ -486,8 +482,7 @@ fn trim_conversation_to_recent_turns_by_count(
         .take_while(|m| is_conversation_system(m))
         .count();
     let system: Vec<ConversationMessage> = history[..leading_system].to_vec();
-    let crumb_offset =
-        usize::from(has_leading_breadcrumb && history.len() > leading_system);
+    let crumb_offset = usize::from(has_leading_breadcrumb && history.len() > leading_system);
     let body_start = leading_system + crumb_offset;
     let body = &history[body_start..];
     let total_turns = body.iter().filter(|m| is_conversation_boundary(m)).count();
@@ -873,7 +868,13 @@ mod tests {
         history.push(conversation_assistant("workflow complete"));
         assert_eq!(history.len(), 64);
 
-        let result = trim_conversation_to_fit_with(history, 50, usize::MAX, 0, |m: &[ConversationMessage]| crate::agent::history_trim::estimate_conversation_tokens(m));
+        let result = trim_conversation_to_fit_with(
+            history,
+            50,
+            usize::MAX,
+            0,
+            |m: &[ConversationMessage]| crate::agent::history_trim::estimate_conversation_tokens(m),
+        );
 
         assert!(!result.trimmed);
         assert_eq!(result.dropped_messages, 0);
@@ -905,7 +906,13 @@ mod tests {
         }
         history.push(conversation_assistant("new answer"));
 
-        let result = trim_conversation_to_fit_with(history, 1, usize::MAX, 0, |m: &[ConversationMessage]| crate::agent::history_trim::estimate_conversation_tokens(m));
+        let result = trim_conversation_to_fit_with(
+            history,
+            1,
+            usize::MAX,
+            0,
+            |m: &[ConversationMessage]| crate::agent::history_trim::estimate_conversation_tokens(m),
+        );
 
         assert!(result.trimmed);
         assert_eq!(result.dropped_turns, 1);
@@ -935,7 +942,13 @@ mod tests {
             history.push(conversation_assistant(&format!("answer {turn}")));
         }
 
-        let result = trim_conversation_to_fit_with(history, 50, usize::MAX, 0, |m: &[ConversationMessage]| crate::agent::history_trim::estimate_conversation_tokens(m));
+        let result = trim_conversation_to_fit_with(
+            history,
+            50,
+            usize::MAX,
+            0,
+            |m: &[ConversationMessage]| crate::agent::history_trim::estimate_conversation_tokens(m),
+        );
 
         assert!(result.trimmed);
         assert_eq!(result.dropped_turns, 10);
@@ -962,7 +975,13 @@ mod tests {
             conversation_assistant("new answer"),
         ];
 
-        let result = trim_conversation_to_fit_with(history, 0, usize::MAX, 0, |m: &[ConversationMessage]| crate::agent::history_trim::estimate_conversation_tokens(m));
+        let result = trim_conversation_to_fit_with(
+            history,
+            0,
+            usize::MAX,
+            0,
+            |m: &[ConversationMessage]| crate::agent::history_trim::estimate_conversation_tokens(m),
+        );
 
         assert!(result.trimmed);
         assert_eq!(result.dropped_messages, 2);
@@ -987,7 +1006,13 @@ mod tests {
             conversation_assistant("new answer"),
         ];
 
-        let result = trim_conversation_to_fit_with(history, 1, usize::MAX, 0, |m: &[ConversationMessage]| crate::agent::history_trim::estimate_conversation_tokens(m));
+        let result = trim_conversation_to_fit_with(
+            history,
+            1,
+            usize::MAX,
+            0,
+            |m: &[ConversationMessage]| crate::agent::history_trim::estimate_conversation_tokens(m),
+        );
 
         assert!(result.trimmed);
         assert_eq!(result.dropped_messages, 3);
@@ -1021,7 +1046,13 @@ mod tests {
         ];
         let original = serde_json::to_value(&history).expect("fixture should serialize");
 
-        let result = trim_conversation_to_fit_with(history, 3, usize::MAX, 0, |m: &[ConversationMessage]| crate::agent::history_trim::estimate_conversation_tokens(m));
+        let result = trim_conversation_to_fit_with(
+            history,
+            3,
+            usize::MAX,
+            0,
+            |m: &[ConversationMessage]| crate::agent::history_trim::estimate_conversation_tokens(m),
+        );
 
         assert!(!result.trimmed);
         assert_eq!(result.dropped_messages, 0);
@@ -1043,7 +1074,13 @@ mod tests {
         ];
         let original = serde_json::to_value(&history).expect("fixture should serialize");
 
-        let result = trim_conversation_to_fit_with(history, 1, usize::MAX, 0, |m: &[ConversationMessage]| crate::agent::history_trim::estimate_conversation_tokens(m));
+        let result = trim_conversation_to_fit_with(
+            history,
+            1,
+            usize::MAX,
+            0,
+            |m: &[ConversationMessage]| crate::agent::history_trim::estimate_conversation_tokens(m),
+        );
 
         assert!(!result.trimmed);
         assert_eq!(result.dropped_messages, 0);
@@ -1063,7 +1100,13 @@ mod tests {
         history.push(conversation_assistant("done"));
         let original = serde_json::to_value(&history).expect("fixture should serialize");
 
-        let result = trim_conversation_to_fit_with(history, 1, usize::MAX, 0, |m: &[ConversationMessage]| crate::agent::history_trim::estimate_conversation_tokens(m));
+        let result = trim_conversation_to_fit_with(
+            history,
+            1,
+            usize::MAX,
+            0,
+            |m: &[ConversationMessage]| crate::agent::history_trim::estimate_conversation_tokens(m),
+        );
 
         assert!(!result.trimmed);
         assert_eq!(result.dropped_messages, 0);
@@ -1087,7 +1130,13 @@ mod tests {
             conversation_assistant("new answer"),
         ];
 
-        let result = trim_conversation_to_fit_with(history, 1, usize::MAX, 0, |m: &[ConversationMessage]| crate::agent::history_trim::estimate_conversation_tokens(m));
+        let result = trim_conversation_to_fit_with(
+            history,
+            1,
+            usize::MAX,
+            0,
+            |m: &[ConversationMessage]| crate::agent::history_trim::estimate_conversation_tokens(m),
+        );
 
         assert!(result.trimmed);
         assert_eq!(result.dropped_messages, 2);
@@ -1118,7 +1167,13 @@ mod tests {
             conversation_assistant("new answer"),
         ];
 
-        let result = trim_conversation_to_fit_with(history, 1, usize::MAX, 0, |m: &[ConversationMessage]| crate::agent::history_trim::estimate_conversation_tokens(m));
+        let result = trim_conversation_to_fit_with(
+            history,
+            1,
+            usize::MAX,
+            0,
+            |m: &[ConversationMessage]| crate::agent::history_trim::estimate_conversation_tokens(m),
+        );
 
         assert!(result.trimmed);
         assert_eq!(result.dropped_messages, 2);
@@ -1149,7 +1204,13 @@ mod tests {
             conversation_assistant("new answer"),
         ];
 
-        let result = trim_conversation_to_fit_with(history, 2, usize::MAX, 0, |m: &[ConversationMessage]| crate::agent::history_trim::estimate_conversation_tokens(m));
+        let result = trim_conversation_to_fit_with(
+            history,
+            2,
+            usize::MAX,
+            0,
+            |m: &[ConversationMessage]| crate::agent::history_trim::estimate_conversation_tokens(m),
+        );
 
         assert!(result.trimmed);
         assert_eq!(result.dropped_messages, 2);
@@ -1907,7 +1968,6 @@ mod tests {
         );
     }
 
-
     /// §2: `ContextCalibration` anchors the size on the provider's reported
     /// count and prices only the not-yet-billed tail.
     /// §2: the retention path drops whole turns only — no model-written
@@ -2406,19 +2466,38 @@ mod tests {
         // A transcript of exactly `keep` turns is already the action's fixed
         // point: there is nothing older to drop.
         let at_capacity = trim_conversation_to_fit_with_crumb(
-            history.clone(), keep, usize::MAX, 0, estimate_conversation_tokens, false,
+            history.clone(),
+            keep,
+            usize::MAX,
+            0,
+            estimate_conversation_tokens,
+            false,
         );
-        assert!(!at_capacity.trimmed, "at `keep` turns there is nothing to drop");
+        assert!(
+            !at_capacity.trimmed,
+            "at `keep` turns there is nothing to drop"
+        );
 
         // One turn older than `keep` is, and the action drops it.
         history.push(conversation_user("turn 5"));
         history.push(conversation_assistant("answer 5"));
         let mut crumb_present = false;
         let first = trim_conversation_to_fit_with_crumb(
-            history.clone(), keep, usize::MAX, 0, estimate_conversation_tokens, crumb_present,
+            history.clone(),
+            keep,
+            usize::MAX,
+            0,
+            estimate_conversation_tokens,
+            crumb_present,
         );
-        assert!(first.trimmed, "the action drops the turns older than `keep`");
-        assert_eq!(first.kept_turns, keep, "the action retains exactly `keep` turns");
+        assert!(
+            first.trimmed,
+            "the action drops the turns older than `keep`"
+        );
+        assert_eq!(
+            first.kept_turns, keep,
+            "the action retains exactly `keep` turns"
+        );
 
         // Replay the action's own output plus its breadcrumb, append a turn,
         // apply the action again: the retained count must not drift.
@@ -2431,7 +2510,12 @@ mod tests {
             running.push(conversation_assistant(&format!("answer {turn}")));
 
             let pass = trim_conversation_to_fit_with_crumb(
-                running.clone(), keep, usize::MAX, 0, estimate_conversation_tokens, crumb_present,
+                running.clone(),
+                keep,
+                usize::MAX,
+                0,
+                estimate_conversation_tokens,
+                crumb_present,
             );
             assert!(pass.trimmed, "the action still truncates at pass {turn}");
             assert_eq!(
@@ -2460,7 +2544,12 @@ mod tests {
             history.push(conversation_assistant(&format!("answer {i}")));
         }
         let result = trim_conversation_to_fit_with_crumb(
-            history.clone(), keep, usize::MAX, 0, estimate_conversation_tokens, false,
+            history.clone(),
+            keep,
+            usize::MAX,
+            0,
+            estimate_conversation_tokens,
+            false,
         );
         let mut kept = result.history.clone();
         insert_conversation_breadcrumb_deduped(&mut kept);
@@ -2468,7 +2557,12 @@ mod tests {
         // Re-trimming the breadcrumbed transcript must see `keep` turns, not
         // `keep + 1`, so it must not trim at all.
         let again = trim_conversation_to_fit_with_crumb(
-            kept.clone(), keep, usize::MAX, 0, estimate_conversation_tokens, true,
+            kept.clone(),
+            keep,
+            usize::MAX,
+            0,
+            estimate_conversation_tokens,
+            true,
         );
         assert!(
             !again.trimmed,

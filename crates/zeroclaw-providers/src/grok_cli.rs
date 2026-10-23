@@ -2244,9 +2244,10 @@ while IFS= read -r line; do :; done
             // The state character follows the executable name, which may
             // itself contain spaces and parentheses, so read it from the last
             // ')' instead of splitting the whole line.
-            let Some(state) = stat.rsplit_once(')').and_then(|(_, rest)| {
-                rest.split_whitespace().next()
-            }) else {
+            let Some(state) = stat
+                .rsplit_once(')')
+                .and_then(|(_, rest)| rest.split_whitespace().next())
+            else {
                 return false;
             };
             if state == "Z" {

@@ -1607,11 +1607,7 @@ impl SessionBackend for SqliteSessionBackend {
     /// Record whether this session's persisted transcript starts with the
     /// synthetic trim breadcrumb, as one canonical fact alongside the
     /// transcript itself.
-    fn set_session_trim_breadcrumb(
-        &self,
-        session_key: &str,
-        present: bool,
-    ) -> std::io::Result<()> {
+    fn set_session_trim_breadcrumb(&self, session_key: &str, present: bool) -> std::io::Result<()> {
         let conn = self.conn.lock();
         let now = Utc::now().to_rfc3339();
         let flag = i64::from(present);
@@ -1663,11 +1659,7 @@ impl SessionBackend for SqliteSessionBackend {
     /// The stamp is the isolation boundary: a session row that cannot name
     /// its owner cannot be isolated after a restart, so the write fails loud
     /// rather than leaving an ownerless row behind.
-    fn set_session_principal(
-        &self,
-        session_key: &str,
-        principal_id: &str,
-    ) -> std::io::Result<()> {
+    fn set_session_principal(&self, session_key: &str, principal_id: &str) -> std::io::Result<()> {
         let conn = self.conn.lock();
         let now = Utc::now().to_rfc3339();
         conn.execute(

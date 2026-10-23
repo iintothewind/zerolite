@@ -802,5 +802,4 @@ mod tests {
         assert_eq!(snapshot[0]["sequence"], 1);
         assert_eq!(snapshot[1]["sequence"], 2);
     }
-
 }

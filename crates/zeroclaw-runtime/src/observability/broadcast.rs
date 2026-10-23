@@ -64,10 +64,7 @@ impl EventBuffer {
     /// of the queue itself — the lock is still taken and released here, and the
     /// caller only gets a borrow of the queue for the duration of `f`.
     #[doc(hidden)]
-    pub fn with_locked_queue<R>(
-        &self,
-        f: impl FnOnce(&mut VecDeque<serde_json::Value>) -> R,
-    ) -> R {
+    pub fn with_locked_queue<R>(&self, f: impl FnOnce(&mut VecDeque<serde_json::Value>) -> R) -> R {
         let mut guard = self.inner.lock().expect("fresh buffer must lock");
         f(&mut guard)
     }

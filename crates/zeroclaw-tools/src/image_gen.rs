@@ -1127,5 +1127,4 @@ mod tests {
             "output must carry a matching [IMAGE:<path>] marker: {out}"
         );
     }
-
 }

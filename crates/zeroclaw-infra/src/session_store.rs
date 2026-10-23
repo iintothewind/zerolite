@@ -68,8 +68,10 @@ impl SessionStore {
     /// corruption, not a value this store ever wrote, and is reported as an
     /// error rather than silently read as "no record".
     fn trim_breadcrumb_path(&self, session_key: &str) -> PathBuf {
-        self.sessions_dir
-            .join(format!("{}.trim_breadcrumb", sanitize_session_key(session_key)))
+        self.sessions_dir.join(format!(
+            "{}.trim_breadcrumb",
+            sanitize_session_key(session_key)
+        ))
     }
 
     /// Load all messages for a session from its JSONL file.
@@ -378,11 +380,7 @@ impl SessionBackend for SessionStore {
         self.update_last(session_key, message)
     }
 
-    fn set_session_trim_breadcrumb(
-        &self,
-        session_key: &str,
-        present: bool,
-    ) -> std::io::Result<()> {
+    fn set_session_trim_breadcrumb(&self, session_key: &str, present: bool) -> std::io::Result<()> {
         let _guard = self.mutation_guard()?;
         let path = self.trim_breadcrumb_path(session_key);
         // One byte, written atomically: a reader must never observe a

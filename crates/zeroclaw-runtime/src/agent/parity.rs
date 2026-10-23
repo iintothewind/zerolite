@@ -185,7 +185,7 @@ async fn parity_l1_engine_honors_excluded_tools() {
                     context_send_budget: 0,
                     keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
                     request_token_ceiling: None,
-                                                                                                                                                                                                                                                                                                                                                                                                                      },
+                },
                 context_limits_resolver: None,
                 knobs: &LoopKnobs::default(),
             },

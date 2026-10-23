@@ -38278,10 +38278,8 @@ BTC is currently around $65,000 based on latest tool output."#
         let alice = shared_topic_message("alice", "m1", "the budget file is v3");
         let bob = shared_topic_message("bob", "m2", "use v4 instead");
 
-        let alice_turn =
-            channel_user_history_content(&alice, WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL);
-        let bob_turn =
-            channel_user_history_content(&bob, WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL);
+        let alice_turn = channel_user_history_content(&alice, WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL);
+        let bob_turn = channel_user_history_content(&bob, WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL);
 
         assert!(
             alice_turn.starts_with("[Message from alice]\n"),
@@ -38298,8 +38296,7 @@ BTC is currently around $65,000 based on latest tool output."#
         // change when per_user_session = true).
         let mut solo = shared_topic_message("alice", "m3", "just me here");
         solo.conversation_scope = zeroclaw_api::channel::ChannelConversationScope::Sender;
-        let solo_turn =
-            channel_user_history_content(&solo, WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL);
+        let solo_turn = channel_user_history_content(&solo, WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL);
         assert!(
             !solo_turn.contains("[Message from"),
             "sender-scoped turns must stay unlabelled: {solo_turn}"
@@ -38310,8 +38307,7 @@ BTC is currently around $65,000 based on latest tool output."#
         wa.channel = "whatsapp".into();
         wa.reply_target = "12036302@g.us".into();
         wa.conversation_scope = zeroclaw_api::channel::ChannelConversationScope::Sender;
-        let wa_turn =
-            channel_user_history_content(&wa, WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL);
+        let wa_turn = channel_user_history_content(&wa, WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL);
         assert!(
             wa_turn.starts_with("[Current WhatsApp group message from carol]\n"),
             "whatsapp group label must be unchanged: {wa_turn}"
@@ -38327,8 +38323,7 @@ BTC is currently around $65,000 based on latest tool output."#
         dm.channel = "wecom_ws".into();
         dm.reply_target = "user--user-1".into();
         dm.thread_ts = None;
-        let dm_turn =
-            channel_user_history_content(&dm, WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL);
+        let dm_turn = channel_user_history_content(&dm, WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL);
         assert!(
             !dm_turn.contains("[Message from"),
             "a single-party WeCom chat must not gain attribution: {dm_turn}"
@@ -38339,8 +38334,7 @@ BTC is currently around $65,000 based on latest tool output."#
         group.channel = "wecom_ws".into();
         group.reply_target = "group--room-9".into();
         group.thread_ts = None;
-        let group_turn =
-            channel_user_history_content(&group, WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL);
+        let group_turn = channel_user_history_content(&group, WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL);
         assert!(
             group_turn.starts_with("[Message from user-1]\n"),
             "a WeCom group room must keep speaker attribution: {group_turn}"

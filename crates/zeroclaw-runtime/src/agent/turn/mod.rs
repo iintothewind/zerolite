@@ -29,9 +29,7 @@ pub(crate) mod vision_route;
 
 pub(crate) use call_prep::{PreparedToolCalls, prepare_tool_calls};
 pub(crate) use context::{TurnCtx, TurnMeta};
-pub(crate) use context_recovery::{
-    record_llm_failure, try_recover_context_overflow,
-};
+pub(crate) use context_recovery::{record_llm_failure, try_recover_context_overflow};
 #[cfg(test)]
 pub(crate) use delivery_defaults::maybe_inject_channel_delivery_defaults;
 pub use events::{
@@ -1237,20 +1235,22 @@ async fn enforce_reported_budget(
                 })
                 .await;
         }
-        observer.record_event(&zeroclaw_api::observability_traits::ObserverEvent::HistoryTrimmed {
-            dropped_messages: result.dropped_messages,
-            kept_turns: result.kept_turns,
-            reason,
-            channel: None,
-            agent_alias: agent_alias.map(str::to_string),
-            turn_id: Some(turn_id.to_string()),
-            token_budget: Some(context_token_budget as u64),
-            tokens_before: Some(result.tokens_before as u64),
-            tokens_after: Some(result.tokens_after as u64),
-            tokens_before_source: Some(zeroclaw_api::agent::TokenCountSource::Provider),
-            tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
-            unsatisfiable_floor: None,
-        });
+        observer.record_event(
+            &zeroclaw_api::observability_traits::ObserverEvent::HistoryTrimmed {
+                dropped_messages: result.dropped_messages,
+                kept_turns: result.kept_turns,
+                reason,
+                channel: None,
+                agent_alias: agent_alias.map(str::to_string),
+                turn_id: Some(turn_id.to_string()),
+                token_budget: Some(context_token_budget as u64),
+                tokens_before: Some(result.tokens_before as u64),
+                tokens_after: Some(result.tokens_after as u64),
+                tokens_before_source: Some(zeroclaw_api::agent::TokenCountSource::Provider),
+                tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
+                unsatisfiable_floor: None,
+            },
+        );
     } else {
         *history = result.history;
     }
@@ -1307,7 +1307,7 @@ fn resolve_context_limits_for_call(
             config.resolved_context_limits_for_route(agent_alias, provider_name, model)
         })
         .unwrap_or(fallback)
-    }
+}
 
 /// Per-invocation turn state: owns the provider-visible transcript and
 /// the canonical current-turn buffer during one `run_tool_call_loop` call.
@@ -3059,7 +3059,8 @@ async fn run_tool_call_loop_impl<'a>(
                     observer,
                     agent_alias,
                     turn_id,
-                    &mut turn_state.crumb_present))
+                    &mut turn_state.crumb_present,
+                ))
                 .await?;
             }
             *history_has_trim_breadcrumb = turn_state.crumb_present;
@@ -4920,7 +4921,6 @@ mod surface3_tests {
             "the cap must not inject a clock envelope"
         );
     }
-
 }
 
 #[cfg(test)]
@@ -4955,7 +4955,8 @@ mod reported_budget_tests {
             observer,
             None,
             "test",
-            crumb_present)
+            crumb_present,
+        )
         .await
     }
 
@@ -5010,7 +5011,8 @@ mod reported_budget_tests {
             &observer,
             Some("effective-agent"),
             "turn-2",
-            &mut false)
+            &mut false,
+        )
         .await;
         let events = observer.0.lock().expect("trim events lock");
         assert!(events.iter().any(|event| matches!(
@@ -5041,7 +5043,8 @@ mod reported_budget_tests {
             1,
             None,
             &NoopObserver,
-            &mut false)
+            &mut false,
+        )
         .await
         .expect("budget enforcement succeeds");
         assert!(
@@ -5074,7 +5077,8 @@ mod reported_budget_tests {
             5,
             None,
             &NoopObserver,
-            &mut false)
+            &mut false,
+        )
         .await
         .expect("budget enforcement succeeds");
         let after: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
@@ -5099,7 +5103,8 @@ mod reported_budget_tests {
             0,
             None,
             &NoopObserver,
-            &mut false)
+            &mut false,
+        )
         .await
         .expect("budget enforcement succeeds");
 
@@ -5124,7 +5129,8 @@ mod reported_budget_tests {
             0,
             None,
             &NoopObserver,
-            &mut false)
+            &mut false,
+        )
         .await
         .expect("budget enforcement succeeds");
         let after: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
@@ -5153,7 +5159,8 @@ mod reported_budget_tests {
             1,
             None,
             &NoopObserver,
-            &mut false)
+            &mut false,
+        )
         .await
         .expect("budget enforcement succeeds");
         let after: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
@@ -5182,7 +5189,8 @@ mod reported_budget_tests {
             1,
             None,
             &NoopObserver,
-            &mut false)
+            &mut false,
+        )
         .await
         .expect("the overflow guard must trim rather than fail");
         assert!(
@@ -5230,7 +5238,8 @@ mod reported_budget_tests {
             1,
             None,
             &NoopObserver,
-            &mut false)
+            &mut false,
+        )
         .await
         .expect("the reserve guard must trim rather than fail");
 
@@ -5267,7 +5276,8 @@ mod reported_budget_tests {
             5,
             None,
             &NoopObserver,
-            &mut false)
+            &mut false,
+        )
         .await
         .expect("a single-turn overflow must dispatch, not fail");
         let after: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
@@ -5276,7 +5286,6 @@ mod reported_budget_tests {
             "nothing can be dropped, so the request goes out unchanged"
         );
     }
-
 
     #[tokio::test]
     async fn calibration_ignores_output_appended_after_the_measured_request() {
@@ -5305,7 +5314,8 @@ mod reported_budget_tests {
             1,
             Some(&tx),
             &NoopObserver,
-            &mut false)
+            &mut false,
+        )
         .await
         .expect("budget enforcement succeeds");
 
@@ -5395,7 +5405,8 @@ mod reported_budget_tests {
             1,
             Some(&tx),
             &NoopObserver,
-            &mut false)
+            &mut false,
+        )
         .await
         .expect("budget enforcement succeeds");
 
@@ -5465,7 +5476,8 @@ mod reported_budget_tests {
             1,
             Some(&tx),
             &NoopObserver,
-            &mut crumb_present)
+            &mut crumb_present,
+        )
         .await
         .expect("budget enforcement succeeds");
         assert!(
@@ -7032,11 +7044,7 @@ mod sop_step_reassembly_tests {
                 assert!(request[0].content.contains("Keep context."));
             }
             if input.contains(TAIL_MARKER) {
-                assert!(
-                    request[0]
-                        .content
-                        .contains(TAIL_MARKER)
-                );
+                assert!(request[0].content.contains(TAIL_MARKER));
             }
             assert_eq!(request[1].content, prompt);
         }
@@ -7753,7 +7761,7 @@ mod sop_step_reassembly_tests {
                 context_send_budget: 0,
                 keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
                 request_token_ceiling: None,
-                                                                                                                                                                                                                                                                                                                                                                                              },
+            },
             None,
             &LoopKnobs::default(),
             "cli",
@@ -9049,7 +9057,7 @@ mod tool_lifecycle_abandonment_tests {
                     keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
                     request_token_ceiling: None,
                     ..zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0)
-                                                                                                                                                                                                                                                                                                        },
+                },
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),

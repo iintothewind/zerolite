@@ -4019,8 +4019,8 @@ impl ResolvedRuntime {
             UNCONFIGURED_CONTEXT_WINDOW_FALLBACK
         };
 
-        let effective_window = model_context_window
-            .min(self.context.request_token_ceiling.unwrap_or(usize::MAX));
+        let effective_window =
+            model_context_window.min(self.context.request_token_ceiling.unwrap_or(usize::MAX));
         let percent = self.context.trim_threshold_percent.clamp(1, 100);
         let percent_threshold = ((effective_window as u64) * (percent as u64) / 100) as usize;
         let context_token_budget = match self.context.reserve_tokens {
@@ -4731,7 +4731,8 @@ impl Config {
     /// it does not trigger trimming by itself.
     #[must_use]
     pub fn effective_request_token_ceiling(&self, agent_alias: &str) -> Option<usize> {
-        self.effective_context_config(agent_alias).request_token_ceiling
+        self.effective_context_config(agent_alias)
+            .request_token_ceiling
     }
 
     /// The model's context window exactly as configured, or `None` when no
@@ -4997,7 +4998,6 @@ impl Config {
         out.resolved = resolved;
         Some(out)
     }
-
 
     /// Resolve the effective skills prompt-injection mode for an agent: use an
     /// explicit runtime-profile override when set, otherwise inherit the global
@@ -7608,7 +7608,6 @@ impl CostRatesConfig {
     /// Deliberate zero-cost entries remain valid and distinguish a configured
     /// free resource from one whose pricing is unavailable.
     pub fn validate(&self) -> Result<()> {
-
         fn validate_rate(path: String, value: Option<f64>) -> Result<()> {
             if let Some(value) = value
                 && !crate::cost::is_sane_usd_rate(value)
@@ -25354,7 +25353,6 @@ impl Config {
                 "delegate.agentic_timeout_secs must be greater than 0"
             );
         }
-
 
         // Per-agent validation. Mandatory + alias-existence checks live
         // here so the gateway PATCH path returns structured per-field
@@ -47123,7 +47121,10 @@ allowed_users = []
         );
 
         config
-            .set_prop("runtime_profiles.fast.context.request_token_ceiling", "100000")
+            .set_prop(
+                "runtime_profiles.fast.context.request_token_ceiling",
+                "100000",
+            )
             .expect("set_prop should accept the runtime-profile nested path");
         assert_eq!(
             config
