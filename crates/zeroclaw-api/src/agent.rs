@@ -134,8 +134,13 @@ pub enum TurnEvent {
         dropped_turns: usize,
         kept_turns: usize,
         reason: String,
-        /// Configured context token budget in effect at trim time. `None` for
-        /// message-limit trims, which carry no token accounting.
+        /// The **send budget** in effect at trim time:
+        /// `effective_context_window − reserve_tokens`, the size the trim was
+        /// asked to reach. Deliberately not the water-line that triggered it —
+        /// that is a different number, reported as `context_token_budget` on
+        /// [`Self::Usage`] and [`Self::ContextEstimate`]. `None` for
+        /// message-limit trims (no token accounting) and when no fit
+        /// constraint applies.
         token_budget: Option<u64>,
         /// Token count before trimming.
         tokens_before: Option<u64>,
@@ -169,8 +174,16 @@ pub enum TurnEvent {
     ContextEstimate {
         /// Locally estimated size of the assembled provider request.
         input_tokens: u64,
-        /// Water-line in effect at assembly time; `None` when trimming is
-        /// disabled, so a client never reads a zero as "budget exhausted".
+        /// The **water-line** in effect at assembly time — the proactive-trim
+        /// threshold, not the send budget. Always `Some` in practice:
+        /// `context_trim_budget()` is `trim_threshold_tokens().max(1)` over a
+        /// `1..=100` percent clamp, so there is no "trimming disabled" state to
+        /// encode. It stays `Option` only because it shares the
+        /// `ContextUsage` wire shape with older daemons.
+        ///
+        /// A client must not read the value as "how much may be sent" — that is
+        /// [`Self::HistoryTrimmed::token_budget`], a different number computed
+        /// from `reserve_tokens`.
         context_token_budget: Option<u64>,
         /// Configured model capacity for the route, when authoritative.
         model_context_window: Option<u64>,

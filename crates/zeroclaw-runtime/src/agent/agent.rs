@@ -13088,6 +13088,104 @@ mod tests {
         );
     }
 
+    /// The chain the meter depends on, driven through the real streaming path:
+    /// a turn whose assembled request crosses the water-line must publish the
+    /// post-trim estimate **before** the provider's usage for the same turn.
+    ///
+    /// Each piece was covered on its own — the trim's accounting in
+    /// `durable_trim_notice_carries_estimated_token_accounting`, the frame shape
+    /// in the gateway — but nothing proved the streaming path emits them in
+    /// that order. A client that only ever saw `done` would show the pre-trim
+    /// number for the whole turn, which is the defect this closed.
+    #[tokio::test]
+    async fn a_streamed_turn_publishes_the_trim_before_the_provider_usage() {
+        // Water-line at 10% of a 2k ceiling: low enough that the fixture below
+        // crosses it, high enough that the newest turn alone still fits under
+        // it, so the trim reaches a satisfiable floor instead of hard-failing.
+        let mut resolved = zeroclaw_config::schema::ResolvedRuntime::default();
+        resolved.context.keep_recent_turns = Some(1);
+        resolved.context.trim_threshold_percent = 10;
+        resolved.context.request_token_ceiling = Some(2_000);
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = trim_test_agent_with_resolved(resolved, observer);
+
+        let mut history = vec![ConversationMessage::Chat(ChatMessage::system("system"))];
+        for index in 0..8 {
+            history.push(ConversationMessage::Chat(ChatMessage::user(&format!(
+                "old user {index}, long enough that eight of these cross the water-line on their own"
+            ))));
+            history.push(ConversationMessage::Chat(ChatMessage::assistant(&format!(
+                "old assistant {index}, answering at a comparable length so the estimate is honest"
+            ))));
+        }
+        agent.history = history;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        agent
+            .turn_streamed("new user", tx, None)
+            .await
+            .expect("the turn must not abort on the trim");
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+
+        let trim_at = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    TurnEvent::HistoryTrimmed {
+                        tokens_after: Some(_),
+                        ..
+                    }
+                )
+            })
+            .expect("the pre-send trim must reach the stream with its token accounting");
+        let estimate_at = events
+            .iter()
+            .position(|event| matches!(event, TurnEvent::ContextEstimate { .. }))
+            .expect("the turn must publish its assembled size before dispatch");
+        let measured_at = events
+            .iter()
+            .position(|event| matches!(event, TurnEvent::Usage { .. }))
+            .expect("the provider call must report usage");
+
+        // The water-line is acted on before the request is assembled, so the
+        // trim lands first, the assembled size second, the measurement third.
+        // Any other order would let a client apply a pre-trim number on top of
+        // a post-trim one.
+        assert!(
+            trim_at < estimate_at,
+            "the trim must be announced before the post-trim assembly: {events:?}"
+        );
+        assert!(
+            estimate_at < measured_at,
+            "the assembly must be published before the measurement it predicts: {events:?}"
+        );
+
+        let TurnEvent::HistoryTrimmed {
+            tokens_before,
+            tokens_after,
+            tokens_after_source,
+            ..
+        } = &events[trim_at]
+        else {
+            unreachable!("the position above matched HistoryTrimmed");
+        };
+        assert!(
+            tokens_after < tokens_before,
+            "the announced trim must actually shrink the request: {tokens_after:?} !< {tokens_before:?}"
+        );
+        assert_eq!(
+            *tokens_after_source,
+            Some(zeroclaw_api::agent::TokenCountSource::Estimated),
+            "a pre-send trim can only report an estimate, never a measurement"
+        );
+    }
+
     /// The regression behind "only 5 turns survive": a trim that fires on the
     /// turn count instead of on the water-line.
     ///

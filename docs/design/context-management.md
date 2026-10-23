@@ -419,6 +419,19 @@ overwrites an earlier one:
 | A provider call returns | `usage` → `input_tokens` | `provider`, or `estimate` when the provider is silent | The only measured number on the path. It replaces the assembled estimate. |
 | The turn ends | `done` → `last_input_tokens` | `provider` | Authoritative for the turn, and it clears the numerator when the accepted route reported no usage. |
 
+Two different budgets appear in these events. Reading one as the other is the
+easy mistake, because both are "the context budget" in conversation:
+
+| Field | On | Is |
+|---|---|---|
+| `context_token_budget` (RPC) / `max_context_tokens` (WS) | `context_usage`, `usage`, `done` | The **water-line**: `trim_threshold_tokens().max(1)`. It answers *when* a trim engages. |
+| `token_budget` | `history_trimmed` | The **send budget**: `effective_context_window − reserve_tokens`. It answers *how small* the trim was asked to make the request. |
+
+The water-line is never absent in practice — `trim_threshold_percent` is
+validated to `1..=100` and `context_trim_budget()` takes `.max(1)`, so there is
+no "trimming disabled" state that could make it `None`. The field is `Option`
+only because it shares the `ContextUsage` wire shape.
+
 Two rules follow from this and are not negotiable:
 
 - **`context_usage` is not `usage`.** Clients fold `usage` into their step
@@ -426,9 +439,20 @@ Two rules follow from this and are not negotiable:
   request is about to go out", so folding it would invent a step that never
   happened. They are separate events for exactly that reason, even though both
   end up as a `ContextUsage` notification on the RPC surface.
-- **A stale estimate never overwrites a newer provider value.** Frames carry
-  the turn's identity and arrive in order on a single connection; the client
-  applies them as they arrive and lets `done` win at the end of the turn.
+- **A stale estimate never overwrites a newer provider value — but ordering,
+  not identity, is what enforces that.** These frames carry **no** turn id.
+  What holds today: a session's turns are serialized by the per-session actor
+  queue (`zeroclaw_infra::session_queue`, which rejects or times out a second
+  concurrent turn instead of running it), a turn's frames are written in order
+  on the connection that owns it, and `done` wins at the end of the turn — so
+  an estimate is always emitted before the `usage` it would otherwise
+  contradict. What would break it: any future path that runs two turns on one
+  session at once, or replays frames after a reconnect — a replayed old
+  estimate would land on a newer provider number and the meter would jump
+  backwards. Both need `turn_id` on `context_usage` and `history_trimmed` plus
+  a per-turn monotonic guard on the client **before** they can be allowed.
+  Until then the guarantee is "serialized turns, one connection, in order" and
+  nothing stronger.
 
 The local estimator over-counts CJK-heavy text (measured 0.44–0.95 tokens per
 character against the flat 1.0 charge, depending on the BPE merges). That is

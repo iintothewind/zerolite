@@ -3991,6 +3991,50 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         );
     }
 
+    /// A trim that carries token accounting must put those numbers on the wire.
+    /// `tokens_after` is what moves the meter without waiting for `done`, and
+    /// its source label is what stops a client rendering an estimate as a
+    /// measurement. The test above pins the count-only shape; this one pins the
+    /// token-rich shape a pre-send trim produces.
+    #[test]
+    fn trimmed_frame_carries_the_post_trim_estimate_and_its_source() {
+        let frame = history_trimmed_frame_for(zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
+            dropped_messages: 16,
+            dropped_turns: 8,
+            kept_turns: 1,
+            reason: "water-line exceeded".into(),
+            // The send budget the trim was asked to reach — not the water-line
+            // that triggered it.
+            token_budget: Some(8_000),
+            tokens_before: Some(9_400),
+            tokens_after: Some(1_200),
+            tokens_before_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
+            tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
+            unsatisfiable_floor: Some(false),
+            retained_context: None,
+        })
+        .expect("a token-rich trim must produce a frame");
+
+        assert_eq!(frame["type"], "history_trimmed");
+        assert_eq!(
+            frame["tokens_after"], 1_200,
+            "the meter moves on this number, so it must survive the mapping"
+        );
+        assert_eq!(
+            frame["tokens_after_source"], "estimate",
+            "a pre-send trim can only report an estimate, and the label is how \
+             the client knows to render it as one"
+        );
+        assert_eq!(
+            frame["token_budget"], 8_000,
+            "the advertised budget is the send target, not the water-line"
+        );
+        assert!(
+            frame["tokens_after"].as_u64() <= frame["token_budget"].as_u64(),
+            "the post-trim size must fit the budget the same frame advertises: {frame}"
+        );
+    }
+
     #[test]
     fn context_estimate_frame_is_a_pre_send_estimate_not_a_usage_step() {
         let frame = context_estimate_ws_frame(9_000, Some(8_000), Some(10_000), Some(10_000));
