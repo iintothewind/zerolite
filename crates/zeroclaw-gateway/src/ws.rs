@@ -6149,6 +6149,19 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(done["output_tokens"], 27);
         assert_eq!(done["steps"], 1, "one LLM call, one step");
         assert_eq!(done["cached_input_tokens"], 42);
+        // The ring's denominator and trigger. `done` is the only frame that
+        // carries them, and the client never resets them, so a missing or zero
+        // value leaves the meter reading "limit —" for the whole session.
+        assert!(
+            done["effective_context_window"]
+                .as_u64()
+                .is_some_and(|w| w > 0),
+            "done must publish the effective window: {done}"
+        );
+        assert!(
+            done["max_context_tokens"].as_u64().is_some_and(|w| w > 0),
+            "done must publish the water-line: {done}"
+        );
 
         // And the turn boundary reaches the chat socket, session-scoped.
         let start = agent_start.unwrap_or_else(|| {
