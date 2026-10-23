@@ -286,6 +286,20 @@ case "$TARGET" in
     ;;
 esac
 
+# A prebuilt image that already carries the cross toolchain takes the apt step
+# off the critical path. That step is the flakiest part of this build: Docker
+# Desktop's network stack intermittently refuses deb.debian.org for minutes at
+# a time even though the host fetches the same URL in 200ms, and each refusal
+# costs a whole build attempt (plus the EXIT reclaim). Detect the capability
+# rather than trusting an image name, so `--image zeroclaw-cross-aarch64:bookworm`
+# and any other prepared image both work.
+if [ -n "$APT_PKGS" ] \
+  && docker run --rm "$RUST_IMAGE" \
+       bash -c 'command -v aarch64-linux-gnu-gcc >/dev/null 2>&1' >/dev/null 2>&1; then
+  step "cross toolchain already present in $RUST_IMAGE — skipping apt"
+  APT_PKGS=""
+fi
+
 step "docker cross-compile ($TARGET, features=$FEATURES) via $RUST_IMAGE"
 
 # Git Bash on Windows rewrites /build unless path conversion is disabled.
@@ -300,16 +314,13 @@ docker run --rm \
   "$RUST_IMAGE" \
   bash -c "
     set -e
-    # Docker Desktop's DNS proxy (192.168.65.7) sometimes answers with AAAA
-    # only — e.g. deb.debian.org resolving to 2a04:4e42:96::644 — while the
-    # container has no IPv6 route. apt then burns its attempts on v6, falls
-    # back to v4, and reports the v4 connect as 'Connection refused (111)',
-    # which reads like a firewall and is really an address-family mismatch.
-    # These containers only ever have IPv4 egress, so pin apt to it and retry:
-    # a transient refusal then costs one retry instead of the whole build.
-    APT_OPTS='-o Acquire::ForceIPv4=true -o Acquire::Retries=3'
-    apt-get \$APT_OPTS update -qq
     if [ -n \"$APT_PKGS\" ]; then
+      # Docker Desktop's DNS proxy sometimes answers AAAA-only while the
+      # container has no IPv6 route, and its NAT intermittently refuses the v4
+      # connect as 'Connection refused (111)'. Pin IPv4 and retry so a
+      # transient refusal costs one retry instead of the whole build.
+      APT_OPTS='-o Acquire::ForceIPv4=true -o Acquire::Retries=3'
+      apt-get \$APT_OPTS update -qq
       apt-get \$APT_OPTS install -y -qq $APT_PKGS
     fi
     rustup target add \"$TARGET\"
