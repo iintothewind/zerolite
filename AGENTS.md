@@ -19,6 +19,13 @@ upstream code; do not deviate from it during a merge.
 
 ## Hard constraints (do not work around these)
 
+- Every `cargo test` / `cargo fmt` / `cargo clippy` run uses this repo's own
+  toolchain image, `zeroclaw-test`, built from
+  `scripts/dev/test-image.Dockerfile`. Plain `rust:1-bookworm` carries no
+  rustfmt or clippy component, so `cargo fmt --check` dies there with
+  "'rustfmt' is not installed for the toolchain". Rebuild the image after a
+  toolchain bump:
+  `docker build -f scripts/dev/test-image.Dockerfile -t zeroclaw-test .`
 - One cargo test command at a time. Test runs share `CARGO_TARGET_DIR`
   (`target-docker`) and the cargo lock; parallel runs block each other
   for hours while producing no output.
