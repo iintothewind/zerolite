@@ -443,6 +443,17 @@ effective water-line a catalog above the configured percentage, because the
 trigger compared a messages-only estimate against a threshold derived from the
 full window.
 
+Where those definitions live depends on the route, and that has a trap for
+anyone testing this. They are in the request's `tools` field only when the
+provider advertises native tool calling
+(`ProviderCapabilities::native_tool_calling`); otherwise the XML dispatcher
+writes the descriptions into the system prompt, where the message estimate
+already covers them. A fixture built on a provider that does not advertise it
+therefore passes "the schema is counted" without the schema term doing anything
+— which is exactly how the first version of this guard's test passed with the
+term forced to zero. Any test asserting that the schemas are priced must use a
+provider that advertises native tool calling.
+
 Three rules follow from this and are not negotiable:
 
 - **`context_usage` is not `usage`.** Clients fold `usage` into their step
