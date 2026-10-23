@@ -417,12 +417,15 @@ mod tests {
         let (dist, _) = dist_and_rest.split_once("goto :do_build").unwrap();
         for feature in spec::resolve_feature_list(&root(), &Selection::Dist).unwrap() {
             assert!(
-                dist.contains(&feature),
+                spec::names_feature(&dist, &feature),
                 "dist feature {feature} not rendered"
             );
         }
         for feature in spec::features_outside_dist(&root()).unwrap() {
-            assert!(!dist.contains(&feature), "{feature} leaked into lean dist");
+            assert!(
+                !spec::names_feature(&dist, &feature),
+                "{feature} leaked into lean dist"
+            );
         }
     }
 

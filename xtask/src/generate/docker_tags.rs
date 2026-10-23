@@ -247,13 +247,13 @@ mod tests {
             crate::generate::spec::resolve_feature_list(&root(), &Selection::Dist).unwrap()
         {
             assert!(
-                dist_features.contains(&feature),
+                crate::generate::spec::names_feature(dist_features, &feature),
                 "dist feature {feature} not rendered"
             );
         }
         for feature in crate::generate::spec::features_outside_dist(&root()).unwrap() {
             assert!(
-                !dist_features.contains(&feature),
+                !crate::generate::spec::names_feature(dist_features, &feature),
                 "{feature} leaked into lean dist"
             );
         }

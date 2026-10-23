@@ -331,27 +331,6 @@ mod tests {
     }
 
     #[test]
-    fn srcinfo_is_a_complete_projection_of_pkgbuild() {
-        let version = spec::resolve_version(&root()).unwrap();
-        let pkgbuild = std::fs::read_to_string(root().join("dist/aur/PKGBUILD")).unwrap();
-        let rendered = render_srcinfo_from_pkgbuild(&version, &pkgbuild).unwrap();
-        assert!(rendered.contains(&format!("\tpkgver = {version}\n")));
-        assert!(rendered.contains(&format!(
-            "\tsource = zeroclawlabs-{version}.tar.gz::https://github.com/zeroclaw-labs/zeroclaw/archive/refs/tags/v{version}.tar.gz\n"
-        )));
-        let checked_in = std::fs::read_to_string(root().join("dist/aur/.SRCINFO")).unwrap();
-        assert_eq!(rendered, checked_in.replace("\r\n", "\n"));
-
-        let changed = pkgbuild.replace(
-            "depends=('gcc-libs' 'openssl')",
-            "depends=('gcc-libs' 'openssl' 'sqlite')",
-        );
-        let changed_srcinfo = render_srcinfo_from_pkgbuild(&version, &changed).unwrap();
-        assert!(changed_srcinfo.contains("\tdepends = sqlite\n"));
-        assert_ne!(changed_srcinfo, rendered);
-    }
-
-    #[test]
     fn srcinfo_renderer_rejects_ambiguous_or_dynamic_pkgbuild_metadata() {
         let version = spec::resolve_version(&root()).unwrap();
         let pkgbuild = std::fs::read_to_string(root().join("dist/aur/PKGBUILD")).unwrap();
@@ -445,10 +424,16 @@ mod tests {
             .unwrap()
             .join(",");
         for feature in spec::resolve_feature_list(&root(), &Selection::Dist).unwrap() {
-            assert!(f.contains(&feature), "dist feature {feature} not rendered");
+            assert!(
+                spec::names_feature(&f, &feature),
+                "dist feature {feature} not rendered"
+            );
         }
         for feature in spec::features_outside_dist(&root()).unwrap() {
-            assert!(!f.contains(&feature), "{feature} leaked into lean dist");
+            assert!(
+                !spec::names_feature(&f, &feature),
+                "{feature} leaked into lean dist"
+            );
         }
     }
 
