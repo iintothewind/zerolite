@@ -13,10 +13,10 @@ use zeroclaw_api::runtime_traits::{POSIX_DELETION_GUIDANCE, ShellProfile};
 /// Maximum characters per injected workspace file (matches `OpenClaw` default).
 pub const BOOTSTRAP_MAX_CHARS: usize = 20_000;
 /// Per-file cap applied to every injected workspace bootstrap file while the
-/// agent's runtime profile has `compact_context` on (the default).
+/// agent's runtime profile has `lean_bootstrap` on (the default).
 /// [`BOOTSTRAP_MAX_CHARS`] is the cap when it is off. Shared by the turn paths
 /// and `doctor` so they report the same budget.
-pub const COMPACT_BOOTSTRAP_MAX_CHARS: usize = 6000;
+pub const LEAN_BOOTSTRAP_MAX_CHARS: usize = 6000;
 /// Workspace files injected into every system prompt, unconditionally.
 pub const BOOTSTRAP_FILES: &[&str] =
     &["AGENTS.md", "SOUL.md", "TOOLS.md", "IDENTITY.md", "USER.md"];
@@ -210,7 +210,7 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     autonomy_config: Option<&zeroclaw_config::schema::RiskProfileConfig>,
     native_tool_specs_present: bool,
     skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
-    compact_context: bool,
+    lean_bootstrap: bool,
     max_system_prompt_chars: usize,
     // When `false`, `MEMORY.md` is omitted from the injected bootstrap files.
     // Set to `false` for isolated / ACP sessions that use `exclude_memory`.
@@ -236,7 +236,7 @@ pub fn build_system_prompt_with_mode_and_autonomy(
         autonomy_config,
         native_tool_specs_present,
         skills_prompt_mode,
-        compact_context,
+        lean_bootstrap,
         max_system_prompt_chars,
         inject_memory,
         show_tool_calls,
@@ -260,7 +260,7 @@ pub fn build_system_prompt_with_mode_and_effective_tools(
     autonomy_config: Option<&zeroclaw_config::schema::RiskProfileConfig>,
     native_tool_specs_present: bool,
     skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
-    compact_context: bool,
+    lean_bootstrap: bool,
     max_system_prompt_chars: usize,
     inject_memory: bool,
     show_tool_calls: bool,
@@ -303,7 +303,7 @@ pub fn build_system_prompt_with_mode_and_effective_tools(
     // ── 1. Tooling ──────────────────────────────────────────────
     if !tools.is_empty() && !native_tool_specs_present {
         prompt.push_str("## Tools\n\n");
-        if compact_context {
+        if lean_bootstrap {
             // Compact mode: tool names only, no descriptions/schemas
             prompt.push_str("Available tools: ");
             let names: Vec<&str> = tools.iter().map(|(name, _)| *name).collect();
@@ -455,10 +455,10 @@ pub fn build_system_prompt_with_mode_and_effective_tools(
 
     // ── 2b. Shell dialect ───────────────────────────────────────
     // Only when a registered tool takes a model-authored command: the syntax
-    // list is dead weight otherwise. Skipped in compact_context for the same
+    // list is dead weight otherwise. Skipped in lean_bootstrap for the same
     // reason the tool catalog is trimmed there. The `## Runtime` line still
     // names the shell in both cases.
-    if !compact_context
+    if !lean_bootstrap
         && zeroclaw_api::runtime_traits::needs_shell_dialect_guidance(
             tools.iter().map(|(name, _)| *name),
         )
@@ -469,7 +469,7 @@ pub fn build_system_prompt_with_mode_and_effective_tools(
     }
 
     // ── 3. Skills (full or compact, based on config) ─────────────
-    if compact_context {
+    if lean_bootstrap {
         append_project_context(
             &mut prompt,
             workspace_dir,
@@ -497,7 +497,7 @@ pub fn build_system_prompt_with_mode_and_effective_tools(
     );
 
     // ── 5. Bootstrap files (injected into context) ──────────────
-    if !compact_context {
+    if !lean_bootstrap {
         append_project_context(
             &mut prompt,
             workspace_dir,
@@ -536,9 +536,9 @@ pub fn build_system_prompt_with_mode_and_effective_tools(
         }
     }
 
-    // ── 8. Channel Capabilities (full copy skipped in compact_context
+    // ── 8. Channel Capabilities (full copy skipped in lean_bootstrap
     //       mode; the timestamp orientation below emits in both modes) ──
-    if !compact_context {
+    if !lean_bootstrap {
         prompt.push_str("## Channel Capabilities\n\n");
         prompt.push_str("- You are running as a messaging bot. Your response is automatically sent back to the user's channel.\n");
         prompt
@@ -564,7 +564,7 @@ pub fn build_system_prompt_with_mode_and_effective_tools(
             prompt.push_str("- NEVER narrate or describe your tool usage. Do NOT say 'Let me fetch...', 'I will use...', 'Searching...', or similar. Give the FINAL ANSWER only — no intermediate steps, no tool mentions, no progress updates.\n");
         }
         prompt.push_str("- Calibration note: agents in this system currently err on the side of silence when a response would be appropriate, which users find frustrating. Skew toward replying. Memory is supplementary context that informs how you respond, not a gate on whether you respond.\n\n");
-    } // end if !compact_context (full Channel Capabilities copy)
+    } // end if !lean_bootstrap (full Channel Capabilities copy)
 
     prompt = finalize_system_prompt(prompt, max_system_prompt_chars);
 
@@ -801,7 +801,7 @@ mod tests {
         assert!(!prompt.contains("read_skill(name)"));
     }
 
-    fn prompt_with_compact_context(compact_context: bool) -> String {
+    fn prompt_with_lean_bootstrap(lean_bootstrap: bool) -> String {
         build_system_prompt_with_mode_and_autonomy(
             std::path::Path::new("/tmp"),
             "test-model",
@@ -812,7 +812,7 @@ mod tests {
             None,
             false,
             SkillsPromptInjectionMode::Full,
-            compact_context,
+            lean_bootstrap,
             0,
             true,
             false,
@@ -823,7 +823,7 @@ mod tests {
     /// Build a prompt with a finite `max_system_prompt_chars` budget and
     /// enough registered tools to overflow it, forcing the truncation path.
     fn prompt_with_finite_budget(
-        compact_context: bool,
+        lean_bootstrap: bool,
         max_system_prompt_chars: usize,
         tools: &[(&str, &str)],
     ) -> String {
@@ -837,7 +837,7 @@ mod tests {
             None,
             false,
             SkillsPromptInjectionMode::Full,
-            compact_context,
+            lean_bootstrap,
             max_system_prompt_chars,
             true,
             false,
@@ -1149,8 +1149,8 @@ mod tests {
     }
 
     #[test]
-    fn compact_context_has_no_runtime_wall_clock_orientation() {
-        let prompt = prompt_with_compact_context(true);
+    fn lean_bootstrap_has_no_runtime_wall_clock_orientation() {
+        let prompt = prompt_with_lean_bootstrap(true);
         assert!(
             !prompt.contains("timestamp metadata added by the runtime"),
             "compact system prompt must not inject wall-clock orientation: {prompt}"
@@ -1227,8 +1227,8 @@ mod tests {
     }
 
     #[test]
-    fn non_compact_context_keeps_full_channel_capabilities_section() {
-        let prompt = prompt_with_compact_context(false);
+    fn non_lean_bootstrap_keeps_full_channel_capabilities_section() {
+        let prompt = prompt_with_lean_bootstrap(false);
         assert!(
             prompt.contains("You are running as a messaging bot"),
             "full system prompt must retain the existing Channel Capabilities copy: {prompt}"

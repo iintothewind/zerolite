@@ -1914,7 +1914,14 @@ mod tests {
             "kept_turns < preferred is exactly the warn condition"
         );
 
-        // The broadcast hook is process-wide: a parallel test that calls
+        // `record!` goes through `tracing`, so the event only reaches the
+        // broadcast hook once a subscriber forwards it. Without this the test
+        // observes nothing and times out — it passed only when another test in
+        // the binary happened to install the subscriber first, which is the
+        // same order dependence every other log-asserting runtime test avoids
+        // by installing it explicitly.
+        zeroclaw_log::try_install_capture_subscriber();
+        // The hook is process-wide: a parallel test that calls
         // `subscribe_or_install` replaces the sender and closes this receiver.
         // Re-subscribe and re-emit rather than fail — the warning is idempotent
         // and what is pinned here is its shape, not its delivery count.

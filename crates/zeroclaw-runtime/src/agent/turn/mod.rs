@@ -3870,8 +3870,8 @@ fn build_owned_step_system_prompt(
         .iter()
         .map(|t| (t.name(), t.description()))
         .collect();
-    let bootstrap_max_chars = if owned.agent.resolved.compact_context {
-        Some(crate::agent::system_prompt::COMPACT_BOOTSTRAP_MAX_CHARS)
+    let bootstrap_max_chars = if owned.agent.resolved.lean_bootstrap {
+        Some(crate::agent::system_prompt::LEAN_BOOTSTRAP_MAX_CHARS)
     } else {
         None
     };
@@ -3890,7 +3890,7 @@ fn build_owned_step_system_prompt(
         owned.activated_tools.as_ref(),
         owned.agent.resolved.strict_tool_parsing,
         owned.agent.resolved.prompt_injection_mode,
-        owned.agent.resolved.compact_context,
+        owned.agent.resolved.lean_bootstrap,
         owned.agent.resolved.max_system_prompt_chars,
         true,
         config.channels.show_tool_calls,

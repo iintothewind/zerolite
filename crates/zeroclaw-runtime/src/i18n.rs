@@ -1831,7 +1831,7 @@ mod tests {
         let file = "AGENTS.md";
         let cases = [
             (
-                "cli-doctor-bootstrap-file-truncated-compact",
+                "cli-doctor-bootstrap-file-truncated-lean",
                 &[
                     ("alias", alias),
                     ("file", file),
@@ -1847,12 +1847,12 @@ mod tests {
                     "6000",
                     "13985",
                     "7985",
-                    "compact_context = false",
+                    "lean_bootstrap = false",
                     "nightly",
                 ][..],
             ),
             (
-                "cli-doctor-bootstrap-file-truncated-compact-no-profile",
+                "cli-doctor-bootstrap-file-truncated-lean-no-profile",
                 &[
                     ("alias", alias),
                     ("file", file),
@@ -1867,7 +1867,7 @@ mod tests {
                     "6000",
                     "13985",
                     "7985",
-                    "compact_context = false",
+                    "lean_bootstrap = false",
                     "runtime_profile = \"<name>\"",
                 ][..],
             ),

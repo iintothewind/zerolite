@@ -850,7 +850,7 @@ pub(crate) fn build_system_prompt_for_turn(
     activated_tools: Option<&Arc<Mutex<crate::tools::ActivatedToolSet>>>,
     strict_tool_parsing: bool,
     skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
-    compact_context: bool,
+    lean_bootstrap: bool,
     max_system_prompt_chars: usize,
     inject_memory: bool,
     show_tool_calls: bool,
@@ -924,7 +924,7 @@ pub(crate) fn build_system_prompt_for_turn(
             Some(risk_profile),
             native_tool_specs_present,
             skills_prompt_mode,
-            compact_context,
+            lean_bootstrap,
             0,
             inject_memory,
             show_tool_calls,
@@ -1608,7 +1608,7 @@ pub async fn run(
         // ── Effective per-agent runtime tunables ──────────────────────
         // Profile values (when set) override the agent's inline fields.
         // See `Config::resolved_agent_config` for precedence rules.
-        let eff_compact_context = agent.resolved.compact_context;
+        let eff_lean_bootstrap = agent.resolved.lean_bootstrap;
         let eff_max_system_prompt_chars = agent.resolved.max_system_prompt_chars;
         let eff_prompt_injection_mode = agent.resolved.prompt_injection_mode;
         let base_observer = observability::create_observer(&config.observability);
@@ -2073,8 +2073,8 @@ pub async fn run(
         ));
         }
         retain_registered_tool_descriptions(&mut tool_descs, &tools_registry);
-        let bootstrap_max_chars = if eff_compact_context {
-            Some(crate::agent::system_prompt::COMPACT_BOOTSTRAP_MAX_CHARS)
+        let bootstrap_max_chars = if eff_lean_bootstrap {
+            Some(crate::agent::system_prompt::LEAN_BOOTSTRAP_MAX_CHARS)
         } else {
             None
         };
@@ -2114,7 +2114,7 @@ pub async fn run(
             activated_handle.as_ref(),
             agent.resolved.strict_tool_parsing,
             eff_prompt_injection_mode,
-            eff_compact_context,
+            eff_lean_bootstrap,
             eff_max_system_prompt_chars,
             true,
             config.channels.show_tool_calls,
@@ -2215,7 +2215,7 @@ pub async fn run(
                 activated_handle.as_ref(),
                 agent.resolved.strict_tool_parsing,
                 eff_prompt_injection_mode,
-                eff_compact_context,
+                eff_lean_bootstrap,
                 eff_max_system_prompt_chars,
                 true,
                 config.channels.show_tool_calls,
@@ -2274,7 +2274,7 @@ pub async fn run(
             // ingress origin (agent::memory_inject). Hardware RAG context
             // stays site-built; the engine prepends the memory block above
             // it, preserving the legacy mem -> hw -> [now] msg order.
-            let rag_limit = if eff_compact_context { 2 } else { 5 };
+            let rag_limit = if eff_lean_bootstrap { 2 } else { 5 };
             let hw_context = hardware_rag
                 .as_ref()
                 .map(|r| {
@@ -2352,7 +2352,7 @@ pub async fn run(
                         activated_handle.as_ref(),
                         agent.resolved.strict_tool_parsing,
                         eff_prompt_injection_mode,
-                        eff_compact_context,
+                        eff_lean_bootstrap,
                         eff_max_system_prompt_chars,
                         true,
                         config.channels.show_tool_calls,
@@ -2908,7 +2908,7 @@ pub async fn run(
                 // the ingress origin (agent::memory_inject). Hardware RAG
                 // stays site-built; the engine prepends the memory block
                 // above it.
-                let rag_limit = if eff_compact_context { 2 } else { 5 };
+                let rag_limit = if eff_lean_bootstrap { 2 } else { 5 };
                 let hw_context = hardware_rag
                     .as_ref()
                     .map(|r| {
@@ -3021,7 +3021,7 @@ pub async fn run(
                             activated_handle.as_ref(),
                             agent.resolved.strict_tool_parsing,
                             eff_prompt_injection_mode,
-                            eff_compact_context,
+                            eff_lean_bootstrap,
                             eff_max_system_prompt_chars,
                             true,
                             config.channels.show_tool_calls,
@@ -3694,7 +3694,7 @@ async fn process_message_inner(
         // ── Effective per-agent runtime tunables ──────────────────────
         // Profile values (when set) override the agent's inline fields.
         // See `Config::resolved_agent_config` for precedence rules.
-        let eff_compact_context = agent.resolved.compact_context;
+        let eff_lean_bootstrap = agent.resolved.lean_bootstrap;
         let eff_max_system_prompt_chars = agent.resolved.max_system_prompt_chars;
         let eff_prompt_injection_mode = agent.resolved.prompt_injection_mode;
 
@@ -4043,8 +4043,8 @@ async fn process_message_inner(
             );
         }
 
-        let bootstrap_max_chars = if eff_compact_context {
-            Some(crate::agent::system_prompt::COMPACT_BOOTSTRAP_MAX_CHARS)
+        let bootstrap_max_chars = if eff_lean_bootstrap {
+            Some(crate::agent::system_prompt::LEAN_BOOTSTRAP_MAX_CHARS)
         } else {
             None
         };
@@ -4078,7 +4078,7 @@ async fn process_message_inner(
                 Some(&risk_profile),
                 native_tool_specs_present,
                 eff_prompt_injection_mode,
-                eff_compact_context,
+                eff_lean_bootstrap,
                 0,
                 false,
                 config.channels.show_tool_calls,
@@ -4159,7 +4159,7 @@ async fn process_message_inner(
         // root span (it runs before AgentStart) but carries the matching
         // zeroclaw.turn_id attribute; nesting it is a tracked follow-up.
         let turn_id = uuid::Uuid::new_v4().to_string();
-        let rag_limit = if eff_compact_context { 2 } else { 5 };
+        let rag_limit = if eff_lean_bootstrap { 2 } else { 5 };
         let hw_context = hardware_rag
             .as_ref()
             .map(|r| {

@@ -242,7 +242,7 @@ fn tight_runtime() -> RuntimeProfileConfig {
             request_token_ceiling: Some(8_000),
             ..crate::scattered_types::ContextConfig::default()
         },
-        compact_context: Some(true),
+        lean_bootstrap: Some(true),
         parallel_tools: Some(false),
         tool_dispatcher: None,
         tool_call_dedup_exempt: vec![],
@@ -268,7 +268,7 @@ fn local_small_runtime() -> RuntimeProfileConfig {
             request_token_ceiling: Some(8_000),
             ..crate::scattered_types::ContextConfig::default()
         },
-        compact_context: Some(true),
+        lean_bootstrap: Some(true),
         parallel_tools: Some(false),
         tool_dispatcher: None,
         tool_call_dedup_exempt: vec![],
@@ -302,7 +302,7 @@ fn unbounded_runtime() -> RuntimeProfileConfig {
             request_token_ceiling: Some(128_000),
             ..crate::scattered_types::ContextConfig::default()
         },
-        compact_context: Some(false),
+        lean_bootstrap: Some(false),
         parallel_tools: Some(true),
         tool_dispatcher: None,
         tool_call_dedup_exempt: vec![],
@@ -624,7 +624,7 @@ mod tests {
         assert_eq!(values.delegation_timeout_secs, Some(60));
         assert_eq!(values.agentic_timeout_secs, Some(120));
         assert_eq!(values.context.request_token_ceiling, Some(8_000));
-        assert_eq!(values.compact_context, Some(true));
+        assert_eq!(values.lean_bootstrap, Some(true));
         assert_eq!(values.parallel_tools, Some(false));
         assert_eq!(values.max_system_prompt_chars, Some(8_000));
         assert_eq!(values.max_tool_result_chars, Some(4_000));
@@ -674,7 +674,7 @@ mod tests {
         assert!(resolved.resolved.strict_tool_parsing);
         assert_eq!(resolved.resolved.max_tool_iterations, 4);
         assert_eq!(resolved.resolved.context.request_token_ceiling, Some(8_000));
-        assert!(resolved.resolved.compact_context);
+        assert!(resolved.resolved.lean_bootstrap);
         assert!(!resolved.resolved.parallel_tools);
         assert_eq!(resolved.resolved.max_system_prompt_chars, 8_000);
         assert_eq!(resolved.resolved.max_tool_result_chars, 4_000);

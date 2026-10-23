@@ -3849,7 +3849,7 @@ impl Default for DelegateToolConfig {
 /// table. The runtime profile is the sole config surface for these.
 #[derive(Debug, Clone)]
 pub struct ResolvedRuntime {
-    pub compact_context: bool,
+    pub lean_bootstrap: bool,
     pub max_tool_iterations: usize,
     pub max_execution_tree_iterations: Option<usize>,
     /// Model's context window (max input tokens) — from provider config.
@@ -4117,7 +4117,7 @@ impl ResolvedRuntime {
 impl Default for ResolvedRuntime {
     fn default() -> Self {
         Self {
-            compact_context: true,
+            lean_bootstrap: true,
             max_tool_iterations: 10,
             max_execution_tree_iterations: None,
             model_context_window: 32_000,
@@ -4901,9 +4901,9 @@ impl Config {
     }
 
     #[must_use]
-    pub fn effective_compact_context(&self, agent_alias: &str) -> bool {
+    pub fn effective_lean_bootstrap(&self, agent_alias: &str) -> bool {
         self.runtime_profile_for_agent(agent_alias)
-            .and_then(|p| p.compact_context)
+            .and_then(|p| p.lean_bootstrap)
             .unwrap_or(true)
     }
 
@@ -4973,7 +4973,7 @@ impl Config {
                 .effective_max_execution_tree_iterations(agent_alias),
             model_context_window: model_context_window.tokens,
             model_context_window_source: model_context_window.source,
-            compact_context: self.effective_compact_context(agent_alias),
+            lean_bootstrap: self.effective_lean_bootstrap(agent_alias),
             parallel_tools: self.effective_parallel_tools(agent_alias),
             tool_dispatcher: self.effective_tool_dispatcher(agent_alias),
             tool_call_dedup_exempt: self.effective_tool_call_dedup_exempt(agent_alias),
@@ -14807,8 +14807,8 @@ pub struct RuntimeProfileConfig {
     /// `[history_pruning]` / `[context_compression]` tables.
     #[nested]
     pub context: crate::scattered_types::ContextConfig,
-    /// Use compact bootstrap (6000 chars / 2 RAG chunks). `None` inherits.
-    pub compact_context: Option<bool>,
+    /// Use lean bootstrap (6000 chars / 2 RAG chunks). `None` inherits.
+    pub lean_bootstrap: Option<bool>,
     /// Enable parallel tool execution per iteration. `None` inherits.
     pub parallel_tools: Option<bool>,
     /// Request one native tool call per provider response when supported. Default off.
@@ -14866,7 +14866,7 @@ impl Default for RuntimeProfileConfig {
             delegation_timeout_secs: None,
             agentic_timeout_secs: None,
             context: crate::scattered_types::ContextConfig::default(),
-            compact_context: None,
+            lean_bootstrap: None,
             parallel_tools: None,
             single_tool_rounds: None,
             tool_dispatcher: None,
@@ -34186,7 +34186,7 @@ reasoning_effort = "turbo"
     #[test]
     async fn agent_config_defaults() {
         let cfg = AliasedAgentConfig::default();
-        assert!(cfg.resolved.compact_context);
+        assert!(cfg.resolved.lean_bootstrap);
         assert_eq!(cfg.resolved.max_tool_iterations, 10);
         assert_eq!(cfg.resolved.max_execution_tree_iterations, None);
         assert!(!cfg.resolved.parallel_tools);
@@ -34244,7 +34244,7 @@ timeout_secs = 0
         let raw = r#"
 default_temperature = 0.7
 [agents.default]
-compact_context = true
+lean_bootstrap = true
 max_tool_iterations = 20
 parallel_tools = true
 tool_dispatcher = "xml"
@@ -34275,6 +34275,29 @@ runtime_profile = "fast"
 "#;
         let parsed = parse_test_config(raw);
         assert_eq!(parsed.effective_max_tool_iterations("default"), 25);
+    }
+
+    #[test]
+    async fn runtime_profile_bootstrap_size_resolves_by_agent() {
+        // The runtime profile is the sole surface for this knob, and an agent
+        // without a profile gets the `true` default.
+        let parsed = parse_test_config(
+            r#"
+[runtime_profiles.tight]
+lean_bootstrap = false
+
+[agents.default]
+runtime_profile = "tight"
+"#,
+        );
+        assert!(!parsed.effective_lean_bootstrap("default"));
+        assert!(
+            parsed.effective_lean_bootstrap("no-such-agent"),
+            "an agent with no profile must fall back to the default"
+        );
+
+        let serialized = toml::to_string(&parsed.runtime_profiles["tight"]).unwrap();
+        assert!(serialized.contains("lean_bootstrap = false"));
     }
 
     #[test]

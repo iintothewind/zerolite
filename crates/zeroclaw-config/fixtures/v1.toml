@@ -143,7 +143,7 @@ max_tasks = 64
 max_concurrent = 4
 
 [agent]
-compact_context = false
+lean_bootstrap = false
 max_tool_iterations = 10
 max_history_messages = 50
 max_context_tokens = 32000

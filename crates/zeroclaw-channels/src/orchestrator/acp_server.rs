@@ -7212,15 +7212,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_load_replays_the_retained_turn_when_a_persisted_crumb_leads_the_seed() {
+    async fn session_load_replays_every_restored_turn_and_skips_only_the_crumb_row() {
         use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
 
-        // `dropped_messages` from the crumb-aware restore trim counts only
-        // real messages, but the persisted leading breadcrumb is still a row
-        // of the seed vector. The replay offset must skip that crumb row too:
-        // with [crumb, old turn, new turn], a one-turn cap drops the old
-        // turn whole, and replay must begin at the new turn, not at the old
-        // turn's assistant reply.
+        // Two contracts meet in this fixture, and the persisted crumb row is
+        // what separates them.
+        //
+        // 1. Restore does not trim. `seed_conversation_history_with_event`
+        //    leaves the restored transcript alone and lets the water-line
+        //    trim inside the turn bound it; capping at seed time would cut
+        //    every restored transcript back to `keep_recent_turns` on load.
+        //    So a low `keep_recent_turns` must change nothing here, and no
+        //    `_zeroclaw/history_trimmed` event may be emitted.
+        // 2. The crumb row is not a turn. It is persisted history but not
+        //    something the client should see replayed, so the replay offset
+        //    skips it while every real turn still replays in order.
         let cwd = tempfile::tempdir().unwrap();
         let store =
             Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
@@ -7294,19 +7300,27 @@ mod tests {
             .collect();
         assert_eq!(
             replayed_texts,
-            vec!["new request".to_string(), "new answer".to_string()],
-            "replay must begin at the first retained real turn, aligned with the provider seed: \
-             {replayed_texts:?}"
-        );
-        assert_eq!(
-            notifications[0]["method"], "_zeroclaw/history_trimmed",
-            "the restore trim event must still be emitted first"
+            vec![
+                "old request".to_string(),
+                "old answer".to_string(),
+                "new request".to_string(),
+                "new answer".to_string(),
+            ],
+            "replay must start at the first real turn — the crumb row is skipped — and must \
+             cover every restored turn because restore does not trim: {replayed_texts:?}"
         );
         assert!(
             !replayed_texts
                 .iter()
-                .any(|text| text.contains("old request") || text.contains("old answer")),
-            "rows from the dropped turn must not be replayed"
+                .any(|text| text.contains("[earlier turns omitted")),
+            "the persisted crumb row is history, not a client-visible message"
+        );
+        assert!(
+            !notifications
+                .iter()
+                .any(|notification| notification["method"] == "_zeroclaw/history_trimmed"),
+            "restore must not trim, so it must not report a trim: capping at seed time would \
+             cut every restored transcript back to keep_recent_turns on load"
         );
     }
 

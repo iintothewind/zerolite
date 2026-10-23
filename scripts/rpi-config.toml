@@ -310,7 +310,7 @@ max_tasks = 64
 max_concurrent = 4
 
 [agent]
-compact_context = true
+lean_bootstrap = true
 max_tool_iterations = 20
 parallel_tools = false
 tool_dispatcher = "auto"

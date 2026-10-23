@@ -10102,7 +10102,7 @@ mod tests {
         async fn streamed_agent_caps_fully_assembled_system_prompt_on_every_turn() {
             let (provider, captured) = capturing_provider(false);
             let mut agent = test_agent_with_provider(provider, vec![Box::new(MockTool)]);
-            agent.config.resolved.compact_context = true;
+            agent.config.resolved.lean_bootstrap = true;
             agent.config.resolved.max_system_prompt_chars = 4_000;
             // MCP/tool guidance is appended after the base identity prompt.
             // The cap must cover this tail, even when the dispatcher switches
@@ -15603,7 +15603,10 @@ mod tests {
         let second_call = seen.get(1).expect("the turn must make a second model call");
         let steer_at = second_call
             .iter()
-            .position(|m| m.role == "user" && m.content.ends_with("]\n\nsteer-now"))
+            // `enrich_user_message` is the identity — the runtime never stamps
+            // a per-turn prefix onto a user message, so the steering turn
+            // reaches the provider exactly as it was sent.
+            .position(|m| m.role == "user" && m.content == "steer-now")
             .unwrap_or_else(|| {
                 panic!(
                     "the step after the tool must see the steering message: {:?}",
@@ -15627,7 +15630,7 @@ mod tests {
                 .iter()
                 .filter(|m| matches!(
                     m,
-                    ConversationMessage::Chat(c) if c.role == "user" && c.content.ends_with("steer-now")
+                    ConversationMessage::Chat(c) if c.role == "user" && c.content == "steer-now"
                 ))
                 .count(),
             1,

@@ -260,7 +260,7 @@ const WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL: &str = "Current WhatsApp group messa
 // System prompt functions live in `zeroclaw_runtime::agent::system_prompt`.
 #[allow(unused_imports)]
 pub use zeroclaw_runtime::agent::system_prompt::{
-    BOOTSTRAP_MAX_CHARS, COMPACT_BOOTSTRAP_MAX_CHARS, build_system_prompt,
+    BOOTSTRAP_MAX_CHARS, LEAN_BOOTSTRAP_MAX_CHARS, build_system_prompt,
     build_system_prompt_with_mode, build_system_prompt_with_mode_and_autonomy,
     build_system_prompt_with_mode_and_effective_tools,
 };
@@ -291,8 +291,8 @@ const MATRIX_SINGLE_MESSAGE_TYPING_CLEANUP_TIMEOUT_MS: u64 = 100;
 const CHANNEL_HEALTH_HEARTBEAT_SECS: u64 = 30;
 const MODEL_CACHE_FILE: &str = "models_cache.json";
 const MODEL_CACHE_PREVIEW_LIMIT: usize = 10;
-const CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES: usize = 12;
-const CHANNEL_HISTORY_COMPACT_CONTENT_CHARS: usize = 600;
+const CHANNEL_HISTORY_TRIM_KEEP_MESSAGES: usize = 12;
+const CHANNEL_HISTORY_TRIM_CONTENT_CHARS: usize = 600;
 /// Proactive context-window budget in estimated characters (~4 chars/token).
 /// Guardrail for hook-modified outbound channel content.
 const CHANNEL_HOOK_MAX_OUTBOUND_CHARS: usize = 20_000;
@@ -3773,7 +3773,7 @@ fn effective_non_cli_tool_names<'a>(
         .collect()
 }
 
-fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool {
+fn trim_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool {
     let mut histories = ctx
         .conversation_histories
         .lock()
@@ -3789,22 +3789,22 @@ fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool
 
     let keep_from = turns
         .len()
-        .saturating_sub(CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES);
-    let mut compacted = normalize_cached_channel_turns(turns[keep_from..].to_vec());
+        .saturating_sub(CHANNEL_HISTORY_TRIM_KEEP_MESSAGES);
+    let mut trimmed = normalize_cached_channel_turns(turns[keep_from..].to_vec());
 
-    for turn in &mut compacted {
-        if turn.content.chars().count() > CHANNEL_HISTORY_COMPACT_CONTENT_CHARS {
+    for turn in &mut trimmed {
+        if turn.content.chars().count() > CHANNEL_HISTORY_TRIM_CONTENT_CHARS {
             turn.content =
-                truncate_with_ellipsis(&turn.content, CHANNEL_HISTORY_COMPACT_CONTENT_CHARS);
+                truncate_with_ellipsis(&turn.content, CHANNEL_HISTORY_TRIM_CONTENT_CHARS);
         }
     }
 
-    if compacted.is_empty() {
+    if trimmed.is_empty() {
         turns.clear();
         return false;
     }
 
-    *turns = compacted;
+    *turns = trimmed;
     true
 }
 
@@ -8855,21 +8855,22 @@ fn record_passive_context(ctx: &ChannelRuntimeContext, msg: &ChannelMessage, his
     );
 }
 
-/// Resolve the cold-start breadcrumb flag for `history_key`: the in-memory
-/// map first, then the durable store's canonical column, and only for
-/// legacy sessions with no record anywhere, inference from the transcript.
+/// Resolve the cold-start breadcrumb flag for `history_key`: the durable
+/// store's canonical column, and nothing else. Provenance is never inferred
+/// from the transcript.
 ///
-/// A provenance-read error (`Err`) is fail-closed to `false` and never
-/// falls through to text inference. Collapsing `Err` into `None` would let
-/// an unreadable backend coincide with a user-controlled first message that
-/// collides with the breadcrumb text, manufacturing synthetic ownership the
-/// backend never recorded — precisely when the canonical owner state is
-/// unavailable. Legacy inference therefore runs only on `Ok(None)` (a
-/// backend that answers but has never recorded a flag for this sender).
-/// Callers that need to distinguish "confirmed absent" from "unreadable"
-/// re-check the store before publishing authoritative trim state; the
-/// post-loop resync leaves cache and flag untouched on a provenance-read
-/// error rather than pairing a guess with a possibly-incomplete reload.
+/// A provenance-read error (`Err`) is fail-closed to `false`. Collapsing
+/// `Err` into `None` would let an unreadable backend coincide with a
+/// user-controlled first message that collides with the breadcrumb text,
+/// manufacturing synthetic ownership the backend never recorded — precisely
+/// when the canonical owner state is unavailable. A backend that answers but
+/// has never recorded a flag (`Ok(None)`) is likewise `false`: the position of
+/// the leading row cannot tell the synthetic crumb from a genuine user turn,
+/// and inspecting its text is the same hazard. Callers that need to
+/// distinguish "confirmed absent" from "unreadable" re-check the store before
+/// publishing authoritative trim state; the post-loop resync leaves cache and
+/// flag untouched on a provenance-read error rather than pairing a guess with
+/// a possibly-incomplete reload.
 fn resolve_cold_crumb_provenance(
     store: Option<&dyn zeroclaw_infra::session_backend::SessionBackend>,
     history_key: &str,
@@ -10934,16 +10935,16 @@ async fn process_channel_message_body(
                     );
                 }
             } else if is_context_window_overflow_error(&e) {
-                let compacted = compact_sender_history(ctx.as_ref(), &history_key);
-                let error_text = if compacted {
-                    "⚠️ Context window exceeded for this conversation. I compacted recent history and kept the latest context. Please resend your last message."
+                let trimmed = trim_sender_history(ctx.as_ref(), &history_key);
+                let error_text = if trimmed {
+                    "⚠️ Context window exceeded for this conversation. I trimmed recent history and kept the latest context. Please resend your last message."
                 } else {
                     "⚠️ Context window exceeded for this conversation. Please resend your last message."
                 };
                 eprintln!(
-                    "  ⚠️ Context window exceeded after {}ms; sender history compacted={}",
+                    "  ⚠️ Context window exceeded after {}ms; sender history trimmed={}",
                     started_at.elapsed().as_millis(),
-                    compacted
+                    trimmed
                 );
                 ::zeroclaw_log::record!(
                     WARN,
@@ -10957,7 +10958,7 @@ async fn process_channel_message_body(
                             "model": route.model,
                             "sender": msg.sender,
                             "reason": "context window exceeded",
-                            "history_compacted": compacted,
+                            "history_trimmed": trimmed,
                         })),
                     "channel_message_error"
                 );
@@ -16364,8 +16365,9 @@ struct HydrationFailed;
 /// follows it down to `false`, and the truncated transcript is persisted
 /// together with the corrected flag so a later restart does not reload the
 /// untruncated transcript and resurrect the turn this pass already dropped.
-/// Legacy sessions that never recorded a flag (`None`) infer once from
-/// text, matching the per-turn cold-cache fallback in the message path.
+/// Legacy sessions that never recorded a flag (`None`) resolve to `false`:
+/// provenance is never inferred from message text or from the position of the
+/// leading row, matching the per-turn cold-cache fallback in the message path.
 /// Returns `Ok(None)` for an empty/missing session and
 /// `Err(HydrationFailed)` when a transcript was loaded but its
 /// reconciliation write failed — callers must keep those distinct (see
@@ -16421,10 +16423,13 @@ fn hydrate_session_transcript(
             return Err(HydrationFailed);
         }
     };
-    // Structural check made BEFORE the cap below can remove it: a synthetic
-    // breadcrumb is the leading non-system row. Provenance itself comes from
-    // the durable flag; this only asks whether the row the flag claims is
-    // still physically there, never whether its text matches.
+    // Structural check made BEFORE the cap below can remove it, and read only
+    // under `Some(true)`: the flag says a synthetic breadcrumb leads the
+    // transcript, and a breadcrumb is inserted at the leading-system boundary,
+    // so it is the leading non-system row by definition. This asks whether
+    // that row is still physically there, never whether its text matches —
+    // with no flag there is nothing to anchor the reading and it is not
+    // consulted at all.
     let marker_present_pre_drain = msgs.first().is_some_and(|first| first.role == "user");
     let truncated = msgs.len() > MAX_CHANNEL_HISTORY;
     if truncated {
@@ -16452,21 +16457,16 @@ fn hydrate_session_transcript(
         orphan_closed = true;
     }
 
-    // Legacy inference (no recorded flag) must reflect the transcript
-    // actually returned to the caller, not the pre-cap snapshot: if the cap
-    // drained the marker off the front, the post-cap transcript no longer
-    // carries it and ownership must not be inferred from a message that is
-    // no longer there.
-    let marker_present_post_cap = if truncated {
-        msgs.first().is_some_and(|first| first.role == "user")
-    } else {
-        marker_present_pre_drain
-    };
-
     let crumb_present = match durable_crumb {
         Some(true) => !(truncated && marker_present_pre_drain),
         Some(false) => false,
-        None => marker_present_post_cap,
+        // No record at all: a session written before the flag existed.
+        // Nothing may be claimed. Position alone cannot tell the synthetic
+        // crumb from a genuine user turn — the cap can leave a real user
+        // row at the front of the transcript — and text is never inspected,
+        // so inferring here would manufacture ownership from content the
+        // user controls. The next trim records the flag authoritatively.
+        None => false,
     };
     // Truncation itself must trigger persistence even when ownership is
     // unchanged: the in-memory transcript returned to the caller no longer
@@ -16916,8 +16916,8 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
         effective_tool_names.retain(|name| !hidden_builtin_names.contains(*name));
         tool_descs.retain(|(name, _)| effective_tool_names.contains(name));
 
-        let bootstrap_max_chars = if agent.resolved.compact_context {
-            Some(COMPACT_BOOTSTRAP_MAX_CHARS)
+        let bootstrap_max_chars = if agent.resolved.lean_bootstrap {
+            Some(LEAN_BOOTSTRAP_MAX_CHARS)
         } else {
             None
         };
@@ -16964,7 +16964,7 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
             Some(&risk_profile),
             native_tools,
             config.effective_skills_prompt_mode(agent_alias),
-            agent.resolved.compact_context,
+            agent.resolved.lean_bootstrap,
             agent.resolved.max_system_prompt_chars,
             true,
             config.channels.show_tool_calls,
@@ -18786,16 +18786,17 @@ fn caller_evicts_cache_and_does_not_guess_flag_when_trim_resync_fails() {
     );
 }
 
-/// Cold-start breadcrumb provenance must fail closed when the store is
-/// unreadable: a provenance-read error resolves to an explicit `false`,
-/// never a fall-through to legacy text inference. The previous code
-/// collapsed `Err` into `None` with `.ok().flatten()`, so an unreadable
-/// backend paired with a user-controlled first message colliding with the
-/// breadcrumb text manufactured synthetic ownership the backend never
-/// recorded — precisely when the canonical owner state was unavailable.
+/// Cold-start breadcrumb provenance is never inferred from message text. A
+/// provenance-read error resolves to an explicit `false`, and so does a
+/// backend that answers but has never recorded a flag. The previous code
+/// collapsed `Err` into `None` with `.ok().flatten()` and then inferred from
+/// text, so an unreadable backend — or a legacy session with no record —
+/// paired with a user-controlled first message colliding with the breadcrumb
+/// text manufactured synthetic ownership the backend never recorded,
+/// precisely when the canonical owner state was unavailable.
 #[cfg(test)]
 #[test]
-fn cold_crumb_provenance_fails_closed_on_provenance_read_error() {
+fn cold_crumb_provenance_never_infers_ownership_from_text() {
     use zeroclaw_infra::session_backend::SessionBackend;
     use zeroclaw_providers::ChatMessage;
 
@@ -18858,12 +18859,13 @@ fn cold_crumb_provenance_fails_closed_on_provenance_read_error() {
         "an unreadable provenance must resolve to false, never to text inference"
     );
 
-    // The legacy migration path is preserved: a backend that answers but
-    // never recorded a flag still infers from the transcript.
+    // `Ok(None)` — a backend that answers but never recorded a flag — is a
+    // legacy session, not a licence to guess. The colliding first user
+    // message must not manufacture ownership; the next trim records the flag.
     let legacy = AnsweringBackend { flag: None };
     assert!(
-        resolve_cold_crumb_provenance(Some(&legacy), "sender", &colliding),
-        "Ok(None) must keep the legacy text-inference migration"
+        !resolve_cold_crumb_provenance(Some(&legacy), "sender", &colliding),
+        "Ok(None) must resolve to false, never to text inference"
     );
 
     // Explicit records win over message text either way.
@@ -20075,7 +20077,7 @@ pub(crate) mod tests {
         assert_eq!(attributes["provider_attempted"], false);
         assert_eq!(attributes["model_context_window"], 64);
         assert!(attributes["estimated_tokens"].as_u64().unwrap() > 64);
-        assert!(attributes.get("history_compacted").is_none());
+        assert!(attributes.get("history_trimmed").is_none());
         assert!(attributes.get("error").is_none());
         assert!(!event.to_string().contains("private-context-prompt"));
     }
@@ -23059,7 +23061,7 @@ api_key = "anthropic-key"
     }
 
     #[test]
-    fn compact_sender_history_keeps_recent_truncated_messages() {
+    fn trim_sender_history_keeps_recent_truncated_messages() {
         let mut histories =
             lru::LruCache::new(std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap());
         let sender = "telegram_u1".to_string();
@@ -23163,7 +23165,7 @@ api_key = "anthropic-key"
             sop_driver_sink: None,
         };
 
-        assert!(compact_sender_history(&ctx, &sender));
+        assert!(trim_sender_history(&ctx, &sender));
 
         let locked_histories = ctx
             .conversation_histories
@@ -23172,12 +23174,11 @@ api_key = "anthropic-key"
         let kept = locked_histories
             .peek(&sender)
             .expect("sender history should remain");
-        assert_eq!(kept.len(), CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES);
+        assert_eq!(kept.len(), CHANNEL_HISTORY_TRIM_KEEP_MESSAGES);
         assert!(kept.iter().all(|turn| {
             let len = turn.content.chars().count();
-            len <= CHANNEL_HISTORY_COMPACT_CONTENT_CHARS
-                || (len <= CHANNEL_HISTORY_COMPACT_CONTENT_CHARS + 3
-                    && turn.content.ends_with("..."))
+            len <= CHANNEL_HISTORY_TRIM_CONTENT_CHARS
+                || (len <= CHANNEL_HISTORY_TRIM_CONTENT_CHARS + 3 && turn.content.ends_with("..."))
         }));
     }
 
@@ -23991,11 +23992,14 @@ api_key = "anthropic-key"
     }
 
     #[test]
-    fn hydration_drops_legacy_marker_ownership_when_the_cap_removes_it() {
-        // No recorded flag (legacy session) and the leading synthetic
-        // marker is old enough that the cap drains it off. Ownership must
-        // be inferred from the transcript actually returned, not from a
-        // pre-cap snapshot that no longer matches what's kept.
+    fn hydration_claims_no_marker_ownership_without_a_recorded_flag() {
+        // No recorded flag (a session written before the sidecar existed) and
+        // the leading synthetic marker is old enough that the cap drains it
+        // off. Two independent reasons not to claim ownership: there is no
+        // record to anchor a reading, and the row the cap leaves at the front
+        // is a genuine user turn that no role check can tell apart from the
+        // crumb. Provenance resolves to `false` and the answer is persisted,
+        // so the next load no longer has to guess at all.
         let tmp = tempfile::TempDir::new().unwrap();
         let store = zeroclaw_infra::session_store::SessionStore::new(tmp.path()).unwrap();
         let sender = "chan_legacy_capped".to_string();
@@ -24019,12 +24023,12 @@ api_key = "anthropic-key"
 
         assert!(
             !hydrated.crumb_present,
-            "the marker was drained by the cap, so legacy inference must not claim ownership"
+            "with no recorded flag, nothing may be claimed from the leading row"
         );
         assert_eq!(
             store.get_session_trim_breadcrumb(&sender).unwrap(),
             Some(false),
-            "the inferred flag must be persisted"
+            "the resolved flag must be persisted so the next load reads a record"
         );
         assert_eq!(
             store.load(&sender).len(),

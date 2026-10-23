@@ -2991,7 +2991,7 @@ impl ModelProvider for ReliableModelProvider {
                                         "Request exceeds model context window and cannot be reduced without \
                                          breaking message/tool pairing ({truncation_limit}). Try using a model \
                                          with a larger context window, reducing the number of tools/skills, or \
-                                         enabling compact_context in config."
+                                         enabling lean_bootstrap in config."
                                     ),
                                     &failures,
                                 );
@@ -3440,7 +3440,7 @@ impl ModelProvider for ReliableModelProvider {
                                         "Request exceeds model context window and cannot be reduced without \
                                          breaking message/tool pairing ({truncation_limit}). Try using a model \
                                          with a larger context window, reducing the number of tools/skills, or \
-                                         enabling compact_context in config."
+                                         enabling lean_bootstrap in config."
                                     ),
                                     &failures,
                                 );
@@ -3817,7 +3817,7 @@ impl ModelProvider for ReliableModelProvider {
                                         "Request exceeds model context window and cannot be reduced without \
                                          breaking message/tool pairing ({truncation_limit}). Try using a model \
                                          with a larger context window, reducing the number of tools/skills, or \
-                                         enabling compact_context in config."
+                                         enabling lean_bootstrap in config."
                                     ),
                                     &failures,
                                 );

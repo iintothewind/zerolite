@@ -1,5 +1,5 @@
 use crate::agent::system_prompt::{
-    BOOTSTRAP_FILES, BOOTSTRAP_MAX_CHARS, COMPACT_BOOTSTRAP_MAX_CHARS, CONDITIONAL_BOOTSTRAP_FILES,
+    BOOTSTRAP_FILES, BOOTSTRAP_MAX_CHARS, CONDITIONAL_BOOTSTRAP_FILES, LEAN_BOOTSTRAP_MAX_CHARS,
     truncate_bootstrap_content,
 };
 use anyhow::{Context, Result};
@@ -1682,9 +1682,9 @@ fn check_agent_bootstrap_truncation(
     if crate::identity::is_aieos_configured(&agent_cfg.identity) {
         return;
     }
-    let compact = config.effective_compact_context(alias);
-    let limit = if compact {
-        COMPACT_BOOTSTRAP_MAX_CHARS
+    let lean = config.effective_lean_bootstrap(alias);
+    let limit = if lean {
+        LEAN_BOOTSTRAP_MAX_CHARS
     } else {
         BOOTSTRAP_MAX_CHARS
     };
@@ -1708,13 +1708,13 @@ fn check_agent_bootstrap_truncation(
             ("discarded", discarded.as_str()),
             ("limit", limit_arg.as_str()),
         ];
-        let key = if !compact {
+        let key = if !lean {
             "cli-doctor-bootstrap-file-truncated"
         } else if profile.is_empty() {
-            "cli-doctor-bootstrap-file-truncated-compact-no-profile"
+            "cli-doctor-bootstrap-file-truncated-lean-no-profile"
         } else {
             args.push(("profile", profile));
-            "cli-doctor-bootstrap-file-truncated-compact"
+            "cli-doctor-bootstrap-file-truncated-lean"
         };
         let msg = crate::i18n::get_required_cli_string_with_args(key, &args);
         items.push(DiagItem::warn(cat, msg));
@@ -3409,10 +3409,10 @@ mod tests {
     }
 
     #[test]
-    fn check_workspace_reports_bootstrap_files_over_the_compact_cap() {
+    fn check_workspace_reports_bootstrap_files_over_the_lean_cap() {
         let tmp = TempDir::new().unwrap();
         let mut config = workspace_test_config(tmp.path());
-        // No runtime profile: compact_context defaults on, so the cap is 6000.
+        // No runtime profile: lean_bootstrap defaults on, so the cap is 6000.
         add_enabled_agent(&mut config, "alpha");
 
         let ws = config.agent_workspace_dir("alpha");
@@ -3473,7 +3473,7 @@ mod tests {
         config.runtime_profiles.insert(
             "nightly".to_string(),
             zeroclaw_config::schema::RuntimeProfileConfig {
-                compact_context: None,
+                lean_bootstrap: None,
                 ..Default::default()
             },
         );
@@ -3570,13 +3570,13 @@ mod tests {
     }
 
     #[test]
-    fn check_workspace_uses_the_full_cap_when_compact_context_is_off() {
+    fn check_workspace_uses_the_full_cap_when_lean_bootstrap_is_off() {
         let tmp = TempDir::new().unwrap();
         let mut config = workspace_test_config(tmp.path());
         config.runtime_profiles.insert(
             "wide".to_string(),
             zeroclaw_config::schema::RuntimeProfileConfig {
-                compact_context: Some(false),
+                lean_bootstrap: Some(false),
                 ..Default::default()
             },
         );
@@ -3593,7 +3593,7 @@ mod tests {
         std::fs::create_dir_all(&ws).unwrap();
         std::fs::write(ws.join("SOUL.md"), b"# soul").unwrap();
 
-        // Over the compact cap but far under the full cap: no truncation row.
+        // Over the lean cap but far under the full cap: no truncation row.
         std::fs::write(ws.join("AGENTS.md"), "a".repeat(7_000)).unwrap();
         let mut items = Vec::new();
         check_workspace(&config, &mut items);
@@ -3630,7 +3630,7 @@ mod tests {
                     .contains("per-file cap retains 20000 of 20500 chars (500 discarded")
         );
         assert!(
-            !warns[0].message.contains("compact_context = false"),
+            !warns[0].message.contains("lean_bootstrap = false"),
             "the non-compact variant must not name the knob: {}",
             warns[0].message
         );
