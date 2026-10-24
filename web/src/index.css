@@ -741,6 +741,18 @@ code, kbd, pre {
   width: calc((85cqi - 1.75rem) / 3);
   max-width: 100%;
 }
+@media (max-width: 767px) {
+  /* On mobile, an image-bearing bubble takes the full column width instead of
+     shrinking to the image; desktop keeps the shrink-to-fit behaviour.
+     `.msg-has-image` is set by `AgentChat` for an image in the answer *or* in
+     the collapsed trajectory group above it. The grow is what makes the
+     `width: 100%` below safe: a percentage of a shrink-to-fit bubble cycles
+     and falls back to the sliver, and `.msg-has-image` is absent exactly when
+     a renderer cannot know an image is coming (a group that has not loaded
+     yet), so a percentage alone is not enough. */
+  .msg-has-image { flex: 1 1 auto; max-width: 100%; }
+  .chat-markdown:has(img.chat-image-tall) { width: 100%; max-width: 100%; }
+}
 .chat-markdown img.chat-image-tall {
   width: 100%;
   max-width: 100%;

@@ -30,6 +30,7 @@ import ChatWorkspace from '@/pages/ChatWorkspace';
 import ToolCallCard from '@/components/ToolCallCard';
 import ToolCallGroup from '@/components/ToolCallGroup';
 import ChatImage from '@/components/ChatImage';
+import { hasChatImage, stepsHaveChatImage } from '@/components/chatImage.logic';
 import ApprovalBanner from '@/components/ApprovalBanner';
 import SessionPicker from '@/components/SessionPicker';
 import InputBar from '@/components/InputBar';
@@ -905,7 +906,10 @@ export function AgentChatInner({
                 <Bot className="h-3.5 w-3.5 text-pc-accent" />
               </div>
             )}
-            <div className="relative max-w-[85%] min-w-0">
+            {/* An image in the streaming trajectory group is rendered by the
+                same `img` renderer, so it needs the same width rule as a
+                committed message. */}
+            <div className={`relative min-w-0 ${stepsHaveChatImage(live.groupSteps) ? 'msg-has-image max-w-[85%]' : 'max-w-[85%]'}`}>
               {/* The trajectory so far, above the answer still arriving: the
                   committed layout, so committing the turn moves nothing. */}
               {showToolActivity && live.groupSteps.length > 0 && (
@@ -1046,6 +1050,10 @@ const MessageItem = memo(function MessageItem({
   // them (that would clip a message starting with a bracketed datetime). Only
   // server-sourced messages can be prefixed.
   const cleanContent = msg.local || msg.ephemeral ? msg.content : stripServerTimestamp(msg.content);
+  // An image in the answer, or in the trajectory group rendered above the
+  // answer, is sized by the same `img` renderer, so both make the bubble
+  // image-bearing (the mobile full-width rule in `index.css` keys on this).
+  const hasImage = hasChatImage(cleanContent) || stepsHaveChatImage(segments?.steps ?? []);
 
   // The hover strip below the bubble is absolutely positioned, so it needs
   // reserved space to land in: it is 20px tall (18px bar + 2px offset) while
@@ -1079,7 +1087,7 @@ const MessageItem = memo(function MessageItem({
           )}
         </div>
       )}
-      <div className="relative max-w-[85%] min-w-0 overflow-visible">
+      <div className={`relative min-w-0 overflow-visible ${hasImage ? 'msg-has-image max-w-[85%]' : 'max-w-[85%]'}`}>
         {segments && segments.steps.length > 0 && onToggleGroup && (
           <ToolCallGroup
             segments={segments}
