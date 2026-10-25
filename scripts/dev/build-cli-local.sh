@@ -187,6 +187,12 @@ _zc_acquire_lock() {
 # Always reclaim bulky cargo intermediates — success, failure, or Ctrl-C.
 # Keeps only dist/bin/<target>/zeroclaw. See scripts/dev/reclaim-cargo-disk.sh.
 _zc_reclaim_on_exit() {
+  # Fingerprint diagnostics write a strings dump to a temp file; drop it on
+  # every exit path (success, die, Ctrl-C), before the reclaim early-return.
+  if [ -n "${_ZC_SCAN:-}" ]; then
+    rm -f "$_ZC_SCAN" 2>/dev/null || true
+    _ZC_SCAN=
+  fi
   # Release the lock first: the success path below returns early.
   if [ -n "${_ZC_LOCK_DIR:-}" ] && [ -d "$_ZC_LOCK_DIR" ]; then
     rm -rf "$_ZC_LOCK_DIR" 2>/dev/null || true
@@ -340,22 +346,63 @@ BIN="target/$TARGET/release/zeroclaw"
 [ -f "$BIN" ] || die "expected binary missing: $BIN"
 
 # ── 5. Prove the CURRENT dashboard is inside the ELF ──────────────────────
+# One `strings` pass is written to a temp file, never piped into `grep -q`:
+# `set -o pipefail` (above) makes `strings "$bin" | grep -F -q "$fp"` return
+# 141 (SIGPIPE) when the fingerprint appears early in the scan — grep exits,
+# the pipe closes, `strings` is killed, and the assert reports a FALSE NEGATIVE
+# on a binary that does embed the dist (measured on the 45 MB dist binary:
+# rc=141 with the fingerprint present twice). Scanning to a file also lets the
+# failure path print what the ELF actually embeds: a silent `grep -q` explains
+# nothing, and the EXIT trap deletes target/ before anyone can inspect the
+# binary. The evidence list is persisted beside dist/bin.
 step "verify binary embeds current web/dist ($FINGERPRINT)"
-bin_has_fingerprint() {
-  local bin="$1"
-  local fp="$2"
-  if command -v strings >/dev/null 2>&1; then
-    strings "$bin" | grep -F -q "$fp"
-  else
-    docker run --rm -v "$REPO_ROOT:/build" -w /build "$RUST_IMAGE" \
-      bash -c "strings \"$bin\" | grep -F -q \"$fp\""
-  fi
-}
+_ZC_SCAN="$(mktemp "${TMPDIR:-/tmp}/zeroclaw-fingerprint-strings.XXXXXX")"
+if command -v strings >/dev/null 2>&1; then
+  strings "$BIN" > "$_ZC_SCAN"
+else
+  docker run --rm -v "$REPO_ROOT:/build" -w /build "$RUST_IMAGE" \
+    bash -c "strings \"$BIN\"" > "$_ZC_SCAN"
+fi
 
-if ! bin_has_fingerprint "$BIN" "$FINGERPRINT"; then
+# `|| true` is load-bearing: with `set -euo pipefail` a grep that finds no
+# asset string (the "embed never ran" case) would abort the script before any
+# of the diagnostics below print — the exact silence this step is meant to fix.
+DISSET="$(grep -oE 'assets/[A-Za-z0-9_-]+\.(js|css)' web/dist/index.html | sort -u || true)"
+EMBEDDED="$(grep -oE 'assets/index-[A-Za-z0-9_-]+\.js' "$_ZC_SCAN" | sort -u || true)"
+
+if grep -F -q "$FINGERPRINT" "$_ZC_SCAN"; then
+  echo "    ok: fingerprint present in $BIN ($(wc -c < "$BIN") bytes)"
+  rm -f "$_ZC_SCAN"; _ZC_SCAN=
+else
+  echo "    expected: $FINGERPRINT (web/dist/index.html)"
+  if [ -n "$EMBEDDED" ]; then
+    echo "    embedded in $BIN:"
+    printf '%s\n' "$EMBEDDED" | sed 's/^/      /'
+  else
+    echo "    embedded in $BIN: no 'assets/index-*.js' string at all"
+  fi
+  echo "    web/dist on disk:"
+  printf '%s\n' "$DISSET" | sed 's/^/      /'
+  REPORT="dist/bin/$TARGET/fingerprint-report.txt"
+  mkdir -p "dist/bin/$TARGET"
+  # Unquoted expansions are deliberate: the fingerprint lists are
+  # whitespace-free filenames, one per line.
+  # shellcheck disable=SC2086
+  {
+    echo "expected:  $FINGERPRINT"
+    echo "binary:    $BIN ($(wc -c < "$BIN") bytes, sha256 $(sha256sum "$BIN" 2>/dev/null | cut -d' ' -f1))"
+    echo "embedded:  $(printf '%s ' $EMBEDDED)"
+    echo "on disk:   $(printf '%s ' $DISSET)"
+    echo "features:  $FEATURES (embedded-web is NOT in Cargo default features)"
+    echo "cause:     embedded hashes present that differ from the current dist"
+    echo "           → web/dist the container compiled against was stale (check --skip-web);"
+    echo "           no asset strings at all → include_dir! never ran, i.e. the gateway"
+    echo "           rlib was built without embedded-web."
+  } > "$REPORT"
+  echo "    report:  $REPORT (kept after target/ is reclaimed)"
+  echo "    Failure modes table: docs/maintainers/build-cli-local.md"
   die "binary does NOT contain '$FINGERPRINT' — embedded-web bake failed; refuse to collect a stale/empty dashboard"
 fi
-echo "    ok: fingerprint present in $BIN"
 
 # ── 6. Collect into dist/bin/<target>/ ────────────────────────────────────
 step "collect into dist/bin/$TARGET/"

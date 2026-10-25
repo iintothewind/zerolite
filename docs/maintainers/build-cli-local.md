@@ -89,7 +89,11 @@ dashboard still looks like yesterday (ctx bar, Progress, …).
    embedded-web,plugins-wasm-cranelift`** (`--no-plugins-wasm` drops the
    latter)
 5. **Assert** the ELF contains the current `assets/index-*.js` fingerprint
-   from `web/dist/index.html` (refuse to collect if missing)
+   from `web/dist/index.html` (refuse to collect if missing). The binary is
+   scanned once with `strings` into a temp file; on failure the script prints
+   the fingerprint lists found in the ELF and on disk and writes
+   `dist/bin/<triple>/fingerprint-report.txt`, which survives the EXIT reclaim
+   of `target/`.
 6. Copy into `dist/bin/<triple>/` via `scripts/dev/collect-dist.sh`
 7. Reclaim compile/test residue on EXIT (`target/`, `%TEMP%\zc-*` / `zc-cargo-home` / `zeroclaw/`, sandbox `cargo-target`)
 
@@ -255,7 +259,8 @@ see `crates/zeroclaw-gateway/src/static_files.rs`).
 |---|---|---|
 | WebUI unchanged after binary deploy | Built **without** `embedded-web`; device still serves old `web_dist_dir` | Use `scripts/dev/build-cli-local.sh` only |
 | WebUI still stale despite embed | Stale `web/dist` or gateway not cleaned | Do not use `--skip-web`; let the script wipe + rebuild + `cargo clean -p zeroclaw-gateway` |
-| Script: fingerprint assert failed | Embed path broken or wrong binary | Check `--features embedded-web`; confirm `web/dist/index.html` exists before Docker build |
+| Script: fingerprint assert failed | Embed path broken, stale `web/dist`, **or** the historical `strings bin \| grep -F -q` false negative (row below) | Check `--features embedded-web`; read the printed embedded list + `dist/bin/<triple>/fingerprint-report.txt` |
+| Assert fails on a binary that **does** embed the dist | `set -o pipefail` + `strings "$bin" \| grep -F -q "$fp"` returns **141 (SIGPIPE)** when the fingerprint appears early in the scan: `grep -q` exits, the pipe closes, `strings` is killed, so the pipeline "fails" | Fixed in the script: scan to a temp file, `grep` reads the file. Measured on the 45 MB dist binary: rc=141 with the fingerprint present twice |
 | Container: `working directory … is invalid` | MSYS path rewrite on Git Bash | Use the script (sets `MSYS_NO_PATHCONV`); or export it yourself |
 | `missing required command: cargo` under `bash` | WSL bash, not Git Bash | Use `scripts\dev\build-cli-local.cmd`, or let the `.sh` re-exec under Git Bash |
 | `build dir not found: …\cursor-sandbox-cache\…\cargo-target` | Host `CARGO_TARGET_DIR` ≠ Docker's `$REPO_ROOT/target` | Script unsets it; `collect-dist` also falls back to repo `target/` |
