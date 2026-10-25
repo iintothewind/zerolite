@@ -2,7 +2,7 @@
   <img src="web/public/logo.png" alt="ZeroLite" width="360" />
 </p>
 
-<h1 align="center">ZeroLite 1.2.3 — Personal AI Assistant</h1>
+<h1 align="center">ZeroLite — Personal AI Assistant</h1>
 
 <p align="center">
   <strong>A ZeroClaw fork. You own the agent, the data, and the machine it runs on.</strong>
@@ -10,7 +10,7 @@
 
 ---
 
-ZeroLite is a fork of [ZeroClaw](https://github.com/zeroclaw-labs/zeroclaw). The binary, config file, and commands stay `zeroclaw`. This tree is crate version `1.2.3`; the release tag is `v1.2.3`.
+ZeroLite is a fork of [ZeroClaw](https://github.com/zeroclaw-labs/zeroclaw). The binary, config file, and commands stay `zeroclaw`. Releases are tagged `vX.Y.Z`; the latest is [here](https://github.com/iintothewind/zerolite/releases/latest).
 
 It is still one Rust binary: LLM providers (Anthropic, OpenAI, Ollama, and ~20 others), 30+ channels (Discord, Telegram, Matrix, email, voice, webhooks, CLI), and tools (shell, browser, HTTP, hardware, custom MCP servers). Everything runs on your machine, with your keys, in your workspace.
 
@@ -31,7 +31,7 @@ keep_recent_turns = 5           # default, clamped 1–10
 ```
 
 - Past the water-line, keep the newest whole turns, then drop older ones down to one. A turn is never split. If the newest turn still does not fit, the turn fails.
-- A trim rewrites stored history and refreshes the meter. Size is a script-aware estimate, then re-anchored on provider `input_tokens`.
+- A trim rewrites stored history and refreshes the meter. The meter is a script-aware estimate priced with the tool definitions the request carries; a provider `input_tokens` report anchors it and the anchor is carried across turns, labelled `calibrated`.
 - Sends keep the longest byte-stable prefix. Cache hits are `zeroclaw_tokens_cached_input_total` and the composer's cache-hit percent. A child's context budget cannot exceed its parent's.
 - Stable prefix: no dates or clocks in the system prompt, channel turn context, or history. `HEARTBEAT.md` loads only for heartbeat. Skill and deferred catalogs are frozen for the session and sorted by name.
 
@@ -39,7 +39,7 @@ keep_recent_turns = 5           # default, clamped 1–10
 
 ### Web chat
 
-- Context ring, plus `N turns · M steps · … tok · cache hit …%`.
+- Context ring, plus `N turns · M steps · … tok · cache hit …%`. The ring moves at turn start, and every number says where it came from (`estimate`, `calibrated`, `provider`).
 - A turn is ordered steps. Earlier steps collapse (`7 tool calls · 6 messages`); the answer stays open. The transcript stays pinned, and a trim cuts it in place.
 - An `https://` markdown image renders in the bubble and in tool steps. Publish the picture to an image host first.
 - Denser chrome, message hover actions, and tall images scroll.
@@ -52,31 +52,33 @@ keep_recent_turns = 5           # default, clamped 1–10
 
 ## Install
 
-Install from the [ZeroLite 1.2.3 release](https://github.com/iintothewind/zerolite/releases/tag/v1.2.3). Each binary has the web dashboard embedded and carries the WASM plugin host. There is no macOS build.
+Install from the [latest ZeroLite release](https://github.com/iintothewind/zerolite/releases/latest). Each binary has the web dashboard embedded and carries the WASM plugin host. There is no macOS build, and the release page carries what is new.
 
 | Platform | Asset |
 |---|---|
-| Windows x64 | `zerolite-1.2.3-x86_64-pc-windows-msvc.zip` |
-| Linux x64 | `zerolite-1.2.3-x86_64-unknown-linux-gnu.tar.gz` |
-| Linux arm64 | `zerolite-1.2.3-aarch64-unknown-linux-gnu.tar.gz` |
+| Windows x64 | `zerolite-*-x86_64-pc-windows-msvc.zip` |
+| Linux x64 | `zerolite-*-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux arm64 | `zerolite-*-aarch64-unknown-linux-gnu.tar.gz` |
+
+The `*` is the release version, so `gh release download` with no tag takes the latest release and the commands below match whatever it ships.
 
 Linux x64:
 
 ```sh
-gh release download v1.2.3 -R iintothewind/zerolite -p 'zerolite-1.2.3-x86_64-unknown-linux-gnu.tar.gz'
-tar -xzf zerolite-1.2.3-x86_64-unknown-linux-gnu.tar.gz
+gh release download -R iintothewind/zerolite -p 'zerolite-*-x86_64-unknown-linux-gnu.tar.gz'
+tar -xzf zerolite-*-x86_64-unknown-linux-gnu.tar.gz
 install -m 755 zeroclaw "${CARGO_HOME:-$HOME/.cargo}/bin/zeroclaw"
 zeroclaw quickstart
 ```
 
-Linux arm64: same steps, with `zerolite-1.2.3-aarch64-unknown-linux-gnu.tar.gz`.
+Linux arm64: same steps, with `zerolite-*-aarch64-unknown-linux-gnu.tar.gz`.
 
 Windows (PowerShell):
 
 ```powershell
-gh release download v1.2.3 -R iintothewind/zerolite -p 'zerolite-1.2.3-x86_64-pc-windows-msvc.zip'
-Expand-Archive .\zerolite-1.2.3-x86_64-pc-windows-msvc.zip -DestinationPath "$env:USERPROFILE\.cargo\bin"
-Rename-Item "$env:USERPROFILE\.cargo\bin\zerolite-1.2.3-x86_64-pc-windows-msvc.exe" zeroclaw.exe
+gh release download -R iintothewind/zerolite -p 'zerolite-*-x86_64-pc-windows-msvc.zip'
+Expand-Archive .\zerolite-*-x86_64-pc-windows-msvc.zip -DestinationPath "$env:USERPROFILE\.cargo\bin"
+Rename-Item "$env:USERPROFILE\.cargo\bin\zerolite-*-x86_64-pc-windows-msvc.exe" zeroclaw.exe
 zeroclaw quickstart
 ```
 
@@ -106,8 +108,8 @@ The registry offers 13 packages built for upstream v0.8.6's plugin contract:
 the Discord, Matrix, Telegram, Bluesky, Gitea, Mattermost, Mochat, Notion,
 Reddit, X (Twitter), WeChat and WeCom channels, plus the `redact-text` tool.
 Plugins stay disabled until you enable them. Operator guide:
-[Plugins](docs/book/src/plugins/index.md) · release notes:
-[docs/releases/v1.2.0.md](docs/releases/v1.2.0.md).
+[Plugins](https://docs.zeroclaw.com/master/en/plugins/index.html) · release notes:
+[the latest release](https://github.com/iintothewind/zerolite/releases/latest).
 
 ## What the runtime does
 
