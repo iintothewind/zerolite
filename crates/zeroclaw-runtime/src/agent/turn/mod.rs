@@ -83,6 +83,7 @@ pub(crate) use tool_specs::build_iteration_tool_specs;
 pub(crate) use vision_route::prepare_messages_for_iteration;
 
 use crate::agent::execution_tree_budget::{ExecutionTreeBudget, ExecutionTreeReservation};
+use crate::agent::history_trim::ContextAnchor;
 use crate::agent::system_prompt::{NATIVE_TOOLS_TASK_FRAMING, NO_TOOLS_TASK_FRAMING};
 use crate::agent::tool_execution::{
     ToolDispatchContext, execute_tools_parallel, execute_tools_sequential,
@@ -92,6 +93,7 @@ use crate::live_config_authority::AgentExecutionAdmission;
 use crate::security::ingress::{IngressPolicy, ingress_policy, steering_policy};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
+pub use outcome::ContextAnchorSink;
 use std::collections::{HashSet, VecDeque};
 use std::io::Write as _;
 use std::sync::Arc;
@@ -920,6 +922,15 @@ pub struct ToolLoop<'a> {
     /// captured even when the provider returns no usage. `None` on paths that
     /// do not publish a terminal snapshot (tests, nested sub-turns).
     pub served_route_sink: Option<ServedRouteSink>,
+    /// The previous turn's provider-measured anchor: seeds this loop's
+    /// calibration and the dispatch ratio so the first dispatch reads a real
+    /// measurement, not a fresh local estimate. `None` on paths that carry no
+    /// meter (tests, nested sub-turns, non-streamed loops).
+    pub context_anchor_seed: Option<ContextAnchor>,
+    /// Sink the loop writes the anchor to when a provider report lands on an
+    /// accepted response, so the caller hands it to the next turn's meter.
+    /// `None` on the same non-meter paths.
+    pub context_anchor_sink: Option<ContextAnchorSink>,
     /// Handle the live SOP driver uses to re-assemble a nested step's execution
     /// context when the step delegates to a different agent (see
     /// [`SopStepReassembly`]). `None` on every path that cannot reach `Config`
@@ -1326,7 +1337,7 @@ async fn enforce_reported_budget(
                 })),
             "Context floor exceeds the send budget"
         );
-        return Err(anyhow::anyhow!(msg));
+        return Err(anyhow::Error::msg(msg));
     }
     Ok(())
 }
@@ -1546,6 +1557,8 @@ async fn run_tool_call_loop_impl<'a>(
         parent_agent_alias,
         turn_id,
         served_route_sink,
+        context_anchor_seed,
+        context_anchor_sink,
         sop_reassembly,
     } = p;
     let image_recovery_has_owner = image_cache.is_some();
@@ -1608,7 +1621,10 @@ async fn run_tool_call_loop_impl<'a>(
     // The provider-authoritative context anchor for this turn: re-anchored on
     // every reported `input_tokens`, so the size the runtime trims against is
     // the provider's own number, not a local estimate (spec R5).
-    let mut context_calibration = crate::agent::history_trim::ContextCalibration::new();
+    let mut context_calibration = context_anchor_seed
+        .as_ref()
+        .map(crate::agent::history_trim::ContextCalibration::seeded)
+        .unwrap_or_default();
 
     turn_state.sync_pending();
 
@@ -1779,7 +1795,17 @@ async fn run_tool_call_loop_impl<'a>(
 
     // Usage describes the completed request, not a prediction of the next
     // hook-selected model, schemas, or prepared messages.
-    let mut pending_reported_usage: Option<ReportedRequestUsage> = seed_reported_usage;
+    let mut pending_reported_usage: Option<ReportedRequestUsage> =
+        seed_reported_usage.or_else(|| {
+            context_anchor_seed
+                .as_ref()
+                .map(|seed| ReportedRequestUsage {
+                    provider_name: seed.provider_name.clone(),
+                    model: seed.model.clone(),
+                    reported_tokens: seed.reported_tokens,
+                    estimated_tokens: seed.anchored_prefix_estimate,
+                })
+        });
 
     for iteration in 0..max_iterations {
         let mut has_new_user_input = iteration == 0;
@@ -2854,7 +2880,24 @@ async fn run_tool_call_loop_impl<'a>(
         // the reported value prices all of it, and every message pushed from
         // here on becomes the unbilled tail `current()` adds back.
         if let Some(reported) = reported_input_tokens {
-            context_calibration.observe_reported(reported as usize, turn_state.history);
+            context_calibration.observe_reported(
+                reported as usize,
+                turn_state.history,
+                active_model_provider_name,
+                provider_request_model,
+                tool_schema_tokens,
+            );
+            // Hand the anchor to the caller's next turn. The population the
+            // provider just billed is `turn_state.history` at this exact
+            // moment (the user row is in it, the assistant reply and tool
+            // results are not), so the anchored prefix covers every durable
+            // row the next turn keeps, and the next turn prices only rows
+            // appended after this point.
+            if let Some(sink) = context_anchor_sink.as_ref()
+                && let Some(anchor) = context_calibration.cross_turn_anchor()
+            {
+                *sink.lock().expect("context anchor sink lock") = Some(anchor);
+            }
         }
 
         let display_text = resolve_display_text(
@@ -4353,6 +4396,8 @@ async fn drive_live_sop_actions(
                                 crate::sop::executor::scope_step_call_sink(
                                     step_call_sink.clone(),
                                     Box::pin(run_tool_call_loop(ToolLoop {
+                                        context_anchor_seed: None,
+                                        context_anchor_sink: None,
                                         history_was_trimmed: None,
                                     exec: ResolvedAgentExecution::resolve(
                                         ResolvedModelAccess {
@@ -6333,6 +6378,8 @@ vision_model_provider = "custom.vision"
         let turn_id = "b3-two-iteration";
 
         let _ = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -7450,6 +7497,8 @@ mod sop_step_reassembly_tests {
         let turn_id = uuid::Uuid::new_v4().to_string();
 
         run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution::resolve(
@@ -9384,6 +9433,8 @@ mod tool_lifecycle_abandonment_tests {
         let mut crumb_present = false;
         let mut injected_preamble = None;
         run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             sop_reassembly: None,

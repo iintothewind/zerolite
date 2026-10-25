@@ -182,8 +182,18 @@ pub enum TurnEvent {
     /// exist. Its only consumer is the context meter, which would otherwise
     /// keep showing the previous turn's number until the response arrives.
     ContextEstimate {
-        /// Locally estimated size of the assembled provider request.
+        /// Size of the assembled provider request: the local estimate when
+        /// nothing measured it, the provider-measured anchor plus a local
+        /// estimate for the rows the provider has not billed yet when a
+        /// previous turn's report applies to this population.
         input_tokens: u64,
+        /// Provenance of `input_tokens`. `estimate` when the local estimator
+        /// priced the whole request; `calibrated` when a provider-reported
+        /// count from an earlier turn anchors the unchanged prefix and the
+        /// estimator prices only the unbilled tail. NEVER `provider`: this
+        /// frame is published before dispatch, so no provider measurement of
+        /// the request being announced can exist yet.
+        input_tokens_source: Option<TokenCountSource>,
         /// The **water-line** in effect at assembly time — the proactive-trim
         /// threshold, not the send budget. Always `Some` in practice:
         /// `context_trim_budget()` is `trim_threshold_tokens().max(1)` over a

@@ -576,6 +576,8 @@ async fn safety_net_thinking_never_leaks_into_draft_or_chunks() {
     let (dtx, mut drx) = mpsc::channel(256);
     let turn_id = uuid::Uuid::new_v4().to_string();
     let result = crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
+        context_anchor_seed: None,
+        context_anchor_sink: None,
         history_was_trimmed: None,
         parent_agent_alias: None,
         served_route_sink: None,
@@ -995,6 +997,8 @@ async fn safety_net_task_locals_probe_per_entry_path() {
         Some("thread-1".into()),
         crate::agent::loop_::scope_session_key(Some("session-1".into()), async {
             crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
+                context_anchor_seed: None,
+                context_anchor_sink: None,
                 history_was_trimmed: None,
                 parent_agent_alias: None,
                 served_route_sink: None,
@@ -2820,6 +2824,8 @@ async fn safety_net_narration_reaches_both_draft_and_event_channels_once() {
     let (etx, mut erx) = mpsc::channel(256);
     let turn_id = uuid::Uuid::new_v4().to_string();
     crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
+        context_anchor_seed: None,
+        context_anchor_sink: None,
         history_was_trimmed: None,
         parent_agent_alias: None,
         sop_reassembly: None,
@@ -4022,6 +4028,8 @@ async fn poisoned_model_switch_callback_still_raises_model_switch_requested() {
     let (dtx, _drx) = mpsc::channel(256);
     let turn_id = uuid::Uuid::new_v4().to_string();
     let result = run_tool_call_loop(ToolLoop {
+        context_anchor_seed: None,
+        context_anchor_sink: None,
         history_was_trimmed: None,
         parent_agent_alias: None,
         sop_reassembly: None,

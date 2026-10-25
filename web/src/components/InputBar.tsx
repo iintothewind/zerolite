@@ -9,6 +9,7 @@ import ContextRing from '@/components/ContextRing';
 import SessionStatsRow from '@/components/SessionStatsRow';
 import { t } from '@/lib/i18n';
 import type { LiveStats } from '@/lib/sessionStats.logic';
+import type { ContextInputSource } from '@/contexts/AgentContext';
 import css from './InputBar.module.css';
 
 interface InputBarProps {
@@ -24,6 +25,8 @@ interface InputBarProps {
   contextEffectiveWindow: number | null;
   /** The water-line: where proactive trimming engages. A trigger, not a limit. */
   contextWaterlineTokens: number | null;
+  /** Provenance of the meter's numerator: provider / estimate / calibrated. */
+  contextInputSource: ContextInputSource;
   liveStats: LiveStats;
   onInputChange: (e: ChangeEvent<HTMLTextAreaElement>) => void;
   onKeyDown: (e: KeyboardEvent<HTMLTextAreaElement>) => void;
@@ -50,6 +53,7 @@ export function InputBar(props: InputBarProps) {
     contextInputTokens,
     contextEffectiveWindow,
     contextWaterlineTokens,
+    contextInputSource,
     liveStats,
     onInputChange,
     onKeyDown,
@@ -140,6 +144,7 @@ export function InputBar(props: InputBarProps) {
               used={contextInputTokens}
               max={contextEffectiveWindow}
               waterline={contextWaterlineTokens}
+              source={contextInputSource}
             />
             {typing ? (
               <button

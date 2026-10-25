@@ -473,6 +473,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.context.ring_detail_waterline': '裁剪触发线 {count}',
     'agent.context.ring_detail_percent': '占用 {percent}%',
 
+    'agent.context.ring_detail_source': '来源：{source}',
     // Message-flow group header. `{calls}` counts tool calls, `{messages}` the
     // steps carrying thinking or text — see lib/messageFlow.logic.ts.
     'agentchat.tool_group_summary': '{calls} 次工具调用 · {messages} 条消息',
@@ -2146,8 +2147,8 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.context.ring_detail_max': 'limit {count}',
     'agent.context.ring_detail_waterline': 'trim trigger {count}',
     'agent.context.ring_detail_percent': '{percent}% used',
+    'agent.context.ring_detail_source': 'Source: {source}',
   },
-
   tr: {
     'sidebar.update_available': "Güncelleme mevcut",
     'upgrade.title': "Yükselt",

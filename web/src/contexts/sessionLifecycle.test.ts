@@ -1538,6 +1538,11 @@ test('a trim cuts the transcript locally, so committed turns stay folded', async
   );
   assert.equal(mounted.context().contextInputTokens, 4200, 'tokens_after still lands');
   assert.equal(
+    mounted.context().contextInputSource,
+    'estimate',
+    'the post-trim number is a fresh raw estimate, not the anchor that priced the dropped rows',
+  );
+  assert.equal(
     groupHeaders(mounted).length,
     1,
     'the kept turn is still folded; the dropped one took its group with it',
@@ -1579,6 +1584,7 @@ test('the meter follows the assembled estimate, then the provider measurement', 
   });
   await settle();
   assert.equal(mounted.context().contextInputTokens, 9000, 'the assembled estimate lands');
+  assert.equal(mounted.context().contextInputSource, 'estimate', 'pre-dispatch size is labelled estimate');
 
   // The provider's own count replaces it mid-turn, without waiting for `done`.
   await act(async () => {
@@ -1590,6 +1596,36 @@ test('the meter follows the assembled estimate, then the provider measurement', 
     8123,
     'a provider measurement supersedes the estimate',
   );
+  assert.equal(
+    mounted.context().contextInputSource,
+    'provider',
+    'the usage frame re-labels the meter provider',
+  );
+
+  // The next turn starts from the last provider measurement anchored on the
+  // unchanged prefix: the meter moves UP, and the label says `calibrated`.
+  await act(async () => {
+    socket.emitMessage({
+      type: 'context_usage',
+      input_tokens: 26033,
+      input_tokens_source: 'calibrated',
+    });
+  });
+  await settle();
+  assert.equal(mounted.context().contextInputTokens, 26033, 'the anchored number moves the meter');
+  assert.equal(
+    mounted.context().contextInputSource,
+    'calibrated',
+    'a provider-anchored number never renders as provider',
+  );
+
+  // The billing numbers stay provider-driven: a calibrated meter number
+  // moves the ring, not the cost stats.
+  assert.equal(
+    mounted.context().liveStats.input,
+    8123,
+    'the meter label change must not feed the billing stats',
+  );
 
   // `done` stays authoritative for the turn and reports the same number here.
   await act(async () => {
@@ -1597,6 +1633,24 @@ test('the meter follows the assembled estimate, then the provider measurement', 
   });
   await settle();
   assert.equal(mounted.context().contextInputTokens, 8123);
+  await unmount(mounted.renderer);
+});
+
+test('a frame with no label reads as estimate', async () => {
+  const { mounted, socket } = await mountLiveChat();
+  await act(async () => {
+    mounted.context().sendMessage('hello');
+  });
+  await act(async () => {
+    socket.emitMessage({ type: 'context_usage', input_tokens: 1200, max_context_tokens: 8000 });
+  });
+  await settle();
+  assert.equal(mounted.context().contextInputTokens, 1200);
+  assert.equal(
+    mounted.context().contextInputSource,
+    'estimate',
+    'a frame without a label reads as estimate, not provider',
+  );
   await unmount(mounted.renderer);
 });
 

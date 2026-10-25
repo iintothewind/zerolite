@@ -115,6 +115,18 @@ export function purgeUiMessagesToKeptUserTurns(
   return messages.slice(start);
 }
 
+/** Provenance of the context meter's numerator, mirroring the wire literals
+ * (`provider` / `estimate` / `calibrated`) so the ring panel can show exactly
+ * what the daemon published. `null` when the meter has no number. */
+export type ContextInputSource = 'provider' | 'estimate' | 'calibrated' | null;
+
+function contextSourceFromWire(source: string | undefined): ContextInputSource {
+  if (source === 'provider' || source === 'calibrated') return source;
+  // A frame with no label — `estimate` or an unlabelled sender — publishes an
+  // estimate. The meter never claims `provider` for a number no provider sent.
+  return 'estimate';
+}
+
 export interface AgentContextValue {
   messages: ChatMessage[];
   sendMessage: (content: string) => void;
@@ -175,6 +187,10 @@ export interface AgentContextValue {
   /** The water-line: where proactive trimming engages. A trigger, not a limit. */
   contextWaterlineTokens: number | null;
   contextInputTokens: number | null;
+  /** Provenance of `contextInputTokens` — the label the ring panel shows.
+   * `calibrated` means the number is a provider measurement anchored on the
+   * unchanged prefix plus a local estimate for the unbilled tail. */
+  contextInputSource: ContextInputSource;
   /** Composer stats. See `webui-overall-plan.md` §10 "Composer stats semantics". */
   liveStats: LiveStats;
   /** The turn in flight: its closed steps and the step still being written.
@@ -304,6 +320,7 @@ export function AgentProvider({
   const [contextEffectiveWindow, setContextEffectiveWindow] = useState<number | null>(null);
   const [contextWaterlineTokens, setContextWaterlineTokens] = useState<number | null>(null);
   const [contextInputTokens, setContextInputTokens] = useState<number | null>(null);
+  const [contextInputSource, setContextInputSource] = useState<ContextInputSource>(null);
   const [tokenStats, setTokenStats] = useState<TokenStats>(emptyTokenStats);
   // Mirrored from the turn-stream ref for the live trajectory view.
   const [liveTurn, setLiveTurn] = useState<LiveTurn>(emptyLiveTurn);
@@ -462,6 +479,7 @@ export function AgentProvider({
         // but a multi-call turn would otherwise sit on the estimate until then.
         if (typeof msg.input_tokens === 'number') {
           setContextInputTokens(msg.input_tokens);
+          setContextInputSource('provider');
         }
         break;
 
@@ -471,6 +489,7 @@ export function AgentProvider({
         // frame means "a request is about to go out", not "a call completed".
         if (typeof msg.input_tokens === 'number') {
           setContextInputTokens(msg.input_tokens);
+          setContextInputSource(contextSourceFromWire(msg.input_tokens_source));
         }
         break;
 
@@ -695,6 +714,10 @@ export function AgentProvider({
         };
         if (typeof msg.tokens_after === 'number') {
           setContextInputTokens(msg.tokens_after);
+          // Post-trim is a fresh raw estimate over the rebuilt transcript; the
+          // provider's anchor (if any) priced rows the trim dropped, so it
+          // cannot price what is left.
+          setContextInputSource('estimate');
         }
         // Cut locally instead of re-reading the store: a store read at this
         // point returns the pre-trim transcript, and rebuilding the list from
@@ -1166,6 +1189,7 @@ export function AgentProvider({
     // them would show the outgoing conversation's token usage against an empty
     // one until the next `done` frame refreshes them.
     setContextInputTokens(null);
+    setContextInputSource(null);
     // Same reasoning for the live counters: they describe the session we are
     // leaving. Switching conversations and back must not carry them over.
     setTokenStats(emptyTokenStats);
@@ -1396,6 +1420,7 @@ export function AgentProvider({
     contextEffectiveWindow,
     contextWaterlineTokens,
     contextInputTokens,
+    contextInputSource,
     liveStats,
     liveTurn,
   };

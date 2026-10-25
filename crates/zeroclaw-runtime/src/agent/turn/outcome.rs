@@ -1,5 +1,6 @@
 //! Turn-loop control-flow outcomes: cancellation and model-switch errors.
 
+use crate::agent::history_trim::ContextAnchor;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
@@ -21,6 +22,13 @@ pub struct ServedRoute {
 /// Shared sink a caller hands the loop to observe the final serving route.
 /// `None` on paths that do not return serving-route metadata (tests, sub-turns).
 pub type ServedRouteSink = Arc<Mutex<Option<ServedRoute>>>;
+
+/// Shared sink a caller hands the tool loop to carry the provider-measured
+/// context anchor across the turn boundary: written when a provider report
+/// lands on an accepted response, read by the caller at turn end, and fed to
+/// the next turn's meter. `None` on paths that never reach a provider report
+/// (tests, sub-turns, non-streamed loops).
+pub type ContextAnchorSink = Arc<Mutex<Option<ContextAnchor>>>;
 
 tokio::task_local! {
     /// Pending model switch for one active tool loop. The loop owns this state;

@@ -942,11 +942,6 @@ fn config_admin_router(inbound_auth: &Arc<principal_gate::GatewayInboundAuth>) -
         ))
 }
 
-/// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
-#[allow(clippy::too_many_lines)]
-// One parameter per daemon-owned dependency; a bundling struct would only
-// move the list. Matches the existing allowance on the runtime spawn paths.
-#[allow(clippy::too_many_arguments)]
 /// Resolve the pairing authority this gateway serves from.
 ///
 /// A supervised run adopts the daemon's live authority verbatim, so a pairing
@@ -966,6 +961,11 @@ fn resolve_pairing_guard(
     Arc::new(shared_pairing.unwrap_or_else(|| PairingGuard::from_gateway_config(gateway_config)))
 }
 
+/// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
+#[allow(clippy::too_many_lines)]
+// One parameter per daemon-owned dependency; a bundling struct would only
+// move the list. Matches the existing allowance on the runtime spawn paths.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_gateway(
     host: &str,
     port: u16,

@@ -1221,6 +1221,8 @@ async fn agent_turn_with_sop_reassembly(
         context_token_budget,
     );
     let result = Box::pin(run_tool_call_loop(ToolLoop {
+        context_anchor_seed: None,
+        context_anchor_sink: None,
         history_was_trimmed: None,
         sop_reassembly,
         history_has_trim_breadcrumb,
@@ -1317,13 +1319,14 @@ async fn agent_turn_with_sop_reassembly(
 // stays the canonical public path via these re-exports.
 pub(crate) use super::turn::StreamCancelledAfterOutput;
 pub use super::turn::{
-    ContextLimitsResolver, DRAFT_PLACEHOLDER, DraftEvent, LoopKnobs, MaxIterationBehavior,
-    MemoryPreamble, ModelSwitchCallback, ModelSwitchRequested, PROGRESS_MIN_INTERVAL_MS,
-    ProgressEvent, REASONING_FULL_PREFIX, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess,
-    ResolvedRuntimeKnobs, ServedRoute, ServedRouteSink, SopStepReassembly, StreamDelta,
-    THINKING_STATUS_PREFIX, ToolLoop, ToolLoopCancelled, drain_steering_messages,
-    is_model_switch_requested, is_thinking_status_text, is_tool_loop_cancelled, run_tool_call_loop,
-    scrub_credentials, thinking_status_label_round, thinking_status_round, thinking_status_text,
+    ContextAnchorSink, ContextLimitsResolver, DRAFT_PLACEHOLDER, DraftEvent, LoopKnobs,
+    MaxIterationBehavior, MemoryPreamble, ModelSwitchCallback, ModelSwitchRequested,
+    PROGRESS_MIN_INTERVAL_MS, ProgressEvent, REASONING_FULL_PREFIX, ResolvedAgentExecution,
+    ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs, ServedRoute, ServedRouteSink,
+    SopStepReassembly, StreamDelta, THINKING_STATUS_PREFIX, ToolLoop, ToolLoopCancelled,
+    drain_steering_messages, is_model_switch_requested, is_thinking_status_text,
+    is_tool_loop_cancelled, run_tool_call_loop, scrub_credentials, thinking_status_label_round,
+    thinking_status_round, thinking_status_text,
 };
 #[cfg(test)]
 pub(crate) use super::turn::{
@@ -2365,86 +2368,84 @@ pub async fn run(
                         thinking_params.native_thinking,
                         TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                             cost_tracking_context.clone(),
-                            run_tool_call_loop(ToolLoop {
-                                history_was_trimmed: None,
-                                    exec: ResolvedAgentExecution::resolve(
-                                    ResolvedModelAccess {
-                                        model_provider: model_provider.as_ref(),
-                                        provider_name: &provider_name,
-                                        model: &model_name,
-                                        dispatch_model: &model_name,
-                                        temperature: effective_temperature,
+                            run_tool_call_loop(ToolLoop { context_anchor_seed: None, context_anchor_sink: None, history_was_trimmed: None,
+                                exec: ResolvedAgentExecution::resolve(
+                                ResolvedModelAccess {
+                                    model_provider: model_provider.as_ref(),
+                                    provider_name: &provider_name,
+                                    model: &model_name,
+                                    dispatch_model: &model_name,
+                                    temperature: effective_temperature,
+                                },
+                                ResolvedIo {
+                                    tools_registry: &tools_registry,
+                                    observer: observer.as_ref(),
+                                    silent: !interactive,
+                                    approval: approval_manager.as_ref(),
+                                    multimodal_config: &config.multimodal,
+                                    config: Some(&config),
+                                    hooks: None,
+                                    activated_tools: activated_handle.as_ref(),
+                                    model_switch_callback: None,
+                                    receipt_generator: None,
+                                    security: Some(security.as_ref()),
+                                },
+                                ResolvedRuntimeKnobs {
+                                    max_tool_iterations: agent.resolved.max_tool_iterations,
+                                    excluded_tools: &excluded_tools,
+                                    dedup_exempt_tools: &agent.resolved.tool_call_dedup_exempt,
+                                    pacing: &config.pacing,
+                                    strict_tool_parsing: agent.resolved.strict_tool_parsing,
+                                    parallel_tools: agent.resolved.parallel_tools,
+                                    max_tool_result_chars: agent.resolved.max_tool_result_chars,
+                                    context_limits,
+                                    context_limits_resolver: None,
+                                    knobs: &LoopKnobs {
+                                        provider_attempt_allowlist:
+                                            active_effort_provider_refs.clone(),
+                                        ..LoopKnobs::default()
                                     },
-                                    ResolvedIo {
-                                        tools_registry: &tools_registry,
-                                        observer: observer.as_ref(),
-                                        silent: !interactive,
-                                        approval: approval_manager.as_ref(),
-                                        multimodal_config: &config.multimodal,
-                                        config: Some(&config),
-                                        hooks: None,
-                                        activated_tools: activated_handle.as_ref(),
-                                        model_switch_callback: None,
-                                        receipt_generator: None,
-                                        security: Some(security.as_ref()),
-                                    },
-                                    ResolvedRuntimeKnobs {
-                                        max_tool_iterations: agent.resolved.max_tool_iterations,
-                                        excluded_tools: &excluded_tools,
-                                        dedup_exempt_tools: &agent.resolved.tool_call_dedup_exempt,
-                                        pacing: &config.pacing,
-                                        strict_tool_parsing: agent.resolved.strict_tool_parsing,
-                                        parallel_tools: agent.resolved.parallel_tools,
-                                        max_tool_result_chars: agent.resolved.max_tool_result_chars,
-                                        context_limits,
-                                        context_limits_resolver: None,
-                                        knobs: &LoopKnobs {
-                                            provider_attempt_allowlist:
-                                                active_effort_provider_refs.clone(),
-                                            ..LoopKnobs::default()
-                                        },
-                                    },
+                                },
+                            ),
+                            history: &mut history,
+                            history_has_trim_breadcrumb: &mut history_has_trim_breadcrumb,
+                            injected_memory_preamble: &mut None,
+                            channel_name,
+                            channel_reply_target: None,
+                            cancellation_token: None,
+                            on_delta: None,
+                            shared_budget: execution_tree_budget.clone(),
+                            channel: None,
+                            collected_receipts: None,
+                            event_tx: None,
+                            steering: None,
+                            new_messages_out: None,
+                            image_cache: None,
+                            // Origin is threaded from the entry point;
+                            // source/transport/trust stay phase-1
+                            // placeholders until per-transport stamping.
+                            memory: Some(crate::agent::memory_inject::TurnMemory {
+                                handle: mem.as_ref(),
+                                query: effective_msg.clone(),
+                                sessions: vec![memory_session_id.clone()],
+                                suppress: suppress_memory_inject,
+                                cfg: crate::agent::memory_inject::MemoryInjectConfig::from_memory_config(
+                                    &config.memory,
+                                    crate::agent::memory_inject::DEFAULT_RECALL_LIMIT,
                                 ),
-                                history: &mut history,
-                                history_has_trim_breadcrumb: &mut history_has_trim_breadcrumb,
-                                injected_memory_preamble: &mut None,
-                                channel_name,
-                                channel_reply_target: None,
-                                cancellation_token: None,
-                                on_delta: None,
-                                shared_budget: execution_tree_budget.clone(),
-                                channel: None,
-                                collected_receipts: None,
-                                event_tx: None,
-                                steering: None,
-                                new_messages_out: None,
-                                image_cache: None,
-                                // Origin is threaded from the entry point;
-                                // source/transport/trust stay phase-1
-                                // placeholders until per-transport stamping.
-                                memory: Some(crate::agent::memory_inject::TurnMemory {
-                                    handle: mem.as_ref(),
-                                    query: effective_msg.clone(),
-                                    sessions: vec![memory_session_id.clone()],
-                                    suppress: suppress_memory_inject,
-                                    cfg: crate::agent::memory_inject::MemoryInjectConfig::from_memory_config(
-                                        &config.memory,
-                                        crate::agent::memory_inject::DEFAULT_RECALL_LIMIT,
-                                    ),
-                                }),
-                                ingress: IngressContext::from_parts(
-                                    origin,
-                                    internal_principal.clone(),
-                                ),
-                                agent_alias: Some(agent_alias),
-                                parent_agent_alias: None,
-                                turn_id: &turn_id,
-                                served_route_sink: None,
-                                sop_reassembly: Some(crate::agent::turn::SopStepReassembly {
-                                    config: &config,
-                                    live_config: None,
-                                }),
                             }),
+                            ingress: IngressContext::from_parts(
+                                origin,
+                                internal_principal.clone(),
+                            ),
+                            agent_alias: Some(agent_alias),
+                            parent_agent_alias: None,
+                            turn_id: &turn_id,
+                            served_route_sink: None,
+                            sop_reassembly: Some(crate::agent::turn::SopStepReassembly {
+                                config: &config,
+                                live_config: None,
+                            }), }),
                         ),
                     )
                     .await
@@ -3034,94 +3035,92 @@ pub async fn run(
                             thinking_params.native_thinking,
                             TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                                 cost_tracking_context.clone(),
-                                run_tool_call_loop(ToolLoop {
-                                    history_was_trimmed: None,
-                                    exec: ResolvedAgentExecution::resolve(
-                                        ResolvedModelAccess {
-                                            model_provider: model_provider.as_ref(),
-                                            provider_name: &provider_name,
-                                            model: &model_name,
-                                            dispatch_model: &model_name,
-                                            temperature: turn_temperature,
+                                run_tool_call_loop(ToolLoop { context_anchor_seed: None, context_anchor_sink: None, history_was_trimmed: None,
+                                exec: ResolvedAgentExecution::resolve(
+                                    ResolvedModelAccess {
+                                        model_provider: model_provider.as_ref(),
+                                        provider_name: &provider_name,
+                                        model: &model_name,
+                                        dispatch_model: &model_name,
+                                        temperature: turn_temperature,
+                                    },
+                                    ResolvedIo {
+                                        tools_registry: &tools_registry,
+                                        observer: observer.as_ref(),
+                                        silent: true,
+                                        approval: approval_manager.as_ref(),
+                                        multimodal_config: &config.multimodal,
+                                        config: Some(&config),
+                                        hooks: None,
+                                        activated_tools: activated_handle.as_ref(),
+                                        model_switch_callback: None,
+                                        receipt_generator: None,
+                                        security: Some(security.as_ref()),
+                                    },
+                                    ResolvedRuntimeKnobs {
+                                        max_tool_iterations: agent.resolved.max_tool_iterations,
+                                        excluded_tools: &excluded_tools,
+                                        dedup_exempt_tools: &agent
+                                            .resolved
+                                            .tool_call_dedup_exempt,
+                                        pacing: &config.pacing,
+                                        strict_tool_parsing: agent.resolved.strict_tool_parsing,
+                                        parallel_tools: agent.resolved.parallel_tools,
+                                        max_tool_result_chars: agent
+                                            .resolved
+                                            .max_tool_result_chars,
+                                        context_limits,
+                                        context_limits_resolver: None,
+                                        knobs: &LoopKnobs {
+                                            provider_attempt_allowlist:
+                                                active_effort_provider_refs.clone(),
+                                            ..LoopKnobs::default()
                                         },
-                                        ResolvedIo {
-                                            tools_registry: &tools_registry,
-                                            observer: observer.as_ref(),
-                                            silent: true,
-                                            approval: approval_manager.as_ref(),
-                                            multimodal_config: &config.multimodal,
-                                            config: Some(&config),
-                                            hooks: None,
-                                            activated_tools: activated_handle.as_ref(),
-                                            model_switch_callback: None,
-                                            receipt_generator: None,
-                                            security: Some(security.as_ref()),
-                                        },
-                                        ResolvedRuntimeKnobs {
-                                            max_tool_iterations: agent.resolved.max_tool_iterations,
-                                            excluded_tools: &excluded_tools,
-                                            dedup_exempt_tools: &agent
-                                                .resolved
-                                                .tool_call_dedup_exempt,
-                                            pacing: &config.pacing,
-                                            strict_tool_parsing: agent.resolved.strict_tool_parsing,
-                                            parallel_tools: agent.resolved.parallel_tools,
-                                            max_tool_result_chars: agent
-                                                .resolved
-                                                .max_tool_result_chars,
-                                            context_limits,
-                                            context_limits_resolver: None,
-                                            knobs: &LoopKnobs {
-                                                provider_attempt_allowlist:
-                                                    active_effort_provider_refs.clone(),
-                                                ..LoopKnobs::default()
-                                            },
-                                        },
-                                    ),
-                                    history: &mut history,
-                                    history_has_trim_breadcrumb:
-                                        &mut history_has_trim_breadcrumb,
-                                    injected_memory_preamble: &mut None,
-                                    channel_name,
-                                    channel_reply_target: None,
-                                    cancellation_token: Some(cancel_token.clone()),
-                                    on_delta: Some(delta_tx.clone()),
-                                    shared_budget: execution_tree_budget.clone(),
-                                    channel: None,
-                                    collected_receipts: None,
-                                    event_tx: None,
-                                    steering: None,
-                                    new_messages_out: None,
-                                    image_cache: Some(crate::agent::turn::ToolLoopImageState {
-                                        cache: &mut image_cache,
-                                        provider_state: &mut provider_image_state,
-                                    }),
-                                    // Origin is threaded from the entry point;
-                                    // source/transport/trust stay phase-1
-                                    // placeholders until per-transport stamping.
-                                    memory: Some(crate::agent::memory_inject::TurnMemory {
-                                        handle: mem.as_ref(),
-                                        query: effective_input.clone(),
-                                        sessions: vec![memory_session_id.clone()],
-                                        suppress: suppress_memory_inject,
-                                        cfg: crate::agent::memory_inject::MemoryInjectConfig::from_memory_config(
-                                            &config.memory,
-                                            crate::agent::memory_inject::DEFAULT_RECALL_LIMIT,
-                                        ),
-                                    }),
-                                    ingress: IngressContext::from_parts(
-                                        origin,
-                                        internal_principal.clone(),
-                                    ),
-                                    agent_alias: Some(agent_alias),
-                                    parent_agent_alias: None,
-                                    turn_id: &turn_id,
-                                    served_route_sink: None,
-                                    sop_reassembly: Some(crate::agent::turn::SopStepReassembly {
-                                        config: &config,
-                                        live_config: None,
-                                    }),
+                                    },
+                                ),
+                                history: &mut history,
+                                history_has_trim_breadcrumb:
+                                    &mut history_has_trim_breadcrumb,
+                                injected_memory_preamble: &mut None,
+                                channel_name,
+                                channel_reply_target: None,
+                                cancellation_token: Some(cancel_token.clone()),
+                                on_delta: Some(delta_tx.clone()),
+                                shared_budget: execution_tree_budget.clone(),
+                                channel: None,
+                                collected_receipts: None,
+                                event_tx: None,
+                                steering: None,
+                                new_messages_out: None,
+                                image_cache: Some(crate::agent::turn::ToolLoopImageState {
+                                    cache: &mut image_cache,
+                                    provider_state: &mut provider_image_state,
                                 }),
+                                // Origin is threaded from the entry point;
+                                // source/transport/trust stay phase-1
+                                // placeholders until per-transport stamping.
+                                memory: Some(crate::agent::memory_inject::TurnMemory {
+                                    handle: mem.as_ref(),
+                                    query: effective_input.clone(),
+                                    sessions: vec![memory_session_id.clone()],
+                                    suppress: suppress_memory_inject,
+                                    cfg: crate::agent::memory_inject::MemoryInjectConfig::from_memory_config(
+                                        &config.memory,
+                                        crate::agent::memory_inject::DEFAULT_RECALL_LIMIT,
+                                    ),
+                                }),
+                                ingress: IngressContext::from_parts(
+                                    origin,
+                                    internal_principal.clone(),
+                                ),
+                                agent_alias: Some(agent_alias),
+                                parent_agent_alias: None,
+                                turn_id: &turn_id,
+                                served_route_sink: None,
+                                sop_reassembly: Some(crate::agent::turn::SopStepReassembly {
+                                    config: &config,
+                                    live_config: None,
+                                }), }),
                             ),
                         )
                         .await
@@ -6155,6 +6154,8 @@ mod tests {
         let observer = NoopObserver;
 
         run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -6409,6 +6410,8 @@ mod tests {
             &mut injected_memory_preamble,
         );
         let _ = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -6842,6 +6845,8 @@ mod tests {
         let observer = NoopObserver;
 
         let err = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -6928,6 +6933,8 @@ mod tests {
         };
 
         let result = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -7044,6 +7051,8 @@ mod tests {
         let turn_id = uuid::Uuid::new_v4().to_string();
 
         let result = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             sop_reassembly: None,
@@ -7214,6 +7223,8 @@ mod tests {
             let mut provider_image_state = crate::agent::turn::ProviderImageState::default();
 
             let result = run_tool_call_loop(ToolLoop {
+                context_anchor_seed: None,
+                context_anchor_sink: None,
                 history_was_trimmed: None,
                 parent_agent_alias: None,
                 served_route_sink: None,
@@ -7313,6 +7324,8 @@ mod tests {
         let turn_id = uuid::Uuid::new_v4().to_string();
 
         let result = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -7411,6 +7424,8 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -7494,6 +7509,8 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -7580,6 +7597,8 @@ mod tests {
         };
 
         let err = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -7667,6 +7686,8 @@ mod tests {
         // Even though vision_model_provider points to a nonexistent model_provider, this
         // should succeed because there are no image markers to trigger routing.
         let result = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -7741,6 +7762,8 @@ mod tests {
             let turn_id = uuid::Uuid::new_v4().to_string();
 
             run_tool_call_loop(ToolLoop {
+                context_anchor_seed: None,
+                context_anchor_sink: None,
                 history_was_trimmed: None,
                 parent_agent_alias: None,
                 served_route_sink: None,
@@ -7938,6 +7961,8 @@ mod tests {
             let turn_id = uuid::Uuid::new_v4().to_string();
 
             run_tool_call_loop(ToolLoop {
+                context_anchor_seed: None,
+                context_anchor_sink: None,
                 history_was_trimmed: None,
                 parent_agent_alias: None,
                 served_route_sink: None,
@@ -8072,6 +8097,8 @@ mod tests {
         };
 
         let err = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -8158,6 +8185,8 @@ mod tests {
         };
 
         let result = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -8243,6 +8272,8 @@ mod tests {
         };
 
         let err = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -8413,6 +8444,8 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -8583,6 +8616,8 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -8719,6 +8754,8 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -8944,6 +8981,8 @@ mod tests {
         );
 
         let run = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -9098,6 +9137,8 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -9285,6 +9326,8 @@ mod tests {
             &mut injected_memory_preamble,
         );
         let _ = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -9402,6 +9445,8 @@ mod tests {
         let turn_id = uuid::Uuid::new_v4().to_string();
 
         let result = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -9503,6 +9548,8 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -9596,6 +9643,8 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -9697,6 +9746,8 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -9801,6 +9852,8 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -9911,6 +9964,8 @@ mod tests {
         );
 
         let result = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -10019,6 +10074,8 @@ mod tests {
             &mut injected_memory_preamble,
         );
         let _ = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -10205,6 +10262,8 @@ mod tests {
         };
 
         let result = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -10350,6 +10409,8 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -10465,6 +10526,8 @@ mod tests {
         let dedup_exempt = vec!["shell".to_string()];
 
         let err = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -10566,6 +10629,8 @@ mod tests {
         let exempt = vec!["count_tool".to_string()];
 
         let result = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -10671,6 +10736,8 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -10778,6 +10845,8 @@ mod tests {
         let exempt = vec!["count_tool".to_string()];
 
         let _result = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -10903,6 +10972,8 @@ mod tests {
                     let observer = NoopObserver;
                     let turn_id = uuid::Uuid::new_v4().to_string();
                     let result = run_tool_call_loop(ToolLoop {
+                        context_anchor_seed: None,
+                        context_anchor_sink: None,
                         history_was_trimmed: None,
                         parent_agent_alias: None,
                         served_route_sink: None,
@@ -11002,6 +11073,8 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -11099,6 +11172,8 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -11191,6 +11266,8 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -11281,6 +11358,8 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -11377,6 +11456,8 @@ mod tests {
             tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(8);
 
         let result = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -11500,6 +11581,8 @@ mod tests {
             tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(16);
 
         let result = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -11629,6 +11712,8 @@ mod tests {
             tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(16);
 
         let result = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -11746,6 +11831,8 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
 
         let result = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -11842,6 +11929,8 @@ mod tests {
         let expected_content = format!("visible\n\n{interrupted_marker}");
 
         let error = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             sop_reassembly: None,
@@ -11940,6 +12029,8 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -12022,6 +12113,8 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -12105,6 +12198,8 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -12188,6 +12283,8 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -12273,6 +12370,8 @@ This is an example, not an invocation."#;
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -12362,6 +12461,8 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
 
         let result = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -12463,6 +12564,8 @@ This is an example, not an invocation."#;
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -12548,6 +12651,8 @@ Done."#;
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -12636,6 +12741,8 @@ Done."#;
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -12722,6 +12829,8 @@ Done."#;
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -12809,6 +12918,8 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
 
         let result = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -12953,6 +13064,8 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
 
         let result = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -13048,6 +13161,8 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
 
         let result = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -13146,6 +13261,8 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
 
         let result = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -13267,6 +13384,8 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
 
         let result = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -13401,6 +13520,8 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(32);
 
         let result = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -13505,6 +13626,8 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(64);
 
         let result = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -13620,6 +13743,8 @@ This is an example, not an invocation."#;
 
         let turn_id = uuid::Uuid::new_v4().to_string();
         let result = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -14538,6 +14663,8 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(64);
 
         let result = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -14655,6 +14782,8 @@ This is an example, not an invocation."#;
         let turn_id = uuid::Uuid::new_v4().to_string();
 
         let result = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -14767,6 +14896,8 @@ This is an example, not an invocation."#;
         let turn_id = uuid::Uuid::new_v4().to_string();
 
         let result = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -14879,6 +15010,8 @@ This is an example, not an invocation."#;
         let turn_id = uuid::Uuid::new_v4().to_string();
 
         let result = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -15049,6 +15182,8 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(32);
 
         let result = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -17887,6 +18022,8 @@ Let me check the result."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(64);
 
         let result = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -18080,6 +18217,8 @@ Let me check the result."#;
             .scope(
                 Some(ctx),
                 run_tool_call_loop(ToolLoop {
+                    context_anchor_seed: None,
+                    context_anchor_sink: None,
                     history_was_trimmed: None,
                     parent_agent_alias: None,
                     served_route_sink: None,
@@ -18209,6 +18348,8 @@ Let me check the result."#;
             .scope(
                 Some(usage_ctx.clone()),
                 run_tool_call_loop(ToolLoop {
+                    context_anchor_seed: None,
+                    context_anchor_sink: None,
                     history_was_trimmed: None,
                     parent_agent_alias: None,
                     sop_reassembly: None,
@@ -18429,6 +18570,8 @@ Let me check the result."#;
             .scope(
                 Some(usage_ctx.clone()),
                 run_tool_call_loop(ToolLoop {
+                    context_anchor_seed: None,
+                    context_anchor_sink: None,
                     history_was_trimmed: None,
                     parent_agent_alias: None,
                     sop_reassembly: None,
@@ -18540,6 +18683,8 @@ Let me check the result."#;
         ];
 
         let result = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -18669,6 +18814,8 @@ Let me check the result."#;
             .scope(
                 Some(ctx),
                 run_tool_call_loop(ToolLoop {
+                    context_anchor_seed: None,
+                    context_anchor_sink: None,
                     history_was_trimmed: None,
                     parent_agent_alias: None,
                     served_route_sink: None,
@@ -18771,6 +18918,8 @@ Let me check the result."#;
         let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
 
         let result = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -18876,6 +19025,8 @@ Let me check the result."#;
             &mut injected_memory_preamble,
         );
         let _ = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -20641,6 +20792,8 @@ Let me check the result."#;
         let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
 
         let result = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             served_route_sink: None,
@@ -20743,6 +20896,8 @@ Let me check the result."#;
             let result = scope_session_key(
                 Some(session_key.to_string()),
                 run_tool_call_loop(ToolLoop {
+                    context_anchor_seed: None,
+                    context_anchor_sink: None,
                     history_was_trimmed: None,
                     parent_agent_alias: None,
                     served_route_sink: None,
@@ -20986,6 +21141,8 @@ Let me check the result."#;
         let turn_id = uuid::Uuid::new_v4().to_string();
 
         run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             sop_reassembly: None,
@@ -21094,6 +21251,8 @@ Let me check the result."#;
         let turn_id = uuid::Uuid::new_v4().to_string();
 
         let result = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             sop_reassembly: None,
@@ -21417,6 +21576,8 @@ Let me check the result."#;
         let result = scope_tool_protocol_prompts(
             Arc::new(ToolProtocolPrompts::new(native_prompt, text_prompt)),
             run_tool_call_loop(ToolLoop {
+                context_anchor_seed: None,
+                context_anchor_sink: None,
                 history_was_trimmed: None,
                 parent_agent_alias: None,
                 sop_reassembly: None,
@@ -21811,6 +21972,8 @@ Let me check the result."#;
         scope_tool_protocol_prompts(
             prompts,
             run_tool_call_loop(ToolLoop {
+                context_anchor_seed: None,
+                context_anchor_sink: None,
                 history_was_trimmed: None,
                 parent_agent_alias: None,
                 sop_reassembly: None,
@@ -21940,6 +22103,8 @@ Let me check the result."#;
         let result = scope_tool_protocol_prompts(
             prompts,
             run_tool_call_loop(ToolLoop {
+                context_anchor_seed: None,
+                context_anchor_sink: None,
                 history_was_trimmed: None,
                 parent_agent_alias: None,
                 sop_reassembly: None,
@@ -22219,6 +22384,8 @@ Let me check the result."#;
         scope_tool_protocol_prompts(
             prompts,
             run_tool_call_loop(ToolLoop {
+                context_anchor_seed: None,
+                context_anchor_sink: None,
                 history_was_trimmed: None,
                 parent_agent_alias: None,
                 sop_reassembly: None,
@@ -23786,6 +23953,8 @@ Pin 13: LED
             &mut injected_memory_preamble,
         );
         let _ = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             history_was_trimmed: None,
             parent_agent_alias: None,
             sop_reassembly: None,
@@ -24117,6 +24286,8 @@ Pin 13: LED
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,

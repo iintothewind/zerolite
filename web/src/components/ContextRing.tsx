@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { t } from '@/lib/i18n';
+import type { ContextInputSource } from '@/contexts/AgentContext';
 
 interface ContextRingProps {
   /** Prompt size of the most recent LLM call, or null before the first `done`. */
@@ -16,6 +17,13 @@ interface ContextRingProps {
    * is a trigger, not a limit — shown so the two numbers are never confused.
    */
   waterline?: number | null;
+  /**
+   * Provenance of `used`: `provider` (measured by the provider), `estimate`
+   * (local heuristic), or `calibrated` (provider measurement anchored on the
+   * unchanged prefix, plus a local estimate for the tail). The wire literal,
+   * shown so the meter's number and its origin never drift apart.
+   */
+  source?: ContextInputSource;
 }
 
 const SIZE = 22;
@@ -35,7 +43,7 @@ function formatExactTokens(n: number): string {
  * (a freshly loaded conversation, before any `done` frame) rather than
  * inventing a fill — the ring is a meter, not a progress indicator.
  */
-export default function ContextRing({ used, max, waterline }: ContextRingProps) {
+export default function ContextRing({ used, max, waterline, source }: ContextRingProps) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
 
@@ -148,6 +156,14 @@ export default function ContextRing({ used, max, waterline }: ContextRingProps) 
               style={{ color: 'var(--pc-text-secondary)' }}
             >
               {t('agent.context.ring_detail_percent').replace('{percent}', String(pctNumber))}
+            </div>
+          )}
+          {source && (
+            <div
+              className="px-3 py-1 text-xs font-mono tabular-nums"
+              style={{ color: 'var(--pc-text-secondary)' }}
+            >
+              {t('agent.context.ring_detail_source').replace('{source}', source)}
             </div>
           )}
         </div>

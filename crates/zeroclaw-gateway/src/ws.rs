@@ -1414,12 +1414,17 @@ fn history_trimmed_ws_frame(
 /// Build the pre-dispatch `context_usage` WS frame from a
 /// [`TurnEvent::ContextEstimate`].
 ///
-/// The source is always `estimate`: this frame is emitted before the request
-/// is sent, so no provider-reported count can exist for it. It is a separate
-/// frame type from `usage` because the web client folds `usage` into its step
-/// boundary — "a call completed" — and a pre-send estimate is not a call.
+/// The source is `estimate` when the local estimator priced the whole request,
+/// and `calibrated` when a provider-reported count from a previous turn anchors
+/// the unchanged prefix of this population. It is never `provider`: this frame
+/// is emitted before the request is sent, so no provider measurement of the
+/// announced request can exist, and claiming one would tell the client to stop
+/// labelling the meter as non-measured. It is a separate frame type from
+/// `usage` because the web client folds `usage` into its step boundary — "a
+/// call completed" — and a pre-send number is not a call.
 fn context_estimate_ws_frame(
     input_tokens: u64,
+    source: Option<zeroclaw_api::agent::TokenCountSource>,
     context_token_budget: Option<u64>,
     model_context_window: Option<u64>,
     effective_context_window: Option<u64>,
@@ -1427,7 +1432,7 @@ fn context_estimate_ws_frame(
     serde_json::json!({
         "type": "context_usage",
         "input_tokens": input_tokens,
-        "input_tokens_source": "estimate",
+        "input_tokens_source": source.map(|s| s.as_str()).unwrap_or("estimate"),
         "max_context_tokens": context_token_budget,
         "model_context_window": model_context_window,
         "effective_context_window": effective_context_window,
@@ -1843,13 +1848,6 @@ fn aborted_frame(fold: &UsageFold) -> serde_json::Value {
     })
 }
 
-/// Process a single chat message through the agent and send the response.
-/// Uses [`Agent::turn_streamed`] so that intermediate text chunks, tool calls,
-/// and tool results are forwarded to the WebSocket client in real time.
-///
-/// Returns `true` when the client went away mid-turn. The turn still ran to
-/// completion and was persisted; the caller should stop servicing the socket.
-#[allow(clippy::too_many_arguments)]
 /// The turn-boundary frame the gateway broadcasts when a turn starts.
 ///
 /// The session id is what scopes it: `is_public_event` admits only frames
@@ -1869,6 +1867,13 @@ pub(crate) fn agent_start_frame(
     })
 }
 
+/// Process a single chat message through the agent and send the response.
+/// Uses [`Agent::turn_streamed`] so that intermediate text chunks, tool calls,
+/// and tool results are forwarded to the WebSocket client in real time.
+///
+/// Returns `true` when the client went away mid-turn. The turn still ran to
+/// completion and was persisted; the caller should stop servicing the socket.
+#[allow(clippy::too_many_arguments)]
 async fn process_chat_message(
     state: &AppState,
     agent: &mut zeroclaw_runtime::agent::Agent,
@@ -2224,11 +2229,13 @@ async fn process_chat_message(
                         }
                         TurnEvent::ContextEstimate {
                             input_tokens,
+                            input_tokens_source,
                             context_token_budget,
                             model_context_window,
                             effective_context_window,
                         } => context_estimate_ws_frame(
                             input_tokens,
+                            input_tokens_source,
                             context_token_budget,
                             model_context_window,
                             effective_context_window,
@@ -4066,7 +4073,13 @@ data: {{\"type\":\"message_stop\"}}\n\n"
 
     #[test]
     fn context_estimate_frame_is_a_pre_send_estimate_not_a_usage_step() {
-        let frame = context_estimate_ws_frame(9_000, Some(8_000), Some(10_000), Some(10_000));
+        let frame = context_estimate_ws_frame(
+            9_000,
+            Some(zeroclaw_api::agent::TokenCountSource::Estimated),
+            Some(8_000),
+            Some(10_000),
+            Some(10_000),
+        );
 
         assert_eq!(
             frame,
@@ -4086,6 +4099,34 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             frame["type"], "usage",
             "the assembled estimate must not be foldable as a step boundary"
         );
+    }
+
+    /// A pre-dispatch frame can carry a provider-measured number for the
+    /// anchored prefix (with the unbilled tail estimated), and the label must
+    /// say `calibrated` — never `provider`, which claims the announced
+    /// request itself was measured.
+    #[test]
+    fn context_estimate_frame_labels_a_calibrated_number_as_calibrated() {
+        let frame = context_estimate_ws_frame(
+            25_787,
+            Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
+            Some(104_857),
+            Some(131_072),
+            Some(131_072),
+        );
+
+        assert_eq!(frame["input_tokens"], 25_787);
+        assert_eq!(
+            frame["input_tokens_source"], "calibrated",
+            "a provider-anchored number must render as calibrated, not as a \
+            raw estimate and not as a measurement of this request"
+        );
+        assert_ne!(
+            frame["input_tokens_source"], "provider",
+            "the frame is emitted before dispatch, so it must never claim a \
+            provider measurement of the request it announces"
+        );
+        assert_eq!(frame["type"], "context_usage");
     }
 
     #[test]

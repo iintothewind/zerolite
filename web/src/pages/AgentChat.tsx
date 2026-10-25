@@ -112,6 +112,7 @@ export function AgentChatInner({
     contextEffectiveWindow,
     contextWaterlineTokens,
     contextInputTokens,
+    contextInputSource,
     liveStats,
     liveTurn,
   } = useAgent();
@@ -992,6 +993,7 @@ export function AgentChatInner({
           contextInputTokens={contextInputTokens}
           contextEffectiveWindow={contextEffectiveWindow}
           contextWaterlineTokens={contextWaterlineTokens}
+          contextInputSource={contextInputSource}
           liveStats={liveStats}
           onInputChange={handleTextareaChange}
           onKeyDown={handleKeyDown}

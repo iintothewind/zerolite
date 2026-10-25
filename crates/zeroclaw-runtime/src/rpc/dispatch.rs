@@ -13792,17 +13792,21 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<St
         }
         TurnEvent::ContextEstimate {
             input_tokens,
+            input_tokens_source,
             context_token_budget,
             model_context_window,
             effective_context_window,
         } => SessionUpdateEvent::ContextUsage {
             session_id: session_id.to_string(),
             input_tokens: Some(*input_tokens),
-            // Always `estimate`: this event is published before dispatch, so
-            // no provider-reported count can exist for it. Claiming otherwise
-            // would tell the client to stop labelling the meter as an
-            // estimate.
-            input_tokens_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
+            // `estimate` when the local estimator priced the whole request,
+            // `calibrated` when a provider report from an earlier turn anchors
+            // this population's prefix. The producer never puts `provider` on
+            // this event: it is published before dispatch, so no measurement
+            // of the announced request exists yet.
+            input_tokens_source: Some(
+                input_tokens_source.unwrap_or(zeroclaw_api::agent::TokenCountSource::Estimated),
+            ),
             max_context_tokens: *context_token_budget,
             model_context_window: *model_context_window,
             effective_context_window: *effective_context_window,
@@ -28142,6 +28146,49 @@ mod tests {
         assert_eq!(
             v["params"]["input_tokens_source"], "estimate",
             "a floored value is still an estimate, not a measured total"
+        );
+    }
+
+    /// The pre-dispatch `ContextEstimate` reaches the RPC wire as
+    /// `context_usage` with the provenance the producer published: `estimate`
+    /// for a raw local estimate, `calibrated` for a provider-anchored number.
+    /// It never claims `provider`, which would tell the client the announced
+    /// request itself was measured.
+    #[test]
+    fn context_estimate_event_reaches_context_usage_with_its_estimate_label() {
+        let event = TurnEvent::ContextEstimate {
+            input_tokens: 9_000,
+            input_tokens_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
+            context_token_budget: Some(104_857),
+            model_context_window: Some(131_072),
+            effective_context_window: Some(131_072),
+        };
+        let v = parse(&notification_for_turn_event("s1", &event).unwrap());
+        assert_eq!(v["params"]["type"], "context_usage");
+        assert_eq!(v["params"]["input_tokens"], 9_000);
+        assert_eq!(v["params"]["input_tokens_source"], "estimate");
+        assert_eq!(v["params"]["max_context_tokens"], 104_857);
+    }
+
+    #[test]
+    fn context_estimate_event_reaches_context_usage_with_its_calibrated_label() {
+        let event = TurnEvent::ContextEstimate {
+            input_tokens: 25_787,
+            input_tokens_source: Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
+            context_token_budget: Some(104_857),
+            model_context_window: Some(131_072),
+            effective_context_window: Some(131_072),
+        };
+        let v = parse(&notification_for_turn_event("s1", &event).unwrap());
+        assert_eq!(v["params"]["input_tokens"], 25_787);
+        assert_eq!(
+            v["params"]["input_tokens_source"], "calibrated",
+            "a provider-anchored number must keep its label through the RPC wire"
+        );
+        assert_ne!(
+            v["params"]["input_tokens_source"], "provider",
+            "the pre-dispatch frame must never claim a measurement of the request \
+            it announces"
         );
     }
 

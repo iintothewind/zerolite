@@ -426,8 +426,14 @@ struct HistoryTrimNotice {
     kept_turns: usize,
     reason: String,
     retained_context: zeroclaw_api::agent::RetainedContextSnapshot,
-    /// Estimated provider-facing size before the trim.
+    /// Provider-facing size before the trim: the number the context meter
+    /// showed when the water-line fired. A calibrated trigger reports the
+    /// provider-measured number; a raw trigger reports the conservative
+    /// local estimate, so `tokens_before` is always the number the user saw.
     tokens_before: u64,
+    /// Label of `tokens_before`: `Calibrated` when a provider measurement
+    /// anchored the trigger, `Estimated` when the raw local estimate did.
+    tokens_before_source: zeroclaw_api::agent::TokenCountSource,
     /// Estimated provider-facing size after the trim and after the breadcrumb
     /// was re-priced. Clients use this to refresh the context meter without
     /// waiting for the next `done` frame.
@@ -449,12 +455,15 @@ impl HistoryTrimNotice {
             token_budget: self.token_budget,
             tokens_before: Some(self.tokens_before),
             tokens_after: Some(self.tokens_after),
-            // Both counts come from the local estimator: the water-line fires
-            // before the request is sent, so no provider usage exists yet.
-            // Labelling them `Provider` would claim a precision this path
-            // cannot have — the estimator over-counts CJK-heavy text, and the
+            // `tokens_before` is the trigger number: the provider-measured
+            // anchor when a valid anchor priced the population, the
+            // conservative local estimate otherwise. `tokens_after` is
+            // always the local estimator re-measured on the trimmed rows:
+            // a trim rewrites the anchored prefix, so the anchor's number
+            // no longer describes any population. Labelling `tokens_after`
+            // `Provider` would claim a precision this path cannot have — the
             // label is how a client knows to show it as an estimate.
-            tokens_before_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
+            tokens_before_source: Some(self.tokens_before_source),
             tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
             unsatisfiable_floor: None,
             retained_context: Some(self.retained_context),
@@ -533,6 +542,12 @@ pub struct Agent {
     /// by this Agent. User text is never inferred to be synthetic by content.
     history_has_trim_breadcrumb: bool,
     history_trim_generation: u64,
+    /// The provider-measured anchor of the last completed turn: the exact
+    /// population the provider last billed, keyed to the route, tool catalog,
+    /// and history prefix that produced it. Seeds the next turn's context
+    /// meter; cleared whenever the durable prefix, the serving route, or the
+    /// tool catalog changes so the anchor no longer describes this Agent.
+    context_anchor: Option<crate::agent::history_trim::ContextAnchor>,
     classification_config: zeroclaw_config::schema::QueryClassificationConfig,
     /// True while the configured baseline may be replaced by automatic routing.
     /// Explicit session and in-turn selection set this false.
@@ -1311,6 +1326,7 @@ impl AgentBuilder {
             history: Vec::new(),
             history_has_trim_breadcrumb: false,
             history_trim_generation: 0,
+            context_anchor: None,
             classification_config: self.classification_config.unwrap_or_default(),
             automatic_model_routing: true,
             model_route_resolver,
@@ -1434,6 +1450,59 @@ impl Agent {
             &crate::agent::dispatcher::XmlToolDispatcher::tool_specs(&self.tools),
         )
     }
+    /// The size the turn-start meter shows for the request about to be
+    /// assembled, and its label. With a valid provider anchor, the number is
+    /// the provider's own measurement of the anchored prefix plus the
+    /// conservative estimate of the rows appended since; validity is checked
+    /// against the route, the tool catalog, and the anchored prefix's
+    /// fingerprint, and a failed check clears the anchor. Without an anchor,
+    /// the number is the conservative local estimate of the whole request —
+    /// conservative because the estimator bills low for these tokenizer
+    /// families, and the meter must never show a number below what the
+    /// provider reports.
+    fn calibrated_turn_start_size(
+        &mut self,
+        provider_messages: &[zeroclaw_providers::ChatMessage],
+        schema_tokens: usize,
+        active_provider_name: &str,
+        active_model_name: &str,
+    ) -> (usize, zeroclaw_api::agent::TokenCountSource) {
+        if let Some(anchor) = self.context_anchor.clone() {
+            if anchor.provider_name == active_provider_name
+                && anchor.model == active_model_name
+                && anchor.anchored_tool_schema_tokens == schema_tokens
+                && provider_messages.len() >= anchor.anchored_population_len
+                && crate::agent::history_trim::provider_prefix_fingerprint(
+                    &provider_messages[..anchor.anchored_population_len],
+                ) == anchor.anchored_prefix_fingerprint
+            {
+                // The provider measured the anchored population as the whole
+                // request it saw, preamble rows and schemas included; those
+                // bytes stay inside `reported_tokens` and are never re-priced
+                // in the tail. Rows past the anchor are unbilled, so the
+                // conservative estimator prices them.
+                let tail = crate::agent::history::estimate_history_tokens(
+                    &provider_messages[anchor.anchored_population_len..],
+                );
+                return (
+                    anchor.reported_tokens.saturating_add(
+                        crate::agent::history_trim::conservative_estimate_tokens(tail),
+                    ),
+                    zeroclaw_api::agent::TokenCountSource::Calibrated,
+                );
+            }
+            // Stale route, changed catalog, or rewritten prefix: the anchor
+            // no longer describes any population this turn can bill. Drop it;
+            // usage will re-anchor at the next accepted report.
+            self.context_anchor = None;
+        }
+        (
+            crate::agent::history_trim::conservative_estimate_tokens(
+                crate::agent::history::estimate_history_tokens(provider_messages) + schema_tokens,
+            ),
+            zeroclaw_api::agent::TokenCountSource::Estimated,
+        )
+    }
 
     /// Trim durable `ConversationMessage` history when the water-line is
     /// exceeded — the only pre-send trigger.
@@ -1446,31 +1515,34 @@ impl Agent {
         &mut self,
         dispatcher: &dyn crate::agent::dispatcher::ToolDispatcher,
         event_tx: Option<&tokio::sync::mpsc::Sender<TurnEvent>>,
-    ) -> Result<(), anyhow::Error> {
+        meter: (usize, zeroclaw_api::agent::TokenCountSource),
+    ) -> Result<bool, anyhow::Error> {
         let water_line = self.config.resolved.context_trim_budget();
         if water_line == 0 {
-            return Ok(());
+            return Ok(false);
         }
-        let estimate = |h: &[zeroclaw_providers::ConversationMessage]| {
-            crate::agent::history::estimate_history_tokens(&dispatcher.to_provider_messages(h))
-        };
-        // Measure the population the provider is actually billed for. Pricing
-        // messages alone put the effective trigger a whole tool catalog above
-        // the configured percentage.
-        let tokens_now = estimate(&self.history) + self.dispatched_tool_schema_tokens(dispatcher);
+        // The trigger reads the meter number, the same number the turn-start
+        // `ContextEstimate` publishes: a user who sees a number past the
+        // water-line sees the trim fire at that number, and a trigger that
+        // read a different number could fire while the meter sat below the
+        // line (or never fire when the meter sat above it).
         let decision =
-            crate::agent::turn::context_pipeline::plan_pre_send_trim(tokens_now, water_line, false);
+            crate::agent::turn::context_pipeline::plan_pre_send_trim(meter.0, water_line, false);
         if !decision.should_trim {
-            return Ok(());
+            return Ok(false);
         }
-        let notice =
-            self.trim_durable_history(dispatcher, self.config.resolved.keep_recent_turns())?;
+        let notice = self.trim_durable_history(
+            dispatcher,
+            self.config.resolved.keep_recent_turns(),
+            Some(meter),
+        )?;
+        let trimmed = notice.is_some();
         if let Some(tx) = event_tx
             && let Some(notice) = notice
         {
             let _ = tx.try_send(notice.into_turn_event());
         }
-        Ok(())
+        Ok(trimmed)
     }
 
     /// Trim durable history after the tool loop, when the loop dropped turns
@@ -1489,7 +1561,10 @@ impl Agent {
         &mut self,
         dispatcher: &dyn crate::agent::dispatcher::ToolDispatcher,
     ) -> Result<Option<HistoryTrimNotice>, anyhow::Error> {
-        self.trim_durable_history(dispatcher, self.config.resolved.keep_recent_turns())
+        // The post-loop path has no pre-send meter number: the loop dropped
+        // turns inside its own provider-shaped copy, so the notice reports
+        // the conservative raw estimate of the trimmed population.
+        self.trim_durable_history(dispatcher, self.config.resolved.keep_recent_turns(), None)
     }
 
     /// The durable trim action itself: cascade keep-N down to the send budget,
@@ -1505,6 +1580,11 @@ impl Agent {
         &mut self,
         dispatcher: &dyn crate::agent::dispatcher::ToolDispatcher,
         keep: usize,
+        // The meter number and label a water-line trigger read, so the
+        // notice reports the number the user saw on the meter. `None` on
+        // the post-loop path: no pre-send meter drove that trim, so the
+        // notice reports the conservative raw estimate.
+        meter: Option<(usize, zeroclaw_api::agent::TokenCountSource)>,
     ) -> Result<Option<HistoryTrimNotice>, anyhow::Error> {
         // `send_budget == 0` means "no fit constraint", not "do nothing": the
         // keep-N preference still applies, and `trim_conversation_to_fit_with`
@@ -1533,6 +1613,13 @@ impl Agent {
             self.config.resolved.effective_context_window(),
             estimate,
         );
+        // A trim rewrites the durable rows, so the population the provider
+        // measured no longer exists as a prefix of this history. Drop the
+        // anchor; the next turn falls back to the raw estimate until usage
+        // re-anchors it.
+        if result.trimmed {
+            self.context_anchor = None;
+        }
         if result.trimmed && !result.exceeds_budget {
             crate::agent::history_trim::insert_conversation_breadcrumb_deduped(&mut result.history);
             self.history_has_trim_breadcrumb = true;
@@ -1564,13 +1651,29 @@ impl Agent {
                 kept_turns: result.kept_turns,
                 reason,
                 retained_context: self.retained_context_snapshot(),
-                // `tokens_after` was re-priced above, after the breadcrumb was
-                // inserted: the breadcrumb is part of what the next request
-                // carries, so reporting the pre-breadcrumb figure would
-                // understate the meter. Both counts add the tool definitions
-                // for the same reason.
-                tokens_before: (result.tokens_before + schema_tokens) as u64,
-                tokens_after: (result.tokens_after + schema_tokens) as u64,
+                // `tokens_after` was re-priced above, after the breadcrumb
+                // was inserted: the breadcrumb is part of what the next
+                // request carries, so reporting the pre-breadcrumb figure
+                // would understate the meter. Both counts add the tool
+                // definitions for the same reason.
+                //
+                // `tokens_before` is the number the trigger read: the
+                // provider-measured anchor when a valid anchor fired the
+                // water-line, the conservative raw estimate otherwise.
+                // `tokens_after` is always the conservative raw estimate:
+                // the trim rewrote the prefix, so no provider measurement
+                // describes the trimmed population yet.
+                tokens_before: meter.map(|(trigger, _)| trigger).unwrap_or_else(|| {
+                    crate::agent::history_trim::conservative_estimate_tokens(
+                        result.tokens_before + schema_tokens,
+                    )
+                }) as u64,
+                tokens_before_source: meter
+                    .map(|(_, source)| source)
+                    .unwrap_or(zeroclaw_api::agent::TokenCountSource::Estimated),
+                tokens_after: crate::agent::history_trim::conservative_estimate_tokens(
+                    result.tokens_after + schema_tokens,
+                ) as u64,
                 token_budget: (send_budget > 0).then_some(send_budget as u64),
             }));
         }
@@ -1598,7 +1701,7 @@ impl Agent {
                     })),
                 &msg
             );
-            return Err(anyhow::anyhow!(msg));
+            return Err(anyhow::Error::msg(msg));
         }
         Ok(None)
     }
@@ -1749,6 +1852,17 @@ impl Agent {
             .all(|(live, expected)| Self::conversation_messages_equal(live, expected))
         {
             return false;
+        }
+        // The anchor prices the durable prefix the provider measured. A
+        // replacement that starts inside the anchored population changes rows
+        // the fingerprint covers; a suffix entirely past it leaves the anchor
+        // intact.
+        if self
+            .context_anchor
+            .as_ref()
+            .is_some_and(|anchor| start < anchor.anchored_population_len)
+        {
+            self.context_anchor = None;
         }
         self.history.truncate(start);
         self.history.extend(replacement);
@@ -2093,7 +2207,10 @@ impl Agent {
         &mut self,
         model_route_resolver: Arc<zeroclaw_providers::router::ModelRouteResolver>,
     ) {
+        // The serving route is part of the anchor's identity; a new provider
+        // box and route table make the last measurement non-transferable.
         self.model_route_resolver = model_route_resolver;
+        self.context_anchor = None;
     }
 
     /// Publish the config generation a freshly swapped provider box was built
@@ -2122,6 +2239,10 @@ impl Agent {
                 });
             }
         }
+        // The new config generation carries different request ceilings and
+        // provider profiles, so the previous turn's measurement is no longer
+        // comparable.
+        self.context_anchor = None;
     }
 
     /// Resolve a selector through the agent's CURRENT route resolver. Test-only
@@ -3694,6 +3815,9 @@ impl Agent {
                 self.model_route_resolver = new_route_resolver;
                 self.model_provider_name = new_model_provider;
                 self.model_name = new_model.clone();
+                // A new provider box measures its own prompts; the anchor
+                // recorded by the previous provider does not transfer.
+                self.context_anchor = None;
                 Some(new_model)
             }
             Err(e) => {
@@ -4089,9 +4213,7 @@ impl Agent {
             }
         };
 
-        if let Err(error) = self.rebuild_system_prompt_for_dispatcher(active_dispatcher.as_ref()) {
-            return Err(error);
-        }
+        self.rebuild_system_prompt_for_dispatcher(active_dispatcher.as_ref())?;
         let tool_protocol_prompts = match self.tool_protocol_prompts() {
             Ok(prompts) => prompts,
             Err(error) => {
@@ -4113,12 +4235,25 @@ impl Agent {
         // `ObserverEvent::HistoryTrimmed` before returning. Anything that
         // shows a meter goes through `turn_streamed`, which passes a real
         // sender and therefore carries `tokens_after` to the client.
-        if let Err(error) =
-            self.trim_durable_history_at_water_line(active_dispatcher.as_ref(), None)
-        {
-            return Err(error);
-        }
+        // The trigger reads the number a meter would show for this request:
+        // an anchor left by a previous streamed turn prices the anchored
+        // prefix, the conservative estimate prices a request with no anchor.
+        // No `ContextEstimate` is published on this path (no event bus), but
+        // the water-line must decide on the same number a meter would, not a
+        // second, lower number.
+        let provider_messages = active_dispatcher.to_provider_messages(&self.history);
+        let schema_tokens = self.dispatched_tool_schema_tokens(active_dispatcher.as_ref());
+        let provider_name = self.model_provider_name.clone();
+        let meter = self.calibrated_turn_start_size(
+            &provider_messages,
+            schema_tokens,
+            &provider_name,
+            &effective_model,
+        );
+        self.trim_durable_history_at_water_line(active_dispatcher.as_ref(), None, meter)?;
 
+        // Rebuild after the trim: a trim rewrites `self.history`, so the
+        // cache key must describe the trimmed request.
         let provider_messages = active_dispatcher.to_provider_messages(&self.history);
         let cache_key = self.response_cache_key_for_messages(&provider_messages, &effective_model);
 
@@ -4186,6 +4321,8 @@ impl Agent {
                 receipt_scope.clone(),
                 Box::pin(crate::agent::loop_::run_tool_call_loop(
                     crate::agent::loop_::ToolLoop {
+                        context_anchor_seed: None,
+                        context_anchor_sink: None,
                         history_was_trimmed: Some(&mut history_was_trimmed),
                         exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
                             crate::agent::loop_::ResolvedModelAccess {
@@ -4604,7 +4741,7 @@ impl Agent {
         self.append_streamed_user_message_to_history(user_message, &mut new_msgs, &turn_id)
             .await;
 
-        let active_dispatcher = {
+        let (active_dispatcher, active_provider_name, active_model_name) = {
             let base_provider_messages = self.tool_dispatcher.to_provider_messages(&self.history);
             let resolved = zeroclaw_providers::reliable::scope_provider_attempt_allowlist(
                 attempt_allowlist.clone(),
@@ -4622,21 +4759,36 @@ impl Agent {
                             attempt_allowlist.as_deref(),
                         )
                         .await?;
-                    let (active_provider, active_model): (&dyn ModelProvider, &str) =
-                        vision_provider_box.as_ref().map_or(
-                            (self.model_provider.as_ref(), effective_model.as_str()),
-                            |resolved| (resolved.provider.as_ref(), resolved.model.as_str()),
-                        );
-                    Ok::<_, anyhow::Error>(tool_dispatcher_for_provider(
-                        &self.config,
-                        active_provider,
-                        active_model,
+                    let (active_provider, active_model, active_provider_name): (
+                        &dyn ModelProvider,
+                        &str,
+                        String,
+                    ) = vision_provider_box.as_ref().map_or(
+                        (
+                            self.model_provider.as_ref(),
+                            effective_model.as_str(),
+                            self.model_provider_name.clone(),
+                        ),
+                        |resolved| {
+                            (
+                                resolved.provider.as_ref(),
+                                resolved.model.as_str(),
+                                resolved.provider_name.clone(),
+                            )
+                        },
+                    );
+                    Ok::<_, anyhow::Error>((
+                        tool_dispatcher_for_provider(&self.config, active_provider, active_model),
+                        active_provider_name,
+                        active_model.to_string(),
                     ))
                 },
             )
             .await;
             match resolved {
-                Ok(dispatcher) => dispatcher,
+                Ok((dispatcher, provider_name, model_name)) => {
+                    (dispatcher, provider_name, model_name)
+                }
                 Err(error) => {
                     return Err(StreamedTurnError {
                         error,
@@ -4665,35 +4817,69 @@ impl Agent {
             }
         };
 
-        if let Err(error) =
-            self.trim_durable_history_at_water_line(active_dispatcher.as_ref(), Some(&event_tx))
-        {
-            return Err(StreamedTurnError {
-                error,
-                committed_response: String::new(),
-                new_messages: new_msgs,
-            });
-        }
+        // The meter number for this turn's request, read BEFORE the
+        // water-line decides: the provider-measured anchor when a valid
+        // anchor prices this population, the conservative local estimate
+        // otherwise. The trigger and the published `ContextEstimate` read
+        // this one number, so a user who sees a number past the water-line
+        // sees the trim fire at that number.
+        let schema_tokens = self.dispatched_tool_schema_tokens(active_dispatcher.as_ref());
+        let pre_trim_messages = active_dispatcher.to_provider_messages(&self.history);
+        let meter = self.calibrated_turn_start_size(
+            &pre_trim_messages,
+            schema_tokens,
+            &active_provider_name,
+            &active_model_name,
+        );
+        let trimmed = match self.trim_durable_history_at_water_line(
+            active_dispatcher.as_ref(),
+            Some(&event_tx),
+            meter,
+        ) {
+            Ok(trimmed) => trimmed,
+            Err(error) => {
+                return Err(StreamedTurnError {
+                    error,
+                    committed_response: String::new(),
+                    new_messages: new_msgs,
+                });
+            }
+        };
 
         let provider_messages = active_dispatcher.to_provider_messages(&self.history);
+        // After a trim the anchored prefix no longer exists — the trim
+        // cleared the anchor — so the meter re-reads the conservative
+        // estimate of the trimmed request. The trim notice already carried
+        // the trigger number as `tokens_before`. Without a trim, the number
+        // the trigger read is the number the frame publishes.
+        let meter = if trimmed {
+            self.calibrated_turn_start_size(
+                &provider_messages,
+                schema_tokens,
+                &active_provider_name,
+                &active_model_name,
+            )
+        } else {
+            meter
+        };
 
         // Publish the assembled size before dispatch. This is the only moment
-        // the exact request body exists while no provider has answered yet, so
-        // the meter can move when the turn starts instead of idling on the
-        // previous turn's number until `done`. Labelled `estimate` by the
-        // adapters — it is the local estimator, not a measurement — and it is
-        // a separate event from `Usage` precisely so clients do not fold it
-        // into their step boundary.
+        // the exact request body exists while no provider has answered yet,
+        // so the meter can move when the turn starts instead of idling on the
+        // previous turn's number until `done`. The label says which face the
+        // number has: a provider-measured anchor is `calibrated`, a local
+        // estimate is `estimate`. It is a separate event from `Usage`
+        // precisely so clients do not fold it into their step boundary, and
+        // the frame NEVER claims `provider` — no provider has answered this
+        // turn.
         //
         // The provider is billed for `messages + tools`, so this prices both.
         // Messages alone made the meter drop by the size of the tool catalog
-        // the moment a turn started, then climb back when `usage` reported the
-        // real number.
-        let assembled_tokens = (crate::agent::history::estimate_history_tokens(&provider_messages)
-            + self.dispatched_tool_schema_tokens(active_dispatcher.as_ref()))
-            as u64;
+        // the moment a turn started, then climb back when `usage` reported
+        // the real number.
         let _ = event_tx.try_send(TurnEvent::ContextEstimate {
-            input_tokens: assembled_tokens,
+            input_tokens: meter.0 as u64,
+            input_tokens_source: Some(meter.1),
             context_token_budget: Some(self.config.resolved.context_trim_budget() as u64),
             model_context_window: Some(self.config.resolved.model_context_window as u64),
             effective_context_window: Some(self.config.resolved.effective_context_window() as u64),
@@ -4793,6 +4979,13 @@ impl Agent {
         // wins.
         let served_route_sink: crate::agent::loop_::ServedRouteSink =
             std::sync::Arc::new(std::sync::Mutex::new(None));
+        // The provider-measured anchor for the NEXT turn's meter. The loop
+        // writes it at every accepted reported usage; the Ok branch reads it
+        // back. Cancel, error, and steering-pending paths keep the anchor the
+        // Agent already had — a turn that never completed does not publish a
+        // measurement of a population the caller will not resume.
+        let context_anchor_sink: crate::agent::loop_::ContextAnchorSink =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
         // Steering prepared and judged at the end of a round, consumed at the
         // top of the next with no await in between.
         let mut steered_continuation: Option<Vec<ChatMessage>> = None;
@@ -4850,6 +5043,8 @@ impl Agent {
                     receipt_scope.clone(),
                     Box::pin(crate::agent::turn::run_tool_call_loop_with_initial_ingress(
                         crate::agent::loop_::ToolLoop {
+                            context_anchor_seed: self.context_anchor.clone(),
+                            context_anchor_sink: Some(context_anchor_sink.clone()),
                             history_was_trimmed: Some(&mut history_was_trimmed),
                             exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
                                 crate::agent::loop_::ResolvedModelAccess {
@@ -5164,6 +5359,13 @@ impl Agent {
                         &event_tx,
                     )
                     .await;
+                    // Publish the loop's anchor for the next turn's meter:
+                    // the population the provider measured at the last
+                    // accepted usage, keyed to the route that served it.
+                    self.context_anchor = context_anchor_sink
+                        .lock()
+                        .expect("context anchor sink lock")
+                        .take();
                     // Prefer the route that actually served the final call
                     // (a per-call vision switch differs from the selected text
                     // route); fall back to the selected route when no call was
@@ -12851,7 +13053,7 @@ mod tests {
         let dispatcher = NativeToolDispatcher;
         let keep = agent.config.resolved.keep_recent_turns();
         agent
-            .trim_durable_history(&dispatcher, keep)
+            .trim_durable_history(&dispatcher, keep, None)
             .expect("trim must not hit an unrecoverable floor in these fixtures")
     }
 
@@ -13091,12 +13293,17 @@ mod tests {
             tokens_after_source,
             Some(zeroclaw_api::agent::TokenCountSource::Estimated)
         );
-        // The retained history must fit the budget the notice advertises, or
-        // the meter would render a value above its own denominator.
+        // The retained history fits the raw send budget; the notice reports
+        // the conservative number, so it sits at most the margin factor above
+        // the advertised budget — the meter must not run away from its own
+        // denominator.
         if let Some(budget) = token_budget {
             assert!(
-                after <= budget,
-                "tokens_after {after} must fit the advertised budget {budget}"
+                after
+                    <= crate::agent::history_trim::conservative_estimate_tokens(budget as usize)
+                        as u64,
+                "the conservative tokens_after {after} must stay within the margin \
+                 of the advertised budget {budget}"
             );
         }
     }
@@ -13415,6 +13622,830 @@ mod tests {
         fn alias(&self) -> &str {
             "reported-input"
         }
+    }
+
+    fn drain_turn_events(rx: &mut tokio::sync::mpsc::Receiver<TurnEvent>) -> Vec<TurnEvent> {
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
+    fn published_meter(
+        events: &[TurnEvent],
+    ) -> (u64, Option<zeroclaw_api::agent::TokenCountSource>) {
+        events
+            .iter()
+            .find_map(|event| match event {
+                TurnEvent::ContextEstimate {
+                    input_tokens,
+                    input_tokens_source,
+                    ..
+                } => Some((*input_tokens, *input_tokens_source)),
+                _ => None,
+            })
+            .expect("the turn publishes its assembled size")
+    }
+
+    fn published_usage(events: &[TurnEvent]) -> u64 {
+        events
+            .iter()
+            .find_map(|event| match event {
+                TurnEvent::Usage {
+                    input_tokens: Some(tokens),
+                    ..
+                } => Some(*tokens),
+                _ => None,
+            })
+            .expect("the provider reports its usage")
+    }
+
+    fn trim_notice(
+        events: &[TurnEvent],
+    ) -> Option<(
+        Option<u64>,
+        Option<zeroclaw_api::agent::TokenCountSource>,
+        Option<u64>,
+    )> {
+        events.iter().find_map(|event| match event {
+            TurnEvent::HistoryTrimmed {
+                tokens_before,
+                tokens_before_source,
+                tokens_after,
+                ..
+            } => Some((*tokens_before, *tokens_before_source, *tokens_after)),
+            _ => None,
+        })
+    }
+
+    /// The turn-start meter must never fall below the provider's last
+    /// measurement. Turn one publishes the conservative local estimate; turn
+    /// two starts from the provider's measurement of turn one's population
+    /// plus the margin-priced tail, so the meter shows a provider-carried
+    /// number labelled `calibrated`. The provider usage frame stays the
+    /// billing number in both turns.
+    #[tokio::test]
+    async fn turn_start_meter_never_falls_below_the_last_provider_measurement() {
+        const REPORTED: u64 = 25_787;
+        // A window far above the fixture keeps the water-line out of the
+        // picture; this test is about the meter, not about trimming.
+        let mut resolved = zeroclaw_config::schema::ResolvedRuntime::default();
+        resolved.model_context_window = 1_000_000;
+        resolved.model_context_window_source =
+            zeroclaw_config::schema::ModelContextWindowSource::Configured;
+        resolved.context.request_token_ceiling = Some(1_000_000);
+        resolved.context.trim_threshold_percent = 80; // water-line 800_000
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = trim_test_agent_with_resolved(resolved, observer);
+        agent.model_provider = Box::new(ReportedInputProvider(Some(REPORTED)));
+        let opening = vec![
+            ConversationMessage::Chat(ChatMessage::system("system")),
+            ConversationMessage::Chat(ChatMessage::user("old user")),
+            ConversationMessage::Chat(ChatMessage::assistant("old assistant")),
+        ];
+        agent.history = opening.clone();
+
+        // Turn one assembles the opening rows plus the user row its turn
+        // appends, so its meter is the conservative margin over the whole
+        // local estimate — no provider measurement exists to anchor on yet.
+        let mut turn1_durable = opening.clone();
+        turn1_durable.push(ConversationMessage::Chat(ChatMessage::user("turn one")));
+        let turn1_rows =
+            crate::agent::dispatcher::NativeToolDispatcher.to_provider_messages(&turn1_durable);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        agent
+            .turn_streamed("turn one", tx, None)
+            .await
+            .expect("turn one must complete");
+        let events1 = drain_turn_events(&mut rx);
+        let schema_tokens =
+            agent.dispatched_tool_schema_tokens(&crate::agent::dispatcher::NativeToolDispatcher);
+        let turn1_raw = crate::agent::history::estimate_history_tokens(&turn1_rows) + schema_tokens;
+
+        let (meter1, source1) = published_meter(&events1);
+        assert_eq!(
+            published_usage(&events1),
+            REPORTED,
+            "the provider reports its own number"
+        );
+        assert!(
+            meter1 >= crate::agent::history_trim::conservative_estimate_tokens(turn1_raw) as u64,
+            "turn one's meter is at least the conservative margin over the local \
+             estimate; the turn-start tool catalog can carry tools the test registry \
+             does not: raw={turn1_raw} rows={}",
+            crate::agent::history::estimate_history_tokens(&turn1_rows)
+        );
+        assert_eq!(
+            source1,
+            Some(zeroclaw_api::agent::TokenCountSource::Estimated),
+            "turn one has no provider measurement, so its number is labelled estimate"
+        );
+
+        // The provider billed exactly the population at accept — the opening
+        // rows plus turn one's user row. The assistant reply and turn two's
+        // user row are the unbilled tail the next meter must price.
+        let rows_after_turn1 =
+            crate::agent::dispatcher::NativeToolDispatcher.to_provider_messages(&agent.history);
+        // The anchor covers the durable population at accept: the opening
+        // rows plus turn one's user row. The assistant reply, plus turn
+        // two's user row added at the next assembly, are the tail.
+        let tail = rows_after_turn1[opening.len() + 1..]
+            .iter()
+            .cloned()
+            .chain(std::iter::once(ChatMessage::user("turn two")))
+            .collect::<Vec<_>>();
+        let meter2_expected = REPORTED
+            + crate::agent::history_trim::conservative_estimate_tokens(
+                crate::agent::history::estimate_history_tokens(&tail),
+            ) as u64;
+
+        let (tx2, mut rx2) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        agent
+            .turn_streamed("turn two", tx2, None)
+            .await
+            .expect("turn two must complete");
+        let events2 = drain_turn_events(&mut rx2);
+
+        let (meter2, source2) = published_meter(&events2);
+        assert_eq!(
+            meter2, meter2_expected,
+            "turn two prices the provider's measurement plus the margin-priced \
+             tail, not a re-estimate of the whole population"
+        );
+        assert!(
+            meter2 >= REPORTED,
+            "the meter must never fall below the provider's last measurement: \
+             {meter2} < {REPORTED}"
+        );
+        assert_eq!(
+            source2,
+            Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
+            "a provider-carried number is labelled calibrated"
+        );
+        assert_eq!(
+            published_usage(&events2),
+            REPORTED,
+            "the provider usage stays the billing number even when the meter is calibrated"
+        );
+    }
+
+    /// A model switch routes the turn at a provider/model the anchor was not
+    /// measured on, so the meter falls back to the conservative estimate.
+    #[tokio::test]
+    async fn model_switch_falls_back_to_the_conservative_estimate() {
+        const REPORTED: u64 = 25_787;
+        let mut resolved = zeroclaw_config::schema::ResolvedRuntime::default();
+        resolved.model_context_window = 131_072;
+        resolved.model_context_window_source =
+            zeroclaw_config::schema::ModelContextWindowSource::Configured;
+        resolved.context.request_token_ceiling = Some(131_072);
+        resolved.context.trim_threshold_percent = 80; // water-line far above the fixture
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = trim_test_agent_with_resolved(resolved, observer);
+        agent.model_provider = Box::new(ReportedInputProvider(Some(REPORTED)));
+        agent.history = vec![
+            ConversationMessage::Chat(ChatMessage::system("system")),
+            ConversationMessage::Chat(ChatMessage::user("old user")),
+            ConversationMessage::Chat(ChatMessage::assistant("old assistant")),
+        ];
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        agent
+            .turn_streamed("turn one", tx, None)
+            .await
+            .expect("turn one must complete");
+        drain_turn_events(&mut rx);
+        let schema_tokens =
+            agent.dispatched_tool_schema_tokens(&crate::agent::dispatcher::NativeToolDispatcher);
+
+        agent.set_model_route_resolver(Arc::new(
+            zeroclaw_providers::router::ModelRouteResolver::new(
+                vec![],
+                "other-provider".to_string(),
+                "other-model".to_string(),
+            ),
+        ));
+
+        let mut turn2_durable = agent.history.clone();
+        turn2_durable.push(ConversationMessage::Chat(ChatMessage::user("turn two")));
+        let raw2 = crate::agent::history::estimate_history_tokens(
+            &crate::agent::dispatcher::NativeToolDispatcher.to_provider_messages(&turn2_durable),
+        ) + schema_tokens;
+        let expected = crate::agent::history_trim::conservative_estimate_tokens(raw2) as u64;
+        assert!(
+            expected
+                >= crate::agent::history::estimate_history_tokens(
+                    &crate::agent::dispatcher::NativeToolDispatcher
+                        .to_provider_messages(&turn2_durable),
+                ) as u64,
+            "the fallback meter never reports a number under the raw estimate"
+        );
+
+        let (tx2, mut rx2) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        agent
+            .turn_streamed("turn two", tx2, None)
+            .await
+            .expect("turn two must complete");
+        let events2 = drain_turn_events(&mut rx2);
+
+        let (meter2, source2) = published_meter(&events2);
+        assert!(
+            meter2 >= expected,
+            "a switched route re-prices from a conservative estimate that covers \
+             the local raw estimate"
+        );
+        assert_eq!(
+            source2,
+            Some(zeroclaw_api::agent::TokenCountSource::Estimated),
+            "the fallback number is labelled estimate, not calibrated"
+        );
+    }
+
+    /// The water-line trigger, the trim notice's `tokens_before`, and the
+    /// meter all report the same calibrated number; the trim clears the
+    /// anchor, so the meter a user sees after the trim is the conservative
+    /// estimate of what the trim left behind.
+    #[tokio::test]
+    async fn the_water_line_trims_at_the_meter_number_and_reports_it() {
+        const REPORTED: u64 = 100_000;
+        // A provider window of 131,072 with an 80% threshold: the
+        // water-line is 104,857. A 32-row opening at 10,000 characters
+        // each puts the conservative margin of the turn-one estimate
+        // (~100,750) under the water-line, so turn one dispatches
+        // untrimmed; the provider reports 100,000 and the anchor carries
+        // it into turn two.
+        let mut resolved = zeroclaw_config::schema::ResolvedRuntime::default();
+        resolved.model_context_window = 131_072;
+        resolved.model_context_window_source =
+            zeroclaw_config::schema::ModelContextWindowSource::Configured;
+        resolved.context.request_token_ceiling = Some(131_072);
+        resolved.context.trim_threshold_percent = 80;
+        let water_line = resolved.context_trim_budget();
+        assert_eq!(water_line, 104_857);
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = trim_test_agent_with_resolved(resolved, observer);
+        agent.model_provider = Box::new(ReportedInputProvider(Some(REPORTED)));
+        let big = "x".repeat(10_000);
+        let mut opening = vec![ConversationMessage::Chat(ChatMessage::system("system"))];
+        for i in 0..16 {
+            opening.push(ConversationMessage::Chat(ChatMessage::user(format!(
+                "user {i} {big}"
+            ))));
+            opening.push(ConversationMessage::Chat(ChatMessage::assistant(format!(
+                "answer {i} {big}"
+            ))));
+        }
+        agent.history = opening.clone();
+
+        // Turn one: the conservative margin over the raw estimate stays under
+        // the water-line, and the provider's report is under it too, so
+        // neither guard fires and the anchor survives.
+        let mut turn1_durable = opening.clone();
+        turn1_durable.push(ConversationMessage::Chat(ChatMessage::user("turn one")));
+        let turn1_rows =
+            crate::agent::dispatcher::NativeToolDispatcher.to_provider_messages(&turn1_durable);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        agent
+            .turn_streamed("turn one", tx, None)
+            .await
+            .expect("turn one must complete");
+        let events1 = drain_turn_events(&mut rx);
+        let schema_tokens =
+            agent.dispatched_tool_schema_tokens(&crate::agent::dispatcher::NativeToolDispatcher);
+        let turn1_raw = crate::agent::history::estimate_history_tokens(&turn1_rows) + schema_tokens;
+
+        let (meter1, source1) = published_meter(&events1);
+        assert!(
+            meter1 >= crate::agent::history_trim::conservative_estimate_tokens(turn1_raw) as u64,
+            "the pre-anchor meter carries the conservative margin over the local estimate"
+        );
+        assert_eq!(
+            source1,
+            Some(zeroclaw_api::agent::TokenCountSource::Estimated)
+        );
+        assert!(
+            meter1 < water_line as u64,
+            "turn one must not trim: its margin-estimate {meter1} reaches the \
+             water-line {water_line}"
+        );
+        assert!(
+            trim_notice(&events1).is_none(),
+            "turn one must not trim: the provider's {REPORTED} also sits under \
+             the water-line {water_line}"
+        );
+
+        // Turn two: the anchor prices the provider's measurement, and the
+        // big user row pushes the calibrated number over the water-line.
+        let big_turn2 = "y".repeat(24_000);
+        let rows_after_turn1 =
+            crate::agent::dispatcher::NativeToolDispatcher.to_provider_messages(&agent.history);
+        // The anchor covers the durable population at accept: the opening
+        // rows plus turn one's user row, which the turn appends before the
+        // provider answers. The assistant reply, plus turn two's big user
+        // row added at the next assembly, are the tail.
+        let tail = rows_after_turn1[opening.len() + 1..]
+            .iter()
+            .cloned()
+            .chain(std::iter::once(ChatMessage::user(big_turn2.clone())))
+            .collect::<Vec<_>>();
+        let meter2_calibrated = REPORTED
+            + crate::agent::history_trim::conservative_estimate_tokens(
+                crate::agent::history::estimate_history_tokens(&tail),
+            ) as u64;
+        assert!(
+            meter2_calibrated >= water_line as u64,
+            "the fixture's calibrated number must cross the water-line \
+             {water_line}: {meter2_calibrated}"
+        );
+
+        let (tx2, mut rx2) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        agent
+            .turn_streamed(&big_turn2, tx2, None)
+            .await
+            .expect("the turn must not abort on the trim");
+        let events2 = drain_turn_events(&mut rx2);
+
+        let (before, before_source, after) = trim_notice(&events2)
+            .expect("a calibrated number crossing the water-line must fire the trim");
+        assert_eq!(
+            before,
+            Some(meter2_calibrated),
+            "the notice reports the number the water-line trigger read"
+        );
+        assert_eq!(
+            before_source,
+            Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
+            "the trigger number is labelled calibrated"
+        );
+
+        // The trim cleared the anchor: the meter a user sees after it is the
+        // conservative estimate of the trimmed population, labelled estimate.
+        let mut post_trim = agent.history.clone();
+        post_trim.pop(); // the assistant reply appended after assembly
+        let post_raw = crate::agent::history::estimate_history_tokens(
+            &crate::agent::dispatcher::NativeToolDispatcher.to_provider_messages(&post_trim),
+        ) + schema_tokens;
+        let (meter2, source2) = published_meter(&events2);
+        assert!(
+            meter2 >= crate::agent::history_trim::conservative_estimate_tokens(post_raw) as u64,
+            "after the trim the meter re-prices from a conservative estimate that \
+             covers the trimmed request"
+        );
+        assert_eq!(
+            source2,
+            Some(zeroclaw_api::agent::TokenCountSource::Estimated),
+            "the post-trim number is labelled estimate"
+        );
+        assert!(
+            post_raw <= water_line,
+            "the trim fits the raw request under the water-line it targets: \
+             {post_raw} > {water_line}"
+        );
+        assert!(after.is_some());
+    }
+
+    /// The pre-dispatch guard scales the raw estimator by the provider's
+    /// ratio; it never multiplies the calibrated meter, whose number has
+    /// already counted the provider-billed population once. Here the
+    /// ratio-scaled raw number fits the send budget while multiplying the
+    /// meter would not, so the turn dispatches without trimming.
+    #[tokio::test]
+    async fn the_dispatch_guard_prices_the_raw_population_not_the_meter() {
+        const REPORTED: u64 = 19_000;
+        // The provider declares no context window, so the effective window
+        // is the 32k compatibility fallback: an 80% water-line is 25,600 and
+        // the send budget is the full 32k.
+        let mut resolved = zeroclaw_config::schema::ResolvedRuntime::default();
+        resolved.context.trim_threshold_percent = 80;
+        let water_line = resolved.context_trim_budget();
+        let send_budget = resolved.context_send_budget();
+        assert_eq!((water_line, send_budget), (25_600, 32_000));
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = trim_test_agent_with_resolved(resolved, observer);
+        agent.model_provider = Box::new(ReportedInputProvider(Some(REPORTED)));
+        let opening = vec![
+            ConversationMessage::Chat(ChatMessage::system("system")),
+            ConversationMessage::Chat(ChatMessage::user("old user")),
+            ConversationMessage::Chat(ChatMessage::assistant("old assistant")),
+        ];
+        agent.history = opening.clone();
+
+        let mut turn1_durable = opening.clone();
+        turn1_durable.push(ConversationMessage::Chat(ChatMessage::user("turn one")));
+        let turn1_rows =
+            crate::agent::dispatcher::NativeToolDispatcher.to_provider_messages(&turn1_durable);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        agent
+            .turn_streamed("turn one", tx, None)
+            .await
+            .expect("turn one must complete");
+        let events1 = drain_turn_events(&mut rx);
+        let schema_tokens =
+            agent.dispatched_tool_schema_tokens(&crate::agent::dispatcher::NativeToolDispatcher);
+        let raw1 = crate::agent::history::estimate_history_tokens(&turn1_rows) + schema_tokens;
+        assert!(trim_notice(&events1).is_none());
+
+        let rows_after_turn1 =
+            crate::agent::dispatcher::NativeToolDispatcher.to_provider_messages(&agent.history);
+        let tail = rows_after_turn1[turn1_rows.len()..]
+            .iter()
+            .cloned()
+            .chain(std::iter::once(ChatMessage::user("turn two")))
+            .collect::<Vec<_>>();
+        let tail_raw = crate::agent::history::estimate_history_tokens(&tail);
+        let meter2 =
+            REPORTED + crate::agent::history_trim::conservative_estimate_tokens(tail_raw) as u64;
+        let ratio = REPORTED as f64 / raw1 as f64;
+        let guard_number = ((raw1 + tail_raw) as f64 * ratio).round() as u64;
+        let meter_scaled = (meter2 as f64 * ratio).round() as u64;
+        assert!(ratio > 1.0);
+        assert!(
+            guard_number < water_line as u64,
+            "the ratio-scaled raw population must fit the water-line target: \
+             {guard_number} >= {water_line}"
+        );
+        assert!(
+            meter_scaled > water_line as u64,
+            "scaling the meter number with the same ratio must cross the \
+             target: {meter_scaled} <= {water_line}"
+        );
+
+        let (tx2, mut rx2) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        agent
+            .turn_streamed("turn two", tx2, None)
+            .await
+            .expect("turn two must complete");
+        let events2 = drain_turn_events(&mut rx2);
+        assert!(
+            trim_notice(&events2).is_none(),
+            "the guard must dispatch the request the provider measured as \
+             fitting, not trim on a meter-scaled number"
+        );
+        let (meter2_published, source2) = published_meter(&events2);
+        assert_eq!(meter2_published, meter2, "turn two prices the tail");
+        assert_eq!(
+            source2,
+            Some(zeroclaw_api::agent::TokenCountSource::Calibrated)
+        );
+    }
+
+    /// A fresh Agent — the session-restore path — has no anchor, so its
+    /// first meter is the conservative local estimate labelled estimate.
+    #[tokio::test]
+    async fn a_fresh_agent_starts_on_the_conservative_estimate() {
+        const REPORTED: u64 = 25_787;
+        let observer1: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut resolved1 = zeroclaw_config::schema::ResolvedRuntime::default();
+        resolved1.model_context_window = 131_072;
+        resolved1.model_context_window_source =
+            zeroclaw_config::schema::ModelContextWindowSource::Configured;
+        resolved1.context.request_token_ceiling = Some(131_072);
+        resolved1.context.trim_threshold_percent = 80;
+        let mut agent = trim_test_agent_with_resolved(resolved1, observer1);
+        agent.model_provider = Box::new(ReportedInputProvider(Some(REPORTED)));
+        agent.history = vec![
+            ConversationMessage::Chat(ChatMessage::system("system")),
+            ConversationMessage::Chat(ChatMessage::user("old user")),
+            ConversationMessage::Chat(ChatMessage::assistant("old assistant")),
+        ];
+        let (tx, mut _rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        agent
+            .turn_streamed("turn one", tx, None)
+            .await
+            .expect("turn one must complete");
+        let carried = agent.history.clone();
+
+        // Restore: a brand-new Agent over the same transcript.
+        let observer2: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut resolved2 = zeroclaw_config::schema::ResolvedRuntime::default();
+        resolved2.model_context_window = 131_072;
+        resolved2.model_context_window_source =
+            zeroclaw_config::schema::ModelContextWindowSource::Configured;
+        resolved2.context.request_token_ceiling = Some(131_072);
+        resolved2.context.trim_threshold_percent = 80;
+        let mut restored = trim_test_agent_with_resolved(resolved2, observer2);
+        restored.model_provider = Box::new(ReportedInputProvider(Some(REPORTED)));
+        restored.history = carried.clone();
+
+        let (tx2, mut rx2) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        restored
+            .turn_streamed("restored turn", tx2, None)
+            .await
+            .expect("the restored turn must complete");
+        let events = drain_turn_events(&mut rx2);
+        let schema_tokens =
+            restored.dispatched_tool_schema_tokens(&crate::agent::dispatcher::NativeToolDispatcher);
+        let mut restored_durable = carried.clone();
+        restored_durable.push(ConversationMessage::Chat(ChatMessage::user(
+            "restored turn",
+        )));
+        let raw = crate::agent::history::estimate_history_tokens(
+            &crate::agent::dispatcher::NativeToolDispatcher.to_provider_messages(&restored_durable),
+        ) + schema_tokens;
+        let (meter, source) = published_meter(&events);
+        assert!(
+            meter >= crate::agent::history_trim::conservative_estimate_tokens(raw) as u64,
+            "a restored session prices from a conservative estimate that covers \
+             the local raw estimate"
+        );
+        assert_eq!(
+            source,
+            Some(zeroclaw_api::agent::TokenCountSource::Estimated),
+            "a restored session has no provider measurement to carry"
+        );
+    }
+
+    /// A history replacement that starts inside the anchored population
+    /// changes rows the provider measured, so the anchor is cleared and the
+    /// next meter falls back to the conservative estimate.
+    #[tokio::test]
+    async fn replacing_history_across_the_anchored_rows_clears_the_meter() {
+        const REPORTED: u64 = 25_787;
+        let mut resolved = zeroclaw_config::schema::ResolvedRuntime::default();
+        resolved.model_context_window = 131_072;
+        resolved.model_context_window_source =
+            zeroclaw_config::schema::ModelContextWindowSource::Configured;
+        resolved.context.request_token_ceiling = Some(131_072);
+        resolved.context.trim_threshold_percent = 80;
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = trim_test_agent_with_resolved(resolved, observer);
+        agent.model_provider = Box::new(ReportedInputProvider(Some(REPORTED)));
+        agent.history = vec![
+            ConversationMessage::Chat(ChatMessage::system("system")),
+            ConversationMessage::Chat(ChatMessage::user("old user")),
+            ConversationMessage::Chat(ChatMessage::assistant("old assistant")),
+        ];
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        agent
+            .turn_streamed("turn one", tx, None)
+            .await
+            .expect("turn one must complete");
+        drain_turn_events(&mut rx);
+        let schema_tokens =
+            agent.dispatched_tool_schema_tokens(&crate::agent::dispatcher::NativeToolDispatcher);
+
+        // The anchored population covers the opening rows plus turn one's
+        // user row; a replacement starting at the opening's user row covers
+        // rows the provider measured.
+        let expected_suffix = agent.history[1..].to_vec();
+        assert!(agent.replace_history_suffix(
+            &expected_suffix,
+            vec![ConversationMessage::Chat(ChatMessage::user("rewritten"))]
+        ));
+
+        let mut turn2_durable = agent.history.clone();
+        turn2_durable.push(ConversationMessage::Chat(ChatMessage::user("turn two")));
+        let raw2 = crate::agent::history::estimate_history_tokens(
+            &crate::agent::dispatcher::NativeToolDispatcher.to_provider_messages(&turn2_durable),
+        ) + schema_tokens;
+
+        let (tx2, mut rx2) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        agent
+            .turn_streamed("turn two", tx2, None)
+            .await
+            .expect("turn two must complete");
+        let events2 = drain_turn_events(&mut rx2);
+        let (meter2, source2) = published_meter(&events2);
+        assert!(
+            meter2 >= crate::agent::history_trim::conservative_estimate_tokens(raw2) as u64,
+            "a replacement covering the anchored rows re-prices from an estimate \
+             that covers the local raw estimate"
+        );
+        assert_eq!(
+            source2,
+            Some(zeroclaw_api::agent::TokenCountSource::Estimated)
+        );
+    }
+
+    /// Changing the tool catalog changes the request the provider measured,
+    /// so the next turn re-prices from the conservative estimate of the new
+    /// schema plus the whole population.
+    #[tokio::test]
+    async fn a_tool_catalog_change_clears_the_meter() {
+        const REPORTED: u64 = 25_787;
+        let mut resolved = zeroclaw_config::schema::ResolvedRuntime::default();
+        resolved.model_context_window = 131_072;
+        resolved.model_context_window_source =
+            zeroclaw_config::schema::ModelContextWindowSource::Configured;
+        resolved.context.request_token_ceiling = Some(131_072);
+        resolved.context.trim_threshold_percent = 80;
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = trim_test_agent_with_resolved(resolved, observer);
+        agent.model_provider = Box::new(ReportedInputProvider(Some(REPORTED)));
+        agent.history = vec![
+            ConversationMessage::Chat(ChatMessage::system("system")),
+            ConversationMessage::Chat(ChatMessage::user("old user")),
+            ConversationMessage::Chat(ChatMessage::assistant("old assistant")),
+        ];
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        agent
+            .turn_streamed("turn one", tx, None)
+            .await
+            .expect("turn one must complete");
+        drain_turn_events(&mut rx);
+
+        agent.tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+            FatSchemaTool("fat".to_string()),
+        )]);
+        let new_schema =
+            agent.dispatched_tool_schema_tokens(&crate::agent::dispatcher::NativeToolDispatcher);
+        let mut turn2_durable = agent.history.clone();
+        turn2_durable.push(ConversationMessage::Chat(ChatMessage::user("turn two")));
+        let raw2 = crate::agent::history::estimate_history_tokens(
+            &crate::agent::dispatcher::NativeToolDispatcher.to_provider_messages(&turn2_durable),
+        ) + new_schema;
+
+        let (tx2, mut rx2) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        agent
+            .turn_streamed("turn two", tx2, None)
+            .await
+            .expect("turn two must complete");
+        let events2 = drain_turn_events(&mut rx2);
+        let (meter2, source2) = published_meter(&events2);
+        assert!(
+            meter2 >= crate::agent::history_trim::conservative_estimate_tokens(raw2) as u64,
+            "a changed catalog prices the new schema on the whole population with \
+             the margin"
+        );
+        assert_eq!(
+            source2,
+            Some(zeroclaw_api::agent::TokenCountSource::Estimated),
+            "the number is labelled estimate, not calibrated"
+        );
+    }
+
+    /// The margin factor covers the observed estimator bias behind the
+    /// deployed-board drop: the raw re-estimate of 20,826 for a provider
+    /// measurement of 25,787.
+    #[test]
+    fn conservative_estimate_covers_the_observed_estimator_bias() {
+        let raw = 20_826;
+        let provider = 25_787;
+        let margin = crate::agent::history_trim::conservative_estimate_tokens(raw);
+        assert!(
+            margin >= raw,
+            "the conservative number never sits under the raw estimate"
+        );
+        assert!(
+            margin >= provider,
+            "the margin must cover the observed 0.808 estimator ratio: \
+             {margin} < {provider}"
+        );
+    }
+
+    /// The turn-start meter contract, asserted directly on
+    /// `calibrated_turn_start_size`: every way the request can drift from
+    /// what the provider measured sends the meter back to the conservative
+    /// estimate and clears the anchor; only an intact prefix calibrates.
+    #[test]
+    fn the_meter_contract_calibrates_an_intact_prefix_and_clears_every_drift() {
+        let reported = 25_787;
+        let prefix = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("u1"),
+            ChatMessage::assistant("a1"),
+        ];
+        let tail = vec![ChatMessage::assistant("a2"), ChatMessage::user("u2")];
+        let schema = 11;
+        let anchor = crate::agent::history_trim::ContextAnchor {
+            provider_name: "mock-provider".to_string(),
+            model: "mock-model".to_string(),
+            reported_tokens: reported,
+            anchored_population_len: prefix.len(),
+            anchored_prefix_fingerprint: crate::agent::history_trim::provider_prefix_fingerprint(
+                &prefix,
+            ),
+            anchored_tool_schema_tokens: schema,
+            anchored_prefix_estimate: crate::agent::history::estimate_history_tokens(&prefix),
+        };
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut resolved = zeroclaw_config::schema::ResolvedRuntime::default();
+        resolved.context.request_token_ceiling = Some(131_072);
+        let mut agent = trim_test_agent_with_resolved(resolved, observer);
+        agent.context_anchor = Some(anchor.clone());
+
+        // Intact prefix plus a tail: the provider number plus the
+        // conservative price of the tail, labelled calibrated.
+        let messages: Vec<ChatMessage> = prefix.iter().chain(tail.iter()).cloned().collect();
+        let (meter, source) =
+            agent.calibrated_turn_start_size(&messages, schema, "mock-provider", "mock-model");
+        assert_eq!(source, zeroclaw_api::agent::TokenCountSource::Calibrated);
+        assert_eq!(
+            meter,
+            reported
+                + crate::agent::history_trim::conservative_estimate_tokens(
+                    crate::agent::history::estimate_history_tokens(&tail)
+                ) as usize,
+            "calibrated = reported + conservative(tail)"
+        );
+        assert_eq!(
+            agent
+                .calibrated_turn_start_size(&prefix, schema, "mock-provider", "mock-model")
+                .0,
+            reported,
+            "an anchor with no tail reports the provider's number exactly"
+        );
+
+        let whole_raw = crate::agent::history::estimate_history_tokens(&messages) + schema;
+        let cases: Vec<(&str, (String, String, usize))> = vec![
+            (
+                "provider",
+                ("other".to_string(), "mock-model".to_string(), schema),
+            ),
+            (
+                "model",
+                ("mock-provider".to_string(), "other".to_string(), schema),
+            ),
+            (
+                "schema",
+                (
+                    "mock-provider".to_string(),
+                    "mock-model".to_string(),
+                    schema + 1,
+                ),
+            ),
+        ];
+        for (what, (provider, model, schema_tokens)) in cases {
+            let whole_raw_case =
+                crate::agent::history::estimate_history_tokens(&messages) + schema_tokens;
+            let expect_fallback =
+                crate::agent::history_trim::conservative_estimate_tokens(whole_raw_case);
+            agent.context_anchor = Some(anchor.clone());
+            let (meter, source) =
+                agent.calibrated_turn_start_size(&messages, schema_tokens, &provider, &model);
+            assert_eq!(
+                source,
+                zeroclaw_api::agent::TokenCountSource::Estimated,
+                "a changed {what} falls back to the estimate"
+            );
+            assert_eq!(
+                meter, expect_fallback,
+                "the fallback prices the whole request"
+            );
+            assert!(
+                meter >= whole_raw_case,
+                "the estimate never sits under the raw estimate"
+            );
+            assert!(
+                agent.context_anchor.is_none(),
+                "a changed {what} clears the anchor"
+            );
+        }
+
+        // A population shorter than the anchored prefix, and a prefix whose
+        // bytes changed, both clear the anchor.
+        agent.context_anchor = Some(anchor.clone());
+        let short = prefix[..2].to_vec();
+        let (meter, source) =
+            agent.calibrated_turn_start_size(&short, schema, "mock-provider", "mock-model");
+        assert_eq!(source, zeroclaw_api::agent::TokenCountSource::Estimated);
+        assert_eq!(
+            meter,
+            crate::agent::history_trim::conservative_estimate_tokens(
+                crate::agent::history::estimate_history_tokens(&short) + schema
+            ),
+            "a population under the anchored prefix re-prices the whole request"
+        );
+        assert!(agent.context_anchor.is_none());
+
+        agent.context_anchor = Some(anchor.clone());
+        let mut rewritten = prefix.clone();
+        rewritten[1] = ChatMessage::user("rewritten");
+        let rewritten: Vec<ChatMessage> = rewritten.into_iter().chain(tail.clone()).collect();
+        let (meter, source) =
+            agent.calibrated_turn_start_size(&rewritten, schema, "mock-provider", "mock-model");
+        assert_eq!(source, zeroclaw_api::agent::TokenCountSource::Estimated);
+        assert!(agent.context_anchor.is_none());
+        assert_eq!(
+            meter,
+            crate::agent::history_trim::conservative_estimate_tokens(
+                crate::agent::history::estimate_history_tokens(&rewritten) + schema
+            ),
+            "the estimate prices the rewritten population with the margin"
+        );
+
+        // A fresh agent has no anchor: the turn-start meter is the
+        // conservative estimate of the whole request.
+        let mut fresh = trim_test_agent_with_resolved(
+            zeroclaw_config::schema::ResolvedRuntime::default(),
+            Arc::from(crate::observability::NoopObserver {}),
+        );
+        let (meter, source) =
+            fresh.calibrated_turn_start_size(&messages, schema, "mock-provider", "mock-model");
+        assert_eq!(source, zeroclaw_api::agent::TokenCountSource::Estimated);
+        assert_eq!(
+            meter,
+            crate::agent::history_trim::conservative_estimate_tokens(whole_raw)
+        );
+        assert_eq!(
+            meter,
+            (whole_raw * 5).div_ceil(4),
+            "the margin is 5/4 rounded up"
+        );
     }
 
     /// Run one turn whose provider reports `reported` input tokens, and return

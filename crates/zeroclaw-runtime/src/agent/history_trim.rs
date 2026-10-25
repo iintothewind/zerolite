@@ -193,6 +193,59 @@ pub fn insert_breadcrumb_deduped(history: &mut Vec<ChatMessage>, crumb_present: 
 
 // ── Budget-cascade primitives (water-line trigger, send-budget fit) ──────
 
+/// The provider-measured size of a message population, pinned to the exact
+/// route and tool catalog that produced it. Recorded when a provider reports
+/// `usage.input_tokens`, and handed across the turn boundary so the next
+/// turn's meter starts on this number instead of falling back to a fresh
+/// local estimate.
+#[derive(Debug, Clone)]
+pub struct ContextAnchor {
+    /// Route provider name the report came from.
+    pub provider_name: String,
+    /// Model the provider request was sent to.
+    pub model: String,
+    /// The whole measured request the provider reported, including the
+    /// preamble rows and tool schemas the request carried beyond the durable
+    /// rows. Preamble bytes stay inside this number: never re-priced in the
+    /// tail, which keeps the meter conservative.
+    pub reported_tokens: usize,
+    /// Durable history length when the report was captured; the anchored
+    /// prefix is `history[..anchored_population_len]`.
+    pub anchored_population_len: usize,
+    /// Fingerprint of the anchored prefix in row order. The durable ->
+    /// provider transform is deterministic, so prefix equality in durable
+    /// space pins the provider-space prefix the provider measured.
+    pub anchored_prefix_fingerprint: u64,
+    /// Tool schema tokens priced into the measured request, so a catalog
+    /// change between turns invalidates the anchor.
+    pub anchored_tool_schema_tokens: usize,
+    /// The local estimator's raw size of the anchored prefix, carried for the
+    /// dispatch ratio (`reported / estimate`). Never shown as a meter number.
+    pub anchored_prefix_estimate: usize,
+}
+
+/// Order-sensitive fingerprint of a message population: role then content, in
+/// row order. Two populations hash equal iff every row matches.
+pub fn provider_prefix_fingerprint(rows: &[ChatMessage]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for row in rows {
+        row.role.hash(&mut hasher);
+        row.content.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// Conservative margin on a raw local estimate published as a pre-send meter
+/// number. The estimator is biased low for the tokenizer families that bill
+/// these requests (the observed provider/estimate ratio was 0.808), so the
+/// number shown before dispatch must sit above what the provider reports.
+/// The margin lives at the consumption sites; the estimator heuristics stay
+/// byte-identical.
+pub fn conservative_estimate_tokens(raw: usize) -> usize {
+    (raw * 5).div_ceil(4)
+}
+
 /// Provider-authoritative context size, replacing the bare local estimate
 /// wherever a trim decision is made after a billed response.
 ///
@@ -214,6 +267,15 @@ pub struct ContextCalibration {
     reported_input_tokens: Option<usize>,
     /// `history.len()` at the moment `reported_input_tokens` was captured.
     calibrated_history_len: usize,
+    /// Route identity the report came from; an anchor is only valid for the
+    /// exact provider + model that produced it.
+    provider_name: Option<String>,
+    model: Option<String>,
+    /// Fingerprint, tool schema token count, and raw estimator size of the
+    /// anchored prefix — see [`ContextAnchor`].
+    anchored_prefix_fingerprint: u64,
+    anchored_tool_schema_tokens: usize,
+    anchored_prefix_estimate: usize,
 }
 
 impl ContextCalibration {
@@ -227,10 +289,56 @@ impl ContextCalibration {
     /// Record a provider-authoritative prompt size for the current history.
     /// Called each time a response carries `usage.input_tokens`; the reported
     /// value is the full prompt the provider just saw, so the messages present
-    /// now are all accounted for and become the new anchor.
-    pub fn observe_reported(&mut self, reported_input_tokens: usize, history: &[ChatMessage]) {
+    /// now are all accounted for and become the new anchor. The route and the
+    /// tool schema charge are recorded with it so a later turn can check the
+    /// anchor against its own request.
+    pub fn observe_reported(
+        &mut self,
+        reported_input_tokens: usize,
+        history: &[ChatMessage],
+        provider_name: &str,
+        model: &str,
+        tool_schema_tokens: usize,
+    ) {
         self.reported_input_tokens = Some(reported_input_tokens);
         self.calibrated_history_len = history.len();
+        self.provider_name = Some(provider_name.to_string());
+        self.model = Some(model.to_string());
+        self.anchored_prefix_fingerprint = provider_prefix_fingerprint(history);
+        self.anchored_tool_schema_tokens = tool_schema_tokens;
+        self.anchored_prefix_estimate = estimate_history_tokens(history);
+    }
+
+    /// A calibration seeded from a previous turn's anchor: the turn starts with
+    /// the provider's number already in place, so the loop's calibration, the
+    /// dispatch ratio, and the meter all read the same measurement from the
+    /// first iteration.
+    #[must_use]
+    pub fn seeded(seed: &ContextAnchor) -> Self {
+        Self {
+            reported_input_tokens: Some(seed.reported_tokens),
+            calibrated_history_len: seed.anchored_population_len,
+            provider_name: Some(seed.provider_name.clone()),
+            model: Some(seed.model.clone()),
+            anchored_prefix_fingerprint: seed.anchored_prefix_fingerprint,
+            anchored_tool_schema_tokens: seed.anchored_tool_schema_tokens,
+            anchored_prefix_estimate: seed.anchored_prefix_estimate,
+        }
+    }
+
+    /// The anchor to hand to the next turn. `None` when no provider report has
+    /// landed in this calibration.
+    #[must_use]
+    pub fn cross_turn_anchor(&self) -> Option<ContextAnchor> {
+        self.reported_input_tokens.map(|reported| ContextAnchor {
+            provider_name: self.provider_name.clone().unwrap_or_default(),
+            model: self.model.clone().unwrap_or_default(),
+            reported_tokens: reported,
+            anchored_population_len: self.calibrated_history_len,
+            anchored_prefix_fingerprint: self.anchored_prefix_fingerprint,
+            anchored_tool_schema_tokens: self.anchored_tool_schema_tokens,
+            anchored_prefix_estimate: self.anchored_prefix_estimate,
+        })
     }
 
     /// Current context size: the authoritative anchor plus the estimated cost
@@ -279,7 +387,7 @@ fn choose_keep_turns_for_budget<T>(
     }
 
     let leading_system = history.iter().take_while(|m| is_system_msg(m)).count();
-    let msg_tokens: Vec<usize> = history.iter().map(|m| message_tokens(m)).collect();
+    let msg_tokens: Vec<usize> = history.iter().map(message_tokens).collect();
     let system_tokens: usize = msg_tokens[..leading_system].iter().copied().sum();
 
     let body = &history[leading_system..];
@@ -2073,7 +2181,7 @@ mod tests {
         // Provider saw a 1_000-token prompt for a 2-message history.
         let mut hist = vec![sys("base"), user("first")];
         let mut cal = ContextCalibration::new();
-        cal.observe_reported(1_000, &hist);
+        cal.observe_reported(1_000, &hist, "test-provider", "test-model", 0);
         // No growth yet: exactly the authoritative anchor.
         assert_eq!(cal.current(&hist), 1_000);
         // The assistant reply + tool result are unbilled: priced locally and
@@ -2094,7 +2202,7 @@ mod tests {
         let big = "x".repeat(400_000); // ~100k tokens by the /4 heuristic
         let mut hist = vec![sys("base"), user(&big)];
         let mut cal = ContextCalibration::new();
-        cal.observe_reported(1_000, &hist); // provider says the prompt is tiny
+        cal.observe_reported(1_000, &hist, "test-provider", "test-model", 0); // provider says the prompt is tiny
         hist.push(asst("ok"));
         let current = cal.current(&hist);
         assert!(
@@ -2196,12 +2304,12 @@ mod tests {
     fn reanchor_after_trim_never_double_counts() {
         let mut hist = vec![sys("base"), user("a"), asst("b"), user("c"), asst("d")];
         let mut cal = ContextCalibration::new();
-        cal.observe_reported(5_000, &hist);
+        cal.observe_reported(5_000, &hist, "test-provider", "test-model", 0);
         hist.push(tool("tail"));
         // Trim drops older turns AND the anchor is refreshed to the post-trim
         // reported total with the current length — the sim of a re-anchor.
         hist = vec![sys("base"), user("c"), asst("d"), tool("tail")];
-        cal.observe_reported(2_000, &hist);
+        cal.observe_reported(2_000, &hist, "test-provider", "test-model", 0);
         assert_eq!(cal.current(&hist), 2_000);
     }
 

@@ -4854,7 +4854,7 @@ fn build_scope_override_summary(
         let scope_line = |scope: OverrideScope| -> String {
             overrides
                 .get(&scope_override_key(scope, msg, ctx.agent_alias.as_str()))
-                .map(&fmt_sel)
+                .map(fmt_sel)
                 .unwrap_or_else(|| "—".to_string())
         };
         (
@@ -10110,97 +10110,95 @@ async fn process_channel_message_body(
                     ctx.non_cli_excluded_tools.as_ref()
                 };
             loop_knobs.provider_attempt_allowlist = attempt_allowlist.clone();
-            let tool_loop = Box::pin(run_tool_call_loop(ToolLoop {
-                history_was_trimmed: None,
-                exec: ResolvedAgentExecution::resolve(
-                    ResolvedModelAccess {
-                        model_provider: active_model_provider.as_ref(),
-                        provider_name: route.model_provider.as_str(),
-                        model: route.model.as_str(),
-                        dispatch_model: route.model.as_str(),
-                        temperature: thinking.effective_temperature,
-                    },
-                    ResolvedIo {
-                        tools_registry: ctx.tools_registry.as_ref(),
-                        observer: notify_observer.as_ref() as &dyn Observer,
-                        silent: true,
-                        approval: Some(&approval_manager),
-                        // The agent's own policy (built at channel start with
-                        // its tools) governs the no-vision marker gate.
-                        security: Some(ctx.security.as_ref()),
-                        multimodal_config: &ctx.multimodal,
-                        // Full config for the vision route to resolve the
-                        // configured `vision_model_provider`'s alias options - the
-                        // same canonical `prompt_config` snapshot this path already
-                        // uses for provider construction.
-                        config: Some(ctx.prompt_config.as_ref()),
-                        hooks: ctx.hooks.as_deref(),
-                        activated_tools: ctx.activated_tools.as_ref(),
-                        model_switch_callback: None,
-                        receipt_generator: ctx.receipt_generator.as_ref(),
-                    },
-                    ResolvedRuntimeKnobs {
-                        max_tool_iterations: ctx.max_tool_iterations,
-                        excluded_tools,
-                        dedup_exempt_tools: ctx.tool_call_dedup_exempt.as_ref(),
-                        pacing: &ctx.pacing,
-                        strict_tool_parsing: ctx.agent_cfg.resolved.strict_tool_parsing,
-                        parallel_tools: ctx.agent_cfg.resolved.parallel_tools,
-                        max_tool_result_chars: ctx.max_tool_result_chars,
-                        context_limits,
-                        context_limits_resolver: None,
-                        knobs: &loop_knobs,
-                    },
-                ),
-                history: &mut history,
-                history_has_trim_breadcrumb: &mut history_has_trim_breadcrumb,
-                injected_memory_preamble: &mut channel_injected_memory_preamble,
-                channel_name: msg.channel.as_str(),
-                channel_reply_target: Some(msg.reply_target.as_str()),
-                cancellation_token: Some(cancellation_token.clone()),
-                on_delta: delta_tx.clone(),
-                shared_budget: execution_tree_budget.clone(),
-                channel: approval_channel.as_deref(),
-                // Collector is meaningful only when the generator is active.
-                // Pass None when receipts are disabled so the call site
-                // reflects that coupling explicitly.
-                collected_receipts: ctx
-                    .receipt_generator
-                    .as_ref()
-                    .map(|_| tool_receipts_collector.as_ref()),
-                event_tx: None,
-                steering: None,
-                new_messages_out: None,
-                image_cache: None,
-                memory: Some(zeroclaw_runtime::agent::memory_inject::TurnMemory {
-                    handle: ctx.memory.as_ref(),
-                    query: msg.content.clone(),
-                    sessions: memory_sessions.clone(),
-                    suppress: false,
-                    // The relevance floor stays the context's resolved copy;
-                    // the rerank stage settings thread from the live config.
-                    cfg: zeroclaw_runtime::agent::memory_inject::MemoryInjectConfig {
-                        min_relevance_score: ctx.min_relevance_score,
-                        ..zeroclaw_runtime::agent::memory_inject::MemoryInjectConfig::from_memory_config(
-                            &ctx.prompt_config.memory,
-                            zeroclaw_runtime::agent::memory_inject::DEFAULT_RECALL_LIMIT,
-                        )
-                    },
-                }),
-                ingress: channel_ingress_context(&msg),
-                agent_alias: Some(ctx.agent_alias.as_str()),
-                parent_agent_alias: None,
-                turn_id: &turn_id,
-                // Live channel-daemon SOP path: re-assemble a nested step's
-                // agent when it delegates to a different agent, so the step runs
-                // with that agent's own gated tools/policy/MCP scope rather than
-                // this turn's.
-                served_route_sink: None,
-                sop_reassembly: Some(zeroclaw_runtime::agent::loop_::SopStepReassembly {
-                    config: ctx.prompt_config.as_ref(),
-                    live_config: Some(ctx.live_config.clone()),
-                }),
-            }));
+            let tool_loop = Box::pin(run_tool_call_loop(ToolLoop { context_anchor_seed: None, context_anchor_sink: None, history_was_trimmed: None,
+            exec: ResolvedAgentExecution::resolve(
+                ResolvedModelAccess {
+                    model_provider: active_model_provider.as_ref(),
+                    provider_name: route.model_provider.as_str(),
+                    model: route.model.as_str(),
+                    dispatch_model: route.model.as_str(),
+                    temperature: thinking.effective_temperature,
+                },
+                ResolvedIo {
+                    tools_registry: ctx.tools_registry.as_ref(),
+                    observer: notify_observer.as_ref() as &dyn Observer,
+                    silent: true,
+                    approval: Some(&approval_manager),
+                    // The agent's own policy (built at channel start with
+                    // its tools) governs the no-vision marker gate.
+                    security: Some(ctx.security.as_ref()),
+                    multimodal_config: &ctx.multimodal,
+                    // Full config for the vision route to resolve the
+                    // configured `vision_model_provider`'s alias options - the
+                    // same canonical `prompt_config` snapshot this path already
+                    // uses for provider construction.
+                    config: Some(ctx.prompt_config.as_ref()),
+                    hooks: ctx.hooks.as_deref(),
+                    activated_tools: ctx.activated_tools.as_ref(),
+                    model_switch_callback: None,
+                    receipt_generator: ctx.receipt_generator.as_ref(),
+                },
+                ResolvedRuntimeKnobs {
+                    max_tool_iterations: ctx.max_tool_iterations,
+                    excluded_tools,
+                    dedup_exempt_tools: ctx.tool_call_dedup_exempt.as_ref(),
+                    pacing: &ctx.pacing,
+                    strict_tool_parsing: ctx.agent_cfg.resolved.strict_tool_parsing,
+                    parallel_tools: ctx.agent_cfg.resolved.parallel_tools,
+                    max_tool_result_chars: ctx.max_tool_result_chars,
+                    context_limits,
+                    context_limits_resolver: None,
+                    knobs: &loop_knobs,
+                },
+            ),
+            history: &mut history,
+            history_has_trim_breadcrumb: &mut history_has_trim_breadcrumb,
+            injected_memory_preamble: &mut channel_injected_memory_preamble,
+            channel_name: msg.channel.as_str(),
+            channel_reply_target: Some(msg.reply_target.as_str()),
+            cancellation_token: Some(cancellation_token.clone()),
+            on_delta: delta_tx.clone(),
+            shared_budget: execution_tree_budget.clone(),
+            channel: approval_channel.as_deref(),
+            // Collector is meaningful only when the generator is active.
+            // Pass None when receipts are disabled so the call site
+            // reflects that coupling explicitly.
+            collected_receipts: ctx
+                .receipt_generator
+                .as_ref()
+                .map(|_| tool_receipts_collector.as_ref()),
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            memory: Some(zeroclaw_runtime::agent::memory_inject::TurnMemory {
+                handle: ctx.memory.as_ref(),
+                query: msg.content.clone(),
+                sessions: memory_sessions.clone(),
+                suppress: false,
+                // The relevance floor stays the context's resolved copy;
+                // the rerank stage settings thread from the live config.
+                cfg: zeroclaw_runtime::agent::memory_inject::MemoryInjectConfig {
+                    min_relevance_score: ctx.min_relevance_score,
+                    ..zeroclaw_runtime::agent::memory_inject::MemoryInjectConfig::from_memory_config(
+                        &ctx.prompt_config.memory,
+                        zeroclaw_runtime::agent::memory_inject::DEFAULT_RECALL_LIMIT,
+                    )
+                },
+            }),
+            ingress: channel_ingress_context(&msg),
+            agent_alias: Some(ctx.agent_alias.as_str()),
+            parent_agent_alias: None,
+            turn_id: &turn_id,
+            // Live channel-daemon SOP path: re-assemble a nested step's
+            // agent when it delegates to a different agent, so the step runs
+            // with that agent's own gated tools/policy/MCP scope rather than
+            // this turn's.
+            served_route_sink: None,
+            sop_reassembly: Some(zeroclaw_runtime::agent::loop_::SopStepReassembly {
+                config: ctx.prompt_config.as_ref(),
+                live_config: Some(ctx.live_config.clone()),
+            }), }));
             // Scope this turn's routing handle so concurrent same-agent turns,
             // which share one SendViaTool, never read each other's routes.
             let tool_loop =

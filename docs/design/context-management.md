@@ -40,7 +40,19 @@ case.
   cannot account for tool schemas, multimodal payloads, or tokenizer
   differences, so it drifts from what the provider actually charges for.
   Sizing decisions anchor on the provider-reported `usage.input_tokens` and
-  price only the not-yet-billed tail locally.
+  price only the not-yet-billed tail locally. The anchor spans turns: the
+  measured count, the provider and model it was measured on, and the
+  fingerprint of the population prefix it covers are recorded at each
+  accepted turn, and the next turn prices its request as that measurement
+  plus the conservative estimate of the rows appended after the prefix. A
+  number the estimator produced is never used raw: every estimate the meter
+  publishes and every trigger reads `estimate × 5/4`, because a raw
+  estimate has never proven sufficient as a pre-send number (GLM-5.2 billed
+  1.24× what the estimator counted). The ratio-scaled estimate is not the
+  carrier: multiplying a biased estimate by a reported/estimated ratio
+  multiplies the estimator's bias into the dispatch upper bound, so a
+  request the provider measured as fitting can be trimmed on a number the
+  provider never accepted.
 - **R6 — Retention is by dropping, never by rewriting.** History is retained
   or dropped in whole turns only. Summarization-based compaction rewrites
   the record: it destroys the byte-stable prefix (R1), inserts model-written
@@ -284,6 +296,22 @@ Context size for the water-line and cascade uses two layers:
    is priced locally. Streaming paths request `stream_options.include_usage`
    when stream options are enabled; if usage is missing, the turn continues on
    the local estimate.
+
+   The anchor is recorded per turn (a `ContextAnchorSink` on the turn loop)
+   and read back at the next turn start, so a new turn's meter and
+   water-line read `reported + conservative(estimate of the rows appended
+   after the anchored prefix)` — the label is `calibrated` (see
+   `context-meter.md` R4–R7). The fingerprint covers the provider-prefix
+   rows as the provider saw them at accept, so the memory preamble and other
+   per-iteration injections stay inside `reported_tokens`: they are
+   over-counted, never priced twice, and never priced in the tail. The
+   anchor is cleared by a trim, a history replacement starting inside the
+   anchored rows, a model/provider switch, a config-generation change, and a
+   tool-catalog change; it is not persisted, so a restored session starts on
+   the conservative estimate. Non-streamed `Agent::turn`, nested SOP turns
+   (`tools/delegate.rs`, `skills/review.rs`), and channel-gated turns carry
+   no anchor: they publish no meter, so the UI number comes from streamed
+   turns.
 
 Optional `prompt_tokens_details.cached_tokens` (vLLM
 `--enable-prompt-tokens-details`, OpenAI, etc.) maps to
