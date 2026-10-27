@@ -14009,6 +14009,16 @@ mod tests {
              {post_raw} > {budget}"
         );
         assert!(after.is_some());
+        // The user-facing requirement: the moment the trim lands, the meter
+        // must show what the trim left behind — not the number that triggered
+        // it, and not whatever the provider reports later. The notice and the
+        // assembled estimate price the same retained population, so they must
+        // agree exactly; a gap here is the ring "still showing the old value".
+        assert_eq!(
+            Some(meter2),
+            after,
+            "the published estimate must equal the notice's post-trim number"
+        );
     }
 
     /// The pre-dispatch guard scales the raw estimator by the provider's

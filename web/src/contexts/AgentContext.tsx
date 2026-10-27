@@ -25,6 +25,7 @@ import {
 import { primeModelProviderCatalog, modelProviderDisplayName } from '@/lib/modelProviders';
 import { resolveAvailableModels } from './modelPicker.logic';
 import { contextLimitsFromDoneFrame } from './contextLimits.logic';
+import { meterUpdateFromFrame, type ContextInputSource } from './contextMeter.logic';
 import { buildHistoryTrimmedNotice } from './historyTrimNotices.logic';
 import type { ToolCall } from '@/lib/toolCall';
 import { emptyLiveTurn, type LiveTurn, type TurnSegments } from '@/lib/turnSegments';
@@ -113,18 +114,6 @@ export function purgeUiMessagesToKeptUserTurns(
     return messages;
   }
   return messages.slice(start);
-}
-
-/** Provenance of the context meter's numerator, mirroring the wire literals
- * (`provider` / `estimate` / `calibrated`) so the ring panel can show exactly
- * what the daemon published. `null` when the meter has no number. */
-export type ContextInputSource = 'provider' | 'estimate' | 'calibrated' | null;
-
-function contextSourceFromWire(source: string | undefined): ContextInputSource {
-  if (source === 'provider' || source === 'calibrated') return source;
-  // A frame with no label — `estimate` or an unlabelled sender — publishes an
-  // estimate. The meter never claims `provider` for a number no provider sent.
-  return 'estimate';
 }
 
 export interface AgentContextValue {
@@ -454,6 +443,14 @@ export function AgentProvider({
 
   // Centralised WebSocket message handler — reused across initial connect and reconnects.
   const handleWsMessage = useCallback((msg: WsMessage) => {
+    // One place folds the context meter, so every frame that prices the request
+    // — the trim's post-trim size, the assembled estimate at turn start, the
+    // provider's measurement, the terminal size — moves the ring the same way.
+    const meterUpdate = meterUpdateFromFrame(msg);
+    if (meterUpdate) {
+      setContextInputTokens(meterUpdate.used);
+      if (meterUpdate.source !== undefined) setContextInputSource(meterUpdate.source);
+    }
     switch (msg.type) {
       case 'session_start':
       case 'connected':
@@ -473,24 +470,13 @@ export function AgentProvider({
         // several calls arriving together one step rather than several.
         foldTurnStream({ type: 'usage' });
         setTokenStats((s) => applyUsage(s, msg));
-        // The provider just reported the real input size for this call, so the
-        // meter can stop showing the pre-dispatch estimate. `done` still wins
-        // at turn end (`last_input_tokens` is the size the turn ended with),
-        // but a multi-call turn would otherwise sit on the estimate until then.
-        if (typeof msg.input_tokens === 'number') {
-          setContextInputTokens(msg.input_tokens);
-          setContextInputSource('provider');
-        }
+        // (The meter moves through `meterUpdateFromFrame` above.)
         break;
 
       case 'context_usage':
         // Pre-dispatch assembled size, published once per turn. Deliberately
         // not folded as a step: the fold only listens to `usage`, because this
         // frame means "a request is about to go out", not "a call completed".
-        if (typeof msg.input_tokens === 'number') {
-          setContextInputTokens(msg.input_tokens);
-          setContextInputSource(contextSourceFromWire(msg.input_tokens_source));
-        }
         break;
 
       case 'thinking':
@@ -566,23 +552,9 @@ export function AgentProvider({
             setContextEffectiveWindow(limits.effectiveWindow);
             setContextTrimBudgetTokens(limits.trimBudgetTokens);
           }
-          // Prefer last_input_tokens (the size the turn ended with) over
-          // accumulated input_tokens for context-bar rendering.
-          // When last_input_tokens is explicitly null, the accepted route has no
-          // usage data; clear the input state and do NOT fall back to the
-          // accumulated input_tokens (which would be stale from a previous route).
-          //
-          // A trim that landed after the final call already replaced this
-          // value server-side (see `UsageFold::note_trim`), so the terminal
-          // frame agrees with the `history_trimmed` frame instead of undoing
-          // it. There is nothing to reconcile here.
-          if (msg.last_input_tokens === null) {
-            setContextInputTokens(null);
-          } else if (typeof msg.last_input_tokens === 'number') {
-            setContextInputTokens(msg.last_input_tokens);
-          } else if (typeof msg.input_tokens === 'number') {
-            setContextInputTokens(msg.input_tokens);
-          }
+          // The terminal size reaches the meter through `meterUpdateFromFrame`
+          // above, which is also what keeps a trim that landed after the final
+          // call from being undone here.
         }
         setTyping(false);
         break;
@@ -712,13 +684,6 @@ export function AgentProvider({
           ephemeral: true,
           notice: true,
         };
-        if (typeof msg.tokens_after === 'number') {
-          setContextInputTokens(msg.tokens_after);
-          // Post-trim is a fresh raw estimate over the rebuilt transcript; the
-          // provider's anchor (if any) priced rows the trim dropped, so it
-          // cannot price what is left.
-          setContextInputSource('estimate');
-        }
         // Cut locally instead of re-reading the store: a store read at this
         // point returns the pre-trim transcript, and rebuilding the list from
         // server rows drops the client-only `segments` that fold a committed

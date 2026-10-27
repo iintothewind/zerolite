@@ -9,7 +9,7 @@ import ContextRing from '@/components/ContextRing';
 import SessionStatsRow from '@/components/SessionStatsRow';
 import { t } from '@/lib/i18n';
 import type { LiveStats } from '@/lib/sessionStats.logic';
-import type { ContextInputSource } from '@/contexts/AgentContext';
+import type { ContextInputSource } from '@/contexts/contextMeter.logic';
 import css from './InputBar.module.css';
 
 interface InputBarProps {

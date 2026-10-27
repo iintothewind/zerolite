@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { t } from '@/lib/i18n';
-import type { ContextInputSource } from '@/contexts/AgentContext';
+import type { ContextInputSource } from '@/contexts/contextMeter.logic';
 
 interface ContextRingProps {
   /** Prompt size of the most recent LLM call, or null before the first `done`. */
