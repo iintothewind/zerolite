@@ -104,9 +104,15 @@
   --pc-scrollbar-track: #27272a;
   --pc-scrollbar-thumb-hover: #71717a;
 
-  /* Fonts */
-  --pc-font-ui: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
-  --pc-font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Monaco, Consolas, monospace;
+  /* Fonts. The Latin families are self-hosted (assets/fonts/fonts.css); the CJK
+     families are named so Chinese resolves to the platform face instead of the
+     generic fallback (whose mono CJK is a Song-style face). Keep in sync with
+     `uiFontStacks` / `monoFontStacks` in contexts/ThemeContext.tsx. */
+  --pc-font-ui: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui,
+    'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif;
+  --pc-font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Monaco,
+    Consolas, 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', 'Noto Sans CJK SC',
+    'Source Han Sans SC', monospace;
   --pc-font-size: 15px;
   --pc-font-size-mono: 14px;
 }

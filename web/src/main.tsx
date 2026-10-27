@@ -3,6 +3,8 @@ import ReactDOM from 'react-dom/client';
 import { BrowserRouter } from 'react-router-dom';
 import App from './App';
 import { basePath } from './lib/basePath';
+// Self-hosted faces first, so the first paint already has them.
+import './assets/fonts/fonts.css';
 import './index.css';
 
 const unsupportedBrowser =

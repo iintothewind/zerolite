@@ -8,18 +8,35 @@ export type AccentColor = 'cyan' | 'violet' | 'emerald' | 'amber' | 'rose' | 'bl
 export type UiFont = 'system' | 'inter' | 'segoe' | 'sf';
 export type MonoFont = 'jetbrains' | 'fira' | 'cascadia' | 'system-mono';
 
+/**
+ * Font stacks. The four Latin families are self-hosted (`assets/fonts/`), so
+ * every option that can exist here resolves without a network call — the CSP is
+ * `font-src 'self'`, and Segoe UI / SF Pro Text are OS-proprietary faces no CDN
+ * serves anyway (they resolve natively on their own platform, and fall through
+ * elsewhere).
+ *
+ * The CJK families are named explicitly and are *not* bundled: Inter, JetBrains
+ * Mono, Fira Code and Cascadia Code carry no CJK glyphs, so Chinese text always
+ * resolves here, and naming the platform faces keeps it out of the generic
+ * fallback (Windows' generic `monospace` CJK is a Song-style face, which is what
+ * made Chinese in code blocks look foreign). In the mono stacks the CJK faces
+ * are sans on purpose: a Chinese comment should sit next to the code, not in a
+ * different type genre.
+ */
+const CJK_SANS = '"PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC", "Source Han Sans SC"';
+
 export const uiFontStacks: Record<UiFont, string> = {
-  system: 'system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
-  inter: '"Inter", system-ui, sans-serif',
-  segoe: '"Segoe UI", system-ui, sans-serif',
-  sf: '-apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif',
+  system: `system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", ${CJK_SANS}, sans-serif`,
+  inter: `"Inter", system-ui, ${CJK_SANS}, sans-serif`,
+  segoe: `"Segoe UI", system-ui, ${CJK_SANS}, sans-serif`,
+  sf: `-apple-system, BlinkMacSystemFont, "SF Pro Text", ${CJK_SANS}, sans-serif`,
 };
 
 export const monoFontStacks: Record<MonoFont, string> = {
-  jetbrains: '"JetBrains Mono", "Fira Code", "Cascadia Code", monospace',
-  fira: '"Fira Code", "JetBrains Mono", "Cascadia Code", monospace',
-  cascadia: '"Cascadia Code", "JetBrains Mono", "Fira Code", monospace',
-  'system-mono': 'ui-monospace, "SF Mono", "Cascadia Code", "Fira Code", monospace',
+  jetbrains: `"JetBrains Mono", "Fira Code", "Cascadia Code", ${CJK_SANS}, monospace`,
+  fira: `"Fira Code", "JetBrains Mono", "Cascadia Code", ${CJK_SANS}, monospace`,
+  cascadia: `"Cascadia Code", "JetBrains Mono", "Fira Code", ${CJK_SANS}, monospace`,
+  'system-mono': `ui-monospace, "SF Mono", "Cascadia Code", "Fira Code", ${CJK_SANS}, monospace`,
 };
 
 export interface ThemeContextValue {
@@ -58,32 +75,12 @@ export const ThemeContext = createContext<ThemeContextValue>({
   setMonoFontSize: () => {},
 });
 
-// ── Font loader (was fontLoader.ts) ──────────────────────────────────────────
-
-const loadedFonts: Set<string> = new Set();
-
-function loadGoogleFont(family: string, weights: string = '400;500;600') {
-  const id = `gfont-${family.replace(/\s+/g, '-').toLowerCase()}`;
-  if (loadedFonts.has(id)) return;
-  loadedFonts.add(id);
-  const link = document.createElement('link');
-  link.id = id;
-  link.rel = 'stylesheet';
-  link.href = `https://fonts.googleapis.com/css2?family=${encodeURIComponent(family)}:wght@${weights}&display=swap`;
-  document.head.appendChild(link);
-}
-
-function loadUiFont(font: string) {
-  if (font === 'inter') loadGoogleFont('Inter');
-  if (font === 'segoe') loadGoogleFont('Segoe UI');
-  if (font === 'sf') loadGoogleFont('SF Pro Text');
-}
-
-function loadMonoFont(font: string) {
-  if (font === 'jetbrains') loadGoogleFont('JetBrains Mono');
-  if (font === 'fira') loadGoogleFont('Fira Code');
-  if (font === 'cascadia') loadGoogleFont('Cascadia Code');
-}
+// Fonts are self-hosted and declared once in `assets/fonts/fonts.css`; a
+// picker change only swaps the CSS variable, so nothing here fetches. The
+// previous loader injected a `fonts.googleapis.com` stylesheet that the
+// dashboard's own CSP (`style-src 'self'`) blocked on every page — dead code
+// and a console error, and for Segoe UI / SF Pro Text it was dead anyway
+// because Google serves neither family.
 
 // ── Locale storage (was localeStorage.ts) ────────────────────────────────────
 
@@ -289,7 +286,6 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
 
   const setUiFont = useCallback((f: UiFont) => {
     setUiFontState(f);
-    loadUiFont(f);
     const next: StoredTheme = { theme, accent, colorTheme, uiFont: f, monoFont, uiFontSize, monoFontSize };
     applyAll(next);
     persist(next);
@@ -297,7 +293,6 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
 
   const setMonoFont = useCallback((f: MonoFont) => {
     setMonoFontState(f);
-    loadMonoFont(f);
     const next: StoredTheme = { theme, accent, colorTheme, uiFont, monoFont: f, uiFontSize, monoFontSize };
     applyAll(next);
     persist(next);
@@ -321,8 +316,6 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     applyAll({ theme, accent, colorTheme, uiFont, monoFont, uiFontSize, monoFontSize });
-    loadUiFont(uiFont);
-    loadMonoFont(monoFont);
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
