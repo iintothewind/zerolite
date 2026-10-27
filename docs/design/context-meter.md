@@ -73,7 +73,7 @@
 | 1 | The wire carries a single budget number; consumers reuse it as both trigger and denominator | Two distinct published numbers: the effective window (denominator) and the trim budget, which is both the trigger and the fit target (see `context-management.md` R9) | R1, R2 |
 | 2 | No published effective window | `effective_context_window` is published on usage events, WS done frames, and the RPC context-usage surface | R2 |
 | 3 | No estimation fallback specified | Provider omits usage → local estimate (script-aware, see `context-management.md` § token estimation) | R3 |
-| 4 | The turn-start meter re-estimates the population from bytes, so it jumps down at every turn start | The turn-start meter is the anchor (provider measurement + conservative tail) or the conservative estimate; the raw estimator stays as the pre-anchor face and as the dispatch guard's ratio input | R4, R5 |
+| 4 | The turn-start meter re-estimates the population from bytes, so it jumps down at every turn start | The turn-start meter is the anchor (provider measurement + conservative tail) or the conservative estimate. The raw estimator stays as the pre-anchor face; the in-turn dispatch guard anchors the same way and is never ratio-scaled | R4, R5 |
 
 ## Merge notes
 
@@ -88,13 +88,19 @@
 - **Code anchors:** `crates/zeroclaw-config/src/scattered_types.rs`
   (`ContextConfig.request_token_ceiling`),
   `crates/zeroclaw-config/src/schema.rs` (`effective_context_window`,
-  `context_trim_budget`), web `contextBar` / `historyTrimNotice`.
+  `context_trim_budget`), web `contextBar` / `historyTrimNotice`, and the one
+  fold point every meter frame goes through:
+  `web/src/contexts/contextMeter.logic.ts` (test beside it). A frame handler
+  moved back into a component splits that fold, which is the defect the module
+  exists to prevent.
 - **Verify post-merge by behavior:** run two turns where the provider
   reports 25,787 input tokens on the first: the second turn's meter must
   sit at or above 25,787, labelled `calibrated`; the usage frame reports
   the provider's own number; switch the model route and confirm the next
   turn is labelled `estimate`; fire a trim and confirm the notice's
-  `tokens_before` equals the number that triggered it.
+  `tokens_before` equals the number that triggered it **and** that its
+  `tokens_after` equals the turn-start `context_usage` that follows it — the
+  ring must move at trim time, before the provider replies.
 - **Code anchors (anchor layer):**
   `crates/zeroclaw-runtime/src/agent/history_trim.rs` (`ContextAnchor`,
   `provider_prefix_fingerprint`, `conservative_estimate_tokens`),
@@ -106,10 +112,11 @@
   --test-threads=1 meter` runs the anchor matrix; `cargo test -p
   zeroclaw-gateway --lib -- --test-threads=1 context_estimate` and
   `cargo test -p zeroclaw-api --lib -- --test-threads=1 estimate` the
-  wire labels; `npm --prefix web test` the ring source row. These are
+  wire labels; `node --experimental-strip-types --test
+  web/src/contexts/contextMeter.logic.test.ts` the frame-to-ring fold (a trim
+  must move the ring to its post-trim number, and `done` must not resurrect a
+  pre-trim figure); `npm --prefix web test` the ring source row. These are
   fork tests and must survive the merge.
-- **Tests:** the meter-denominator tests and the estimate-fallback tests
-  are fork tests; they must survive the merge.
 
 ## Sources
 

@@ -14021,11 +14021,11 @@ mod tests {
         );
     }
 
-    /// The pre-dispatch guard scales the raw estimator by the provider's
-    /// ratio; it never multiplies the calibrated meter, whose number has
-    /// already counted the provider-billed population once. Here the
-    /// ratio-scaled raw number fits the budget while multiplying the meter
-    /// would not, so the turn dispatches without trimming.
+    /// The guard anchors on the provider's own measurement and margins only the
+    /// tail; it never scales the whole population — or the meter — by the
+    /// reported/estimated ratio. The ratio construction is computed below only
+    /// to show what it *would* do: cross the budget on a request the provider
+    /// measured as fitting, and trim for nothing.
     #[tokio::test]
     async fn the_dispatch_guard_prices_the_raw_population_not_the_meter() {
         const REPORTED: u64 = 19_000;

@@ -1989,7 +1989,7 @@ mod tests {
         assert!(!r.history.iter().any(|m| m.content.contains("t0")));
     }
 
-    /// §"The trim action": stage 2 must **warn** when the chosen keep is below
+    /// §"How a trim works": stage 2 must **warn** when the chosen keep is below
     /// preferred. `below_preferred_keep` is asserted at struct level elsewhere;
     /// this pins that the warning actually reaches the log, carrying the numbers
     /// an operator needs to decide whether to raise the window or shrink the

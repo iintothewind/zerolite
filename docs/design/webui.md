@@ -15,7 +15,10 @@
   bar and the trim notice render from the same published numbers as the
   runtime (see `context-meter.md`): effective window as denominator,
   trim budget as trigger. A UI that renders its own arithmetic will
-  disagree with the runtime.
+  disagree with the runtime. Every frame that prices the request goes
+  through `contexts/contextMeter.logic.ts`; a handler added anywhere else
+  is a second arithmetic, and a trim would then show up in the transcript
+  without moving the meter.
 - **R3 — Fork identity is visible, not just a version string.** The
   zerolite mark is the web logo and the release names are zerolite's.
   Upstream branding assets must not silently replace them in a merge.

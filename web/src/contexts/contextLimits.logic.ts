@@ -2,7 +2,7 @@ import type { WsMessage } from '../types/api';
 
 /**
  * The context limits of the route that served the last call, in the terms of
- * `docs/book/src/agents/context-management.md`:
+ * `docs/design/context-management.md`:
  *
  * - `effectiveWindow` — the **effective context window**
  *   (`model_window.min(request_token_ceiling)`). This is the meter

@@ -170,7 +170,7 @@ export interface AgentContextValue {
   pendingApproval: PendingApproval | null;
   respondToApproval: (decision: ApprovalDecision) => void;
   // Context window tracking (from "done" WS frames). See #7311 and
-  // docs/book/src/agents/context-management.md.
+  // docs/design/context-management.md.
   /** The effective context window: the meter denominator. */
   contextEffectiveWindow: number | null;
   /** The trim budget: where proactive trimming engages, and what it retains to. */
