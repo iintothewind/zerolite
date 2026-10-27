@@ -427,7 +427,7 @@ struct HistoryTrimNotice {
     reason: String,
     retained_context: zeroclaw_api::agent::RetainedContextSnapshot,
     /// Provider-facing size before the trim: the number the context meter
-    /// showed when the water-line fired. A calibrated trigger reports the
+    /// showed when the budget trigger fired. A calibrated trigger reports the
     /// provider-measured number; a raw trigger reports the conservative
     /// local estimate, so `tokens_before` is always the number the user saw.
     tokens_before: u64,
@@ -438,10 +438,9 @@ struct HistoryTrimNotice {
     /// was re-priced. Clients use this to refresh the context meter without
     /// waiting for the next `done` frame.
     tokens_after: u64,
-    /// Send budget in effect at trim time. `None` when the window is
-    /// unbounded (`context_send_budget() == 0` means "no fit constraint", not
-    /// "budget of zero"), so a client never reads a zero budget as a demand to
-    /// trim to nothing.
+    /// Trim budget in effect at trim time. `None` when no budget was resolved
+    /// (a stub route reads as "no constraint", not "budget of zero"), so a
+    /// client never reads a zero budget as a demand to trim to nothing.
     token_budget: Option<u64>,
 }
 
@@ -1504,30 +1503,30 @@ impl Agent {
         )
     }
 
-    /// Trim durable `ConversationMessage` history when the water-line is
-    /// exceeded — the only pre-send trigger.
+    /// Trim durable `ConversationMessage` history when the trim budget is
+    /// exceeded — the pre-send trigger.
     ///
-    /// The water-line is a token test; the action it opens is keep-N, which
-    /// cascades down to keep≥1 until the history fits the **send** budget.
-    /// Returns `Err` when even that floor exceeds it, so the turn aborts
-    /// instead of sending an oversized request.
-    fn trim_durable_history_at_water_line(
+    /// The budget is one number: it is both the trigger and the fit target the
+    /// action drives toward. The action is keep-N, which drops one turn at a
+    /// time further down to keep≥1 until the history fits that budget. Returns
+    /// `Err` when even the floor exceeds it, so the turn aborts instead of
+    /// sending an oversized request.
+    fn trim_durable_history_at_budget(
         &mut self,
         dispatcher: &dyn crate::agent::dispatcher::ToolDispatcher,
         event_tx: Option<&tokio::sync::mpsc::Sender<TurnEvent>>,
         meter: (usize, zeroclaw_api::agent::TokenCountSource),
     ) -> Result<bool, anyhow::Error> {
-        let water_line = self.config.resolved.context_trim_budget();
-        if water_line == 0 {
+        let budget = self.config.resolved.context_trim_budget();
+        if budget == 0 {
             return Ok(false);
         }
         // The trigger reads the meter number, the same number the turn-start
-        // `ContextEstimate` publishes: a user who sees a number past the
-        // water-line sees the trim fire at that number, and a trigger that
-        // read a different number could fire while the meter sat below the
-        // line (or never fire when the meter sat above it).
-        let decision =
-            crate::agent::turn::context_pipeline::plan_pre_send_trim(meter.0, water_line, false);
+        // `ContextEstimate` publishes: a user who sees a number past the budget
+        // sees the trim fire at that number, and a trigger that read a
+        // different number could fire while the meter sat below the budget (or
+        // never fire when the meter sat above it).
+        let decision = crate::agent::turn::context_pipeline::plan_pre_send_trim(meter.0, budget);
         if !decision.should_trim {
             return Ok(false);
         }
@@ -1567,40 +1566,41 @@ impl Agent {
         self.trim_durable_history(dispatcher, self.config.resolved.keep_recent_turns(), None)
     }
 
-    /// The durable trim action itself: cascade keep-N down to the send budget,
-    /// insert the breadcrumb, record the observer event, and take the result
-    /// as the new history. Returns the notice so the caller can forward it to
-    /// the event bus; `None` when nothing was dropped.
+    /// The durable trim action itself: keep the newest `keep_recent_turns`
+    /// turns, cascade one turn at a time while the retained set still exceeds
+    /// the budget, insert the breadcrumb, record the observer event, and take
+    /// the result as the new history. Returns the notice so the caller can
+    /// forward it to the event bus; `None` when nothing was dropped.
     ///
     /// Callers own the decision to enter — see
-    /// [`Self::trim_durable_history_at_water_line`] (water-line) and
+    /// [`Self::trim_durable_history_at_budget`] (budget) and
     /// [`Self::trim_durable_history_after_loop`] (loop dropped turns). This
     /// function is the action, never the trigger.
     fn trim_durable_history(
         &mut self,
         dispatcher: &dyn crate::agent::dispatcher::ToolDispatcher,
         keep: usize,
-        // The meter number and label a water-line trigger read, so the
-        // notice reports the number the user saw on the meter. `None` on
-        // the post-loop path: no pre-send meter drove that trim, so the
-        // notice reports the conservative raw estimate.
+        // The meter number and label a budget trigger read, so the notice
+        // reports the number the user saw on the meter. `None` on the
+        // post-loop path: no pre-send meter drove that trim, so the notice
+        // reports the conservative raw estimate.
         meter: Option<(usize, zeroclaw_api::agent::TokenCountSource)>,
     ) -> Result<Option<HistoryTrimNotice>, anyhow::Error> {
-        // `send_budget == 0` means "no fit constraint", not "do nothing": the
-        // keep-N preference still applies, and `trim_conversation_to_fit_with`
-        // treats a zero budget exactly that way.
-        let send_budget = self.config.resolved.context_send_budget();
-        // The cascade prices messages, while `send_budget` bounds the whole
+        // A zero budget means "no fit constraint", not "do nothing": the keep-N
+        // preference still applies, and `trim_conversation_to_fit_with` treats a
+        // zero budget exactly that way.
+        let budget = self.config.resolved.context_trim_budget();
+        // The cascade prices messages, while the budget bounds the whole
         // request — messages plus the tool definitions it carries. Handing the
         // cascade the full budget would let a post-trim request exceed it by
         // the schema size. The `.max(1)` keeps a real constraint real when the
         // schemas alone fill the budget: passing zero would read as "no
         // constraint" and the oversized turn would be sent instead of failing.
         let schema_tokens = self.dispatched_tool_schema_tokens(dispatcher);
-        let history_budget = if send_budget == 0 {
+        let history_budget = if budget == 0 {
             0
         } else {
-            send_budget.saturating_sub(schema_tokens).max(1)
+            budget.saturating_sub(schema_tokens).max(1)
         };
         let estimate = |h: &[zeroclaw_providers::ConversationMessage]| {
             crate::agent::history::estimate_history_tokens(&dispatcher.to_provider_messages(h))
@@ -1659,7 +1659,7 @@ impl Agent {
                 //
                 // `tokens_before` is the number the trigger read: the
                 // provider-measured anchor when a valid anchor fired the
-                // water-line, the conservative raw estimate otherwise.
+                // budget trigger, the conservative raw estimate otherwise.
                 // `tokens_after` is always the conservative raw estimate:
                 // the trim rewrote the prefix, so no provider measurement
                 // describes the trimmed population yet.
@@ -1674,7 +1674,7 @@ impl Agent {
                 tokens_after: crate::agent::history_trim::conservative_estimate_tokens(
                     result.tokens_after + schema_tokens,
                 ) as u64,
-                token_budget: (send_budget > 0).then_some(send_budget as u64),
+                token_budget: (budget > 0).then_some(budget as u64),
             }));
         }
         self.history = result.history;
@@ -1682,8 +1682,8 @@ impl Agent {
             let system_floor = crate::agent::history::estimate_system_floor_tokens(
                 &dispatcher.to_provider_messages(&self.history),
             ) + schema_tokens;
-            let msg = if system_floor >= send_budget {
-                crate::agent::history::context_floor_remediation(system_floor, send_budget)
+            let msg = if system_floor >= budget {
+                crate::agent::history::context_floor_remediation(system_floor, budget)
             } else {
                 "Context overflow unrecoverable: only one turn left, cannot trim further"
                     .to_string()
@@ -1695,7 +1695,7 @@ impl Agent {
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                     .with_attrs(::serde_json::json!({
                         "tokens_after": result.tokens_after,
-                        "budget": send_budget,
+                        "budget": budget,
                         "kept_turns": result.kept_turns,
                         "error_key": "context_floor_exceeds_budget",
                     })),
@@ -2535,7 +2535,7 @@ impl Agent {
             }
         }
         // Restored history is not capped at seed time: context is bounded by
-        // the water-line trim inside the turn. Trimming here would instead cut
+        // the budget trim inside the turn. Trimming here would instead cut
         // every restored transcript back to keep_recent_turns on load.
         None
     }
@@ -2568,7 +2568,7 @@ impl Agent {
             self.history.push(msg);
         }
         // Restored history is not capped at seed time: context is bounded by
-        // the water-line trim inside the turn. Trimming here would instead cut
+        // the budget trim inside the turn. Trimming here would instead cut
         // every restored transcript back to keep_recent_turns on load.
         None
     }
@@ -4221,9 +4221,9 @@ impl Agent {
             }
         };
 
-        // Durable water-line trim: shrink Agent.history before building the
+        // Durable budget trim: shrink Agent.history before building the
         // provider view so session/UI and the model share one transcript. The
-        // water-line is the only pre-send trigger; the action it opens is
+        // budget is the only pre-send trigger; the action it opens is
         // keep-N.
         //
         // `None` is deliberate, not an oversight: this non-streaming path has
@@ -4239,7 +4239,7 @@ impl Agent {
         // an anchor left by a previous streamed turn prices the anchored
         // prefix, the conservative estimate prices a request with no anchor.
         // No `ContextEstimate` is published on this path (no event bus), but
-        // the water-line must decide on the same number a meter would, not a
+        // the budget must decide on the same number a meter would, not a
         // second, lower number.
         let provider_messages = active_dispatcher.to_provider_messages(&self.history);
         let schema_tokens = self.dispatched_tool_schema_tokens(active_dispatcher.as_ref());
@@ -4250,7 +4250,7 @@ impl Agent {
             &provider_name,
             &effective_model,
         );
-        self.trim_durable_history_at_water_line(active_dispatcher.as_ref(), None, meter)?;
+        self.trim_durable_history_at_budget(active_dispatcher.as_ref(), None, meter)?;
 
         // Rebuild after the trim: a trim rewrites `self.history`, so the
         // cache key must describe the trimmed request.
@@ -4818,10 +4818,10 @@ impl Agent {
         };
 
         // The meter number for this turn's request, read BEFORE the
-        // water-line decides: the provider-measured anchor when a valid
+        // budget decides: the provider-measured anchor when a valid
         // anchor prices this population, the conservative local estimate
         // otherwise. The trigger and the published `ContextEstimate` read
-        // this one number, so a user who sees a number past the water-line
+        // this one number, so a user who sees a number past the budget
         // sees the trim fire at that number.
         let schema_tokens = self.dispatched_tool_schema_tokens(active_dispatcher.as_ref());
         let pre_trim_messages = active_dispatcher.to_provider_messages(&self.history);
@@ -4831,7 +4831,7 @@ impl Agent {
             &active_provider_name,
             &active_model_name,
         );
-        let trimmed = match self.trim_durable_history_at_water_line(
+        let trimmed = match self.trim_durable_history_at_budget(
             active_dispatcher.as_ref(),
             Some(&event_tx),
             meter,
@@ -11019,7 +11019,6 @@ mod tests {
                 context_token_budget: 160_000,
                 model_context_window_source:
                     zeroclaw_config::schema::ModelContextWindowSource::Configured,
-                context_send_budget: 0,
                 keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
                 request_token_ceiling: None,
             }
@@ -12019,7 +12018,7 @@ mod tests {
         );
     }
 
-    /// Restored history is not capped at seed time: the water-line trim
+    /// Restored history is not capped at seed time: the budget trim
     /// inside the turn bounds it. Seeding a transcript that is already over
     /// the configured keep-N does not trim it, and no transport event is
     /// emitted — the trim that will actually drop turns happens when the turn
@@ -12037,7 +12036,7 @@ mod tests {
         assert_eq!(
             agent.history.len(),
             5,
-            "seed keeps every restored message; the turn's water-line trim bounds it"
+            "seed keeps every restored message; the turn's budget trim bounds it"
         );
         assert!(!agent.history_has_trim_breadcrumb);
     }
@@ -12073,7 +12072,7 @@ mod tests {
         assert_eq!(
             agent.history.len(),
             7,
-            "seed keeps every restored message; the turn's water-line trim bounds it"
+            "seed keeps every restored message; the turn's budget trim bounds it"
         );
         assert!(!agent.history_has_trim_breadcrumb);
     }
@@ -13002,7 +13001,7 @@ mod tests {
     }
 
     /// The same fixture with an explicit runtime resolution, so a test can pin
-    /// the context window and water-line percentage the trim cascade reads.
+    /// the context window and trim budget percentage the trim cascade reads.
     fn trim_test_agent_with_resolved(
         resolved: zeroclaw_config::schema::ResolvedRuntime,
         observer: Arc<dyn Observer>,
@@ -13310,11 +13309,11 @@ mod tests {
 
     /// The regression this whole change exists for. `service start` reported a
     /// trim on every single turn because the upstream `trim_history` cut the
-    /// transcript back to keep-N on the turn's success path. The water-line is
+    /// transcript back to keep-N on the turn's success path. The budget is
     /// the only pre-send trigger, so a transcript that never crosses it must
     /// come out of the turn intact.
     #[tokio::test]
-    async fn a_turn_below_the_water_line_keeps_every_turn() {
+    async fn a_turn_below_the_budget_keeps_every_turn() {
         let capturing = Arc::new(CapturingObserver::default());
         let observer: Arc<dyn Observer> = capturing.clone();
         let mut agent = trim_test_agent(observer);
@@ -13333,7 +13332,7 @@ mod tests {
                 message,
                 ConversationMessage::Chat(chat) if chat.content == "older user"
             )),
-            "a transcript under the water-line must not lose turns"
+            "a transcript under the budget must not lose turns"
         );
         assert!(
             !agent.history_has_trim_breadcrumb,
@@ -13345,12 +13344,12 @@ mod tests {
                 .lock()
                 .iter()
                 .any(|event| matches!(event, ObserverEvent::HistoryTrimmed { .. })),
-            "no trim event may be emitted below the water-line"
+            "no trim event may be emitted below the budget"
         );
     }
 
     /// The chain the meter depends on, driven through the real streaming path:
-    /// a turn whose assembled request crosses the water-line must publish the
+    /// a turn whose assembled request crosses the budget must publish the
     /// post-trim estimate **before** the provider's usage for the same turn.
     ///
     /// Each piece was covered on its own — the trim's accounting in
@@ -13374,7 +13373,7 @@ mod tests {
         let mut history = vec![ConversationMessage::Chat(ChatMessage::system("system"))];
         for index in 0..8 {
             history.push(ConversationMessage::Chat(ChatMessage::user(&format!(
-                "old user {index}, long enough that eight of these cross the water-line on their own"
+                "old user {index}, long enough that eight of these cross the budget on their own"
             ))));
             history.push(ConversationMessage::Chat(ChatMessage::assistant(&format!(
                 "old assistant {index}, answering at a comparable length so the estimate is honest"
@@ -13414,7 +13413,7 @@ mod tests {
             .position(|event| matches!(event, TurnEvent::Usage { .. }))
             .expect("the provider call must report usage");
 
-        // The water-line is acted on before the request is assembled, so the
+        // The budget is acted on before the request is assembled, so the
         // trim lands first, the assembled size second, the measurement third.
         // Any other order would let a client apply a pre-trim number on top of
         // a post-trim one.
@@ -13448,7 +13447,7 @@ mod tests {
     }
 
     /// A tool whose description is large enough to dominate a small history, so
-    /// a water-line fixture can cross the line with the schema alone.
+    /// a budget fixture can cross the line with the schema alone.
     struct FatSchemaTool(String);
 
     #[async_trait]
@@ -13472,7 +13471,7 @@ mod tests {
     }
     zeroclaw_api::mock_tool_attribution!(FatSchemaTool);
 
-    /// The water-line and the assembled size are measured against the
+    /// The budget and the assembled size are measured against the
     /// population the provider is billed for: messages **plus** the tool
     /// definitions the request carries.
     ///
@@ -13483,7 +13482,7 @@ mod tests {
     /// message estimate, which is what made it drop mid-turn and climb back
     /// when `usage` arrived with the real number.
     #[tokio::test]
-    async fn the_water_line_counts_the_tool_schemas_the_request_carries() {
+    async fn the_budget_counts_the_tool_schemas_the_request_carries() {
         let fat = FatSchemaTool("d".repeat(20_000));
         let schema_tokens = crate::agent::history::estimate_tool_schema_tokens(&[fat.spec()]);
         assert!(
@@ -13493,7 +13492,12 @@ mod tests {
 
         let mut resolved = zeroclaw_config::schema::ResolvedRuntime::default();
         resolved.context.keep_recent_turns = Some(1);
-        resolved.context.trim_threshold_percent = 10;
+        // 30% of the 20k ceiling is a 6k budget: big enough for the schema
+        // (~4.6k) plus the retained turn, which is what makes "the retained
+        // request fits the budget" a reachable claim here. A budget under the
+        // schema itself would make the floor unreachable and turn this into a
+        // soft-floor test instead.
+        resolved.context.trim_threshold_percent = 30;
         resolved.context.request_token_ceiling = Some(20_000);
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = trim_test_agent_with_resolved(resolved, observer);
@@ -13509,7 +13513,7 @@ mod tests {
             crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(fat)]);
         agent.history = vec![
             ConversationMessage::Chat(ChatMessage::system("system")),
-            ConversationMessage::Chat(ChatMessage::user("old user")),
+            ConversationMessage::Chat(ChatMessage::user("x".repeat(40_000))),
             ConversationMessage::Chat(ChatMessage::assistant("old assistant")),
         ];
 
@@ -13688,14 +13692,14 @@ mod tests {
     #[tokio::test]
     async fn turn_start_meter_never_falls_below_the_last_provider_measurement() {
         const REPORTED: u64 = 25_787;
-        // A window far above the fixture keeps the water-line out of the
+        // A window far above the fixture keeps the budget out of the
         // picture; this test is about the meter, not about trimming.
         let mut resolved = zeroclaw_config::schema::ResolvedRuntime::default();
         resolved.model_context_window = 1_000_000;
         resolved.model_context_window_source =
             zeroclaw_config::schema::ModelContextWindowSource::Configured;
         resolved.context.request_token_ceiling = Some(1_000_000);
-        resolved.context.trim_threshold_percent = 80; // water-line 800_000
+        resolved.context.trim_threshold_percent = 80; // budget 800_000
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = trim_test_agent_with_resolved(resolved, observer);
         agent.model_provider = Box::new(ReportedInputProvider(Some(REPORTED)));
@@ -13801,7 +13805,7 @@ mod tests {
         resolved.model_context_window_source =
             zeroclaw_config::schema::ModelContextWindowSource::Configured;
         resolved.context.request_token_ceiling = Some(131_072);
-        resolved.context.trim_threshold_percent = 80; // water-line far above the fixture
+        resolved.context.trim_threshold_percent = 80; // budget far above the fixture
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = trim_test_agent_with_resolved(resolved, observer);
         agent.model_provider = Box::new(ReportedInputProvider(Some(REPORTED)));
@@ -13863,17 +13867,17 @@ mod tests {
         );
     }
 
-    /// The water-line trigger, the trim notice's `tokens_before`, and the
+    /// The budget trigger, the trim notice's `tokens_before`, and the
     /// meter all report the same calibrated number; the trim clears the
     /// anchor, so the meter a user sees after the trim is the conservative
     /// estimate of what the trim left behind.
     #[tokio::test]
-    async fn the_water_line_trims_at_the_meter_number_and_reports_it() {
+    async fn the_budget_trims_at_the_meter_number_and_reports_it() {
         const REPORTED: u64 = 100_000;
         // A provider window of 131,072 with an 80% threshold: the
-        // water-line is 104,857. A 32-row opening at 10,000 characters
+        // budget is 104,857. A 32-row opening at 10,000 characters
         // each puts the conservative margin of the turn-one estimate
-        // (~100,750) under the water-line, so turn one dispatches
+        // (~100,750) under the budget, so turn one dispatches
         // untrimmed; the provider reports 100,000 and the anchor carries
         // it into turn two.
         let mut resolved = zeroclaw_config::schema::ResolvedRuntime::default();
@@ -13882,8 +13886,8 @@ mod tests {
             zeroclaw_config::schema::ModelContextWindowSource::Configured;
         resolved.context.request_token_ceiling = Some(131_072);
         resolved.context.trim_threshold_percent = 80;
-        let water_line = resolved.context_trim_budget();
-        assert_eq!(water_line, 104_857);
+        let budget = resolved.context_trim_budget();
+        assert_eq!(budget, 104_857);
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = trim_test_agent_with_resolved(resolved, observer);
         agent.model_provider = Box::new(ReportedInputProvider(Some(REPORTED)));
@@ -13900,7 +13904,7 @@ mod tests {
         agent.history = opening.clone();
 
         // Turn one: the conservative margin over the raw estimate stays under
-        // the water-line, and the provider's report is under it too, so
+        // the budget, and the provider's report is under it too, so
         // neither guard fires and the anchor survives.
         let mut turn1_durable = opening.clone();
         turn1_durable.push(ConversationMessage::Chat(ChatMessage::user("turn one")));
@@ -13927,18 +13931,18 @@ mod tests {
             Some(zeroclaw_api::agent::TokenCountSource::Estimated)
         );
         assert!(
-            meter1 < water_line as u64,
+            meter1 < budget as u64,
             "turn one must not trim: its margin-estimate {meter1} reaches the \
-             water-line {water_line}"
+             budget {budget}"
         );
         assert!(
             trim_notice(&events1).is_none(),
             "turn one must not trim: the provider's {REPORTED} also sits under \
-             the water-line {water_line}"
+             the budget {budget}"
         );
 
         // Turn two: the anchor prices the provider's measurement, and the
-        // big user row pushes the calibrated number over the water-line.
+        // big user row pushes the calibrated number over the budget.
         let big_turn2 = "y".repeat(24_000);
         let rows_after_turn1 =
             crate::agent::dispatcher::NativeToolDispatcher.to_provider_messages(&agent.history);
@@ -13956,9 +13960,9 @@ mod tests {
                 crate::agent::history::estimate_history_tokens(&tail),
             ) as u64;
         assert!(
-            meter2_calibrated >= water_line as u64,
-            "the fixture's calibrated number must cross the water-line \
-             {water_line}: {meter2_calibrated}"
+            meter2_calibrated >= budget as u64,
+            "the fixture's calibrated number must cross the budget \
+             {budget}: {meter2_calibrated}"
         );
 
         let (tx2, mut rx2) = tokio::sync::mpsc::channel::<TurnEvent>(64);
@@ -13969,11 +13973,11 @@ mod tests {
         let events2 = drain_turn_events(&mut rx2);
 
         let (before, before_source, after) = trim_notice(&events2)
-            .expect("a calibrated number crossing the water-line must fire the trim");
+            .expect("a calibrated number crossing the budget must fire the trim");
         assert_eq!(
             before,
             Some(meter2_calibrated),
-            "the notice reports the number the water-line trigger read"
+            "the notice reports the number the budget trigger read"
         );
         assert_eq!(
             before_source,
@@ -14000,9 +14004,9 @@ mod tests {
             "the post-trim number is labelled estimate"
         );
         assert!(
-            post_raw <= water_line,
-            "the trim fits the raw request under the water-line it targets: \
-             {post_raw} > {water_line}"
+            post_raw <= budget,
+            "the trim fits the raw request under the budget it targets: \
+             {post_raw} > {budget}"
         );
         assert!(after.is_some());
     }
@@ -14010,19 +14014,17 @@ mod tests {
     /// The pre-dispatch guard scales the raw estimator by the provider's
     /// ratio; it never multiplies the calibrated meter, whose number has
     /// already counted the provider-billed population once. Here the
-    /// ratio-scaled raw number fits the send budget while multiplying the
-    /// meter would not, so the turn dispatches without trimming.
+    /// ratio-scaled raw number fits the budget while multiplying the meter
+    /// would not, so the turn dispatches without trimming.
     #[tokio::test]
     async fn the_dispatch_guard_prices_the_raw_population_not_the_meter() {
         const REPORTED: u64 = 19_000;
         // The provider declares no context window, so the effective window
-        // is the 32k compatibility fallback: an 80% water-line is 25,600 and
-        // the send budget is the full 32k.
+        // is the 32k compatibility fallback: an 80% budget is 25,600.
         let mut resolved = zeroclaw_config::schema::ResolvedRuntime::default();
         resolved.context.trim_threshold_percent = 80;
-        let water_line = resolved.context_trim_budget();
-        let send_budget = resolved.context_send_budget();
-        assert_eq!((water_line, send_budget), (25_600, 32_000));
+        let budget = resolved.context_trim_budget();
+        assert_eq!(budget, 25_600);
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = trim_test_agent_with_resolved(resolved, observer);
         agent.model_provider = Box::new(ReportedInputProvider(Some(REPORTED)));
@@ -14064,14 +14066,14 @@ mod tests {
         let meter_scaled = (meter2 as f64 * ratio).round() as u64;
         assert!(ratio > 1.0);
         assert!(
-            guard_number < water_line as u64,
-            "the ratio-scaled raw population must fit the water-line target: \
-             {guard_number} >= {water_line}"
+            guard_number < budget as u64,
+            "the ratio-scaled raw population must fit the budget target: \
+             {guard_number} >= {budget}"
         );
         assert!(
-            meter_scaled > water_line as u64,
+            meter_scaled > budget as u64,
             "scaling the meter number with the same ratio must cross the \
-             target: {meter_scaled} <= {water_line}"
+             target: {meter_scaled} <= {budget}"
         );
 
         let (tx2, mut rx2) = tokio::sync::mpsc::channel::<TurnEvent>(64);
@@ -14278,23 +14280,32 @@ mod tests {
         );
     }
 
-    /// The margin factor covers the observed estimator bias behind the
-    /// deployed-board drop: the raw re-estimate of 20,826 for a provider
-    /// measurement of 25,787.
+    /// The margin factor: one tenth above the raw estimate, rounded up. The
+    /// deployed-board drop that first motivated a margin (a raw re-estimate of
+    /// 20,826 for a provider measurement of 25,787) is what put the factor on
+    /// the map; how wide it is stays the operator's call, and widening it
+    /// biases the trigger further above the provider's real number.
     #[test]
-    fn conservative_estimate_covers_the_observed_estimator_bias() {
-        let raw = 20_826;
-        let provider = 25_787;
-        let margin = crate::agent::history_trim::conservative_estimate_tokens(raw);
-        assert!(
-            margin >= raw,
-            "the conservative number never sits under the raw estimate"
+    fn conservative_estimate_adds_one_tenth_and_never_undershoots() {
+        assert_eq!(
+            crate::agent::history_trim::conservative_estimate_tokens(100),
+            110
         );
-        assert!(
-            margin >= provider,
-            "the margin must cover the observed 0.808 estimator ratio: \
-             {margin} < {provider}"
+        assert_eq!(
+            crate::agent::history_trim::conservative_estimate_tokens(20_826),
+            22_909
         );
+        for raw in [1usize, 9, 10, 11, 99, 1_000, 20_826] {
+            let margin = crate::agent::history_trim::conservative_estimate_tokens(raw);
+            assert!(
+                margin >= raw,
+                "the conservative number never sits under the raw estimate (raw={raw})"
+            );
+            assert!(
+                margin * 10 <= raw * 11 + 10,
+                "the margin stays within one tenth plus rounding (raw={raw}, margin={margin})"
+            );
+        }
     }
 
     /// The turn-start meter contract, asserted directly on
@@ -14443,8 +14454,8 @@ mod tests {
         );
         assert_eq!(
             meter,
-            (whole_raw * 5).div_ceil(4),
-            "the margin is 5/4 rounded up"
+            (whole_raw * 11).div_ceil(10),
+            "the margin is 11/10 rounded up"
         );
     }
 
@@ -14452,7 +14463,7 @@ mod tests {
     /// the trim's `(tokens_before, tokens_before_source, tokens_after)`.
     ///
     /// Sized so only the post-response guard can fire: three old turns stay
-    /// under the water-line on their own, and the reported count clears it. The
+    /// under the budget on their own, and the reported count clears it. The
     /// fixture asserts that by checking `tokens_before`, so a sizing mistake
     /// fails loudly instead of quietly testing the other guard.
     async fn post_response_trim_under(
@@ -14466,7 +14477,7 @@ mod tests {
         let mut resolved = zeroclaw_config::schema::ResolvedRuntime::default();
         resolved.context.keep_recent_turns = Some(1);
         // The fixture's provider declares no context window, so the effective
-        // window is the 32k compatibility fallback and the water-line is 50% of
+        // window is the 32k compatibility fallback and the budget is 50% of
         // it. That has to clear `messages + schema` (~5.6k) or the pre-send
         // guard trims first and this test never reaches the post-response one.
         resolved.context.trim_threshold_percent = 50;
@@ -14526,7 +14537,7 @@ mod tests {
                 found = Some((tokens_before, tokens_before_source, tokens_after));
             }
         }
-        found.expect("a reported count over the water-line must trim the durable history")
+        found.expect("a reported count over the budget must trim the durable history")
     }
 
     /// The post-response guard reports the size the NEXT request carries, and
@@ -14577,10 +14588,10 @@ mod tests {
     }
 
     /// The regression behind "only 5 turns survive": a trim that fires on the
-    /// turn count instead of on the water-line.
+    /// turn count instead of on the budget.
     ///
     /// `keep_recent_turns` is a **retention** preference — how many turns are
-    /// kept *if* the water-line fires — and never a trigger of its own. With
+    /// kept *if* the budget fires — and never a trigger of its own. With
     /// `keep = 2` and six turns (three times the preference), any per-turn cap
     /// would have cut the transcript from turn 3 onward, which is exactly the
     /// shape of the reported bug.
@@ -14620,7 +14631,7 @@ mod tests {
                     .lock()
                     .iter()
                     .any(|event| matches!(event, ObserverEvent::HistoryTrimmed { .. })),
-                "no trim may be observable on turn {index}: the water-line was never crossed"
+                "no trim may be observable on turn {index}: the budget was never crossed"
             );
         }
 
@@ -14638,24 +14649,24 @@ mod tests {
         }
     }
 
-    /// The other half of the pre-send trigger. Above the water-line the trim
+    /// The other half of the pre-send trigger. Above the budget the trim
     /// fires *before* the request is built, so the durable transcript — not
     /// just the disposable provider view — is what shrinks.
     #[tokio::test]
-    async fn a_turn_above_the_water_line_trims_before_sending() {
+    async fn a_turn_above_the_budget_trims_before_sending() {
         const WINDOW: usize = 40_000;
         let mut resolved = zeroclaw_config::schema::ResolvedRuntime::default();
         resolved.model_context_window = WINDOW;
-        // 30%: the water-line sits at 12k, comfortably under the window, so a
+        // 30%: the budget sits at 12k, comfortably under the window, so a
         // transcript that already fits the window can still be over the
-        // trigger. That is the distinction the two numbers exist for.
+        // budget. That is the distinction between the budget and the window.
         resolved.context.trim_threshold_percent = 30;
 
         let capturing = Arc::new(CapturingObserver::default());
         let observer: Arc<dyn Observer> = capturing.clone();
         let mut agent = trim_test_agent_with_resolved(resolved, observer);
 
-        // Seven old turns of ~1k tokens each: ~14k, above the 12k water-line,
+        // Seven old turns of ~1k tokens each: ~14k, above the 12k budget,
         // below the window, and more turns than keep-N prefers to retain.
         let padding = "x".repeat(4_000);
         agent.history = vec![ConversationMessage::Chat(ChatMessage::system("system"))];
@@ -14676,19 +14687,19 @@ mod tests {
         );
         assert!(
             before > agent.config.resolved.context_trim_budget(),
-            "the fixture must start above the water-line ({before} <= {})",
+            "the fixture must start above the budget ({before} <= {})",
             agent.config.resolved.context_trim_budget()
         );
         assert!(
             before <= WINDOW,
-            "and below the window ({before} > {WINDOW}), so only the water-line can fire"
+            "and below the window ({before} > {WINDOW}), so only the budget can fire"
         );
 
         agent.turn("new user").await.expect("turn should succeed");
 
         assert!(
             agent.history_has_trim_breadcrumb,
-            "crossing the water-line must trim and record the breadcrumb"
+            "crossing the budget must trim and record the breadcrumb"
         );
         assert!(
             !agent.history.iter().any(|message| matches!(
@@ -14723,7 +14734,7 @@ mod tests {
         const WINDOW: usize = 40_000;
         let mut resolved = zeroclaw_config::schema::ResolvedRuntime::default();
         resolved.model_context_window = WINDOW;
-        // 100%: the water-line sits at the window, so it cannot fire on a
+        // 100%: the budget sits at the window, so it cannot fire on a
         // transcript that still fits. Only the loop's own cascade can.
         resolved.context.trim_threshold_percent = 100;
 
@@ -18537,7 +18548,7 @@ mod tests {
                 .expect("memory creation should succeed with valid config"),
         );
 
-        // Default runtime resolution: the water-line is far above this
+        // Default runtime resolution: the budget is far above this
         // transcript, so pre-filling must not trigger any trim.
         let agent_config = zeroclaw_config::schema::AliasedAgentConfig {
             resolved: zeroclaw_config::schema::ResolvedRuntime::default(),
@@ -19389,7 +19400,7 @@ mod tests {
         let (budget, window) = terminal_usage
             .expect("a terminal Usage snapshot must fire even without provider usage");
         // Default builder has no configured capacity -> the 32k compatibility
-        // stub, whose water-line is 80% of it. The window is omitted from the
+        // stub, whose budget is 80% of it. The window is omitted from the
         // wire (not configured truth).
         assert_eq!(budget, Some(25_600));
         assert_eq!(
@@ -19515,7 +19526,6 @@ mod tests {
                 context_token_budget: 180_000,
                 model_context_window_source:
                     zeroclaw_config::schema::ModelContextWindowSource::Configured,
-                context_send_budget: 0,
                 keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
                 request_token_ceiling: None,
             }
@@ -19818,13 +19828,13 @@ vision_model_provider = "custom.vision"
             Some(200_000),
             "the first usage frame must carry the 200k text route it was served on"
         );
-        // No runtime profile in this config, so the water-line is 80% of the
+        // No runtime profile in this config, so the budget is 80% of the
         // text route's 200k capacity, which is what distinguishes it from the
         // vision frame below.
         assert_eq!(
             first_budget,
             Some(160_000),
-            "the water-line follows the text route's 200k capacity"
+            "the budget follows the text route's 200k capacity"
         );
 
         let terminal_index = usage_frames
@@ -19849,7 +19859,7 @@ vision_model_provider = "custom.vision"
         assert_eq!(
             budget,
             Some(6_400),
-            "the 8k vision capacity clamps the water-line to 80% of it"
+            "the 8k vision capacity clamps the budget to 80% of it"
         );
 
         // Route IDENTITY on the outcome, not just the numbers: a window that
@@ -19872,7 +19882,7 @@ vision_model_provider = "custom.vision"
         );
         assert_eq!(
             final_limits.context_token_budget, 6_400,
-            "the outcome's limits must agree with the terminal snapshot's water-line"
+            "the outcome's limits must agree with the terminal snapshot's budget"
         );
     }
 
@@ -20117,7 +20127,7 @@ model_provider = "custom.primary"
         );
         assert_eq!(
             final_limits.context_token_budget, 6_400,
-            "the fallback's 8k capacity must clamp the water-line to 80% of it"
+            "the fallback's 8k capacity must clamp the budget to 80% of it"
         );
 
         // The wire frame consumers actually read must agree with the outcome.
@@ -20136,7 +20146,7 @@ model_provider = "custom.primary"
             terminal,
             Some((Some(6_400), Some(8_000))),
             "the usage-less fallback must publish a terminal snapshot carrying ITS window \
-             and the 80% water-line derived from it"
+             and the 80% budget derived from it"
         );
     }
 
@@ -20738,7 +20748,7 @@ model_provider = "custom.only"
         );
         assert_eq!(
             limits.context_token_budget, 6_400,
-            "the water-line is 80% of the refreshed 8k capacity"
+            "the budget is 80% of the refreshed 8k capacity"
         );
         assert_eq!(
             agent
@@ -21169,7 +21179,6 @@ model_provider = "custom.only"
                     context_token_budget: 180_000,
                     model_context_window_source:
                         zeroclaw_config::schema::ModelContextWindowSource::Configured,
-                    context_send_budget: 0,
                     keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
                     request_token_ceiling: None,
                 },
@@ -21178,7 +21187,6 @@ model_provider = "custom.only"
                     context_token_budget: 7_200,
                     model_context_window_source:
                         zeroclaw_config::schema::ModelContextWindowSource::Configured,
-                    context_send_budget: 0,
                     keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
                     request_token_ceiling: None,
                 },
@@ -21187,7 +21195,6 @@ model_provider = "custom.only"
                     context_token_budget: 32_000,
                     model_context_window_source:
                         zeroclaw_config::schema::ModelContextWindowSource::CompatibilityFallback,
-                    context_send_budget: 0,
                     keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
                     request_token_ceiling: None,
                 },
@@ -21209,7 +21216,6 @@ model_provider = "custom.only"
                 context_token_budget: 7_200,
                 model_context_window_source:
                     zeroclaw_config::schema::ModelContextWindowSource::Configured,
-                context_send_budget: 0,
                 keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
                 request_token_ceiling: None,
             },

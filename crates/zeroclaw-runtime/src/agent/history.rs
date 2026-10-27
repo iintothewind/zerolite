@@ -523,7 +523,7 @@ mod tests {
 
     #[test]
     fn estimate_ascii_matches_legacy_four_chars_per_token() {
-        // Pure ASCII stays at ~4 chars/token + framing so English water-lines
+        // Pure ASCII stays at ~4 chars/token + framing so English budgets
         // do not jump relative to the historical byte heuristic.
         let msg = "a".repeat(40);
         assert_eq!(

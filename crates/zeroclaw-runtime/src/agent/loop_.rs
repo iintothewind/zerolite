@@ -322,12 +322,9 @@ const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
 fn interactive_context_recovery_budget(
     context_limits: zeroclaw_config::schema::ResolvedContextLimits,
 ) -> usize {
-    // The fit target is the send budget (window − reserve), never a
-    // hardcoded fraction of the window.
-    crate::agent::history_trim::resolve_send_budget(
-        context_limits.context_send_budget,
-        context_limits.context_token_budget,
-    )
+    // One budget, both roles: the same number triggers a trim and bounds what
+    // survives it. Never a hardcoded fraction of the window.
+    context_limits.context_token_budget
 }
 
 /// The single autosave decision for a turn's user-side text, shared by both
@@ -4475,7 +4472,6 @@ mod tests {
             context_token_budget,
             model_context_window_source:
                 zeroclaw_config::schema::ModelContextWindowSource::CompatibilityFallback,
-            context_send_budget: 0,
             keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
             request_token_ceiling: None,
         }
@@ -17936,24 +17932,19 @@ Let me check the result."#;
     }
 
     #[test]
-    fn cli_outer_recovery_uses_the_send_budget() {
+    fn cli_outer_recovery_uses_the_trim_budget() {
         let context_limits = zeroclaw_config::schema::ResolvedContextLimits {
             model_context_window: 32_000,
             model_context_window_source:
                 zeroclaw_config::schema::ModelContextWindowSource::Configured,
             context_token_budget: 7_200,
-            context_send_budget: 28_800,
             keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
             request_token_ceiling: None,
         };
         let recovery_budget = interactive_context_recovery_budget(context_limits);
         assert_eq!(
-            recovery_budget, 28_800,
-            "recovery fits against the send budget, never a hardcoded fraction of the window"
-        );
-        assert_ne!(
-            recovery_budget, context_limits.context_token_budget,
-            "the send budget is distinct from the proactive water-line"
+            recovery_budget, 7_200,
+            "recovery fits against the configured trim budget, never a hardcoded fraction of the window"
         );
 
         let big = "x".repeat(4000);
@@ -17968,8 +17959,9 @@ Let me check the result."#;
             "fixture must overflow the window: got {tokens_before}"
         );
 
-        // Recovery fits against the send budget: prefer the configured
-        // keep-N turns, then cascade down until the retained set fits.
+        // Recovery fits against the trim budget: prefer the configured
+        // keep-N turns, then drop one turn at a time until the retained set
+        // fits that one number.
         let result = crate::agent::history_trim::trim_to_fit(
             history,
             context_limits.keep_recent_turns,
@@ -17978,7 +17970,7 @@ Let me check the result."#;
         );
         assert!(
             result.trimmed,
-            "recovery must trim when the estimate exceeds the 90% budget"
+            "recovery must trim when the estimate exceeds the budget"
         );
         assert!(
             result.tokens_after <= recovery_budget,
@@ -18604,7 +18596,6 @@ Let me check the result."#;
                             context_token_budget: 100,
                             model_context_window_source:
                                 zeroclaw_config::schema::ModelContextWindowSource::Configured,
-                            context_send_budget: 0,
                             keep_recent_turns:
                                 zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
                             request_token_ceiling: None,
@@ -21614,7 +21605,6 @@ Let me check the result."#;
                             } else {
                                 32_768
                             },
-                            context_send_budget: 0,
                             keep_recent_turns:
                                 zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
                             request_token_ceiling: None,
@@ -22006,7 +21996,6 @@ Let me check the result."#;
                     // population exceeds it, but comfortable for the first.
                     context_limits: zeroclaw_config::schema::ResolvedContextLimits {
                         model_context_window: 2_000,
-                        context_send_budget: 0,
                         keep_recent_turns:
                             zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
                         request_token_ceiling: None,
@@ -22139,7 +22128,6 @@ Let me check the result."#;
                     max_tool_result_chars: 0,
                     context_limits: zeroclaw_config::schema::ResolvedContextLimits {
                         model_context_window,
-                        context_send_budget: 0,
                         keep_recent_turns:
                             zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
                         request_token_ceiling: None,
@@ -22420,7 +22408,6 @@ Let me check the result."#;
                     // (well under 100 tokens for two short text messages).
                     context_limits: zeroclaw_config::schema::ResolvedContextLimits {
                         model_context_window: 500,
-                        context_send_budget: 0,
                         keep_recent_turns:
                             zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
                         request_token_ceiling: None,
@@ -23890,7 +23877,7 @@ Pin 13: LED
     }
 
     #[tokio::test]
-    async fn pre_send_trim_fits_to_send_budget_distinct_from_water_line() {
+    async fn pre_send_trim_drives_history_down_to_the_budget() {
         use super::{ToolLoop, run_tool_call_loop};
         use crate::agent::history::estimate_history_tokens;
         use crate::observability::noop::NoopObserver;
@@ -23924,28 +23911,15 @@ Pin 13: LED
             ChatMessage::user("turn7 short"),
         ];
         let estimated = estimate_history_tokens(&history);
+        // One budget for both roles: the pre-send cascade must bring the
+        // retained history under this same number.
         let context_token_budget = estimated.saturating_sub(100);
-        let context_send_budget = {
-            // Keep the two newest whole turns and read back what that costs.
-            // `trim_to_fit` takes the preferred keep-N as its first
-            // argument, so the budget that fits those two turns is the send
-            // budget the loop must respect.
-            let keep2 = crate::agent::history_trim::trim_to_fit(history.clone(), 2, usize::MAX, 0);
-            keep2.tokens_after
-        };
-        assert!(
-            context_send_budget < context_token_budget,
-            "fixture must keep send and water-line budgets distinct"
-        );
         let seed = history.clone();
-        let send_fit =
-            crate::agent::history_trim::trim_to_fit(seed.clone(), 5, context_send_budget, 0);
-        let token_fit = crate::agent::history_trim::trim_to_fit(seed, 5, context_token_budget, 0);
+        let expected = crate::agent::history_trim::trim_to_fit(seed, 5, context_token_budget, 0);
         assert!(
-            send_fit.kept_turns <= token_fit.kept_turns,
-            "fixture must make send budget trim more aggressively than the water-line budget"
+            expected.trimmed,
+            "fixture must make the pre-send cascade trim"
         );
-
         let mut history_has_trim_breadcrumb = false;
         let mut injected_memory_preamble: Option<crate::agent::turn::MemoryPreamble> = None;
         let _ = (
@@ -23993,7 +23967,6 @@ Pin 13: LED
                     model_context_window_source:
                         zeroclaw_config::schema::ModelContextWindowSource::CompatibilityFallback,
                     context_token_budget,
-                    context_send_budget,
                     keep_recent_turns: 5,
                     request_token_ceiling: None,
                 },
@@ -24016,7 +23989,7 @@ Pin 13: LED
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
-            turn_id: "send-budget-trim-test",
+            turn_id: "budget-trim-test",
         })
         .await
         .expect("loop should succeed");
@@ -24027,12 +24000,12 @@ Pin 13: LED
             .filter(|m| m.role == "user" && m.content != breadcrumb)
             .count();
         assert!(
-            kept_user_turns <= send_fit.kept_turns,
-            "pre-send cascade must follow send budget ({context_send_budget}), kept {kept_user_turns} user turns"
+            kept_user_turns <= expected.kept_turns,
+            "pre-send cascade must follow the budget ({context_token_budget}), kept {kept_user_turns} user turns"
         );
         assert!(
             !history.iter().any(|m| m.content.contains("turn1")),
-            "water-line trigger must still trim via the send budget, not retain the full window"
+            "the budget trigger must drop the oldest whole turns, not retain the full history"
         );
     }
 
@@ -24122,7 +24095,7 @@ Pin 13: LED
         );
 
         // The trim action keeps the most recent `keep_recent_turns` whole
-        // turns (the token water-line lives in the trigger, not here). With
+        // turns (the token budget lives in the trigger, not here). With
         // ~1000+ tokens per turn, keeping 5 lands the payload back under both
         // the recovery budget and the raw model window.
         let result = trim_to_fit(history, 5, recovery_budget, model_context_window);

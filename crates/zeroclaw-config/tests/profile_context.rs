@@ -145,24 +145,22 @@ fn the_input_ceiling_clamps_the_effective_context_window() {
 }
 
 #[test]
-fn the_send_budget_is_the_window_minus_the_reserve() {
+fn the_trim_budget_is_bounded_by_the_reserve() {
     let cfg = profile_config();
     let resolved = cfg
         .resolved_agent_config("coder")
         .expect("the agent resolves")
         .resolved;
     let window = resolved.effective_context_window();
-    assert_eq!(resolved.context_send_budget(), window - 16_384);
-    // The water-line never exceeds the send budget: the reserve bounds it.
-    assert!(resolved.context_trim_budget() <= resolved.context_send_budget());
+    // One number owns both roles, and the reserve bounds it from above.
+    assert!(resolved.context_trim_budget() <= window - 16_384);
 }
 
-/// §2 invariant: the water-line equals
-/// `min(window × percent / 100, window − reserve)`, and the send budget is
-/// `window − reserve`. They coincide only when the reserve is the binding
-/// constraint — the two numbers are independently derived.
+/// §2 invariant: the trim budget equals
+/// `min(window × percent / 100, window − reserve)`. It is one number: the
+/// trigger and the fit target are the same value.
 #[test]
-fn the_water_line_is_the_min_of_the_percentage_and_the_reserve() {
+fn the_trim_budget_is_the_min_of_the_percentage_and_the_reserve() {
     let cfg = profile_config();
     let resolved = cfg
         .resolved_agent_config("coder")
@@ -171,15 +169,8 @@ fn the_water_line_is_the_min_of_the_percentage_and_the_reserve() {
     let window = resolved.effective_context_window();
     let expected = ((window * 80) / 100).min(window - 16_384);
     assert_eq!(resolved.context_trim_budget(), expected);
-    assert_eq!(resolved.context_send_budget(), window - 16_384);
-    // In this profile the reserve binds, so the two numbers coincide.
-    assert_eq!(
-        resolved.context_trim_budget(),
-        resolved.context_send_budget()
-    );
 
-    // With a non-binding reserve they are distinct: engage at 80%, fit under
-    // the full window minus a small output reserve.
+    // With a non-binding reserve the percentage is the binding constraint.
     let mut cfg = profile_config();
     cfg.runtime_profiles
         .get_mut("coder")
@@ -192,16 +183,10 @@ fn the_water_line_is_the_min_of_the_percentage_and_the_reserve() {
         .resolved;
     let window = resolved.effective_context_window();
     assert_eq!(resolved.context_trim_budget(), (window * 80) / 100);
-    assert_eq!(resolved.context_send_budget(), window - 1_000);
-    assert_ne!(
-        resolved.context_trim_budget(),
-        resolved.context_send_budget(),
-        "the water-line and the send budget are two distinct numbers"
-    );
 }
 
 /// §2 invariant: trimming cannot be disabled — no `[context]` value yields a
-/// zero water-line.
+/// zero budget.
 #[test]
 fn no_context_value_disables_trimming() {
     for percent in [1usize, 50, 80, 100] {
@@ -254,12 +239,12 @@ fn the_removed_upstream_knobs_do_not_change_resolution() {
         assert_eq!(
             resolved.context_trim_budget(),
             baseline_resolved.context_trim_budget(),
-            "`{removed}` must not move the water-line"
+            "`{removed}` must not move the budget"
         );
         assert_eq!(
-            resolved.context_send_budget(),
-            baseline_resolved.context_send_budget(),
-            "`{removed}` must not move the send budget"
+            resolved.context_trim_budget(),
+            baseline_resolved.context_trim_budget(),
+            "`{removed}` must not move the trim budget"
         );
         assert_eq!(
             resolved.keep_recent_turns(),

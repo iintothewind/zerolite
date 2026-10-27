@@ -1,5 +1,8 @@
-//! Whole-turn history trimming. One rule: keep the most recent whole turns
-//! that fit the token budget, drop the rest, never cut a turn in half.
+//! Whole-turn history trimming. One rule: when the replayed context exceeds
+//! the trim budget, keep the newest whole turns and drop the rest — never cut
+//! a turn in half. The action has one shape at every trigger: retain
+//! `keep_recent_turns` newest whole turns, then drop one more at a time while
+//! the retained set still exceeds the budget.
 
 use crate::agent::history::estimate_history_tokens;
 use zeroclaw_api::model_provider::ConversationMessage;
@@ -17,7 +20,7 @@ pub struct TrimResult {
     pub tokens_before: usize,
     pub tokens_after: usize,
     pub trimmed: bool,
-    /// After cascading to `kept_turns == 1`, history still exceeds `send_budget`.
+    /// After cascading to `kept_turns == 1`, history still exceeds `budget`.
     pub exceeds_budget: bool,
     /// True when a successful cascade kept fewer turns than `preferred_keep`.
     pub below_preferred_keep: bool,
@@ -191,7 +194,7 @@ pub fn insert_breadcrumb_deduped(history: &mut Vec<ChatMessage>, crumb_present: 
     true
 }
 
-// ── Budget-cascade primitives (water-line trigger, send-budget fit) ──────
+// ── Budget-cascade primitives (one budget: trigger and fit target) ───────
 
 /// The provider-measured size of a message population, pinned to the exact
 /// route and tool catalog that produced it. Recorded when a provider reports
@@ -238,12 +241,13 @@ pub fn provider_prefix_fingerprint(rows: &[ChatMessage]) -> u64 {
 
 /// Conservative margin on a raw local estimate published as a pre-send meter
 /// number. The estimator is biased low for the tokenizer families that bill
-/// these requests (the observed provider/estimate ratio was 0.808), so the
-/// number shown before dispatch must sit above what the provider reports.
-/// The margin lives at the consumption sites; the estimator heuristics stay
-/// byte-identical.
+/// these requests, so the number shown before dispatch must sit above what
+/// the provider reports. One tenth is the margin: the families in use come in
+/// far closer than the 1.24× that once motivated a quarter, and an
+/// over-wide margin trims early for no benefit. The margin lives at the
+/// consumption sites; the estimator heuristics stay byte-identical.
 pub fn conservative_estimate_tokens(raw: usize) -> usize {
-    (raw * 5).div_ceil(4)
+    (raw * 11).div_ceil(10)
 }
 
 /// Provider-authoritative context size, replacing the bare local estimate
@@ -357,20 +361,12 @@ impl ContextCalibration {
     }
 }
 
-pub fn resolve_send_budget(context_send_budget: usize, context_token_budget: usize) -> usize {
-    if context_send_budget > 0 {
-        context_send_budget
-    } else {
-        context_token_budget
-    }
-}
-
-/// Pick the largest `kept_turns` in `1..=preferred` that fits `send_budget`
-/// using one per-message token pass + O(1) probes (no full-history clones).
+/// Pick the largest `kept_turns` in `1..=preferred` that fits `budget` using
+/// one per-message token pass + O(1) probes (no full-history clones).
 fn choose_keep_turns_for_budget<T>(
     history: &[T],
     preferred: usize,
-    send_budget: usize,
+    budget: usize,
     message_tokens: impl Fn(&T) -> usize,
     is_system_msg: impl Fn(&T) -> bool,
     is_boundary: impl Fn(&T, usize) -> bool,
@@ -382,7 +378,7 @@ fn choose_keep_turns_for_budget<T>(
         .count()
         .max(1);
     let mut chosen_keep = preferred.max(1).min(total_turns);
-    if send_budget == 0 {
+    if budget == 0 {
         return chosen_keep;
     }
 
@@ -411,7 +407,7 @@ fn choose_keep_turns_for_budget<T>(
         let start = boundaries[boundaries.len() - chosen_keep];
         let abs_start = leading_system + start;
         let after = system_tokens.saturating_add(suffix[abs_start]);
-        if after <= send_budget {
+        if after <= budget {
             break;
         }
         chosen_keep -= 1;
@@ -419,20 +415,20 @@ fn choose_keep_turns_for_budget<T>(
     chosen_keep
 }
 
-/// Cascade the preferred keep-N down until the retained set fits `send_budget`.
+/// Cascade the preferred keep-N down until the retained set fits `budget`.
 ///
-/// The spec's trim action is "prefer `keep_recent_turns` newest whole turns,
-/// then cascade down to `kept_turns == 1` when those turns still exceed the
-/// send budget". This helper owns that second stage: it asks
+/// The trim action is "prefer `keep_recent_turns` newest whole turns, then
+/// drop one more at a time while those turns still exceed the budget, down to
+/// the floor of one". This helper owns that cascade: it asks
 /// [`choose_keep_turns_for_budget`] for the largest keep in `1..=preferred`
 /// that fits, then performs a single [`keep_recent_whole_turns`] cut.
 ///
-/// `send_budget == 0` means "no fit target": the preferred keep-N is applied
+/// `budget == 0` means "no fit target": the preferred keep-N is applied
 /// as-is.
 pub fn trim_to_fit_with_crumb(
     history: Vec<ChatMessage>,
     preferred_keep: usize,
-    send_budget: usize,
+    budget: usize,
     model_window: usize,
     has_leading_breadcrumb: bool,
 ) -> TrimResult {
@@ -447,7 +443,7 @@ pub fn trim_to_fit_with_crumb(
     let chosen_keep = choose_keep_turns_for_budget(
         &history,
         preferred,
-        send_budget,
+        budget,
         |m| estimate_history_tokens(std::slice::from_ref(m)),
         is_system,
         |m, index| crumb_index != Some(index) && is_turn_boundary(m),
@@ -475,13 +471,13 @@ pub fn trim_to_fit_with_crumb(
         // drop one more turn until it fits or only the floor remains.
         let whole = estimate_history_tokens(&candidate.history);
         candidate.tokens_after = candidate.tokens_after.max(whole);
-        if send_budget == 0 || candidate.tokens_after <= send_budget || keep <= 1 {
+        if budget == 0 || candidate.tokens_after <= budget || keep <= 1 {
             break candidate;
         }
         keep -= 1;
     };
     // The hard floor is the model's own capacity: a retention that misses the
-    // send budget but still fits the window is a soft floor — the newest turn
+    // trim budget but still fits the window is a soft floor — the newest turn
     // is dispatched rather than rejected. Only a population the model cannot
     // take is an unsatisfiable floor.
     result.exceeds_budget = model_window > 0 && result.tokens_after > model_window;
@@ -490,14 +486,14 @@ pub fn trim_to_fit_with_crumb(
     result
 }
 
-/// Cascade to the send budget, without a leading synthetic breadcrumb.
+/// Cascade to the trim budget, without a leading synthetic breadcrumb.
 pub fn trim_to_fit(
     history: Vec<ChatMessage>,
     preferred_keep: usize,
-    send_budget: usize,
+    budget: usize,
     model_window: usize,
 ) -> TrimResult {
-    trim_to_fit_with_crumb(history, preferred_keep, send_budget, model_window, false)
+    trim_to_fit_with_crumb(history, preferred_keep, budget, model_window, false)
 }
 
 /// Outcome of trimming durable [`ConversationMessage`] history. Mirrors
@@ -640,17 +636,17 @@ fn trim_conversation_to_recent_turns_by_count(
     }
 }
 
-/// Durable conversation cascade — same stages as [`trim_to_fit`].
+/// Durable conversation cascade — the same action as [`trim_to_fit`].
 pub fn trim_conversation_to_fit(
     history: Vec<ConversationMessage>,
     preferred_keep: usize,
-    send_budget: usize,
+    budget: usize,
     model_window: usize,
 ) -> ConversationTrimResult {
     trim_conversation_to_fit_with(
         history,
         preferred_keep,
-        send_budget,
+        budget,
         model_window,
         estimate_conversation_tokens,
     )
@@ -661,14 +657,14 @@ pub fn trim_conversation_to_fit(
 pub fn trim_conversation_to_fit_with(
     history: Vec<ConversationMessage>,
     preferred_keep: usize,
-    send_budget: usize,
+    budget: usize,
     model_window: usize,
     estimate: impl Fn(&[ConversationMessage]) -> usize,
 ) -> ConversationTrimResult {
     trim_conversation_to_fit_with_crumb(
         history,
         preferred_keep,
-        send_budget,
+        budget,
         model_window,
         estimate,
         false,
@@ -681,7 +677,7 @@ pub fn trim_conversation_to_fit_with(
 pub fn trim_conversation_to_fit_with_crumb(
     history: Vec<ConversationMessage>,
     preferred_keep: usize,
-    send_budget: usize,
+    budget: usize,
     model_window: usize,
     estimate: impl Fn(&[ConversationMessage]) -> usize,
     has_leading_breadcrumb: bool,
@@ -700,7 +696,7 @@ pub fn trim_conversation_to_fit_with_crumb(
     let chosen_keep = choose_keep_turns_for_budget(
         &history,
         preferred,
-        send_budget,
+        budget,
         |m| estimate(std::slice::from_ref(m)),
         is_conversation_system,
         |m, index| crumb_index != Some(index) && is_conversation_boundary(m),
@@ -729,7 +725,7 @@ pub fn trim_conversation_to_fit_with_crumb(
         // one more turn until it fits or only the floor remains.
         let whole = estimate(&candidate.history);
         candidate.tokens_after = retained_tokens.max(whole);
-        if send_budget == 0 || candidate.tokens_after <= send_budget || keep <= 1 {
+        if budget == 0 || candidate.tokens_after <= budget || keep <= 1 {
             break candidate;
         }
         keep -= 1;
@@ -743,7 +739,7 @@ pub fn trim_conversation_to_fit_with_crumb(
 
 fn warn_below_preferred_keep_inner(
     preferred_keep: usize,
-    send_budget: usize,
+    budget: usize,
     below_preferred_keep: bool,
     kept_turns: usize,
     tokens_after: usize,
@@ -758,25 +754,21 @@ fn warn_below_preferred_keep_inner(
             .with_attrs(::serde_json::json!({
                 "preferred_keep": preferred_keep,
                 "kept_turns": kept_turns,
-                "send_budget": send_budget,
+                "trim_budget": budget,
                 "tokens_after": tokens_after,
                 "error_key": "context_trim_below_preferred_keep",
             })),
         format!(
-            "Context trim kept {kept_turns} turn(s), below preferred keep_recent_turns={preferred_keep}, to fit send budget {send_budget}"
+            "Context trim kept {kept_turns} turn(s), below preferred keep_recent_turns={preferred_keep}, to fit trim budget {budget}"
         )
     );
 }
 
 /// Log a warning when the cascade kept fewer turns than the preferred keep.
-pub fn warn_if_below_preferred_keep(
-    preferred_keep: usize,
-    send_budget: usize,
-    result: &TrimResult,
-) {
+pub fn warn_if_below_preferred_keep(preferred_keep: usize, budget: usize, result: &TrimResult) {
     warn_below_preferred_keep_inner(
         preferred_keep,
-        send_budget,
+        budget,
         result.below_preferred_keep,
         result.kept_turns,
         result.tokens_after,
@@ -786,12 +778,12 @@ pub fn warn_if_below_preferred_keep(
 /// Durable-history variant of [`warn_if_below_preferred_keep`].
 pub fn warn_if_conversation_below_preferred_keep(
     preferred_keep: usize,
-    send_budget: usize,
+    budget: usize,
     result: &ConversationTrimResult,
 ) {
     warn_below_preferred_keep_inner(
         preferred_keep,
-        send_budget,
+        budget,
         result.below_preferred_keep,
         result.kept_turns,
         result.tokens_after,
@@ -2004,13 +1996,13 @@ mod tests {
     /// tool surface.
     #[tokio::test]
     async fn a_cascade_below_the_preferred_keep_emits_the_warning() {
-        // Five turns of ~1k tokens each. A 2.5k send budget fits two turns but
-        // not the preferred five, so stage 2 lands below preferred and still
-        // fits — the one combination that warns.
+        // Five turns of ~1k tokens each. A 2.5k trim budget fits two turns but
+        // not the preferred five, so the cascade lands below preferred and
+        // still fits — the one combination that warns.
         let history = multi_turn_history(5, &"x".repeat(2_000));
         let preferred = 5;
-        let send_budget = 2_500;
-        let result = trim_to_fit(history, preferred, send_budget, 0);
+        let budget = 2_500;
+        let result = trim_to_fit(history, preferred, budget, 0);
         assert!(result.trimmed);
         assert!(
             !result.exceeds_budget,
@@ -2035,7 +2027,7 @@ mod tests {
         // and what is pinned here is its shape, not its delivery count.
         let mut rx = zeroclaw_log::subscribe_or_install();
         while rx.try_recv().is_ok() {}
-        warn_if_below_preferred_keep(preferred, send_budget, &result);
+        warn_if_below_preferred_keep(preferred, budget, &result);
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         let record = loop {
@@ -2058,11 +2050,11 @@ mod tests {
                 Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
                     rx = zeroclaw_log::subscribe_or_install();
                     while rx.try_recv().is_ok() {}
-                    warn_if_below_preferred_keep(preferred, send_budget, &result);
+                    warn_if_below_preferred_keep(preferred, budget, &result);
                 }
                 Err(_elapsed) => {
                     // The record may have gone to a hook we were not on yet.
-                    warn_if_below_preferred_keep(preferred, send_budget, &result);
+                    warn_if_below_preferred_keep(preferred, budget, &result);
                 }
             }
         };
@@ -2078,8 +2070,8 @@ mod tests {
             Some(result.kept_turns as u64)
         );
         assert_eq!(
-            attrs.get("send_budget").and_then(|v| v.as_u64()),
-            Some(send_budget as u64)
+            attrs.get("trim_budget").and_then(|v| v.as_u64()),
+            Some(budget as u64)
         );
     }
 
@@ -2314,16 +2306,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_send_budget_falls_back_to_token_budget_when_send_unset() {
-        assert_eq!(resolve_send_budget(0, 10_000), 10_000);
-    }
-
-    #[test]
-    fn resolve_send_budget_prefers_explicit_send_budget() {
-        assert_eq!(resolve_send_budget(500, 10_000), 500);
-    }
-
-    #[test]
     fn single_turn_never_trimmed() {
         let h = vec![sys("s"), user("only"), asst("a")];
         let r = trim_to_fit(h, 1, 0, 0);
@@ -2353,32 +2335,6 @@ mod tests {
                 .iter()
                 .any(|m| m.content.starts_with("[Tool results]")),
             "the dropped turn's tool-results tail must go with it"
-        );
-    }
-
-    #[test]
-    /// Baseline name from v1.0.0. The primitive it names is now
-    /// [`trim_to_fit`] (budget trim by whole turns); the assertions are
-    /// unchanged from the baseline.
-    fn trim_to_budget_uses_send_budget_not_token_budget() {
-        let big = "x".repeat(800);
-        let h = multi_turn_history(6, &big);
-        let keep2 = trim_to_fit(h.clone(), 2, 0, 0);
-        let send_budget = keep2.tokens_after;
-        let token_budget = send_budget.saturating_mul(4);
-
-        let send_trim = trim_to_fit(h.clone(), 5, send_budget, 0);
-        let token_trim = trim_to_fit(h, 5, token_budget, 0);
-
-        assert!(send_trim.trimmed);
-        assert!(send_trim.tokens_after <= send_budget);
-        assert!(
-            send_trim.kept_turns <= token_trim.kept_turns,
-            "a tighter send budget must retain no more turns than a looser fit budget"
-        );
-        assert!(
-            send_trim.kept_turns < 5 || send_trim.tokens_after < token_trim.tokens_after,
-            "send budget must drive the cascade, not the water-line token budget"
         );
     }
 
@@ -2535,12 +2491,12 @@ mod tests {
             }
         };
         let keep1 = trim_conversation_to_recent_turns_by_count(history.clone(), 1, false);
-        let send_budget = inflate(&keep1.history).saturating_add(10);
-        let r = trim_conversation_to_fit_with(history, 5, send_budget, 0, inflate);
+        let budget = inflate(&keep1.history).saturating_add(10);
+        let r = trim_conversation_to_fit_with(history, 5, budget, 0, inflate);
         assert!(r.trimmed);
         assert_eq!(r.kept_turns, 1);
         assert!(!r.exceeds_budget);
-        assert!(r.tokens_after <= send_budget);
+        assert!(r.tokens_after <= budget);
     }
 
     #[test]
@@ -2557,13 +2513,14 @@ mod tests {
 
     /// The keep-N *action* under an unbounded fit budget — never a trigger.
     ///
-    /// `keep` is a retention preference. Called with `send_budget = usize::MAX`
-    /// the fit check can never fail, so stage 1 retains the newest `keep` whole
-    /// turns and drops everything older. That is truncation, and it is all this
-    /// function ever does: it is the action a trigger opens, never a trigger.
+    /// `keep` is a retention preference. Called with `budget = usize::MAX`
+    /// the fit check can never fail, so the action retains the newest `keep`
+    /// whole turns and drops everything older. That is truncation, and it is
+    /// all this function ever does: it is the action a trigger opens, never a
+    /// trigger.
     ///
-    /// No production trigger calls it this way. The water-line decides *when*,
-    /// and it is a token test, so a transcript under the water-line is never
+    /// No production trigger calls it this way. The trim budget decides *when*,
+    /// and it is a token test, so a transcript under the budget is never
     /// handed here however many turns it holds. What is pinned below is only
     /// that repeated application is stable: the breadcrumb the first pass
     /// inserts is machinery, and if it counted as a turn each pass would drop

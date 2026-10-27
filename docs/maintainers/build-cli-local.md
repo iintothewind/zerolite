@@ -48,6 +48,13 @@ failure, or interrupt) via `scripts/dev/reclaim-cargo-disk.sh`:
 - sandbox `CARGO_TARGET_DIR` / `…/cargo-target` when present
 - repo `.cache/npm` (Windows web-build workaround)
 
+The cross-compile runs as root inside the container, so the `target/` it
+writes is root-owned and a host-side `rm -rf` fails on it. The reclaim step
+detects that residue and removes it from inside an already-local container
+image (`$ZEROCLAW_RUST_IMAGE`, else `zeroclaw-test`, else `rust:1-bookworm`);
+no image is pulled for this. If none of those images exists locally, the step
+fails loudly instead of leaving hundreds of GB behind silently.
+
 It does **not** run `docker system prune`. Cargo’s intermediate
 `target/<triple>/release/zeroclaw` is gone; the next local build is a cold
 start. Keep only `dist/bin/<triple>/zeroclaw`. Default triple:

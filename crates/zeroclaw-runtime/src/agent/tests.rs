@@ -721,15 +721,15 @@ async fn turn_propagates_provider_error() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// `keep_recent_turns` is a keep-N *preference*, not a per-turn cap: it
-/// applies when the water-line fires. A long conversation that stays under the
-/// water-line must keep every turn — the upstream per-turn cap cut the
+/// applies when the budget fires. A long conversation that stays under the
+/// budget must keep every turn — the upstream per-turn cap cut the
 /// transcript back to keep-N on every success, which is what made
 /// `service start` report a trim on every turn.
 #[tokio::test]
-async fn history_keeps_every_turn_while_under_the_water_line() {
+async fn history_keeps_every_turn_while_under_the_budget() {
     // The retention preference is 6 and the run is 11 turns, so the transcript
     // passes `keep_recent_turns` on turn 7. Nothing may be dropped: the turn
-    // count is not a trigger — only the token water-line is, and this
+    // count is not a trigger — only the token budget is, and this
     // transcript never reaches it.
     let keep_recent = 6;
     let turns = keep_recent + 5;
@@ -762,7 +762,7 @@ async fn history_keeps_every_turn_while_under_the_water_line() {
             message,
             ConversationMessage::Chat(chat) if chat.content == breadcrumb
         )),
-        "nothing may be trimmed below the water-line"
+        "nothing may be trimmed below the budget"
     );
 
     let retained_messages: Vec<_> = agent
@@ -779,7 +779,7 @@ async fn history_keeps_every_turn_while_under_the_water_line() {
     assert_eq!(
         kept_turns.len(),
         turns,
-        "every turn must survive while the transcript is under the water-line"
+        "every turn must survive while the transcript is under the budget"
     );
     assert!(agent.history().iter().any(|message| matches!(
         message,
@@ -1398,7 +1398,7 @@ async fn multi_turn_maintains_growing_history() {
         let current = agent.history().len();
         assert!(
             current > previous,
-            "history must grow on every turn below the water-line \
+            "history must grow on every turn below the budget \
              (turn {i}: {previous} -> {current})"
         );
         previous = current;

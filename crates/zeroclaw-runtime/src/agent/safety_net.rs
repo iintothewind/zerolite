@@ -616,7 +616,6 @@ async fn safety_net_thinking_never_leaks_into_draft_or_chunks() {
                     context_token_budget: 100_000,
                     model_context_window_source:
                         zeroclaw_config::schema::ModelContextWindowSource::Configured,
-                    context_send_budget: 0,
                     keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
                     request_token_ceiling: None,
                 },
@@ -1037,7 +1036,6 @@ async fn safety_net_task_locals_probe_per_entry_path() {
                             context_token_budget: 100_000,
                             model_context_window_source:
                                 zeroclaw_config::schema::ModelContextWindowSource::Configured,
-                            context_send_budget: 0,
                             keep_recent_turns:
                                 zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
                             request_token_ceiling: None,

@@ -184,8 +184,8 @@ export interface AgentContextValue {
   // docs/book/src/agents/context-management.md.
   /** The effective context window: the meter denominator. */
   contextEffectiveWindow: number | null;
-  /** The water-line: where proactive trimming engages. A trigger, not a limit. */
-  contextWaterlineTokens: number | null;
+  /** The trim budget: where proactive trimming engages, and what it retains to. */
+  contextTrimBudgetTokens: number | null;
   contextInputTokens: number | null;
   /** Provenance of `contextInputTokens` — the label the ring panel shows.
    * `calibrated` means the number is a provider measurement anchored on the
@@ -318,7 +318,7 @@ export function AgentProvider({
   const [pendingApproval, setPendingApproval] = useState<PendingApproval | null>(null);
   // Context window tracking (from "done" WS frames). See #7311.
   const [contextEffectiveWindow, setContextEffectiveWindow] = useState<number | null>(null);
-  const [contextWaterlineTokens, setContextWaterlineTokens] = useState<number | null>(null);
+  const [contextTrimBudgetTokens, setContextTrimBudgetTokens] = useState<number | null>(null);
   const [contextInputTokens, setContextInputTokens] = useState<number | null>(null);
   const [contextInputSource, setContextInputSource] = useState<ContextInputSource>(null);
   const [tokenStats, setTokenStats] = useState<TokenStats>(emptyTokenStats);
@@ -561,10 +561,10 @@ export function AgentProvider({
           setTokenStats((s) => applyDone(s, msg));
           {
             // One authoritative snapshot per done frame: the effective window
-            // (meter denominator) and the water-line (trim trigger).
+            // (meter denominator) and the trim budget (trigger and fit target).
             const limits = contextLimitsFromDoneFrame(msg);
             setContextEffectiveWindow(limits.effectiveWindow);
-            setContextWaterlineTokens(limits.waterlineTokens);
+            setContextTrimBudgetTokens(limits.trimBudgetTokens);
           }
           // Prefer last_input_tokens (the size the turn ended with) over
           // accumulated input_tokens for context-bar rendering.
@@ -1418,7 +1418,7 @@ export function AgentProvider({
     respondToApproval,
     // Context window tracking (from "done" WS frames). See #7311.
     contextEffectiveWindow,
-    contextWaterlineTokens,
+    contextTrimBudgetTokens,
     contextInputTokens,
     contextInputSource,
     liveStats,

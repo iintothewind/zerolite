@@ -3908,13 +3908,11 @@ pub struct ResolvedModelContextWindow {
 pub struct ResolvedContextLimits {
     pub model_context_window: usize,
     pub model_context_window_source: ModelContextWindowSource,
-    /// The water-line: the token count at which proactive trimming engages.
-    /// Never a fit target — that is [`Self::context_send_budget`].
+    /// The single trim budget: one resolved number is both the trigger
+    /// (trim when replayed tokens exceed it) and the fit target (retain no
+    /// more than it). `0` means "unset" — callers fall back to the model
+    /// window, and the pre-send planner treats it as "no proactive trim".
     pub context_token_budget: usize,
-    /// The send / fit budget: the largest retained population that still
-    /// fits the effective window. `0` means "unset" — callers resolve it to
-    /// the water-line via [`crate::agent::history_trim::resolve_send_budget`].
-    pub context_send_budget: usize,
     /// Preferred whole-turn retention when a trim fires.
     pub keep_recent_turns: usize,
     /// The configured input ceiling (`[context].request_token_ceiling`) for this
@@ -3940,7 +3938,6 @@ impl Default for ResolvedContextLimits {
             model_context_window: UNCONFIGURED_CONTEXT_WINDOW_FALLBACK,
             model_context_window_source: ModelContextWindowSource::CompatibilityFallback,
             context_token_budget: 0,
-            context_send_budget: 0,
             keep_recent_turns: crate::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
             request_token_ceiling: None,
         }
@@ -3984,7 +3981,6 @@ impl ResolvedContextLimits {
             model_context_window,
             model_context_window_source: capacity.source,
             context_token_budget: budget.min(model_context_window),
-            context_send_budget: 0,
             keep_recent_turns: crate::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
             request_token_ceiling: None,
         }
@@ -4032,18 +4028,10 @@ impl ResolvedRuntime {
         .max(1);
 
         let context_token_budget = context_token_budget.min(model_context_window);
-        // The send budget is the effective window minus the output reserve:
-        // the largest retained population that still leaves room for the
-        // model's own reply.
-        let context_send_budget = match self.context.reserve_tokens {
-            Some(reserve) if reserve < effective_window => effective_window - reserve,
-            _ => effective_window,
-        };
         ResolvedContextLimits {
             model_context_window,
             model_context_window_source: self.model_context_window_source,
             context_token_budget,
-            context_send_budget,
             keep_recent_turns: self.keep_recent_turns(),
             request_token_ceiling: self.context.request_token_ceiling,
         }
@@ -4080,34 +4068,19 @@ impl ResolvedRuntime {
         }
     }
 
-    /// Compatibility accessor for call sites that consume a single trim
-    /// budget. The former `effective_context_budget` conflated the hard
-    /// ceiling with the trim trigger; this returns the trim **water-line**
-    /// (trigger) only — not the cascade fit target.
+    /// The trim budget: the number that both triggers a trim and bounds what
+    /// is retained. There is no separate fit target — one number owns both
+    /// roles.
     #[must_use]
     pub fn context_trim_budget(&self) -> usize {
         self.trim_threshold_tokens().max(1)
     }
 
-    /// Post-trim send / fit budget: `effective_context_window − reserve_tokens`
-    /// when a reserve is set and below the window; otherwise the full effective
-    /// window. Cascade (`history_trim::trim_to_fit`) and hard-fail checks use
-    /// this number; the water-line ([`Self::context_trim_budget`]) only decides
-    /// *when* trimming engages.
-    #[must_use]
-    pub fn context_send_budget(&self) -> usize {
-        let window = self.effective_context_window();
-        match self.context.reserve_tokens {
-            Some(reserve) if reserve < window => window - reserve,
-            _ => window,
-        }
-    }
-
-    /// Number of recent whole turns preferred when a trim fires. Clamped to
-    /// `MIN_KEEP_RECENT_TURNS..=MAX_KEEP_RECENT_TURNS`; `None` resolves to
-    /// `DEFAULT_KEEP_RECENT_TURNS`. The trim *trigger* is the token
-    /// water-line; the *action* prefers this many newest turns, then cascades
-    /// down to `kept_turns == 1` until under the **send** budget.
+    /// Number of recent whole turns the trim action retains when it fires.
+    /// Clamped to `MIN_KEEP_RECENT_TURNS..=MAX_KEEP_RECENT_TURNS`; `None`
+    /// resolves to `DEFAULT_KEEP_RECENT_TURNS`. The action keeps this many
+    /// newest whole turns, then drops one more at a time while the retained
+    /// set still exceeds the trim budget, down to `kept_turns == 1`.
     #[must_use]
     pub fn keep_recent_turns(&self) -> usize {
         self.context.resolved_keep_recent_turns()
@@ -29140,7 +29113,7 @@ mod tests {
     }
 
     #[::core::prelude::v1::test]
-    fn effective_context_budget_derives_the_water_line_from_the_context_table() {
+    fn effective_context_budget_derives_the_trim_budget_from_the_context_table() {
         use super::{ModelContextWindowSource, ResolvedRuntime};
 
         // Default policy: 80% of the selected model window.
@@ -29151,7 +29124,7 @@ mod tests {
         };
         assert_eq!(r.effective_context_budget(), 160_000);
 
-        // The trim percentage is the only knob on the water-line.
+        // The trim percentage is the only knob on the budget.
         let r = ResolvedRuntime {
             model_context_window: 200_000,
             model_context_window_source: ModelContextWindowSource::Configured,
@@ -29163,7 +29136,7 @@ mod tests {
         };
         assert_eq!(r.effective_context_budget(), 100_000);
 
-        // The input ceiling clamps the effective window, so the water-line
+        // The input ceiling clamps the effective window, so the budget
         // follows it.
         let r = ResolvedRuntime {
             model_context_window: 200_000,
@@ -29176,7 +29149,7 @@ mod tests {
         };
         assert_eq!(r.effective_context_budget(), 40_000);
 
-        // The output reserve bounds the water-line from above.
+        // The output reserve bounds the budget from above.
         let r = ResolvedRuntime {
             model_context_window: 200_000,
             model_context_window_source: ModelContextWindowSource::Configured,
@@ -29189,7 +29162,7 @@ mod tests {
         assert_eq!(r.effective_context_budget(), 50_000);
 
         // Trimming can never be disabled: no configuration yields a zero
-        // water-line.
+        // budget.
         let r = ResolvedRuntime {
             model_context_window: 8_000,
             model_context_window_source: ModelContextWindowSource::Configured,
@@ -29212,7 +29185,7 @@ mod tests {
         };
         assert!(r.effective_context_budget() > 0);
 
-        // The water-line never exceeds the send budget: the reserve bounds it.
+        // One number owns both roles, and the reserve bounds it from above.
         let r = ResolvedRuntime {
             model_context_window: 200_000,
             model_context_window_source: ModelContextWindowSource::Configured,
@@ -29222,8 +29195,8 @@ mod tests {
             },
             ..ResolvedRuntime::default()
         };
-        assert!(r.context_trim_budget() <= r.context_send_budget());
-        assert_eq!(r.context_send_budget(), 200_000 - 16_384);
+        assert_eq!(r.context_trim_budget(), r.trim_threshold_tokens().max(1));
+        assert!(r.context_trim_budget() <= 200_000 - 16_384);
     }
 
     #[::core::prelude::v1::test]
@@ -29285,7 +29258,7 @@ mod tests {
     }
 
     /// An input ceiling only ever clamps the window *down*: an unknown
-    /// capacity stays the 32,000 compatibility stub, and the water-line is
+    /// capacity stays the 32,000 compatibility stub, and the budget is
     /// that stub scaled by the trim percentage.
     #[::core::prelude::v1::test]
     fn unconfigured_provider_capacity_is_bounded_by_the_input_ceiling() {
@@ -29322,7 +29295,7 @@ mod tests {
         let limits =
             cfg.resolved_context_limits_for_route("zerocode", "anthropic.clod", "claude-opus-5-5");
         // The ceiling never raises an unknown capacity: the stub stays the
-        // window, and the water-line is 80% of it.
+        // window, and the budget is 80% of it.
         assert_eq!(limits.model_context_window, 32_000);
         assert_eq!(limits.context_token_budget, 25_600);
         assert_eq!(
@@ -50876,26 +50849,25 @@ mod context_budget_tests {
     }
 
     #[tokio::test]
-    async fn context_send_budget_is_full_window_without_reserve() {
+    async fn trim_budget_is_one_number_for_trigger_and_fit() {
         let rt = runtime_with_context(100_000, None, 80, None);
         assert_eq!(rt.context_trim_budget(), 80_000);
-        assert_eq!(rt.context_send_budget(), 100_000);
+        assert_eq!(rt.context_trim_budget(), rt.trim_threshold_tokens());
     }
 
     #[tokio::test]
-    async fn context_send_budget_respects_input_ceiling() {
+    async fn trim_budget_respects_input_ceiling() {
         let rt = runtime_with_context(131_072, Some(100_000), 80, Some(10_000));
         assert_eq!(rt.effective_context_window(), 100_000);
-        assert_eq!(rt.context_send_budget(), 90_000);
+        // min(80% of the clamped window, window − reserve) = min(80k, 90k).
         assert_eq!(rt.context_trim_budget(), 80_000);
     }
 
     #[tokio::test]
-    async fn context_send_budget_subtracts_reserve() {
-        let rt = runtime_with_context(100_000, None, 80, Some(16_000));
-        // Water-line: min(80k, 84k) = 80k; send: 100k − 16k = 84k.
-        assert_eq!(rt.context_trim_budget(), 80_000);
-        assert_eq!(rt.context_send_budget(), 84_000);
+    async fn trim_budget_is_bounded_by_reserve() {
+        let rt = runtime_with_context(100_000, None, 95, Some(16_000));
+        // min(95k, 84k) = 84k: the reserve caps the single budget.
+        assert_eq!(rt.context_trim_budget(), 84_000);
     }
 
     #[tokio::test]

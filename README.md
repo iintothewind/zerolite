@@ -20,17 +20,17 @@ What this fork adds on top of upstream ZeroClaw 0.8.6. Inherited runtime behavio
 
 ### Context engine
 
-`zeroclaw-context` sets the send budget and keeps the prefix cacheable. Policy is on the runtime profile:
+`zeroclaw-context` keeps the replayed context inside one trim budget and keeps the prefix cacheable. Policy is on the runtime profile:
 
 ```toml
 [runtime_profiles.coder.context]
 request_token_ceiling = 100_000      # optional window ceiling
-trim_threshold_percent = 80     # default water-line
+trim_threshold_percent = 80     # budget: 80% of the window (with reserve_tokens, whichever is tighter)
 reserve_tokens = 16_384         # output headroom
 keep_recent_turns = 5           # default, clamped 1–10
 ```
 
-- Past the water-line, keep the newest whole turns, then drop older ones down to one. A turn is never split. If the newest turn still does not fit, the turn fails.
+- Past the budget, keep the newest `keep_recent_turns` whole turns in one cut, then drop older ones one at a time down to one. A turn is never split. If the newest turn still does not fit the model window, the turn fails.
 - A trim rewrites stored history and refreshes the meter. The meter is a script-aware estimate priced with the tool definitions the request carries; a provider `input_tokens` report anchors it and the anchor is carried across turns, labelled `calibrated`.
 - Sends keep the longest byte-stable prefix. Cache hits are `zeroclaw_tokens_cached_input_total` and the composer's cache-hit percent. A child's context budget cannot exceed its parent's.
 - Stable prefix: no dates or clocks in the system prompt, channel turn context, or history. `HEARTBEAT.md` loads only for heartbeat. Skill and deferred catalogs are frozen for the session and sorted by name.

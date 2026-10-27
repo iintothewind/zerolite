@@ -14,7 +14,7 @@
 - **R2 — The meter and the trim notice are one contract.** The context
   bar and the trim notice render from the same published numbers as the
   runtime (see `context-meter.md`): effective window as denominator,
-  water-line as trigger. A UI that renders its own arithmetic will
+  trim budget as trigger. A UI that renders its own arithmetic will
   disagree with the runtime.
 - **R3 — Fork identity is visible, not just a version string.** The
   zerolite mark is the web logo and the release names are zerolite's.

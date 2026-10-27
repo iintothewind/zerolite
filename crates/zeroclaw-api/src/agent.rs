@@ -135,19 +135,11 @@ pub enum TurnEvent {
         kept_turns: usize,
         reason: String,
         /// The budget this trim was measured against — the number the notice
-        /// quotes as the "configured token budget". It is **not** one
-        /// well-known quantity, so a client must not treat it as a fit target
-        /// it can reason about on its own; which budget it is depends on the
-        /// guard that fired:
-        ///
-        /// - the post-response guard quotes the **water-line**
-        ///   (`context_token_budget`): that is what the operator configured and
-        ///   therefore what the notice should name;
-        /// - overflow recovery and the durable water-line trim quote the
-        ///   **send budget** (`effective_context_window − reserve_tokens`), the
-        ///   size the trim was asked to reach;
-        /// - the hard-limit and max-iteration paths quote the model window or
-        ///   their own event budget.
+        /// quotes as the "configured token budget". For every budget-driven
+        /// guard that is the **trim budget** (`trim_threshold_tokens().max(1)`),
+        /// the one number that is both the trigger and the fit target; the
+        /// hard-limit path quotes the model window instead. A client may show
+        /// it, but it is a quoted figure rather than a separate knob.
         ///
         /// `None` for message-limit trims (no token accounting) and when no
         /// budget applied.
@@ -172,8 +164,8 @@ pub enum TurnEvent {
         /// ignore this field; it is never serialized as a turn event.
         retained_context: Option<RetainedContextSnapshot>,
     },
-    /// The assembled request size, published once per turn after the
-    /// water-line decision and before dispatch.
+    /// The assembled request size, published once per turn after the budget
+    /// decision and before dispatch.
     ///
     /// Deliberately **not** [`TurnEvent::Usage`]: `Usage` means the provider
     /// answered and billed the call, and clients fold it into their step
@@ -194,18 +186,16 @@ pub enum TurnEvent {
         /// frame is published before dispatch, so no provider measurement of
         /// the request being announced can exist yet.
         input_tokens_source: Option<TokenCountSource>,
-        /// The **water-line** in effect at assembly time — the proactive-trim
-        /// threshold, not the send budget. Always `Some` in practice:
-        /// `context_trim_budget()` is `trim_threshold_tokens().max(1)` over a
-        /// `1..=100` percent clamp, so there is no "trimming disabled" state to
-        /// encode. It stays `Option` only because it shares the
-        /// `ContextUsage` wire shape with older daemons.
+        /// The **trim budget** in effect at assembly time: crossing it engages
+        /// a trim, and it is the size a trim drives the retained history down
+        /// to. Always `Some` in practice: `context_trim_budget()` is
+        /// `trim_threshold_tokens().max(1)` over a `1..=100` percent clamp, so
+        /// there is no "trimming disabled" state to encode. It stays `Option`
+        /// only because it shares the `ContextUsage` wire shape with older
+        /// daemons.
         ///
-        /// A client must not read the value as "how much may be sent" — that is
-        /// the send budget, `effective_context_window − reserve_tokens`. It
-        /// reaches the wire as [`Self::HistoryTrimmed::token_budget`] only on
-        /// the guards that trim against it; the post-response guard quotes the
-        /// water-line in that same field, so the two are not interchangeable.
+        /// A client must not read the value as the model's capacity — that is
+        /// [`Self::effective_context_window`].
         context_token_budget: Option<u64>,
         /// Configured model capacity for the route, when authoritative.
         model_context_window: Option<u64>,

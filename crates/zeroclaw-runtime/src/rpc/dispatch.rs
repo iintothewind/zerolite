@@ -27500,9 +27500,9 @@ mod tests {
         use zeroclaw_config::providers::Providers;
         use zeroclaw_config::schema::{AliasedAgentConfig, Config, RuntimeProfileConfig};
 
-        // (context.request_token_ceiling, provider.context_window, expected water-line)
+        // (context.request_token_ceiling, provider.context_window, expected budget)
         //
-        // The water-line is `min(model window, input ceiling) × percent / 100`,
+        // The budget is `min(model window, input ceiling) × percent / 100`,
         // so a ceiling and an unknown capacity both bound it.
         let cases: &[(Option<usize>, Option<usize>, u64)] = &[
             (Some(128_000), None, 25_600), // unknown capacity (32k stub) × 80%
@@ -27654,7 +27654,7 @@ mod tests {
         assert_eq!(v["params"]["type"], "context_usage");
         assert_eq!(
             v["params"]["max_context_tokens"], 640_000,
-            "emitted context_usage must carry the water-line: 80% of the clamped window"
+            "emitted context_usage must carry the budget: 80% of the clamped window"
         );
         assert_eq!(
             v["params"]["model_context_window"], 1_000_000,
@@ -27745,7 +27745,7 @@ mod tests {
         assert_eq!(v["params"]["type"], "context_usage");
         assert_eq!(
             v["params"]["max_context_tokens"], 25_600,
-            "the water-line is 80% of the effective window: the unknown-capacity stub, \
+            "the budget is 80% of the effective window: the unknown-capacity stub, \
              clamped by the explicit input ceiling"
         );
         assert!(
@@ -28017,7 +28017,7 @@ mod tests {
         assert_eq!(v["params"]["type"], "context_usage");
         assert_eq!(
             v["params"]["max_context_tokens"], 25_600,
-            "the water-line survives the same-profile fallback: 80% of the effective window"
+            "the budget survives the same-profile fallback: 80% of the effective window"
         );
         assert!(
             v["params"].get("model_context_window").is_none(),
@@ -28323,14 +28323,14 @@ mod tests {
     }
 
     /// An explicit input ceiling clamps the effective window, so the
-    /// water-line follows it; the model-window helper is unaffected.
+    /// budget follows it; the model-window helper is unaffected.
     #[test]
     fn context_usage_max_tokens_clamped_by_explicit_ceiling() {
         let cfg = cfg_with_window_and_cap(Some(200_000), Some(50_000));
         assert_eq!(
             context_usage_max_tokens(&cfg, "coder"),
             45_000,
-            "the input ceiling clamps the effective window, so the water-line is 50k × 90%"
+            "the input ceiling clamps the effective window, so the budget is 50k × 90%"
         );
         assert_eq!(
             context_usage_model_window(&cfg, "coder"),
@@ -28351,7 +28351,7 @@ mod tests {
     }
 
     /// Trimming can never be disabled: no `[context]` value yields a zero
-    /// water-line.
+    /// budget.
     #[test]
     fn context_usage_never_reports_a_zero_trim_budget() {
         let cfg = cfg_with_window_and_cap(Some(200_000), Some(0));
@@ -28409,7 +28409,7 @@ mod tests {
         assert_eq!(v["params"]["type"], "context_usage");
         assert_eq!(
             v["params"]["max_context_tokens"], 45_000,
-            "wire max_context_tokens must carry the water-line: 90% of the clamped window"
+            "wire max_context_tokens must carry the budget: 90% of the clamped window"
         );
         assert_eq!(
             v["params"]["model_context_window"], 200_000,

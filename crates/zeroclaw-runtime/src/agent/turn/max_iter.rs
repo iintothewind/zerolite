@@ -244,19 +244,20 @@ pub(crate) async fn finish_after_max_iterations(
                 );
                 messages.extend(transient_suffix);
             }
-            let tokens_before =
-                token_counter.count(crate::agent::history::estimate_history_tokens(&messages));
+            let (tokens_before, _) =
+                token_counter.measure(crate::agent::history::estimate_history_tokens(&messages));
             let mut dropped_messages = 0;
             let mut dropped_turns = 0;
             loop {
-                let tokens =
-                    token_counter.count(crate::agent::history::estimate_history_tokens(&messages));
-                let mut trim = super::surface_oversized_dispatch_if_needed(
+                let (tokens, tokens_source) = token_counter
+                    .measure(crate::agent::history::estimate_history_tokens(&messages));
+                let mut trim = super::trim_whole_turns_for_dispatch(
                     injected_memory_preamble,
                     history,
                     crumb_present,
                     tokens,
                     trim_budget,
+                    context_limits.keep_recent_turns,
                 );
                 dropped_messages += trim.dropped_messages;
                 if trim.outcome == super::PreDispatchOutcome::Trimmed {
@@ -267,7 +268,7 @@ pub(crate) async fn finish_after_max_iterations(
                             "turn-context-hook-mutation-unsafe-error",
                         ));
                     }
-                    dropped_turns += 1;
+                    dropped_turns += trim.dropped_turns;
                     messages = super::vision_route::prepare_messages_for_iteration(
                         history,
                         multimodal_config,
@@ -286,14 +287,14 @@ pub(crate) async fn finish_after_max_iterations(
                     continue;
                 }
                 trim.dropped_messages = dropped_messages;
+                trim.dropped_turns = dropped_turns;
                 super::record_dispatch_trim(
                     (provider_name, &selected_model),
                     &trim,
-                    dropped_turns,
                     trim_budget,
                     tokens_before,
                     tokens,
-                    token_counter.source(),
+                    tokens_source,
                 );
                 let floor = tokens > context_limits.model_context_window as u64;
                 let event_budget = if floor {
@@ -302,7 +303,7 @@ pub(crate) async fn finish_after_max_iterations(
                     trim_budget
                 };
                 if dropped_messages > 0 || floor {
-                    let source = token_counter.source();
+                    let source = tokens_source;
                     let reason = crate::i18n::get_required_cli_string("history-trim-reason-budget");
                     if let Some(tx) = event_tx {
                         let _ = tx
@@ -347,7 +348,7 @@ pub(crate) async fn finish_after_max_iterations(
                         (provider_name, &selected_model),
                         context_limits,
                         tokens,
-                        token_counter.source(),
+                        tokens_source,
                     ));
                 }
                 break;
@@ -1051,7 +1052,6 @@ mod graceful_summary_metering_tests {
                     assert_eq!(model, "summary-model");
                     ResolvedContextLimits {
                         model_context_window: budget,
-                        context_send_budget: 0,
                         keep_recent_turns:
                             zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
                         request_token_ceiling: None,
@@ -1204,7 +1204,6 @@ mod graceful_summary_metering_tests {
                     assert_eq!(model, "summary-model");
                     ResolvedContextLimits {
                         model_context_window: budget,
-                        context_send_budget: 0,
                         keep_recent_turns:
                             zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
                         request_token_ceiling: None,
@@ -1279,7 +1278,6 @@ mod graceful_summary_metering_tests {
                 None,
                 |_, _| ResolvedContextLimits {
                     model_context_window: budget,
-                    context_send_budget: 0,
                     keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
                     request_token_ceiling: None,
                     ..ResolvedContextLimits::legacy_fallback(if disable_soft_budget {

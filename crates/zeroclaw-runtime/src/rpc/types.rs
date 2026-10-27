@@ -1928,8 +1928,8 @@ rpc_type! {
         pub model: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub last_input_tokens: Option<u64>,
-        /// The water-line of the serving route: where proactive trimming
-        /// engages. A trigger, not a limit.
+        /// The trim budget of the serving route: where proactive trimming
+        /// engages, and the size it drives the retained history down to.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub max_context_tokens: Option<u64>,
         /// Configured context window of the serving model.

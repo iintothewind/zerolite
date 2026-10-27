@@ -23,8 +23,8 @@ interface InputBarProps {
   contextInputTokens: number | null;
   /** The effective context window: the meter denominator. */
   contextEffectiveWindow: number | null;
-  /** The water-line: where proactive trimming engages. A trigger, not a limit. */
-  contextWaterlineTokens: number | null;
+  /** The trim budget: where proactive trimming engages, and what it retains to. */
+  contextTrimBudgetTokens: number | null;
   /** Provenance of the meter's numerator: provider / estimate / calibrated. */
   contextInputSource: ContextInputSource;
   liveStats: LiveStats;
@@ -52,7 +52,7 @@ export function InputBar(props: InputBarProps) {
     fileInputRef,
     contextInputTokens,
     contextEffectiveWindow,
-    contextWaterlineTokens,
+    contextTrimBudgetTokens,
     contextInputSource,
     liveStats,
     onInputChange,
@@ -143,7 +143,7 @@ export function InputBar(props: InputBarProps) {
             <ContextRing
               used={contextInputTokens}
               max={contextEffectiveWindow}
-              waterline={contextWaterlineTokens}
+              trimBudget={contextTrimBudgetTokens}
               source={contextInputSource}
             />
             {typing ? (

@@ -1561,7 +1561,6 @@ fn done_frame_context_limits(
                 context_token_budget: 0,
                 model_context_window_source:
                     zeroclaw_config::schema::ModelContextWindowSource::CompatibilityFallback,
-                context_send_budget: 0,
                 keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
                 request_token_ceiling: None,
             }),
@@ -2672,7 +2671,6 @@ mod tests {
             context_token_budget: 180_000,
             model_context_window_source:
                 zeroclaw_config::schema::ModelContextWindowSource::Configured,
-            context_send_budget: 0,
             keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
             request_token_ceiling: None,
         };
@@ -2690,7 +2688,6 @@ mod tests {
             context_token_budget: 0,
             model_context_window_source:
                 zeroclaw_config::schema::ModelContextWindowSource::Configured,
-            context_send_budget: 0,
             keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
             request_token_ceiling: None,
         };
@@ -2707,7 +2704,6 @@ mod tests {
             context_token_budget: 16_000,
             model_context_window_source:
                 zeroclaw_config::schema::ModelContextWindowSource::CompatibilityFallback,
-            context_send_budget: 0,
             keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
             request_token_ceiling: None,
         };
@@ -2727,7 +2723,6 @@ mod tests {
             context_token_budget: 7_200,
             model_context_window_source:
                 zeroclaw_config::schema::ModelContextWindowSource::Configured,
-            context_send_budget: 0,
             keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
             request_token_ceiling: None,
         };
@@ -2748,7 +2743,6 @@ mod tests {
             context_token_budget: 180_000,
             model_context_window_source:
                 zeroclaw_config::schema::ModelContextWindowSource::Configured,
-            context_send_budget: 0,
             keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
             request_token_ceiling: None,
         };
@@ -2978,7 +2972,7 @@ data: {\"type\":\"message_stop\"}\n\n",
     }
 
     /// Restore does **not** cap the transcript. `seed_conversation_history_with_event`
-    /// deliberately leaves the restored rows alone — the water-line trim inside
+    /// deliberately leaves the restored rows alone — the budget trim inside
     /// the turn is what bounds context, and capping at seed time would cut every
     /// restored session back to `keep_recent_turns` on load. Pinning the
     /// opposite (the upstream behaviour this fork deleted) made the test demand
@@ -4038,7 +4032,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             dropped_messages: 16,
             dropped_turns: 8,
             kept_turns: 1,
-            reason: "water-line exceeded".into(),
+            reason: "budget exceeded".into(),
             // Whichever budget the guard measured against — quoted, not
             // interpreted: the notice prints it as the configured budget.
             token_budget: Some(8_000),
@@ -5091,7 +5085,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
 
         // (provider_alias, context_window, expected_model_window, ceiling)
         //
-        // `max_context_tokens` on the done frame is the water-line (the
+        // `max_context_tokens` on the done frame is the trim budget (the
         // proactive-trim threshold), while `effective_context_window` is the
         // meter denominator: `min(model_window, ceiling)`. The web client
         // reads them as two different numbers (see
@@ -5151,7 +5145,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             };
 
             let limits = cfg.resolved_context_limits_for_route("coder", provider_alias, "glm-5.2");
-            // The water-line the done frame reports as `max_context_tokens`.
+            // The budget the done frame reports as `max_context_tokens`.
             let max_ctx = limits.context_token_budget as u64;
             let model_ctx_window = limits.configured_model_context_window().map(|v| v as u64);
             assert_eq!(
@@ -5183,7 +5177,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             assert_eq!(v["type"], "done");
             assert_eq!(
                 v["max_context_tokens"], max_ctx,
-                "the water-line must be emitted as max_context_tokens"
+                "the budget must be emitted as max_context_tokens"
             );
             // Provider field carries the full configured reference (e.g., "openai.vendor"),
             // matching pre-change gateway behavior. provider_ref carries the serving identity.
@@ -5425,7 +5419,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         );
         assert_eq!(
             v["max_context_tokens"], max_ctx,
-            "the water-line of the fallback route survives the same-profile fallback (#10068)"
+            "the budget of the fallback route survives the same-profile fallback (#10068)"
         );
         assert_eq!(v["last_serving_model"], "model-b");
     }
@@ -6201,7 +6195,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         );
         assert!(
             done["max_context_tokens"].as_u64().is_some_and(|w| w > 0),
-            "done must publish the water-line: {done}"
+            "done must publish the trim budget: {done}"
         );
 
         // And the turn boundary reaches the chat socket, session-scoped.

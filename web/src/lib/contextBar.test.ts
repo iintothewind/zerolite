@@ -3,8 +3,8 @@ import test from 'node:test';
 
 import { resolveContextBarState } from './contextBar.ts';
 
-test('uses the effective window as denominator and marks the water-line', () => {
-  // (effectiveWindow, waterlineTokens, used)
+test('uses the effective window as denominator and marks the trim budget', () => {
+  // (effectiveWindow, trimBudgetTokens, used)
   const state = resolveContextBarState(200_000, 180_000, 100_000);
   assert.ok(state);
   assert.equal(state.denominator, 200_000);
@@ -13,7 +13,7 @@ test('uses the effective window as denominator and marks the water-line', () => 
   assert.equal(state.cells[14], '│');
 });
 
-test('a water-line at the effective window has no marker', () => {
+test('a trim budget at the effective window has no marker', () => {
   const state = resolveContextBarState(32_000, 32_000, 16_000);
   assert.ok(state);
   assert.equal(state.denominator, 32_000);

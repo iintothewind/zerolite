@@ -7219,7 +7219,7 @@ mod tests {
         // what separates them.
         //
         // 1. Restore does not trim. `seed_conversation_history_with_event`
-        //    leaves the restored transcript alone and lets the water-line
+        //    leaves the restored transcript alone and lets the budget
         //    trim inside the turn bound it; capping at seed time would cut
         //    every restored transcript back to `keep_recent_turns` on load.
         //    So a low `keep_recent_turns` must change nothing here, and no

@@ -10,13 +10,14 @@ export interface ContextBarState {
  * Build the provider-route-aware state shared by the context meter UI.
  *
  * The denominator is the **effective context window** — the model's capacity
- * clamped by `[context].request_token_ceiling`. The water-line (the token
- * count at which proactive trimming engages) is NOT a limit: it only marks
- * where trimming starts, so it is drawn as a marker inside the bar.
+ * clamped by `[context].request_token_ceiling`. The trim budget (the token
+ * count at which a trim engages, and the size it retains to) is NOT a limit:
+ * it only marks where trimming starts, so it is drawn as a marker inside the
+ * bar.
  */
 export function resolveContextBarState(
   contextEffectiveWindow: number | null,
-  contextWaterlineTokens: number | null,
+  contextTrimBudgetTokens: number | null,
   contextInputTokens: number | null,
   barWidth = 16,
 ): ContextBarState | null {
@@ -30,12 +31,12 @@ export function resolveContextBarState(
   let trimMarkerIndex: number | null = null;
   if (
     denominator &&
-    contextWaterlineTokens !== null &&
-    contextWaterlineTokens > 0 &&
-    contextWaterlineTokens < denominator
+    contextTrimBudgetTokens !== null &&
+    contextTrimBudgetTokens > 0 &&
+    contextTrimBudgetTokens < denominator
   ) {
     trimMarkerIndex = Math.min(
-      Math.round((contextWaterlineTokens / denominator) * barWidth),
+      Math.round((contextTrimBudgetTokens / denominator) * barWidth),
       barWidth - 1,
     );
     cells[trimMarkerIndex] = '│';

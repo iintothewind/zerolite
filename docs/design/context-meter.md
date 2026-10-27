@@ -9,13 +9,13 @@
 ## Decision record: why this shape
 
 - **R1 — The meter denominator is the effective window, never the trigger.**
-  The ring's contract says "effective context window". Rendering the
-  water-line (the token count at which trimming engages) as the limit
+  The ring's contract says "effective context window". Rendering the trim
+  budget (the token count at which trimming engages) as the limit
   understates the window and makes the meter lie — the exact bug that
   shipped once (ring showed 104857 where the model side allows 131072).
 - **R2 — A ceiling must be representable.** A configured
-  `request_token_ceiling` scales the water-line but is neither the raw
-  model capacity nor the water-line. The runtime therefore publishes the
+  `request_token_ceiling` scales the trim budget but is neither the raw
+  model capacity nor the budget. The runtime therefore publishes the
   clamped window (`model_window.min(request_token_ceiling)`) as
   `effective_context_window` on the usage event, the WS done frame, and
   the RPC context-usage surface. Every consumer reads the same number.
@@ -36,16 +36,19 @@
   prefix)`. Mid-session, the meter never falls below the provider's last
   measurement.
 - **R5 — The estimate the meter publishes is conservative.** Every
-  estimate the meter publishes — turn-start meter, water-line trigger,
-  trim-notice `tokens_before` / `tokens_after` — is `estimate × 5/4`
-  (`conservative_estimate_tokens`). A raw estimate has never proven
-  sufficient as the pre-send number: GLM-5.2 billed 1.24× what the
-  estimator counted, and the margin factor covers the observed bias. The
-  margin biases the water-line toward trimming early — the safe
-  direction, since trim is cheap and missing the provider's real size is
-  not — and keeps the dispatch guard's upper bound from under-committing.
-  The estimator heuristics themselves are unchanged; the margin lives at
-  the consuming sites.
+  estimate the meter publishes — turn-start meter, trim-budget trigger,
+  in-turn dispatch guard, trim-notice `tokens_before` / `tokens_after` —
+  is `estimate × 11/10` (`conservative_estimate_tokens`). A raw estimate
+  has never proven sufficient as the pre-send number: the estimator prices
+  characters, not tokens, and the families these deployments bill have
+  charged more than it counted. One tenth is the margin that is always
+  applied; where a provider measurement exists the number is
+  `reported + margin(tail)` instead, and the ratio between the two is
+  never multiplied into a bound. The margin biases the budget toward
+  trimming early — the safe direction, since trim is cheap and missing the
+  provider's real size is not — and keeps the dispatch guard's upper bound
+  from under-committing. The estimator heuristics themselves are
+  unchanged; the margin lives at the consuming sites.
 - **R6 — Every published meter number carries its face.** Three sources
   exist: `provider` (the provider's own usage report), `estimate` (a
   local conservative estimate), `calibrated` (a provider measurement
@@ -60,14 +63,14 @@
   switch, a config-generation change, and a tool-catalog change all
   clear the anchor; a fresh `Agent` (session restore) has none. After a
   clear the meter falls back to the conservative estimate labelled
-  `estimate`, and the water-line follows it. The anchor is not persisted
+  `estimate`, and the trim budget follows it. The anchor is not persisted
   across sessions.
 
 ## Where upstream conflicts
 
 | # | Upstream | ZeroLite (this page) | Grounded in |
 |---|---|---|---|
-| 1 | The wire carries a single budget number; consumers reuse it as both trigger and denominator | Three distinct published numbers: effective window (denominator), water-line (trigger), send budget (fit target). The wire field `max_context_tokens` carries the water-line — it is not a limit and must never be rendered as one | R1, R2 |
+| 1 | The wire carries a single budget number; consumers reuse it as both trigger and denominator | Two distinct published numbers: the effective window (denominator) and the trim budget, which is both the trigger and the fit target (see `context-management.md` R9) | R1, R2 |
 | 2 | No published effective window | `effective_context_window` is published on usage events, WS done frames, and the RPC context-usage surface | R2 |
 | 3 | No estimation fallback specified | Provider omits usage → local estimate (script-aware, see `context-management.md` § token estimation) | R3 |
 | 4 | The turn-start meter re-estimates the population from bytes, so it jumps down at every turn start | The turn-start meter is the anchor (provider measurement + conservative tail) or the conservative estimate; the raw estimator stays as the pre-anchor face and as the dispatch guard's ratio input | R4, R5 |
@@ -76,7 +79,7 @@
 
 - **Verify post-merge by behavior:** set a ceiling below the model window
   and confirm the ring denominator equals the clamped window, not the
-  water-line and not the raw model capacity; run a provider that omits
+  trim budget and not the raw model capacity; run a provider that omits
   usage and confirm the meter shows an estimate, not 0.
 - **Field rename (history, not a decision):** `max_input_tokens` was
   renamed to `request_token_ceiling` because it is a ceiling on request
@@ -85,7 +88,7 @@
 - **Code anchors:** `crates/zeroclaw-config/src/scattered_types.rs`
   (`ContextConfig.request_token_ceiling`),
   `crates/zeroclaw-config/src/schema.rs` (`effective_context_window`,
-  `context_send_budget`), web `contextBar` / `historyTrimNotice`.
+  `context_trim_budget`), web `contextBar` / `historyTrimNotice`.
 - **Verify post-merge by behavior:** run two turns where the provider
   reports 25,787 input tokens on the first: the second turn's meter must
   sit at or above 25,787, labelled `calibrated`; the usage frame reports
@@ -116,5 +119,6 @@
 - 2026-10 session diagnostics: a turn billed 25,787 input tokens; the
   next turn's turn-start estimate published 20,826 (byte estimate of the
   same rows, ratio 0.808) and the meter fell ~20% below the number just
-  charged; the anchor + 5/4 margin (20,826 × 5/4 = 26,033 ≥ 25,787) is
-  the fix.
+  charged; the anchor plus a conservative margin was the fix. The factor
+  has since been tightened from 5/4 to 11/10 — the bias is real but the
+  families in use came in far closer to the estimate than that session did.

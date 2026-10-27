@@ -11,6 +11,12 @@
 # CARGO_TARGET_DIR / …/cargo-target when present (Cursor redirect; can be
 # tens of GB). Does NOT run docker system prune.
 #
+# Residue the host user cannot delete — the cross-compile in
+# scripts/dev/build-cli-local.sh runs without `--user`, so it writes target/
+# as root — is retried from inside a local container image, where the same
+# repo mount is writable. No image is pulled for this: a fallback is only
+# possible when one is already local.
+#
 # Usage:
 #   bash scripts/dev/reclaim-cargo-disk.sh
 #   scripts\dev\reclaim-cargo-disk.cmd
@@ -24,12 +30,50 @@ cd "$REPO_ROOT"
 
 removed_any=0
 
+# Pick an already-local image able to run `rm -rf` on the mounted repo.
+_reclaim_rm_image() {
+  local image
+  for image in "${ZEROCLAW_RUST_IMAGE:-}" zeroclaw-test rust:1-bookworm; do
+    [ -n "$image" ] || continue
+    if docker image inspect "$image" >/dev/null 2>&1; then
+      printf '%s\n' "$image"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# 0 = nothing left at $1, 1 = still there (or not reachable from a container).
+_reclaim_rm_in_container() {
+  local path="$1" rel image
+  case "$path" in
+    "$REPO_ROOT"/*) rel="${path#"$REPO_ROOT"/}" ;;
+    *) return 1 ;;
+  esac
+  command -v docker >/dev/null 2>&1 || return 1
+  if ! image="$(_reclaim_rm_image)"; then
+    echo "    (still there; no local docker image to remove it with)" >&2
+    return 1
+  fi
+  echo "    (still there after the host-side rm — removing $rel from inside $image)"
+  # MSYS_NO_PATHCONV: Git Bash must not rewrite /work/<rel> into a Windows path.
+  MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' docker run --rm \
+    -v "$REPO_ROOT:/work" -w /work "$image" \
+    rm -rf -- "/work/$rel" >/dev/null 2>&1 || true
+  [ ! -e "$path" ]
+}
+
 wipe_path() {
   local path="$1"
   local label="$2"
   if [ -e "$path" ]; then
     echo "==> remove $label: $path"
-    rm -rf "$path"
+    # A failing rm must not abort under `set -e`: the fallback below is the
+    # reason this is tolerated here.
+    rm -rf "$path" 2>/dev/null || true
+    if [ -e "$path" ]; then
+      _reclaim_rm_in_container "$path" || true
+    fi
     if [ -e "$path" ]; then
       echo "error: failed to remove $path" >&2
       exit 1

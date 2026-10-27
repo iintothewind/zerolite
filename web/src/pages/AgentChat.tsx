@@ -110,7 +110,7 @@ export function AgentChatInner({
     pendingApproval,
     respondToApproval,
     contextEffectiveWindow,
-    contextWaterlineTokens,
+    contextTrimBudgetTokens,
     contextInputTokens,
     contextInputSource,
     liveStats,
@@ -992,7 +992,7 @@ export function AgentChatInner({
           fileInputRef={fileInputRef}
           contextInputTokens={contextInputTokens}
           contextEffectiveWindow={contextEffectiveWindow}
-          contextWaterlineTokens={contextWaterlineTokens}
+          contextTrimBudgetTokens={contextTrimBudgetTokens}
           contextInputSource={contextInputSource}
           liveStats={liveStats}
           onInputChange={handleTextareaChange}

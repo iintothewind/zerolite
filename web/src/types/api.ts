@@ -287,8 +287,8 @@ export interface WsMessage {
   served_model?: string;
   fallback_kind?: "server" | "client" | "client_server";
   // Context window info (present on "done" frames). See #7311.
-  // `max_context_tokens` is the WATER-LINE: the token count at which proactive
-  // trimming engages. It is a trigger, not a limit.
+  // `max_context_tokens` is the TRIM BUDGET: the token count at which a trim
+  // engages, and the size the trim drives the retained history down to.
   // `model_context_window` is the model's own capacity, before the
   // `[context].request_token_ceiling` clamp.
   // `effective_context_window` is the EFFECTIVE context window

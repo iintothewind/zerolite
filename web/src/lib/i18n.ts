@@ -470,7 +470,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.context.ring_label': '上下文占用',
     'agent.context.ring_detail_used': '已用 {count}',
     'agent.context.ring_detail_max': '上限 {count}',
-    'agent.context.ring_detail_waterline': '裁剪触发线 {count}',
+    'agent.context.ring_detail_trim_budget': '裁剪预算 {count}',
     'agent.context.ring_detail_percent': '占用 {percent}%',
 
     'agent.context.ring_detail_source': '来源：{source}',
@@ -2145,7 +2145,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.context.ring_label': 'Context usage',
     'agent.context.ring_detail_used': 'used {count}',
     'agent.context.ring_detail_max': 'limit {count}',
-    'agent.context.ring_detail_waterline': 'trim trigger {count}',
+    'agent.context.ring_detail_trim_budget': 'trim budget {count}',
     'agent.context.ring_detail_percent': '{percent}% used',
     'agent.context.ring_detail_source': 'Source: {source}',
   },

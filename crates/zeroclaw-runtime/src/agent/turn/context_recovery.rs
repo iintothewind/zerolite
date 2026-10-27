@@ -65,10 +65,9 @@ pub(crate) async fn try_recover_context_overflow(
     event_tx: Option<&tokio::sync::mpsc::Sender<zeroclaw_api::agent::TurnEvent>>,
     on_delta: Option<&tokio::sync::mpsc::Sender<super::events::DraftEvent>>,
     observer: &dyn Observer,
-    context_token_budget: usize,
-    context_send_budget: usize,
+    trim_budget: usize,
     // The model's own capacity: the hard floor. A retention that misses the
-    // send budget but still fits the window is a soft floor.
+    // trim budget but still fits the window is a soft floor.
     model_context_window: usize,
     keep_recent_turns: usize,
     calibration: &ContextCalibration,
@@ -83,16 +82,15 @@ pub(crate) async fn try_recover_context_overflow(
             "Context window exceeded, attempting in-loop recovery"
         );
 
-        // The provider rejected this history: cascade keep-N → keep≥1 toward
-        // the fit budget (same action as the token-triggered lines). The
-        // current size is the provider-authoritative calibration, kept for
-        // telemetry and the system-floor guard below.
+        // The provider rejected this history, so recovery runs the same action
+        // every other trigger runs: keep the newest `keep_recent_turns` whole
+        // turns, then one fewer at a time while the retained set still exceeds
+        // the trim budget. There is no deeper variant — the keep-N cut is
+        // already deep, and the cascade is what covers a rejection the budget
+        // did not predict. The current size is the provider-authoritative
+        // calibration, kept for telemetry and the system-floor guard below.
         let tokens_now = calibration.current(history);
         let owned = std::mem::take(history);
-        let send_budget = crate::agent::history_trim::resolve_send_budget(
-            context_send_budget,
-            context_token_budget,
-        );
         // The synthetic crumb is not a turn: it must not consume a keep-N
         // slot nor be dropped by the cascade.
         let has_leading_breadcrumb = {
@@ -100,19 +98,23 @@ pub(crate) async fn try_recover_context_overflow(
             leading_system < owned.len()
                 && owned[leading_system].content == crate::agent::history_trim::breadcrumb().content
         };
-        // The provider's rejection is authoritative: its own limit is smaller
-        // than anything the local estimate can see, so the recovery shrinks
-        // below the preferred retention instead of trusting the configured
-        // budget. The forced-shrink target is a fraction of the CURRENT size,
-        // so the cascade has somewhere to go even when the preferred count
-        // still fits the budget.
-        let target_budget =
-            crate::agent::turn::context_pipeline::plan_pre_send_trim(tokens_now, send_budget, true)
-                .target_budget;
+        // A rejection is evidence the local estimate cannot see (an image's
+        // real cost, one-time tool schemas), so the action runs at least one
+        // step deeper than the estimate alone would: the cascade starts at one
+        // turn fewer than is retained when the configured retention would keep
+        // them all, and at the configured retention otherwise. The retry is
+        // then strictly smaller than the request the provider just refused, and
+        // the same budget still caps how much survives.
+        let retained_turns = crate::agent::history_trim::count_turns(&owned)
+            .saturating_sub(usize::from(has_leading_breadcrumb));
+        let preferred_keep = keep_recent_turns
+            .max(1)
+            .min(retained_turns.saturating_sub(1))
+            .max(1);
         let result = crate::agent::history_trim::trim_to_fit_with_crumb(
             owned,
-            keep_recent_turns,
-            target_budget,
+            preferred_keep,
+            trim_budget,
             model_context_window,
             has_leading_breadcrumb,
         );
@@ -125,7 +127,7 @@ pub(crate) async fn try_recover_context_overflow(
         if trimmed && !exceeds_budget {
             crate::agent::history_trim::warn_if_below_preferred_keep(
                 keep_recent_turns,
-                send_budget,
+                trim_budget,
                 &result,
             );
         }
@@ -163,7 +165,7 @@ pub(crate) async fn try_recover_context_overflow(
                         dropped_turns,
                         kept_turns,
                         reason: reason.clone(),
-                        token_budget: Some(send_budget as u64),
+                        token_budget: Some(trim_budget as u64),
                         tokens_before: Some(tokens_now as u64),
                         tokens_after: Some(tokens_after as u64),
                         tokens_before_source: Some(
@@ -191,7 +193,7 @@ pub(crate) async fn try_recover_context_overflow(
                 channel: None,
                 agent_alias: None,
                 turn_id: None,
-                token_budget: Some(send_budget as u64),
+                token_budget: Some(trim_budget as u64),
                 tokens_before: Some(tokens_now as u64),
                 tokens_after: Some(tokens_after as u64),
                 tokens_before_source: Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
@@ -202,7 +204,7 @@ pub(crate) async fn try_recover_context_overflow(
         }
 
         let system_floor = crate::agent::history::estimate_system_floor_tokens(history);
-        if system_floor >= send_budget {
+        if system_floor >= trim_budget {
             ::zeroclaw_log::record!(
                 ERROR,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -210,10 +212,10 @@ pub(crate) async fn try_recover_context_overflow(
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                     .with_attrs(::serde_json::json!({
                         "system_floor": system_floor,
-                        "budget": send_budget,
+                        "budget": trim_budget,
                         "error_key": "context_floor_exceeds_budget",
                     })),
-                crate::agent::history::context_floor_remediation(system_floor, send_budget)
+                crate::agent::history::context_floor_remediation(system_floor, trim_budget)
             );
         } else {
             ::zeroclaw_log::record!(
@@ -268,7 +270,6 @@ mod tests {
             &observer,
             budget,
             budget,
-            budget,
             keep,
             &ContextCalibration::new(),
             &mut crumb_present,
@@ -310,7 +311,6 @@ mod tests {
             &observer,
             32_000,
             32_000,
-            32_000,
             5,
             &ContextCalibration::new(),
             &mut crumb_present,
@@ -347,7 +347,6 @@ mod tests {
             None,
             Some(&delta_tx),
             &observer,
-            32_000,
             32_000,
             32_000,
             5,
@@ -391,7 +390,6 @@ mod tests {
             &observer,
             32_000,
             32_000,
-            32_000,
             5,
             &ContextCalibration::new(),
             &mut crumb_present,
@@ -429,7 +427,6 @@ mod tests {
             Some(&tx),
             None,
             &observer,
-            32_000,
             32_000,
             32_000,
             5,
@@ -492,7 +489,6 @@ mod tests {
             &observer,
             100,
             100,
-            100,
             5,
             &ContextCalibration::new(),
             &mut crumb_present,
@@ -532,7 +528,6 @@ mod tests {
             Some(&tx),
             None,
             &observer,
-            32_000,
             32_000,
             32_000,
             5,
@@ -579,7 +574,6 @@ mod tests {
             None,
             None,
             &observer,
-            budget,
             budget,
             budget,
             5,

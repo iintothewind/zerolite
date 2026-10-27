@@ -8,15 +8,16 @@ interface ContextRingProps {
   /**
    * The effective context window — the model's capacity clamped by
    * `[context].request_token_ceiling` — or null until the gateway reports it.
-   * This is the meter denominator; the water-line (where trimming engages) is
-   * a trigger, not this limit.
+   * This is the meter denominator; the trim budget (where trimming engages,
+   * and the size a trim retains to) is a trigger, not this limit.
    */
   max: number | null;
   /**
-   * The water-line: the token count at which proactive trimming engages. It
-   * is a trigger, not a limit — shown so the two numbers are never confused.
+   * The trim budget: the token count at which proactive trimming engages,
+   * and the size it drives the retained history down to. It is a trigger,
+   * not a limit — shown so the two numbers are never confused.
    */
-  waterline?: number | null;
+  trimBudget?: number | null;
   /**
    * Provenance of `used`: `provider` (measured by the provider), `estimate`
    * (local heuristic), or `calibrated` (provider measurement anchored on the
@@ -43,7 +44,7 @@ function formatExactTokens(n: number): string {
  * (a freshly loaded conversation, before any `done` frame) rather than
  * inventing a fill — the ring is a meter, not a progress indicator.
  */
-export default function ContextRing({ used, max, waterline, source }: ContextRingProps) {
+export default function ContextRing({ used, max, trimBudget, source }: ContextRingProps) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
 
@@ -66,9 +67,10 @@ export default function ContextRing({ used, max, waterline, source }: ContextRin
   }, [open]);
 
   const hasWindow = typeof max === 'number' && max > 0;
-  // The water-line is only worth showing when it is strictly below the limit
+  // The trim budget is only worth showing when it is strictly below the limit
   // (it always is, unless the percentage is 100).
-  const hasWaterline = typeof waterline === 'number' && waterline > 0 && waterline < (max ?? 0);
+  const hasTrimBudget =
+    typeof trimBudget === 'number' && trimBudget > 0 && trimBudget < (max ?? 0);
   const usedTokens = typeof used === 'number' && used > 0 ? used : 0;
   const pct = hasWindow ? Math.min((usedTokens / (max as number)) * 100, 100) : 0;
   // The templates carry their own `%`, so they take the bare number; only the
@@ -139,14 +141,14 @@ export default function ContextRing({ used, max, waterline, source }: ContextRin
               hasWindow ? formatExactTokens(max as number) : '—',
             )}
           </div>
-          {hasWaterline && (
+          {hasTrimBudget && (
             <div
               className="px-3 py-1 text-xs font-mono tabular-nums"
               style={{ color: 'var(--pc-text-secondary)' }}
             >
-              {t('agent.context.ring_detail_waterline').replace(
+              {t('agent.context.ring_detail_trim_budget').replace(
                 '{count}',
-                formatExactTokens(waterline as number),
+                formatExactTokens(trimBudget as number),
               )}
             </div>
           )}
