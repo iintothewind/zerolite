@@ -599,6 +599,30 @@ mod test_pre_save_pause_gate {
     }
 }
 
+/// Config writes the runtime applies on its own, without a daemon reload.
+///
+/// A session's model selection lands as `agents.<alias>.model_provider`. The
+/// agent republishes its config generation from the live config source at every
+/// turn boundary and rebuilds its provider from it (`sync_config_generation` +
+/// `try_apply_model_switch`), so the next turn already runs the new model.
+/// Raising `pending_reload` for that asked the operator to reload a daemon that
+/// would behave identically — and a reload tears down every channel, which is
+/// exactly the disruption a model switch must not cause. Switching models is a
+/// routine action, so it stays silent; every other path keeps the flag.
+///
+/// An empty set means the write did not go through the per-path set-prop
+/// surface (a whole-config save), which is not evidence of a hot-applied
+/// change: keep the conservative default and flag it.
+fn config_write_needs_reload(dirty_paths: &std::collections::HashSet<String>) -> bool {
+    dirty_paths.is_empty()
+        || dirty_paths.iter().any(|path| {
+            !path
+                .strip_prefix("agents.")
+                .and_then(|rest| rest.split_once('.'))
+                .is_some_and(|(alias, field)| !alias.is_empty() && field == "model_provider")
+        })
+}
+
 /// Save-and-swap half of the config persistence sequence, split from the
 /// channel-generation drain so the retained destructive transaction can commit
 /// the alias generation synchronously after the live swap and before the
@@ -624,6 +648,9 @@ async fn persist_and_swap_prepared(
     authorization
         .covers_all(new_config.dirty_paths.iter().map(String::as_str))
         .map_err(IntoResponse::into_response)?;
+    // Decide from the paths this write touched, and do it before `save_dirty`,
+    // which drains the set once the per-path PATCH is applied.
+    let needs_reload = config_write_needs_reload(&new_config.dirty_paths);
     if let Err(e) = zeroclaw_runtime::rpc::auth::validate_accepted_auth_config(&new_config) {
         return Err(error_response(ConfigApiError::new(
             ConfigApiCode::ValidationFailed,
@@ -681,11 +708,15 @@ async fn persist_and_swap_prepared(
         )));
     }
 
+    // Only writes that need a subsystem re-init raise the flag; a model switch
+    // does not (see `config_write_needs_reload`).
     authorization.publish_persisted(&new_config);
     commit
         .publish(revision, new_config)
         .map_err(|e| error_response(config_commit_publish_error(e)))?;
-    pending_reload.store(true, std::sync::atomic::Ordering::Relaxed);
+    if needs_reload {
+        pending_reload.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     Ok(prepared_channel_generation)
 }
 
@@ -1298,14 +1329,18 @@ pub async fn handle_drift(State(state): State<AppState>) -> Response {
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ReloadStatusResponse {
-    /// Whether any config write has landed since the last admin reload and may
-    /// still require subsystem re-instantiation to take effect.
+    /// Whether a config write since the last admin reload may still require
+    /// subsystem re-instantiation to take effect. Not every write qualifies: a
+    /// session's model selection (`agents.<alias>.model_provider`) is applied by
+    /// the runtime on the next turn, so it never raises this flag — see
+    /// `config_write_needs_reload`.
     pub pending_reload: bool,
     pub application: zeroclaw_runtime::config_application::ConfigApplicationStatus,
 }
 
-/// `GET /api/config/reload-status` — pending-reload flag for the dashboard's
-/// reload banner. Goes true on any config write, false on `/admin/reload`.
+/// `GET /api/config/reload-status` — pending-reload flag for the dashboard.
+/// Raised by config writes that need subsystem re-instantiation, cleared by
+/// `/admin/reload`. Model selection is deliberately exempt (applied per turn).
 pub async fn handle_reload_status(State(state): State<AppState>) -> Response {
     let pending_reload = state
         .pending_reload
@@ -3716,6 +3751,67 @@ mod tests {
         let (_, cleared) = response_json(router.oneshot(read()).await.unwrap()).await;
         assert_eq!(cleared["pending_reload"], false);
         assert_eq!(cleared["application"], saved["application"]);
+    }
+
+    /// A model selection is a config write the runtime applies on the next turn
+    /// (`sync_config_generation` + `try_apply_model_switch`), so it must not
+    /// raise `pending_reload`: a reload would tear down every channel and change
+    /// nothing. Switching models is a routine action — it must stay silent.
+    /// Every other path keeps the flag.
+    #[tokio::test]
+    async fn a_model_selection_write_never_flags_a_pending_reload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        config.providers.models.ensure("custom", "a").unwrap();
+        config.providers.models.ensure("custom", "b").unwrap();
+        config.agents.insert(
+            "swan".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                model_provider: "custom.a".into(),
+                ..Default::default()
+            },
+        );
+        config.save().await.unwrap();
+        let state = test_state(config);
+
+        let put = |path: &str, value: &str| {
+            handle_prop_put(
+                State(state.clone()),
+                None,
+                axum::Json(PropPutBody {
+                    path: path.to_string(),
+                    value: serde_json::json!(value),
+                    comment: None,
+                }),
+            )
+        };
+
+        let (status, _) = response_json(put("agents.swan.model_provider", "custom.b").await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !state
+                .pending_reload
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "a model switch is applied live; flagging it asked for a reload that changes nothing"
+        );
+        assert_eq!(
+            state.config.read().agents["swan"].model_provider.as_str(),
+            "custom.b",
+            "the write still lands in the live config"
+        );
+
+        // A path the runtime does not re-read per turn keeps the flag. (The
+        // gateway's listen port needs a rebind — the same write the
+        // reload-status test above uses.)
+        let (status, _) = response_json(put("gateway.port", "42618").await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            state
+                .pending_reload
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "only the model selection is exempt"
+        );
     }
 
     #[tokio::test]
