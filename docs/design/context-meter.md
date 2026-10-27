@@ -81,6 +81,14 @@
   and confirm the ring denominator equals the clamped window, not the
   trim budget and not the raw model capacity; run a provider that omits
   usage and confirm the meter shows an estimate, not 0.
+- **Verify post-merge by behavior (mid-turn switch):** in one turn, have a tool
+  ask for a different model and keep the turn running. The `usage` frame for the
+  switched route's call must already carry that route's `max_context_tokens` /
+  `model_context_window` / `effective_context_window`; a merge that strips those
+  from the per-step frame leaves the ring on the old route's numbers until
+  `done`, which is the defect this check exists for. Both tests live in
+  `ws::tests` (`usage_frame_carries_the_serving_route_window_and_budget`,
+  `usage_frame_follows_an_in_turn_route_switch`).
 - **Field rename (history, not a decision):** `max_input_tokens` was
   renamed to `request_token_ceiling` because it is a ceiling on request
   input tokens, not a window. A merge that reintroduces the old name or

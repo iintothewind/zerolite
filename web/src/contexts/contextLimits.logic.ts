@@ -26,8 +26,15 @@ export const EMPTY_CONTEXT_LIMITS: ContextLimitsState = {
   modelWindow: null,
 };
 
-/** Read a done frame as one authoritative window/trim-budget snapshot. */
-export function contextLimitsFromDoneFrame(
+/**
+ * Read a frame that carries the serving route as one authoritative
+ * window/trim-budget snapshot.
+ *
+ * `done` and (since the mid-turn model switch) `usage` both publish all three
+ * fields; `context_usage` publishes them too. A frame without them yields all
+ * nulls, which callers read as "no route information here, keep what you have".
+ */
+export function contextLimitsFromFrame(
   frame: Pick<
     WsMessage,
     'max_context_tokens' | 'model_context_window' | 'effective_context_window'

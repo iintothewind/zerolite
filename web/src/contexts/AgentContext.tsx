@@ -24,8 +24,7 @@ import {
 } from '@/lib/api';
 import { primeModelProviderCatalog, modelProviderDisplayName } from '@/lib/modelProviders';
 import { resolveAvailableModels } from './modelPicker.logic';
-import { contextLimitsFromDoneFrame } from './contextLimits.logic';
-import { meterUpdateFromFrame, type ContextInputSource } from './contextMeter.logic';
+import { contextMeterStep, type ContextInputSource } from './contextMeter.logic';
 import { buildHistoryTrimmedNotice } from './historyTrimNotices.logic';
 import type { ToolCall } from '@/lib/toolCall';
 import { emptyLiveTurn, type LiveTurn, type TurnSegments } from '@/lib/turnSegments';
@@ -443,13 +442,19 @@ export function AgentProvider({
 
   // Centralised WebSocket message handler — reused across initial connect and reconnects.
   const handleWsMessage = useCallback((msg: WsMessage) => {
-    // One place folds the context meter, so every frame that prices the request
-    // — the trim's post-trim size, the assembled estimate at turn start, the
-    // provider's measurement, the terminal size — moves the ring the same way.
-    const meterUpdate = meterUpdateFromFrame(msg);
-    if (meterUpdate) {
-      setContextInputTokens(meterUpdate.used);
-      if (meterUpdate.source !== undefined) setContextInputSource(meterUpdate.source);
+    // One place folds the context meter: numerator, label and the serving
+    // route's window/budget. Every frame that prices the request moves the ring
+    // through this step, so the four paths cannot drift apart — and a mid-turn
+    // model switch reaches `limit` / `trim budget` on the first post-switch
+    // frame instead of waiting for `done`.
+    const meterStep = contextMeterStep(msg);
+    if (meterStep) {
+      if (meterStep.used !== undefined) setContextInputTokens(meterStep.used);
+      if (meterStep.source !== undefined) setContextInputSource(meterStep.source);
+      if (meterStep.limits) {
+        setContextEffectiveWindow(meterStep.limits.effectiveWindow);
+        setContextTrimBudgetTokens(meterStep.limits.trimBudgetTokens);
+      }
     }
     switch (msg.type) {
       case 'session_start':
@@ -545,15 +550,8 @@ export function AgentProvider({
           // counts `Usage` events, and they diverge only when the page missed
           // part of the turn.
           setTokenStats((s) => applyDone(s, msg));
-          {
-            // One authoritative snapshot per done frame: the effective window
-            // (meter denominator) and the trim budget (trigger and fit target).
-            const limits = contextLimitsFromDoneFrame(msg);
-            setContextEffectiveWindow(limits.effectiveWindow);
-            setContextTrimBudgetTokens(limits.trimBudgetTokens);
-          }
-          // The terminal size reaches the meter through `meterUpdateFromFrame`
-          // above, which is also what keeps a trim that landed after the final
+          // The route snapshot and the terminal size arrive through the two
+          // folds above, which also keep a trim that landed after the final
           // call from being undone here.
         }
         setTyping(false);

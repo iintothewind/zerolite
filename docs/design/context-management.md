@@ -226,10 +226,17 @@ The client folds all four in one place, `web/src/contexts/contextMeter.logic.ts`
 dispatched, which is why the runtime publishes the re-read post-trim estimate on
 `context_usage`, and a test asserts the two numbers are equal.
 
-Two wire fields, one number: `context_token_budget` (RPC) / `max_context_tokens`
-(WS) on `context_usage`, `usage` and `done` carries the trim budget; the
-notice's `token_budget` quotes whichever budget the guard that fired measured
-against (the model window for the hard-limit path). Non-negotiable:
+The route snapshot — `max_context_tokens` (`context_token_budget` on RPC),
+`model_context_window`, `effective_context_window` — rides on **all four** frames,
+not only on `done`. A turn can switch models mid-flight (a tool asks for another
+route) and keep running, so the ring must adopt the new route's `limit` and
+`trim budget` from the first post-switch frame; otherwise it shows the previous
+route's numbers until the turn ends while the guard has been budgeting against
+the new one. A frame that carries none of the three (an older daemon) means "no
+route information here", not "no window": the client keeps the snapshot it has.
+`history_trimmed`'s `token_budget` is the one exception in kind — it quotes
+whichever budget the guard that fired measured against (the model window for the
+hard-limit path), which is a figure, not a knob. Non-negotiable:
 
 - **`context_usage` is not `usage`.** `usage` means "a call completed" and closes
   a client step; the assembled estimate means "a request is about to go out".

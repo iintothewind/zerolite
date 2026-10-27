@@ -1730,11 +1730,20 @@ impl UsageFold {
         if let Some(cu) = cost_usd {
             entry.cost_usd += cu;
         }
+        // The window fields ride along so a model switch is visible as soon as
+        // the serving route answers, not only on the terminal `done` frame: a
+        // turn can switch models mid-flight and keep running, and without these
+        // the ring would keep the previous route's `limit` / `trim budget` for
+        // the rest of that turn even though the runtime has been trimming
+        // against the new route all along.
         Some(serde_json::json!({
             "type": "usage",
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "cached_input_tokens": cached_input_tokens,
+            "max_context_tokens": context_token_budget,
+            "model_context_window": model_context_window,
+            "effective_context_window": effective_context_window,
         }))
     }
 
@@ -5873,6 +5882,98 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         let entries = fold.take_sorted_entries();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].cached_input_tokens, 80);
+    }
+
+    /// The per-step `usage` frame carries the serving route's window and budget.
+    ///
+    /// A turn can switch models mid-flight (a tool asks for another route) and
+    /// keep running. Without these fields the browser kept the previous route's
+    /// `limit` / `trim budget` until the turn ended, even though the runtime had
+    /// been trimming against the new route from the first post-switch dispatch
+    /// — the ring showed 65,536 while the guard was budgeting against 1,048,576.
+    #[test]
+    fn usage_frame_carries_the_serving_route_window_and_budget() {
+        let mut fold = UsageFold::default();
+        let frame = fold
+            .apply(zeroclaw_api::agent::TurnEvent::Usage {
+                input_tokens: Some(14_900),
+                output_tokens: Some(120),
+                cached_input_tokens: None,
+                cost_usd: None,
+                context_token_budget: Some(838_860),
+                model_context_window: Some(1_048_576),
+                effective_context_window: Some(1_048_576),
+                provider_ref: "test.provider".to_string(),
+                model: "big-model".to_string(),
+                accepted: true,
+                estimated_input_tokens: None,
+            })
+            .expect("an accepted usage event closes a step");
+
+        assert_eq!(frame["type"], "usage");
+        assert_eq!(frame["input_tokens"], 14_900);
+        assert_eq!(frame["max_context_tokens"], 838_860);
+        assert_eq!(frame["model_context_window"], 1_048_576);
+        assert_eq!(frame["effective_context_window"], 1_048_576);
+    }
+
+    /// A route switch *inside* one turn: the frame for the new route's call
+    /// carries the new window/budget, and the turn's accepted snapshot moves
+    /// with it — so the terminal frame does not fall back to the old route.
+    ///
+    /// This is the reported case: a small route answered first (65,536 window,
+    /// 52,428 budget), a tool asked for a 1M model, and the ring kept showing
+    /// 65,536 until the turn ended while the guard was already budgeting against
+    /// 1,048,576.
+    #[test]
+    fn usage_frame_follows_an_in_turn_route_switch() {
+        let mut fold = UsageFold::default();
+
+        let before = fold
+            .apply(zeroclaw_api::agent::TurnEvent::Usage {
+                input_tokens: Some(14_900),
+                output_tokens: Some(80),
+                cached_input_tokens: None,
+                cost_usd: None,
+                context_token_budget: Some(52_428),
+                model_context_window: Some(65_536),
+                effective_context_window: Some(65_536),
+                provider_ref: "test.small".to_string(),
+                model: "small-model".to_string(),
+                accepted: true,
+                estimated_input_tokens: None,
+            })
+            .expect("the first accepted call closes a step");
+        assert_eq!(before["max_context_tokens"], 52_428);
+        assert_eq!(before["effective_context_window"], 65_536);
+
+        let after = fold
+            .apply(zeroclaw_api::agent::TurnEvent::Usage {
+                input_tokens: Some(15_200),
+                output_tokens: Some(40),
+                cached_input_tokens: None,
+                cost_usd: None,
+                context_token_budget: Some(838_860),
+                model_context_window: Some(1_048_576),
+                effective_context_window: Some(1_048_576),
+                provider_ref: "test.big".to_string(),
+                model: "big-model".to_string(),
+                accepted: true,
+                estimated_input_tokens: None,
+            })
+            .expect("the switched route's call closes a step");
+        assert_eq!(
+            after["max_context_tokens"], 838_860,
+            "the post-switch frame carries the new route's budget, not the old one"
+        );
+        assert_eq!(after["model_context_window"], 1_048_576);
+        assert_eq!(after["effective_context_window"], 1_048_576);
+
+        // The accepted-serving snapshot moved too, so `done` reports the route
+        // that actually answered last.
+        assert_eq!(fold.last_model.as_deref(), Some("big-model"));
+        assert_eq!(fold.last_context_token_budget, Some(838_860));
+        assert_eq!(fold.last_effective_context_window, Some(1_048_576));
     }
 
     #[test]
