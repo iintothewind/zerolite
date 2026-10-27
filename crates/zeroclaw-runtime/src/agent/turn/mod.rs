@@ -9938,15 +9938,20 @@ mod tool_lifecycle_abandonment_tests {
         // The provider rejects the first request; the recovery path must drop
         // the oversized old turn and keep the image.
         //
-        // The budget is wide enough to keep both turns, so the pre-dispatch
-        // gate leaves the old turn in place and the provider is the one that
-        // rejects it. That rejection is the fallback case: the local estimate
-        // cannot see everything the provider will charge for (an image's real
-        // cost, one-time tool schemas), so a request can still overflow after
-        // the local check. The rejection is therefore its own trigger, and the
-        // action runs one step deeper than the estimate — a whole turn is
-        // dropped, the retry is smaller, and the image still fits afterwards.
-        let budget = crate::agent::history::IMAGE_TOKEN_ESTIMATE + 1_000 + 10_000;
+        // Sized so the local gate stays silent, with headroom for the
+        // conservative margin every pre-send number carries: this fixture is
+        // about the fallback *after* a provider rejection, so the gate must not
+        // trim first. That rejection is the case the local estimate cannot
+        // cover (an image's real cost, one-time tool schemas), and it is its own
+        // trigger: recovery runs the same action one step deeper, a whole turn
+        // is dropped, the retry is smaller, and the image still fits.
+        let budget = crate::agent::history_trim::conservative_estimate_tokens(
+            crate::agent::history::estimate_history_tokens(&history),
+        );
+        assert!(
+            crate::agent::history::estimate_history_tokens(&history) < budget,
+            "the gate must stay silent so the provider is the one that rejects"
+        );
         let result = run_scripted_loop_with_budget(
             &provider,
             &registry,

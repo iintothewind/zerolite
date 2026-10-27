@@ -1,107 +1,139 @@
-# Handoff — 2026-10-27: in-turn trim guard
+# Handoff — 2026-10-27/28: in-turn trim guard (context)
 
-Branch `zerolite`, HEAD `0762173f3 fix(context): anchor the in-turn dispatch
-guard on the provider measurement`. Working tree clean.
+Branch `zerolite`. Everything today is committed except the work described under
+"What is still open".
 
-## What landed today
+## Why the guard missed (the question, answered)
 
-1. **One budget, one action.** `trim_budget = max(1, min(window ×
-   trim_threshold_percent/100, window − reserve_tokens))` is both the trigger
-   and the fit target. `context_send_budget` / `resolve_send_budget` deleted;
-   `water-line` retired as a name across Rust, docs and README (design record
-   gains R8 one-retention-semantic, R9 one-number).
-2. **One retention action everywhere.** Keep the newest `keep_recent_turns`
-   whole turns in a single cut, then drop one more turn at a time while the
-   retained request still exceeds the budget. The per-dispatch nibble
-   (`surface_oversized_dispatch_if_needed`) and the 2/3 overflow-recovery
-   shrink are gone.
-3. **Conservative margin 11/10** (`conservative_estimate_tokens`), now applied
-   to the in-turn guard as well.
-4. **In-turn guard anchored** (`DispatchTokenCounter`, `turn/mod.rs`):
-   `reported + margin(tail)` when the route's report applies and the
-   population is still a superset of the measured rows, else `margin(estimate)`.
-   The old `estimate × ratio` scaling is gone. **This is what caused the red
-   tests below.**
-5. Web: `waterline`/`waterlineTokens` → `trimBudget`/`trimBudgetTokens`,
-   i18n `ring_detail_trim_budget` (wire `max_context_tokens` unchanged).
-6. `scripts/dev/reclaim-cargo-disk.sh`: root-owned `target/` (written by the
-   cross-compile container) is removed from inside a local image instead of
-   failing the reclaim step. Verified both paths by hand.
-7. Shipped: arm64 binary on `ivarvps:~/Download/zeroclaw`
-   (`sha256 3b6cac41…`, `zeroclaw 1.2.5`, `plugin` present, remote is aarch64).
+The check-before-every-dispatch *position* has existed since the v0.8.6 merge —
+it was not missing. What was wrong was **the number it compared**:
 
-## Open item 1 — 9 red tests (blocking the next commit)
+- With no report yet it used the **raw** estimate, with no conservative margin.
+  `pending_reported_usage` is `None` at the top of the loop (`turn/mod.rs:1848`)
+  and is only assigned after a response (`:3561`), so the **first request of
+  every turn** was priced without the margin — while the turn-start check it had
+  just passed used `calibrated_turn_start_size` (`agent.rs:1486-1503`), which is
+  `reported + margin(tail)` or `margin(estimate)`. A population in that band
+  (raw ≤ budget < margined) slipped past the guard, was dispatched, and was
+  trimmed only after the provider answered — the observed "trim lands after the
+  response".
+- With a report it multiplied the **whole** population by a ratio fitted on the
+  *previous* population — so the tail (a tool result, where the estimator is
+  worst) was priced by an old factor, and `ratio ≤ 1.0` fell back to the raw
+  estimate again. The guard and the trigger never read the same number.
 
-`cargo test -p zeroclaw-runtime --lib -- --test-threads=1` → 5802 passed,
-9 failed. All nine encode the retired contract or a fixture tuned to the old
-under-count. Decide per group whether the **fixture** is stale or the **code**
-is wrong; do not blanket-rewrite assertions.
+Fix (`0762173f3`): `DispatchTokenCounter::measure` returns
+`reported + margin(tail)` when the route's report applies and the population is
+still a superset of the rows it measured, else `margin(estimate)`; the label
+follows the number actually used (a population a mid-turn trim pushed below the
+anchor is `estimate`, not `calibrated`).
 
-**(a) "calibrated" label + exact post-trim count** — `agent/loop_.rs`
-- `next_request_keeps_same_model_reported_usage_calibration` (:21789 label,
-  :21794 count). The count assertion still models `estimate × usage_multiplier`;
-  the guard now returns `reported + margin(tail)`.
-- `hook_plain_to_native_trims_the_actual_next_request` (:21783)
-- `hook_selected_native_schema_soft_floor_still_dispatches` (:21794)
-- `max_iteration_summary_trims_the_prepared_request` (:21794)
-- `max_iteration_summary_floor_preserves_the_latest_real_turn` (:21780)
-- `max_iteration_summary_soft_floor_still_dispatches` (:21783)
-  Shared helper `assert_next_request…` around :21760-21800.
+## What is committed
 
-**(b) fixture expected "no trim"** — the margin moved the population over the
-budget:
-- `hook_native_to_plain_preserves_history_not_needed_for_schemas` (:21698,
-  `untrimmed` expectation).
-- `soft_context_floor_dispatches_the_complete_latest_turn` (:22163): zero
-  provider requests now — the margin pushed the population past the **model
-  window**, so the guard hard-failed instead of dispatching a soft floor.
-  This one is a real risk to weigh: a conservative pre-send number can now
-  fail a request the provider would have accepted. Decide between retuning the
-  fixture, or exempting the soft floor from the margin.
+| commit | content |
+|---|---|
+| `0762173f3` | one `trim_budget` (trigger == fit target), one retention action (single cut to `keep_recent_turns`, then one turn at a time), margin `11/10`, anchored in-turn guard, web `waterline*` → `trimBudget*`, reclaim helper removes root-owned `target/` from a local image, docs (context-management, context-meter, webui, build-cli-local, README) |
+| `840a7c2e9` | the first handoff |
 
-**(c) premise overtaken** — `agent/turn/mod.rs:9968`
-`tool_lifecycle_abandonment_tests::image_recovery_leaves_context_overflow_to_history_trimming`
-assumed the provider rejects first, then recovery trims. The local guard now
-trims before the request goes out (the desired behaviour), so the fixture no
-longer reaches the rejection path. Rewrite the premise, or lower the fixture
-budget so the guard stays silent and the rejection path is still exercised.
+Both request-construction sites in a turn are guarded: `turn/mod.rs:2368` →
+`call_provider(… &provider_request_messages …)` at `:2734`, and `max_iter.rs:254`
+→ the summary request at `:356`. Retries inside `call_provider` (reliable
+fallback, image recovery) reuse the same or a smaller request.
 
-## Open item 2 — context ring shows a stale number after a trim
+## Verified after the red-test fix
 
-Reported: after the trim notice, the web ring keeps the trim's number and does
-not move on the next turn. Evidence points at a **stale browser bundle**, not
-runtime logic:
+- `cargo test -p zeroclaw-runtime --lib -- --test-threads=1` → **5812 passed, 0
+  failed**, 8 ignored.
+- `cargo fmt --all -- --check` → 0 diffs.
+- `cargo test -p zeroclaw-gateway --lib` → 682 passed; `-p zeroclaw-config --test
+  profile_context` → 10 passed (both were green before this round; the fix
+  touched runtime only).
 
-- runtime publishes the post-trim estimate at turn start
-  (`agent.rs:4849-4886`), gateway forwards `TurnEvent::ContextEstimate`
-  unconditionally (`ws.rs:2229-2241`), client applies it
-  (`AgentContext.tsx:486-494`);
-- the deployed binary embeds the current bundle: `trim budget {count}` present,
-  `trim trigger {count}` absent, `assets/index-Em65wyAm.js`;
-- the user's panel reads **"trim trigger"** — a string that only exists in a
-  pre-refactor bundle, so the page is not served from this binary (or is
-  browser-cached).
+## The nine red tests: what each needed, and the two decisions
 
-Next: on `ivarvps`, `curl -s http://127.0.0.1:42617/ | grep -oE
-'assets/index-[A-Za-z0-9_-]+\.js'` and compare with `index-Em65wyAm.js`; check
-`readlink -f /proc/$(pgrep -o zeroclaw)/exe`; hard refresh + unregister any
-service worker. If the panel then reads "trim budget" and the ring still
-sticks, capture the WS frame order (`history_trimmed` / `context_usage` /
-`usage` / `done`) — that would be a real bug.
+They fell into three shapes. Fixtures were tuned to the *unmargined* number, and
+two assertions encoded the retired contract.
 
-## Environment / how to run
+1. **Expectation encoded the old formula** — `agent/loop_.rs`
+   `assert_hook_selected_request_budget` now derives the expected number from the
+   captured requests using the documented rule (anchor when both requests went to
+   the same model and the population did not shrink, else margin), and checks the
+   label from the same predicate. A fixture that encoded `estimate × multiplier`
+   and one that re-checked `×2` against the budget were removed rather than
+   re-pinned; the anchored count assertion is what proves the report is reused.
+2. **Budgets sized against the raw population** — `NativeToPlain*` and `Summary*`
+   budgets now carry the margin, so the opening request fits and the trim being
+   tested is the one that fires. `Summary*` had to move because iteration 0's
+   guard fired first (its event was the one the harness then compared against the
+   summary request).
+3. **Premise overtaken by the fix** —
+   `image_recovery_leaves_context_overflow_to_history_trimming` sized its budget
+   so the *provider* rejected first; with the margin the local gate trims first
+   and the rejection path is never reached. Budget re-derived from the fixture
+   population × margin, with an assertion that the gate stays silent, so the test
+   still covers the rejection fallback it is named for.
 
-- Tests, fmt, clippy all run in the repo image, one cargo command at a time:
-  ```bash
-  MSYS_NO_PATHCONV=1 docker run --rm -v "$PWD:/work" -v "$HOME/.cargo:/cargo-host" \
-    -e CARGO_HOME=/cargo-host -e CARGO_TARGET_DIR=/work/target-docker -w /work \
-    zeroclaw-test cargo test -p zeroclaw-runtime --lib -- --test-threads=1
-  ```
-- `target-docker` (12 GB) was deliberately kept warm for tomorrow; delete it
-  with `docker run --rm -v "$PWD:/work" -w /work zeroclaw-test rm -rf
-  /work/target-docker` if the disk is needed.
-- `cargo fmt --all` was **not** re-run after the final edit — run it before the
-  next commit.
-- Rebuild + redeploy: `bash scripts/dev/build-cli-local.sh` (reclaims
-  `target/` itself now), then `scp -p
-  dist/bin/aarch64-unknown-linux-gnu/zeroclaw ivarvps:~/Download/`.
+**Decision A — capacity is compared in conservative units (recorded in
+`docs/design/context-management.md`).** A population whose *conservative* size
+exceeds the model window now **fails closed**, even when the raw estimate fits it
+exactly. The old fixture pinned the opposite (`capacity == estimate` dispatches).
+Rationale: R5 exists because the raw estimate under-counts, so "raw fits" is not
+evidence the model can take it; a typed capacity error is diagnosable, a
+mid-reply stall is not. **Cost: availability** — a request within the margin of
+capacity is refused instead of sent. If that trade is wrong, the fix is two
+numbers (margin for the trigger/fit, raw for the accept/reject decision); say so
+and it is a small change.
+
+**Decision B — the floor may still land over budget.** Stage 2 stops at
+`kept_turns == 1` even when that is over the trim budget, so the tests now assert
+"over budget ⇒ `kept_turns == 1`" instead of a per-scenario `over_soft_budget`
+flag. This follows from the cascade rule already in the spec.
+
+Tests added: `agent::turn::trim_budget_tests::the_in_turn_guard_anchors_on_the_reported_request_not_a_ratio`,
+`…::the_in_turn_guard_margins_a_population_it_cannot_anchor`,
+`…::the_in_turn_guard_ignores_a_report_from_another_route`,
+`…::a_population_that_shrank_below_the_anchor_is_labelled_an_estimate`,
+`…::the_first_pass_cuts_to_the_configured_retention_not_the_minimum`,
+`agent::loop_::tests::a_population_within_the_margin_of_capacity_fails_closed`.
+
+## What is still open
+
+1. **`soft_context_floor_dispatches_the_complete_latest_turn`** — kept, with its
+   boundary case re-expressed as Decision A's fail-closed pin. If Decision A is
+   reversed, both tests change together.
+2. **Context ring shows a stale number after a trim** (user report). Evidence
+   still points at a **stale browser bundle**, not runtime logic: the runtime
+   publishes the post-trim estimate at turn start (`agent.rs:4849-4886`), the
+   gateway forwards `TurnEvent::ContextEstimate` unconditionally
+   (`ws.rs:2229-2241`), and the client applies it (`AgentContext.tsx:486-494`).
+   The user's panel reads **"trim trigger"**, a string that exists only in a
+   pre-refactor bundle, while the deployed binary embeds `trim budget` and
+   `index-Em65wyAm.js`.
+   Check on `ivarvps`:
+   ```bash
+   readlink -f /proc/$(pgrep -o zeroclaw)/exe
+   curl -s http://127.0.0.1:42617/ | grep -oE 'assets/index-[A-Za-z0-9_-]+\.js'
+   curl -s http://127.0.0.1:42617/assets/index-Em65wyAm.js | grep -c 'trim budget'
+   ```
+   Then hard-refresh and unregister any service worker. If the panel reads "trim
+   budget" and the ring still sticks, capture the WS frame order
+   (`history_trimmed` / `context_usage` / `usage` / `done`) — that would be a real
+   bug, and the fix belongs next to `UsageFold::note_trim` (`ws.rs:1640`).
+3. **Rebuild + redeploy** after this round: `bash scripts/dev/build-cli-local.sh`
+   (it now reclaims root-owned `target/` itself), then
+   `scp -p dist/bin/aarch64-unknown-linux-gnu/zeroclaw ivarvps:~/Download/`.
+   `ivarvps` is aarch64; `~/Download/zeroclaw` currently holds the *previous*
+   build (`sha256 3b6cac41…`), which predates the guard fix.
+
+## Environment
+
+```bash
+MSYS_NO_PATHCONV=1 docker run --rm -v "$PWD:/work" -v "$HOME/.cargo:/cargo-host" \
+  -e CARGO_HOME=/cargo-host -e CARGO_TARGET_DIR=/work/target-docker -w /work \
+  zeroclaw-test cargo test -p zeroclaw-runtime --lib -- --test-threads=1
+```
+
+One cargo command at a time (shared `target-docker` + lock). `target-docker` is
+kept warm (~12 GB); remove it with
+`docker run --rm -v "$PWD:/work" -w /work zeroclaw-test rm -rf /work/target-docker`
+(root-owned files need the container).

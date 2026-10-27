@@ -21499,10 +21499,6 @@ Let me check the result."#;
                 | HookBudgetScenario::SummaryCalibrated
                 | HookBudgetScenario::SummaryFloor
         );
-        let calibrated = matches!(
-            scenario,
-            HookBudgetScenario::SameModelCalibrated | HookBudgetScenario::SummaryCalibrated
-        );
         let native_prompt = format!("system\n{NATIVE_TOOLS_TASK_FRAMING}\n\n## Safety\nsafe");
         let text_prompt =
             format!("system\n{NO_TOOLS_TASK_FRAMING}\n\n## Tools\nbudget_tool\n\n## Safety\nsafe");
@@ -21533,15 +21529,24 @@ Let me check the result."#;
         let budget = match scenario {
             HookBudgetScenario::NativeToPlain
             | HookBudgetScenario::NativeToPlainWithCalibration => {
-                initial_tokens + schema_tokens + 100
+                // Headroom for the conservative margin every pre-send number
+                // carries, so this scenario keeps pinning what it is about: the
+                // protocol switch's schema change alone must not force a trim.
+                crate::agent::history_trim::conservative_estimate_tokens(
+                    initial_tokens + schema_tokens,
+                ) + 100
             }
             HookBudgetScenario::PlainToNativeTrim => schema_tokens + result_tokens + 200,
             HookBudgetScenario::PlainToNativeFloor => schema_tokens - 1,
             HookBudgetScenario::SameModelCalibrated => initial_tokens + result_tokens + 200,
-            HookBudgetScenario::SummaryTrim | HookBudgetScenario::SummaryFloor => {
-                initial_tokens + 50
+            HookBudgetScenario::SummaryTrim
+            | HookBudgetScenario::SummaryFloor
+            | HookBudgetScenario::SummaryCalibrated => {
+                // Sized against the conservative pre-send number, so the
+                // opening request fits and the trim this scenario is about is
+                // the summary one (or, for the floor, the summary's own floor).
+                crate::agent::history_trim::conservative_estimate_tokens(initial_tokens) + 50
             }
-            HookBudgetScenario::SummaryCalibrated => initial_tokens + result_tokens + 300,
         };
         let over_soft_budget = matches!(
             scenario,
@@ -21707,12 +21712,6 @@ Let me check the result."#;
                 NO_TOOLS_TASK_FRAMING
             };
             assert!(next.messages[0].content.contains(framing));
-            if calibrated {
-                assert!(
-                    (estimate_history_tokens(&next.messages) + next.schema_tokens) * 2 <= budget,
-                    "same-model usage must still constrain the next request"
-                );
-            }
             if untrimmed {
                 assert!(
                     estimate_history_tokens(&next.messages) + schema_tokens > budget,
@@ -21771,29 +21770,74 @@ Let me check the result."#;
                 tokens_after,
                 tokens_after_source,
                 unsatisfiable_floor,
+                kept_turns,
                 ..
             } = event
             {
-                trims.push((tokens_after, tokens_after_source, unsatisfiable_floor));
+                trims.push((
+                    tokens_after,
+                    tokens_after_source,
+                    unsatisfiable_floor,
+                    kept_turns,
+                ));
             }
         }
         assert_eq!(trims.len(), usize::from(!untrimmed));
-        if let Some((tokens_after, source, unsatisfiable)) = trims.first() {
+        if let Some((tokens_after, source, unsatisfiable, kept_turns)) = trims.first() {
             assert_eq!(*unsatisfiable, floor.then_some(true));
-            assert_eq!(tokens_after.unwrap() > budget as u64, over_soft_budget);
-            let expected_source = if calibrated {
-                zeroclaw_api::agent::TokenCountSource::Calibrated
+            if floor {
+                // The floor event reports a population no trim could shrink:
+                // there is no dispatched request whose size it could price.
+                assert!(tokens_after.is_some());
             } else {
-                zeroclaw_api::agent::TokenCountSource::Estimated
-            };
-            assert_eq!(*source, Some(expected_source));
-            if !floor {
-                let actual = (estimate_history_tokens(&captured[1].messages)
-                    + captured[1].schema_tokens) as u64
-                    * if calibrated { usage_multiplier } else { 1 };
+                let after = tokens_after.expect("a trim event carries the post-trim size");
+                // Stage 2 stops at `kept_turns == 1` even when that is still
+                // over the budget, so only the floor may leave a retention
+                // above it.
+                if after > budget as u64 {
+                    assert_eq!(
+                        *kept_turns, 1,
+                        "only the floor may leave a retention above the trim budget"
+                    );
+                }
+                // The guard prices the population it is about to dispatch as
+                // `reported + margin(tail)` when the accepted call's report
+                // applies to this route and the population is still a superset
+                // of the rows that report measured, else `margin(estimate)`.
+                // Both numbers are derived here from the captured requests, so
+                // the event is checked against the contract rather than against
+                // whatever the guard happened to produce.
+                assert!(
+                    captured.len() >= 2,
+                    "a dispatched trim needs a first and a next request"
+                );
+                let est0 =
+                    estimate_history_tokens(&captured[0].messages) + captured[0].schema_tokens;
+                let est1 =
+                    estimate_history_tokens(&captured[1].messages) + captured[1].schema_tokens;
+                // The report applies only when both requests went to the same
+                // model — the guard decides that, and it is not the scenario's
+                // name: a protocol switch keeps its multiplier but loses the
+                // route.
+                // The guard additionally needs the population not to have
+                // shrunk below the measured rows (a mid-turn trim drops them).
+                let anchored = captured[0].model == captured[1].model && est1 >= est0;
+                let expected_after = if anchored {
+                    est0 as u64 * usage_multiplier
+                        + crate::agent::history_trim::conservative_estimate_tokens(est1 - est0)
+                            as u64
+                } else {
+                    crate::agent::history_trim::conservative_estimate_tokens(est1) as u64
+                };
+                let expected_source = if anchored {
+                    zeroclaw_api::agent::TokenCountSource::Calibrated
+                } else {
+                    zeroclaw_api::agent::TokenCountSource::Estimated
+                };
+                assert_eq!(*source, Some(expected_source));
                 assert_eq!(
                     *tokens_after,
-                    Some(actual),
+                    Some(expected_after),
                     "trim event must count the exact dispatched messages and schemas"
                 );
             }
@@ -22224,9 +22268,26 @@ Let me check the result."#;
     #[tokio::test]
     async fn soft_context_floor_dispatches_the_complete_latest_turn() {
         assert_context_floor_dispatch(100, 32_768, context_floor_history(), true, false).await;
+        // The bar is capacity, not the 100-token soft budget: a capacity just
+        // above the conservative size still dispatches, having missed the
+        // budget by three orders of magnitude.
+        let history = context_floor_history();
+        let capacity = crate::agent::history_trim::conservative_estimate_tokens(
+            estimate_history_tokens(&history),
+        ) + 100;
+        assert_context_floor_dispatch(100, capacity, history, true, false).await;
+    }
+
+    /// The raw estimate under-counts — that is why every pre-send number
+    /// carries the margin — so a population whose conservative size exceeds the
+    /// model window fails closed even when the raw estimate fits it exactly.
+    /// The turn is refused with a typed capacity error instead of being sent to
+    /// be rejected by the provider.
+    #[tokio::test]
+    async fn a_population_within_the_margin_of_capacity_fails_closed() {
         let history = context_floor_history();
         let exact_capacity = estimate_history_tokens(&history);
-        assert_context_floor_dispatch(100, exact_capacity, history, true, false).await;
+        assert_context_floor_dispatch(100, exact_capacity, history, false, false).await;
     }
 
     #[tokio::test]

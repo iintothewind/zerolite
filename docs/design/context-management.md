@@ -422,6 +422,17 @@ clamped by `request_token_ceiling`) is a *soft floor*: the newest turn is
 dispatched rather than rejected. Only a population the model cannot take is an
 unsatisfiable floor.
 
+**Capacity is compared in the same conservative units as the budget.** The
+number the guard weighs against the window is the pre-send number (R5), not the
+raw estimate, so a population whose conservative size exceeds the window fails
+closed even when the raw estimate fits it exactly. That is deliberate: the raw
+estimator is known to under-count (R5 exists because of it), so "the raw number
+fits" is not evidence the model can take the request. The cost is availability —
+a request within the margin of capacity is refused instead of sent — and the
+trade is accepted because a rejected turn is diagnosable (a typed capacity
+error), while an over-capacity request that the provider takes and then runs out
+of room mid-reply is not.
+
 **Settlement.** The cascade selects by summing per-message estimates, which is
 only exact when the estimator is additive. A provider view that prices the
 whole slice higher than the sum of its messages — per-call framing, one-time tool
