@@ -647,10 +647,6 @@ export function getDrift(): Promise<{ drifted: DriftEntry[] }> {
   return apiFetch<{ drifted: DriftEntry[] }>("/api/config/drift");
 }
 
-export function getReloadStatus(): Promise<{ pending_reload: boolean }> {
-  return apiFetch<{ pending_reload: boolean }>("/api/config/reload-status");
-}
-
 export function getOpenApiSchema(): Promise<unknown> {
   return apiFetch<unknown>("/api/openapi.json");
 }
