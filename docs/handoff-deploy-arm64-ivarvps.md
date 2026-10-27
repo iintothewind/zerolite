@@ -36,39 +36,39 @@ Constraints:
 - Record three values from the build output: the new `sha256`, the embedded
   fingerprint (`assets/index-<hash>.js`), and the binary size.
 
-## 2. Stale frontend caches — purge **before** the restart
+## 2. Stale frontend caches
 
-Two independent classes. Both must be handled; the script must not conflate them.
+One `rm -rf` on the server (hygiene) and one instruction for the browser (the
+actual fix for "the dashboard still looks old"). The script must not conflate
+them.
 
-### 2a. Server-side dashboard trees (files)
-
-`resolve_web_dist_dir` auto-detects, in this order, and the first hit wins:
-
-1. `web/dist` relative to the **daemon's working directory** (unit has no
-   `WorkingDirectory`, so systemd uses `%h` → `/home/ubuntu/web/dist`)
-2. `<dir of the running executable>/web/dist` → `~/.cargo/bin/web/dist`
-3. `/zeroclaw-data/web/dist`
-4. `/usr/share/zeroclawlabs/web/dist`
-5. `~/.local/share/zeroclaw/web/dist`
-
-On this host step 5 exists and carries the **Aug 2** dashboard
-(`assets/index-D7KfOnNy.js`, no `ring_detail_trim_budget` key). A binary built
-with `embedded-web` outranks all of them at request time, so this tree is not
-what the browser got — but it is exactly the trap that bites the next
-non-embedded build or installer, and it is what makes "which dashboard is live?"
-ambiguous during a debug session. The deploy script should remove every
-auto-detect hit, not only the one that resolves today:
+### 2a. Server-side dashboard tree — one line
 
 ```bash
-for d in "$PWD/web/dist" "$HOME/web/dist" "$(dirname "$(command -v zeroclaw)")/web/dist" \
-         /zeroclaw-data/web/dist /usr/share/zeroclawlabs/web/dist \
-         "$HOME/.local/share/zeroclaw/web/dist" "$HOME/.zeroclaw/src/web/dist"; do
-  [ -e "$d" ] && sudo rm -rf -- "$d"     # sudo only where the path is not owned by ubuntu
-done
+rm -rf ~/.local/share/zeroclaw/web/dist
 ```
 
+That is the whole purge. It is owned by `ubuntu`, no `sudo` needed.
+
+Why only one line: `resolve_web_dist_dir` auto-detects five locations
+(CWD-relative `web/dist`, `<exe dir>/web/dist`, `/zeroclaw-data/web/dist`,
+`/usr/share/zeroclawlabs/web/dist`, `~/.local/share/zeroclaw/web/dist`) and the
+first hit wins — but on this host **only the last one exists**. The others are
+absent, so a portable loop buys nothing here.
+
+Why it is not the fix: under `--features embedded-web` the gateway serves the
+embedded copy and never reads this tree, so deleting it does **not** change what
+the browser receives. It is hygiene — it holds the **Aug 2** dashboard
+(`assets/index-D7KfOnNy.js`, which has no `ring_detail_trim_budget` key), it makes
+"which dashboard is live?" ambiguous while debugging, and a future non-embedded
+build or installer would pick it up. Remove it for a clean host; skip it and
+nothing breaks.
+
+`~/.zeroclaw/src/web/dist` holds a single `logo.png` and no `index.html`: not
+servable, not in the auto-detect list. Leave it alone.
+
 Do **not** delete `dist/bin/**` on the dev host, and do not delete
-`~/.zeroclaw/src` wholesale — only its `web/dist`.
+`~/.zeroclaw/{agents,data,state,config.toml}`.
 
 ### 2b. Browser page caches (clients)
 
@@ -113,8 +113,8 @@ site data) and reload; a tab opened before this deploy keeps the old bundle.
    ```
    Verify the installed copy, not the staging copy:
    `sha256sum ~/.cargo/bin/zeroclaw`.
-3. Purge the dashboard trees from §2a (now, while stopped, so nothing can be
-   read mid-delete).
+3. Optionally delete the stale dashboard tree (§2a): one `rm -rf`, while
+   stopped. Nothing depends on it — skip it if you prefer fewer moving parts.
 4. Start and wait for readiness:
    ```bash
    systemctl --user start zeroclaw
