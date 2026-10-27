@@ -1736,14 +1736,24 @@ impl UsageFold {
         // the ring would keep the previous route's `limit` / `trim budget` for
         // the rest of that turn even though the runtime has been trimming
         // against the new route all along.
+        //
+        // A rejected attempt carries no window of its own — it was refused
+        // before billing a context — and a provider that omits usage may not
+        // report one either, while the frame still closes a step. Advising the
+        // route the turn is actually running on beats sending nulls: a client
+        // reads null as "no route information" and would blank the ring.
+        let frame_budget = context_token_budget.or(self.last_context_token_budget);
+        let frame_model_window = model_context_window.or(self.last_model_context_window);
+        let frame_effective_window =
+            effective_context_window.or(self.last_effective_context_window);
         Some(serde_json::json!({
             "type": "usage",
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "cached_input_tokens": cached_input_tokens,
-            "max_context_tokens": context_token_budget,
-            "model_context_window": model_context_window,
-            "effective_context_window": effective_context_window,
+            "max_context_tokens": frame_budget,
+            "model_context_window": frame_model_window,
+            "effective_context_window": frame_effective_window,
         }))
     }
 
@@ -5997,6 +6007,87 @@ data: {{\"type\":\"message_stop\"}}\n\n"
 
         let entries = fold.take_sorted_entries();
         assert_eq!(entries[0].cached_input_tokens, 900);
+    }
+
+    /// A rejected attempt still closes a step, but it has no window of its own
+    /// — the request was refused before billing a context. Its frame must
+    /// describe the route the turn is running on, not send nulls: a client
+    /// reads null as "no route information", and a client that only adopts
+    /// present fields would leave the ring on whatever it had. This was the
+    /// remaining way to get a `usage` frame with no window fields.
+    #[test]
+    fn a_rejected_attempt_frame_keeps_the_serving_route_window() {
+        let mut fold = UsageFold::default();
+
+        // The route that answered: 1M window, 838,860 budget.
+        fold.apply(zeroclaw_api::agent::TurnEvent::Usage {
+            input_tokens: Some(15_200),
+            output_tokens: Some(40),
+            cached_input_tokens: None,
+            cost_usd: None,
+            context_token_budget: Some(838_860),
+            model_context_window: Some(1_048_576),
+            effective_context_window: Some(1_048_576),
+            provider_ref: "test.big".to_string(),
+            model: "big-model".to_string(),
+            accepted: true,
+            estimated_input_tokens: None,
+        });
+
+        // A billable attempt on the same turn that the reliable layer refused:
+        // no window of its own, `accepted: false`.
+        let rejected = fold
+            .apply(zeroclaw_api::agent::TurnEvent::Usage {
+                input_tokens: Some(9_000),
+                output_tokens: None,
+                cached_input_tokens: None,
+                cost_usd: None,
+                context_token_budget: None,
+                model_context_window: None,
+                effective_context_window: None,
+                provider_ref: "test.big".to_string(),
+                model: "big-model".to_string(),
+                accepted: false,
+                estimated_input_tokens: None,
+            })
+            .expect("a rejected attempt still closes a step");
+
+        assert_eq!(rejected["input_tokens"], 9_000);
+        assert_eq!(
+            rejected["max_context_tokens"], 838_860,
+            "the frame adopts the accepted route's budget instead of null"
+        );
+        assert_eq!(rejected["model_context_window"], 1_048_576);
+        assert_eq!(rejected["effective_context_window"], 1_048_576);
+        // Advertising the window must not promote the rejected attempt to the
+        // turn's accepted-serving snapshot.
+        assert_eq!(fold.last_input_tokens, Some(15_200));
+    }
+
+    /// With no accepted call yet there is nothing to fall back to, so the frame
+    /// carries nulls rather than inventing a route — and still closes a step.
+    #[test]
+    fn a_rejected_attempt_before_any_accepted_call_advertises_no_window() {
+        let mut fold = UsageFold::default();
+        let frame = fold
+            .apply(zeroclaw_api::agent::TurnEvent::Usage {
+                input_tokens: Some(1_200),
+                output_tokens: None,
+                cached_input_tokens: None,
+                cost_usd: None,
+                context_token_budget: None,
+                model_context_window: None,
+                effective_context_window: None,
+                provider_ref: "test.big".to_string(),
+                model: "big-model".to_string(),
+                accepted: false,
+                estimated_input_tokens: None,
+            })
+            .expect("a rejected attempt still closes a step");
+
+        assert_eq!(frame["input_tokens"], 1_200);
+        assert!(frame["max_context_tokens"].is_null());
+        assert_eq!(fold.steps, 1);
     }
 
     #[test]

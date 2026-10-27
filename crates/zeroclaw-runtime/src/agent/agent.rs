@@ -4877,12 +4877,38 @@ impl Agent {
         // Messages alone made the meter drop by the size of the tool catalog
         // the moment a turn started, then climb back when `usage` reported
         // the real number.
+        //
+        // The frame describes the route that will serve THIS request, not the
+        // agent profile's defaults: a session can select a different model than
+        // the profile names, and the ring's denominator must be the capacity the
+        // guard actually budgets against. `selected_route` is the route
+        // resolver's verdict — the pair the per-route limits are keyed by —
+        // while `active_model_name` is the *selector* (`hint:fast` under
+        // classification routing) and `active_provider_name` is the agent's
+        // bound alias rather than the routed provider.
+        let route =
+            self.context_limits_for_route(&selected_route.provider_name, &selected_route.model);
+        let (budget, model_window, effective_window) = if route.context_token_budget > 0 {
+            (
+                route.context_token_budget,
+                route.model_context_window,
+                route.effective_context_window(),
+            )
+        } else {
+            // Stub route with no resolved budget: the profile is the only number
+            // available, and a zero budget must never be advertised.
+            (
+                self.config.resolved.context_trim_budget(),
+                self.config.resolved.model_context_window,
+                self.config.resolved.effective_context_window(),
+            )
+        };
         let _ = event_tx.try_send(TurnEvent::ContextEstimate {
             input_tokens: meter.0 as u64,
             input_tokens_source: Some(meter.1),
-            context_token_budget: Some(self.config.resolved.context_trim_budget() as u64),
-            model_context_window: Some(self.config.resolved.model_context_window as u64),
-            effective_context_window: Some(self.config.resolved.effective_context_window() as u64),
+            context_token_budget: Some(budget as u64),
+            model_context_window: Some(model_window as u64),
+            effective_context_window: Some(effective_window as u64),
         });
         let cache_key = self.response_cache_key_for_messages(&provider_messages, &effective_model);
 
@@ -11034,12 +11060,18 @@ mod tests {
         assert_eq!(outcome.model, "anthropic/claude-haiku-4-5");
         let seen = seen_models.lock();
         assert_eq!(seen.as_slice(), &["hint:fast".to_string()]);
-        assert_eq!(
-            resolved_routes.lock().as_slice(),
-            &[(
-                "anthropic.fast".to_string(),
-                "anthropic/claude-haiku-4-5".to_string(),
-            )]
+        // Every resolution this turn must name the served route: the turn-start
+        // frame resolves it once, the tool loop again after acceptance, and
+        // neither may key on the `hint:` selector.
+        let routes = resolved_routes.lock();
+        assert!(
+            !routes.is_empty()
+                && routes
+                    .iter()
+                    .all(|(provider, model)| provider == "anthropic.fast"
+                        && model == "anthropic/claude-haiku-4-5"),
+            "the limits resolver must be asked for the served route, never the hint selector: \
+             {routes:?}"
         );
         let usage = std::iter::from_fn(|| event_rx.try_recv().ok())
             .find(|event| matches!(event, TurnEvent::Usage { .. }))
@@ -14018,6 +14050,70 @@ mod tests {
             Some(meter2),
             after,
             "the published estimate must equal the notice's post-trim number"
+        );
+    }
+
+    /// The turn-start frame advertises the **route's** window and budget, not
+    /// the agent profile's defaults.
+    ///
+    /// The reported field case: the profile resolves a 65,536-token route, the
+    /// session picks a 1M model, and the ring kept `limit 65,536` /
+    /// `trim budget 52,428` while the guard had already been budgeting against
+    /// 1,048,576 / 838,860. This frame is the ring's denominator, so it must
+    /// name the capacity the dispatch will actually be held to.
+    #[tokio::test]
+    async fn the_turn_start_frame_advertises_the_route_limits_not_the_profile() {
+        let mut resolved = zeroclaw_config::schema::ResolvedRuntime::default();
+        resolved.model_context_window = 65_536;
+        resolved.model_context_window_source =
+            zeroclaw_config::schema::ModelContextWindowSource::Configured;
+        resolved.context.trim_threshold_percent = 80;
+        assert_eq!(
+            resolved.context_trim_budget(),
+            52_428,
+            "the profile default"
+        );
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = trim_test_agent_with_resolved(resolved, observer);
+        agent.context_limits_resolver = Some(Arc::new(|_provider, _model| {
+            zeroclaw_config::schema::ResolvedContextLimits {
+                model_context_window: 1_048_576,
+                model_context_window_source:
+                    zeroclaw_config::schema::ModelContextWindowSource::Configured,
+                context_token_budget: 838_860,
+                keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
+                request_token_ceiling: None,
+            }
+        }));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        agent
+            .turn_streamed("which window am I on?", tx, None)
+            .await
+            .expect("the turn must complete");
+        let events = drain_turn_events(&mut rx);
+
+        let estimate = events
+            .iter()
+            .find_map(|event| match event {
+                TurnEvent::ContextEstimate {
+                    context_token_budget,
+                    model_context_window,
+                    effective_context_window,
+                    ..
+                } => Some((
+                    *context_token_budget,
+                    *model_context_window,
+                    *effective_context_window,
+                )),
+                _ => None,
+            })
+            .expect("the turn publishes its assembled size");
+        assert_eq!(
+            estimate,
+            (Some(838_860), Some(1_048_576), Some(1_048_576)),
+            "the frame must carry the route's limits, not the profile's 52,428 / 65,536"
         );
     }
 
