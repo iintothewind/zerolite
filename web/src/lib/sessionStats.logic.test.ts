@@ -9,6 +9,7 @@ import {
   countTranscriptTurns,
   displayStats,
   emptyTokenStats,
+  formatRate,
   formatTokens,
   turnStarted,
   type TokenStats,
@@ -91,6 +92,9 @@ test('hydrated history: N user + N final answers → N turns and N steps', () =>
     input: 0,
     output: 0,
     cached: 0,
+    rate: null,
+    rateMuted: false,
+    rateBilled: false,
   });
 });
 
@@ -144,6 +148,9 @@ test('displayStats pairs list counts with live token totals', () => {
     input: 100,
     output: 5,
     cached: 40,
+    rate: null,
+    rateMuted: false,
+    rateBilled: false,
   });
 });
 
@@ -212,4 +219,47 @@ test('formatTokens matches the reference row', () => {
   assert.equal(formatTokens(Number.NaN), '0');
   assert.equal(formatTokens(Number.POSITIVE_INFINITY), '0');
   assert.equal(formatTokens(-5), '0');
+});
+
+// ── Live rate meter ────────────────────────────────────────────────────────
+
+test('displayStats passes the meter snapshot through, and blanks it when absent', () => {
+  const tokens = run([{ kind: 'usage', f: { input_tokens: 100, output_tokens: 20 } }]);
+  const metered = displayStats([], tokens, null, { rate: 42.5, rateMuted: true, rateBilled: true });
+  assert.deepEqual(
+    { rate: metered.rate, rateMuted: metered.rateMuted, rateBilled: metered.rateBilled },
+    { rate: 42.5, rateMuted: true, rateBilled: true },
+  );
+  const blank = displayStats([], tokens, null);
+  assert.deepEqual(
+    { rate: blank.rate, rateMuted: blank.rateMuted, rateBilled: blank.rateBilled },
+    { rate: null, rateMuted: false, rateBilled: false },
+  );
+});
+
+test('the meter snapshot never disturbs turns, steps, tokens, or the cache ratio', () => {
+  const messages = [msg('user'), msg('agent')];
+  const tokens = run([
+    { kind: 'usage', f: { input_tokens: 1000, cached_input_tokens: 500, output_tokens: 30 } },
+  ]);
+  const plain = displayStats(messages, tokens, null);
+  const metered = displayStats(messages, tokens, null, { rate: 7, rateMuted: false, rateBilled: false });
+  assert.deepEqual(
+    { turns: metered.turns, steps: metered.steps, input: metered.input, output: metered.output, cached: metered.cached },
+    { turns: plain.turns, steps: plain.steps, input: plain.input, output: plain.output, cached: plain.cached },
+  );
+  assert.equal(cacheHitRatio(metered), cacheHitRatio(plain));
+});
+
+test('formatRate reads 0 below the floor, integers at 10 and above, one decimal below', () => {
+  assert.equal(formatRate(0), '0');
+  assert.equal(formatRate(0.04), '0');
+  assert.equal(formatRate(1.234), '1.2');
+  assert.equal(formatRate(9.9), '9.9');
+  assert.equal(formatRate(10), '10');
+  assert.equal(formatRate(12.4), '12');
+  assert.equal(formatRate(42.7), '43');
+  assert.equal(formatRate(Number.NaN), '0');
+  assert.equal(formatRate(Number.POSITIVE_INFINITY), '0');
+  assert.equal(formatRate(-3), '0');
 });

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import test, { beforeEach } from 'node:test';
+import test, { afterEach, beforeEach, mock } from 'node:test';
 import React, { createElement } from 'react';
 import {
   act,
@@ -435,6 +435,12 @@ beforeEach(() => {
       agent_alias: 'ops', channel_id: null,
     },
   ];
+});
+
+// Mock timers are process-wide: restore them after every test so the next one
+// starts with real clocks, even when a test fails mid-way.
+afterEach(() => {
+  mock.timers.reset();
 });
 
 for (const scenario of ['unknown', 'disabled'] as const) {
@@ -1189,7 +1195,7 @@ function expandGroupButton(mounted: MountedChat): ReactTestInstance | undefined 
     .find((button) => button.props['aria-label'] === 'Expand the tool-call trajectory');
 }
 
-test('the stats row recounts the message list and accumulates tokens live', async () => {
+test('the stats row recounts the message list and keeps token totals live', async () => {
   const { mounted, socket } = await mountLiveChat();
   assert.equal(mounted.context().liveStats.turns, 0);
   assert.equal(mounted.context().liveStats.steps, 0);
@@ -1214,7 +1220,12 @@ test('the stats row recounts the message list and accumulates tokens live', asyn
   });
   assert.equal(mounted.context().liveStats.turns, 1);
   assert.equal(mounted.context().liveStats.steps, 0);
-  assert.match(renderedText(mounted), /17\.2K tok/);
+  // No cumulative token segment: the row's rate needs streamed evidence
+  // (≥200 tokens over ≥4s), and one `usage` frame supplies neither, so the
+  // row carries counts and cache hit only.
+  assert.equal(mounted.context().liveStats.rate, null);
+  assert.doesNotMatch(renderedText(mounted), /17\.2K tok/);
+  assert.doesNotMatch(renderedText(mounted), /tok\/s/);
   assert.match(renderedText(mounted), /cache hit 9%/);
 
   await act(async () => {
@@ -1238,6 +1249,11 @@ test('the stats row recounts the message list and accumulates tokens live', asyn
     },
     { turns: 1, steps: 1, input: 17214, output: 32, cached: 1536 },
   );
+  // The turn's first `usage` frame bills the reading and `done` snapshots it
+  // muted. Without streamed evidence there is nothing to show.
+  assert.equal(stats.rateBilled, true);
+  assert.equal(stats.rateMuted, true);
+  assert.equal(stats.rate, null, 'no streamed evidence, so no rate to mute');
   assert.match(renderedText(mounted), /1 turns 1 steps/);
   await unmount(mounted.renderer);
 });
@@ -1764,5 +1780,200 @@ test('a hydrated conversation renders ungrouped: the trajectory is live-only', a
   assert.equal(mounted.context().messages.some((message) => message.segments), false);
   // The `message` frame still commits an agent bubble (no segments) → +1 step.
   assert.equal(mounted.context().liveStats.steps, 1);
+  await unmount(mounted.renderer);
+});
+
+// ── Live throughput meter ───────────────────────────────────────────────────
+//
+// The composer row's `X tok/s` segment comes only from WebSocket frames. The
+// meter's evidence gate (≥200 tokens over ≥4s of stream) and the 1Hz publisher
+// both key on wall time, so the fake clock owns `Date` and the ticker's
+// `setInterval` together: one `tick()` advances the stream, the gate, and the
+// publish cycle. `setTimeout` stays real, so `settle()` keeps working.
+
+const RATE_CHUNK = 'word '.repeat(24); // ~30 estimated tokens per frame.
+
+function rateReading(mounted: MountedChat): { rate: number | null; rateMuted: boolean; rateBilled: boolean } {
+  const { rate, rateMuted, rateBilled } = mounted.context().liveStats;
+  return { rate, rateMuted, rateBilled };
+}
+
+/** The rendered rate segment's own props: its dimming and its `est` flag. */
+function rateSegment(mounted: MountedChat): { style?: { color?: string } | undefined; title?: string } | undefined {
+  const matches = mounted.renderer.root
+    .findAllByType('span')
+    .filter((instance) => /tok\/s/.test(nodeText(instance)));
+  // Tree order is outermost-first, so the last match is the segment span itself.
+  return matches.length > 0
+    ? matches[matches.length - 1]!.props as { style?: { color?: string } | undefined; title?: string }
+    : undefined;
+}
+
+/** `frames` content frames, `spacingMs` of faked clock between each. */
+async function streamFrames(
+  socket: FakeSocket,
+  type: 'chunk' | 'thinking',
+  frames: number,
+  spacingMs: number,
+): Promise<void> {
+  for (let i = 0; i < frames; i += 1) {
+    await act(async () => {
+      mock.timers.tick(spacingMs);
+      socket.emitMessage({ type, content: RATE_CHUNK });
+    });
+  }
+}
+
+/** One cycle of the 1Hz ticker: the fake clock fires the mocked `setInterval`. */
+async function publishOnce(): Promise<void> {
+  await act(async () => {
+    mock.timers.tick(1000);
+  });
+}
+
+test('the composer rate publishes from streamed chunks, bills on usage, and mutes at the terminal', async () => {
+  const { mounted, socket } = await mountLiveChat();
+  mock.timers.enable({ apis: ['Date', 'setInterval'] });
+
+  await act(async () => {
+    mounted.context().sendMessage('analyze this');
+  });
+  await act(async () => {
+    socket.emitMessage({ type: 'agent_start', session_id: socket.sessionId });
+  });
+  assert.deepEqual(
+    rateReading(mounted),
+    { rate: null, rateMuted: false, rateBilled: false },
+    'a new turn starts the meter clean',
+  );
+
+  // Eight ~30-token frames across 4s stay below the evidence gate: the row
+  // carries no rate segment, and no `0 tok/s` placeholder stands in for it.
+  await streamFrames(socket, 'chunk', 8, 500);
+  assert.equal(mounted.context().liveStats.rate, null, 'frames feed the meter; they do not publish it');
+  assert.doesNotMatch(renderedText(mounted), /tok\/s/);
+
+  // The crossing belongs to the publisher, not the frame: one cycle of the
+  // 1Hz ticker publishes the decayed-window reading.
+  await publishOnce();
+  const live = mounted.context().liveStats.rate;
+  assert.ok(live !== null && live > 40 && live < 65, `the crossed gate reads ${live}`);
+  assert.equal(rateSegment(mounted)?.style, undefined, 'an active reading is not dimmed');
+
+  await act(async () => {
+    mock.timers.tick(200);
+    socket.emitMessage({ type: 'usage', input_tokens: 900, output_tokens: 300 });
+  });
+  const billed = mounted.context().liveStats;
+  assert.equal(billed.rateBilled, true, 'the first usage frame bills the reading');
+  assert.ok(billed.rate !== null && billed.rate > (live ?? 0),
+    'the billed total lifts the local estimate: pre-delta reasoning is charged against the silent span');
+  assert.equal(rateSegment(mounted)?.title, undefined, 'a billed reading carries no est flag');
+  assert.match(renderedText(mounted), /cache hit \d+% · \d+(?:\.\d+)? tok\/s/,
+    'the rate sits after cache hit, so the counts prefix never shifts');
+
+  await act(async () => {
+    mock.timers.tick(100);
+    socket.emitMessage({ type: 'done', full_response: 'the answer', steps: 1 });
+  });
+  const terminal = mounted.context().liveStats;
+  assert.equal(terminal.rateMuted, true);
+  assert.ok(terminal.rate !== null && Math.abs(terminal.rate - (billed.rate ?? 0)) < 2,
+    'the terminal keeps the last reading on screen');
+  assert.equal(rateSegment(mounted)?.style?.color, 'var(--pc-text-faint)',
+    'the retained reading is dimmed');
+  assert.match(renderedText(mounted), /cache hit \d+% · \d+(?:\.\d+)? tok\/s/,
+    'the retained reading keeps its tail position after cache hit');
+
+  await unmount(mounted.renderer);
+});
+
+test('reasoning-only streams count toward the rate and stay flagged as estimated', async () => {
+  const { mounted, socket } = await mountLiveChat();
+  mock.timers.enable({ apis: ['Date', 'setInterval'] });
+
+  await act(async () => {
+    mounted.context().sendMessage('think first');
+  });
+  await act(async () => {
+    socket.emitMessage({ type: 'agent_start', session_id: socket.sessionId });
+  });
+  await streamFrames(socket, 'thinking', 8, 500);
+  await publishOnce();
+  const live = mounted.context().liveStats;
+  assert.ok(live.rate !== null && live.rate > 40 && live.rate < 65,
+    `reasoning text feeds the meter (${live.rate})`);
+  assert.equal(live.rateBilled, false);
+  assert.equal(rateSegment(mounted)?.title, 'est', 'an unbilled reading is flagged est');
+
+  await act(async () => {
+    mock.timers.tick(100);
+    socket.emitMessage({ type: 'done', full_response: 'the answer', steps: 1 });
+  });
+  const terminal = mounted.context().liveStats;
+  assert.equal(terminal.rateMuted, true);
+  assert.equal(terminal.rateBilled, false, 'a reasoning-only turn never gets billed');
+  assert.equal(rateSegment(mounted)?.title, 'est');
+
+  await unmount(mounted.renderer);
+});
+
+test('a cancelled turn keeps its muted reading; a switch or a clear zeroes the meter', async () => {
+  const { runtime, mounted, socket } = await mountLiveChat();
+  mock.timers.enable({ apis: ['Date', 'setInterval'] });
+
+  await act(async () => {
+    mounted.context().sendMessage('cancel me');
+  });
+  await act(async () => {
+    socket.emitMessage({ type: 'agent_start', session_id: socket.sessionId });
+  });
+  await streamFrames(socket, 'chunk', 9, 500);
+  await act(async () => {
+    mock.timers.tick(200);
+    socket.emitMessage({ type: 'usage', input_tokens: 900, output_tokens: 300 });
+  });
+  const billed = mounted.context().liveStats;
+  assert.ok(billed.rate !== null && billed.rate > 50, `the usage frame publishes the reading (${billed.rate})`);
+
+  await act(async () => {
+    mock.timers.tick(100);
+    socket.emitMessage({
+      type: 'aborted',
+      input_tokens: 900,
+      output_tokens: 300,
+      cached_input_tokens: 0,
+      steps: 1,
+    });
+  });
+  const cancelled = mounted.context().liveStats;
+  assert.equal(cancelled.rateMuted, true, 'a cancel mutes the reading like any terminal');
+  assert.ok(cancelled.rate !== null && Math.abs(cancelled.rate - (billed.rate ?? 0)) < 2);
+  assert.ok(/tok\/s/.test(renderedText(mounted)), 'the cancelled turn still shows its rate');
+
+  // Session switch: the outgoing conversation's meter must not follow it.
+  runtime.queueMessages('B', () => Promise.resolve(messagesResponse('B', true)));
+  assert.equal(await goToSession(mounted, 'B'), true);
+  await settle();
+  assert.deepEqual(rateReading(mounted), { rate: null, rateMuted: false, rateBilled: false });
+  assert.doesNotMatch(renderedText(mounted), /tok\/s/);
+
+  // Clearing the conversation zeroes it the same way.
+  assert.equal(await goToSession(mounted, 'A'), true);
+  await settle();
+  const liveSocket = runtime.sockets[runtime.sockets.length - 1]!;
+  await openSocket(runtime, runtime.sockets.length - 1);
+  await streamFrames(liveSocket, 'chunk', 10, 500);
+  await act(async () => {
+    mock.timers.tick(200);
+    liveSocket.emitMessage({ type: 'usage', input_tokens: 900, output_tokens: 300 });
+  });
+  assert.ok(mounted.context().liveStats.rate !== null, 'the new socket feeds the meter again');
+  await act(async () => {
+    mounted.context().clearAllMessages();
+  });
+  await settle();
+  assert.deepEqual(rateReading(mounted), { rate: null, rateMuted: false, rateBilled: false });
+
   await unmount(mounted.renderer);
 });

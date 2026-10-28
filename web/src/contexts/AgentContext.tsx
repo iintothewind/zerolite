@@ -45,6 +45,7 @@ import {
   type LiveStats,
   type TokenStats,
 } from '@/lib/sessionStats.logic';
+import { TokenRateMeter, estimateTokens } from '@/lib/tokenRate';
 import {
   loadChatHistory,
   mapServerMessagesToPersisted,
@@ -179,7 +180,8 @@ export interface AgentContextValue {
    * `calibrated` means the number is a provider measurement anchored on the
    * unchanged prefix plus a local estimate for the unbilled tail. */
   contextInputSource: ContextInputSource;
-  /** Composer stats. See `webui-overall-plan.md` §10 "Composer stats semantics". */
+  /** Composer stats snapshot. Canonical rule: `docs/design/webui.md`,
+   *  "Composer stats semantics". */
   liveStats: LiveStats;
   /** The turn in flight: its closed steps and the step still being written.
    *  Empty between turns, and the transcript renders it as the live trajectory
@@ -310,11 +312,17 @@ export function AgentProvider({
   const [contextInputTokens, setContextInputTokens] = useState<number | null>(null);
   const [contextInputSource, setContextInputSource] = useState<ContextInputSource>(null);
   const [tokenStats, setTokenStats] = useState<TokenStats>(emptyTokenStats);
+  const [tokenRateState, setTokenRateState] = useState<{ rate: number | null; rateMuted: boolean; rateBilled: boolean }>({
+    rate: null,
+    rateMuted: false,
+    rateBilled: false,
+  });
+  const tokenRateRef = useRef<TokenRateMeter>(new TokenRateMeter(estimateTokens));
   // Mirrored from the turn-stream ref for the live trajectory view.
   const [liveTurn, setLiveTurn] = useState<LiveTurn>(emptyLiveTurn);
   const liveStats = useMemo(
-    () => displayStats(messages, tokenStats, liveTurn),
-    [messages, tokenStats, liveTurn],
+    () => displayStats(messages, tokenStats, liveTurn, tokenRateState),
+    [messages, tokenStats, liveTurn, tokenRateState],
   );
 
   const wsRef = useRef<WebSocketClient | null>(null);
@@ -348,6 +356,27 @@ export function AgentProvider({
   sessionPersistenceRef.current = sessionPersistence;
   typingRef.current = typing;
   sessionRuntimeRef.current = sessionRuntime;
+
+  // The live throughput readout refreshes once per second while a turn streams.
+  // `typing` is the turn's lifecycle flag, so `done`/`aborted`/reset stop the
+  // ticker through their own `setTyping(false)`. The meter's decayed window is
+  // what makes a stall fall visibly, so the tick is the only publisher for
+  // idle time; frames feed the meter, they never publish it. Returning the same
+  // state object when there is nothing to show makes React bail out, so the tick
+  // costs no render before the evidence gate opens.
+  useEffect(() => {
+    if (!typing) return;
+    const tick = setInterval(() => {
+      const now = Date.now();
+      const reading = tokenRateRef.current.rate(now);
+      setTokenRateState((s) =>
+        reading === null && s.rate === null
+          ? s
+          : { rate: reading, rateMuted: s.rateMuted, rateBilled: s.rateBilled },
+      );
+    }, 1000);
+    return () => clearInterval(tick);
+  }, [typing]);
 
   // Prime the model-provider catalog once so error formatting can resolve
   // display names from the backend registry rather than a local shadow list.
@@ -465,6 +494,8 @@ export function AgentProvider({
         // Turn boundary for token bookkeeping (`applyDone` reconciliation).
         // Displayed turns come from user bubbles in `messages`, not this frame.
         setTokenStats(turnStarted);
+        tokenRateRef.current.begin(Date.now());
+        setTokenRateState({ rate: null, rateMuted: false, rateBilled: false });
         break;
 
       case 'usage':
@@ -475,6 +506,12 @@ export function AgentProvider({
         // several calls arriving together one step rather than several.
         foldTurnStream({ type: 'usage' });
         setTokenStats((s) => applyUsage(s, msg));
+        tokenRateRef.current.end(msg.output_tokens, Date.now());
+        setTokenRateState((s) => ({
+          rate: tokenRateRef.current.rate(Date.now()),
+          rateMuted: s.rateMuted,
+          rateBilled: true,
+        }));
         // (The meter moves through `meterUpdateFromFrame` above.)
         break;
 
@@ -487,11 +524,13 @@ export function AgentProvider({
       case 'thinking':
         setTyping(true);
         foldTurnStream({ type: 'thinking', content: msg.content });
+        tokenRateRef.current.push(msg.content ?? '', Date.now());
         break;
 
       case 'chunk':
         setTyping(true);
         foldTurnStream({ type: 'chunk', content: msg.content });
+        tokenRateRef.current.push(msg.content ?? '', Date.now());
         break;
 
       case 'chunk_reset':
@@ -554,6 +593,9 @@ export function AgentProvider({
           // folds above, which also keep a trim that landed after the final
           // call from being undone here.
         }
+        tokenRateRef.current.end(undefined, Date.now());
+        const _rateNow = tokenRateRef.current.rate(Date.now());
+        setTokenRateState((s) => ({ rate: _rateNow, rateMuted: true, rateBilled: s.rateBilled }));
         setTyping(false);
         break;
       }
@@ -691,6 +733,8 @@ export function AgentProvider({
         // about, so they must be zeroed here. This is the only reset that is
         // not free. See the composer plan §4.1.
         setTokenStats(emptyTokenStats);
+        tokenRateRef.current.reset();
+        setTokenRateState({ rate: null, rateMuted: false, rateBilled: false });
         localMessageMutationVersionRef.current += 1;
         const keptTurns = typeof msg.kept_turns === 'number' ? msg.kept_turns : 0;
         setMessages((prev) => {
@@ -755,6 +799,9 @@ export function AgentProvider({
         // `aborted` carries the same totals as `done`: a cancelled turn still
         // spent the steps and tokens it spent, so the stats row keeps them.
         setTokenStats((s) => applyDone(s, msg));
+        tokenRateRef.current.end(undefined, Date.now());
+        const _rateAborted = tokenRateRef.current.rate(Date.now());
+        setTokenRateState((s) => ({ rate: _rateAborted, rateMuted: true, rateBilled: s.rateBilled }));
         foldTurnStream({ type: 'aborted' });
         setTyping(false);
         setPendingApproval(null);
@@ -1156,6 +1203,8 @@ export function AgentProvider({
     // Same reasoning for the live counters: they describe the session we are
     // leaving. Switching conversations and back must not carry them over.
     setTokenStats(emptyTokenStats);
+    tokenRateRef.current.reset();
+    setTokenRateState({ rate: null, rateMuted: false, rateBilled: false });
   }, [foldTurnStream]);
 
   const clearAllMessages = useCallback(() => {

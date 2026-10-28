@@ -33,6 +33,36 @@
 | 4 | Zerolite mark as web logo; zerolite release names | `9548ae163`, `31fb2d06b`, release notes in `docs/releases/` |
 | 5 | Zerocode keymap: QueueWiden / QueueNarrow | `apps/zerocode/src/keymap/actions.rs` |
 
+### Composer stats semantics (behavior #3)
+
+The InputBar toolbar row renders `N turns · M steps · cache hit …% · X tok/s`
+from a single published `LiveStats` snapshot
+(`web/src/lib/sessionStats.logic.ts`):
+
+- **Estimator, not timer.** `X tok/s` is the reading of
+  `web/src/lib/tokenRate.ts` (`TokenRateMeter`): a decayed sliding window over
+  streamed text — three exponential half-lives (5 s / 20 s / 80 s), 250 ms
+  buckets — plus the history billed by `usage` frames. The meter is pure and
+  timer-free; `rate(now)` computes from arrival timestamps.
+- **Lower bound.** The gateway streams answer text only, so a live reading
+  counts streamed evidence; the model's unstreamed output (reasoning,
+  tool-call arguments) is invisible, so a reading is a lower bound on the true
+  speed. The first `usage` frame marks the reading billed: it adds the
+  provider's `output_tokens` against the silent span and clears the `est`
+  flag.
+- **Publisher.** `chunk`/`thinking` frames feed the meter and never publish.
+  A 1 Hz ticker publishes the reading while a turn is active, which is what
+  lets a stall fall visibly; terminal frames (`message`/`done`/`aborted`)
+  publish once and mute it, so the last reading stays on screen, dimmed.
+- **No placeholder.** While the meter has no evidence (gate: ≥200 estimated
+  tokens over ≥4 s of stream), the segment is absent — never `0 tok/s`.
+  Formatting: `formatRate`, integers at ≥10, one decimal below.
+- **Reset with the transcript.** Session switch, `clearAllMessages`,
+  `history_trimmed`, and unmount zero the meter. The outgoing conversation's
+  speed must not follow into the new one.
+- The cumulative `X tok` segment is retired; session totals live in the
+  session dashboard.
+
 ## Merge notes
 
 - **Verify post-merge by behavior:** trigger a trim and confirm the

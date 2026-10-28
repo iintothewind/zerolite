@@ -1,6 +1,6 @@
-// Composer stats: turns/steps from the transcript; tokens from this page's
-// `usage` frames. Canonical product rules:
-// `docs/reports/webui-overall-plan.md` §10 "Composer stats semantics".
+// Composer stats: turns/steps from the local transcript, cache hit from this
+// page's `usage` frames, and the live rate from the meter snapshot the caller
+// passes in. Canonical rule: `docs/design/webui.md` → "Composer stats semantics".
 
 /** Wire payload of a per-step `usage` frame. */
 export interface UsageFrame {
@@ -40,6 +40,9 @@ export interface LiveStats {
   input: number;
   output: number;
   cached: number;
+  rate: number | null;
+  rateMuted: boolean;
+  rateBilled: boolean;
 }
 
 export interface TokenStats {
@@ -126,13 +129,18 @@ export function displayStats(
   messages: readonly TranscriptMessage[],
   tokens: TokenStats,
   liveTurn?: TranscriptLiveTurn | null,
+  meterSnapshot?: { rate: number | null; rateMuted: boolean; rateBilled: boolean } | null,
 ): LiveStats {
+  const snap = meterSnapshot ?? null;
   return {
     turns: countTranscriptTurns(messages),
     steps: countTranscriptSteps(messages, liveTurn),
     input: tokens.input,
     output: tokens.output,
     cached: tokens.cached,
+    rate: snap ? snap.rate : null,
+    rateMuted: snap ? snap.rateMuted : false,
+    rateBilled: snap ? snap.rateBilled : false,
   };
 }
 
@@ -167,6 +175,17 @@ export function applyDone(s: TokenStats, frame: TurnTerminalFrame): TokenStats {
 export function cacheHitRatio(s: Pick<LiveStats, 'input' | 'cached'>): number {
   if (s.input <= 0) return 0;
   return Math.min(1, Math.max(0, s.cached / s.input));
+}
+
+/**
+ * Rate readout: below `0.05` tok/s the meter is not worth a reading, so "0";
+ * ≥10 reads as a whole number; below that, one decimal keeps the width stable
+ * between ticks (`tabular-nums`).
+ */
+export function formatRate(rate: number): string {
+  if (!Number.isFinite(rate) || rate < 0.05) return '0';
+  if (rate >= 10) return String(Math.round(rate));
+  return (Math.round(rate * 10) / 10).toFixed(1);
 }
 
 export function formatTokens(n: number): string {
