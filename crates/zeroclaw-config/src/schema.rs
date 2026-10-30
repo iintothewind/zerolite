@@ -7278,8 +7278,11 @@ pub struct MultimodalConfig {
     #[serde(default)]
     pub allow_remote_fetch: bool,
     /// ModelProvider name to use for vision/image messages (e.g. `"ollama"`).
-    /// When set, messages containing `[IMAGE:]` markers are routed to this
-    /// model_provider instead of the default text model_provider.
+    /// When set, a turn that introduces new `[IMAGE:]` markers is routed to this
+    /// model_provider instead of the default text model_provider. Images carried
+    /// over from earlier turns do not trigger the detour — a primary without
+    /// vision serves those turns with the markers stripped, so the selected
+    /// model keeps serving the conversation.
     #[serde(default)]
     pub vision_model_provider: Option<String>,
     /// Model to use when routing to the vision model_provider (e.g. `"llava:7b"`).

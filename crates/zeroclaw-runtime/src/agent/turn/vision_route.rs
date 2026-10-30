@@ -30,13 +30,20 @@ pub(crate) fn policy_permits_image_path(policy: &SecurityPolicy, path: &std::pat
 
 /// Decide this turn's image-input route.
 ///
-/// No image markers in the history, or a primary provider that already
-/// accepts images (`capabilities_for_model(dispatch_model)`): the primary
-/// serves the turn unchanged, `(None, false)`. A non-vision primary with a
-/// configured `[multimodal] vision_model_provider`: the configured provider
-/// is built through the alias-aware factory and returned, `(Some(_), false)`;
-/// a configured provider that itself lacks vision is an operator
-/// misconfiguration and surfaces as a `ProviderCapabilityError`.
+/// A primary provider that already accepts images
+/// (`capabilities_for_model(dispatch_model)`), or a turn that introduces no new
+/// image marker, serves unchanged: `(None, false)`. Images carried over from
+/// earlier user turns never justify the detour — routing on them pinned the
+/// whole conversation to the vision provider, so the selected model could never
+/// serve again. With a non-vision primary and no new marker, those carried-over
+/// markers are stripped from the request instead (`(None, true)`), matching what
+/// a text-only provider can consume.
+///
+/// A non-vision primary and a turn that does introduce markers, with a
+/// configured `[multimodal] vision_model_provider`: the configured provider is
+/// built through the alias-aware factory and returned, `(Some(_), false)`; a
+/// configured provider that itself lacks vision is an operator misconfiguration
+/// and surfaces as a `ProviderCapabilityError`.
 ///
 /// `security` governs one thing: which local image-marker references in the
 /// latest user message count as "resolvable" for the no-vision, no-fallback
@@ -68,11 +75,32 @@ pub(crate) async fn resolve_vision_provider_with_allowed_refs(
 ) -> Result<(Option<ResolvedVisionProvider>, bool)> {
     let image_marker_count = multimodal::count_image_markers(history);
     let latest_user_image_marker_count = multimodal::count_latest_user_image_markers(history);
+    // Markers this turn introduces, as opposed to images carried over from
+    // earlier user turns; only the former may move the turn off the selected
+    // model.
+    let current_turn_image_marker_count = multimodal::count_current_turn_image_markers(history);
 
     let mut degrade_strip_images = false;
+    let primary_accepts_images = model_provider.capabilities_for_model(dispatch_model).vision;
     let vision_model_provider: Option<ResolvedVisionProvider> = if image_marker_count > 0
-        && !model_provider.capabilities_for_model(dispatch_model).vision
+        && !primary_accepts_images
+        && current_turn_image_marker_count == 0
     {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_category(::zeroclaw_log::EventCategory::Provider)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "model_provider": provider_name,
+                    "image_marker_count": image_marker_count,
+                    "current_turn_image_marker_count": current_turn_image_marker_count,
+                })),
+            "images carried over from earlier turns stay off the vision route; serving the selected model with old markers stripped"
+        );
+        degrade_strip_images = true;
+        None
+    } else if image_marker_count > 0 && !primary_accepts_images {
         if let Some(ref vp) = multimodal_config.vision_model_provider {
             let provider_allowed = allowed_provider_refs.map_or_else(
                 || zeroclaw_providers::reliable::provider_ref_allowed_for_turn(vp),
@@ -1716,6 +1744,111 @@ model = "vision-model"
         );
         server.abort();
     }
+
+    /// Carried-over attachments must not pin the conversation to the vision
+    /// route: the selected model serves, and the markers it cannot consume are
+    /// stripped. Routing on them kept the whole session on the fallback after a
+    /// single upload, so switching back to the text model never took effect.
+    #[tokio::test]
+    async fn carried_over_images_keep_the_selected_model() {
+        struct NonVisionPrimary;
+        #[async_trait::async_trait]
+        impl ModelProvider for NonVisionPrimary {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+        }
+        impl zeroclaw_api::attribution::Attributable for NonVisionPrimary {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Role::Provider(
+                    zeroclaw_api::attribution::ProviderKind::Model(
+                        zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "NonVisionPrimary"
+            }
+        }
+
+        let config: Config = toml::from_str(
+            r#"
+schema_version = 3
+[providers.models.custom.visionroute]
+uri = "http://127.0.0.1:9/v1"
+model = "vision-model"
+"#,
+        )
+        .expect("config parses");
+        let multimodal = MultimodalConfig {
+            vision_model_provider: Some("custom.visionroute".to_string()),
+            ..Default::default()
+        };
+
+        let carried_over = vec![
+            ChatMessage::user("look [IMAGE:/tmp/earlier.png]".to_string()),
+            ChatMessage::assistant("A screenshot.".to_string()),
+            ChatMessage::user("what did we decide?".to_string()),
+        ];
+        let (vision_provider, degrade_strip_images) = resolve_vision_provider(
+            Some(&config),
+            &NonVisionPrimary,
+            &carried_over,
+            &multimodal,
+            "primary",
+            "primary-model",
+            "primary-model",
+            None,
+        )
+        .await
+        .expect("carried-over markers must not fail the turn");
+        assert!(
+            vision_provider.is_none(),
+            "an attachment from an earlier turn must not move this turn off the selected model"
+        );
+        assert!(
+            degrade_strip_images,
+            "the primary cannot consume those markers, so they are stripped"
+        );
+
+        let fresh = vec![
+            ChatMessage::user("look [IMAGE:/tmp/earlier.png]".to_string()),
+            ChatMessage::assistant("A screenshot.".to_string()),
+            ChatMessage::user("and this one [IMAGE:/tmp/now.png]".to_string()),
+        ];
+        let (vision_provider, degrade_strip_images) = resolve_vision_provider(
+            Some(&config),
+            &NonVisionPrimary,
+            &fresh,
+            &multimodal,
+            "primary",
+            "primary-model",
+            "primary-model",
+            None,
+        )
+        .await
+        .expect("a fresh marker must resolve the configured vision route");
+        let resolved =
+            vision_provider.expect("a new attachment still routes to the vision provider");
+        assert!(
+            resolved
+                .provider
+                .capabilities_for_model(&resolved.model)
+                .vision,
+            "the configured fallback must be vision-capable"
+        );
+        assert!(
+            !degrade_strip_images,
+            "a live vision route must not degrade/strip images"
+        );
+    }
+
     /// DECISIVE, no-vision route: a tool-result carrier with one declared
     /// attachment and marker-looking body text. The degrade strips exactly
     /// the declared attachment; the body — including its literal marker —

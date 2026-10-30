@@ -1033,6 +1033,23 @@ pub fn count_latest_user_image_markers(messages: &[ChatMessage]) -> usize {
         .unwrap_or(0)
 }
 
+/// Count image markers THIS turn introduces: the latest user message plus
+/// every tool-result carrier after it. Markers in earlier user turns are
+/// carried over, not introduced here.
+///
+/// Route decisions use this instead of [`count_image_markers`]: an image from
+/// an earlier turn cannot justify serving the turn on a different model, or a
+/// single attachment would pin the whole conversation to the vision route and
+/// the selected model would never serve again.
+pub fn count_current_turn_image_markers(messages: &[ChatMessage]) -> usize {
+    let Some(start) = messages.iter().rposition(|message| {
+        message.role == "user" && !is_tool_result_carrier(&message.role, &message.content)
+    }) else {
+        return 0;
+    };
+    count_image_markers(&messages[start..])
+}
+
 /// Count image markers in the latest user message whose references would
 /// actually resolve to an attachment: an inline `data:` URI that passes the
 /// shared structural check, a remote `http(s)` URL when `remote_allowed` is
@@ -9879,6 +9896,37 @@ mod tests {
         ];
 
         assert_eq!(count_image_markers(&messages), 1);
+    }
+
+    #[test]
+    fn count_current_turn_image_markers_ignores_carried_over_user_images() {
+        let carried_over = vec![
+            ChatMessage::user("[IMAGE:/tmp/earlier.png]".to_string()),
+            ChatMessage::assistant("Described.".to_string()),
+            ChatMessage::user("next question".to_string()),
+        ];
+
+        assert_eq!(count_image_markers(&carried_over), 1);
+        assert_eq!(count_current_turn_image_markers(&carried_over), 0);
+
+        let just_sent = vec![ChatMessage::user("[IMAGE:/tmp/now.png]".to_string())];
+        assert_eq!(count_current_turn_image_markers(&just_sent), 1);
+    }
+
+    #[test]
+    fn count_current_turn_image_markers_counts_this_turns_tool_carriers() {
+        let messages = vec![
+            ChatMessage::user("[IMAGE:/tmp/earlier.png]".to_string()),
+            ChatMessage::assistant("Described.".to_string()),
+            ChatMessage::user("generate another".to_string()),
+            ChatMessage::tool(native_carrier(
+                "tc1",
+                "Generated",
+                &["/tmp/same-turn-tool.png".to_string()],
+            )),
+        ];
+
+        assert_eq!(count_current_turn_image_markers(&messages), 1);
     }
 
     #[test]
