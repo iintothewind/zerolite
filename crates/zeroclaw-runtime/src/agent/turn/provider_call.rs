@@ -278,7 +278,20 @@ pub(crate) async fn call_provider(
         // attempt ledger instead of opening a second scope.
         let scope = zeroclaw_providers::dispatch::AccountedChatScope::new();
         let (result, live_deltas, protocol_suppressed, visible_text, recovered_image_request) = scope
-            .scope(Box::pin(zeroclaw_providers::reliable::scope_provider_fallback(Box::pin(async {
+            .scope(Box::pin(with_exact_dispatch_route(
+                // A provider leaf reports its `Attributable::alias` as the
+                // accounting identity: the bare `[providers.models.<type>.
+                // <alias>]` key, not a config reference. Everything downstream
+                // keys on the reference — the usage frame, the terminal
+                // snapshot, and the limits resolver, which cannot split the
+                // family off a bare alias and therefore falls back to the 32k
+                // unconfigured-window stub. Name the route here exactly as the
+                // non-streaming path below does. Inner Reliable/router frames
+                // (each candidate's own `<type>.<alias>`) still win over this
+                // one, so a fallback keeps its own identity and capacity.
+                active_model_provider_name.to_string(),
+                active_model.to_string(),
+                zeroclaw_providers::reliable::scope_provider_fallback(Box::pin(async {
                     match consume_provider_streaming_response_with_policy(
                         active_model_provider,
                         original_request,
@@ -525,7 +538,7 @@ pub(crate) async fn call_provider(
                             }
                         }
                     }
-                }))))
+                })))))
             .await;
         if result.is_ok() {
             scope.mark_logical_success();

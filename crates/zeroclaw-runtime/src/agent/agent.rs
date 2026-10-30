@@ -19991,6 +19991,236 @@ vision_model_provider = "custom.vision"
             "the outcome's limits must agree with the terminal snapshot's budget"
         );
     }
+    /// The WS chat path builds providers through the real alias factory, so every
+    /// identity string it publishes (`TurnEvent::Usage.provider_ref`, terminal
+    /// provider name) and every pair key the limits resolver receives must be the
+    /// `<family>.<alias>` config reference. Factory leaves historically report the
+    /// bare leaf label as their attribution alias: `provider_reference()` reads
+    /// `Attributable::alias`, so a vision-routed turn hands the resolver a
+    /// family-less key, `find(family, alias)` misses the entry, and the client sees
+    /// fallback stub window/budget instead of the configured capacity. The existing
+    /// streamed-vision harness uses inline providers with hand-dotted aliases, so
+    /// this production construction path was never asserted.
+    #[tokio::test]
+    async fn factory_built_streamed_vision_turn_publishes_config_refs_and_limits() {
+        use axum::{Json, Router, response::IntoResponse, routing::post};
+
+        // Both endpoints answer a STREAMING completion. The production WS path
+        // consumes SSE; a plain JSON body instead triggers the non-stream
+        // recovery path, which applies an exact dispatch route of its own and
+        // would mask the defect this test exists to catch.
+        fn sse_reply(text: &str) -> axum::response::Response {
+            let chunk = serde_json::json!({
+                "choices": [{"delta": {"content": text}, "finish_reason": "stop"}]
+            });
+            (
+                [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                format!("data: {chunk}\n\ndata: [DONE]\n\n"),
+            )
+                .into_response()
+        }
+        async fn base_reply(Json(body): Json<serde_json::Value>) -> axum::response::Response {
+            assert_eq!(
+                body["stream"],
+                serde_json::json!(true),
+                "base turn must stream"
+            );
+            sse_reply("the answer")
+        }
+        async fn vision_reply(Json(body): Json<serde_json::Value>) -> axum::response::Response {
+            assert_eq!(
+                body["stream"],
+                serde_json::json!(true),
+                "vision turn must stream"
+            );
+            sse_reply("vision saw the image")
+        }
+
+        let base_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind base provider");
+        let base_addr = base_listener.local_addr().expect("base provider address");
+        let _base_server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(
+                base_listener,
+                Router::new().route("/v1/chat/completions", post(base_reply)),
+            )
+            .await
+            .expect("base serves");
+        });
+        let vision_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind vision provider");
+        let vision_addr = vision_listener
+            .local_addr()
+            .expect("vision provider address");
+        let _vision_server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(
+                vision_listener,
+                Router::new().route("/v1/chat/completions", post(vision_reply)),
+            )
+            .await
+            .expect("vision serves");
+        });
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let image_path = temp.path().join("shot.png");
+        std::fs::write(
+            &image_path,
+            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+        )
+        .expect("write png");
+
+        let config: zeroclaw_config::schema::Config = toml::from_str(&format!(
+            r#"
+schema_version = 3
+[providers.models.custom.text]
+uri = "http://{base_addr}/v1"
+model = "text-model"
+native_tools = true
+vision = false
+context_window = 200000
+[providers.models.custom.vision]
+uri = "http://{vision_addr}/v1"
+model = "vision-model"
+vision = true
+context_window = 8000
+[multimodal]
+vision_model_provider = "custom.vision"
+"#
+        ))
+        .expect("config parses");
+
+        // The base leaf is built through the real alias factory, exactly as the
+        // gateway construction path does.
+        let base_ref =
+            zeroclaw_providers::create_model_provider_from_ref_with_model(&config, "custom.text")
+                .expect("base factory leaf should build");
+
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, temp.path(), None)
+                .expect("memory creation should succeed"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+
+        let pairs = Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
+        let limit_config = Arc::new(config.clone());
+        let pairs_for_resolver = Arc::clone(&pairs);
+
+        let mut agent = Agent::builder()
+            .model_provider(base_ref.provider)
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                Vec::new(),
+            ))
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(temp.path().to_path_buf())
+            .agent_alias("coder".into())
+            .model_provider_name("custom.text".into())
+            .model_name(base_ref.model.expect("the entry pins its model"))
+            .multimodal_config(config.multimodal.clone())
+            .provider_switch_config(ProviderSwitchConfig {
+                config: Some(Arc::new(config.clone())),
+                live_config: None,
+                live: None,
+            })
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        agent.context_limits_resolver = Some(Arc::new(move |provider_ref, model| {
+            pairs_for_resolver
+                .lock()
+                .unwrap()
+                .push((provider_ref.to_string(), model.to_string()));
+            limit_config.resolved_context_limits_for_route("coder", provider_ref, model)
+        }));
+
+        fn drain_frames(rx: &mut tokio::sync::mpsc::Receiver<TurnEvent>) -> Vec<(String, String)> {
+            let mut out = Vec::new();
+            while let Ok(ev) = rx.try_recv() {
+                if let TurnEvent::Usage {
+                    provider_ref,
+                    model,
+                    context_token_budget,
+                    model_context_window,
+                    ..
+                } = &ev
+                {
+                    assert_eq!(
+                        (*context_token_budget, *model_context_window),
+                        if provider_ref == "custom.text" {
+                            (Some(160_000), Some(200_000))
+                        } else {
+                            (Some(6_400), Some(8_000))
+                        },
+                        "every usage frame carries that route's configured window and budget, \
+                         got provider_ref={provider_ref} budget={context_token_budget:?} window={model_context_window:?}"
+                    );
+                    out.push((provider_ref.clone(), model.clone()));
+                }
+            }
+            out
+        }
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+
+        // Turn 1: text-only on the base route.
+        let outcome1 = agent
+            .turn_streamed_with_steering_state("what is WAL?", event_tx.clone(), None, None)
+            .await
+            .expect("text turn should succeed");
+        let frames1 = drain_frames(&mut event_rx);
+
+        // Turn 2: the WS attachment marker routes this iteration onto the configured vision provider.
+        let outcome2 = agent
+            .turn_streamed_with_steering_state(
+                &format!("look at this [IMAGE:{}]", image_path.display()),
+                event_tx.clone(),
+                None,
+                None,
+            )
+            .await
+            .expect("attachment turn should succeed");
+        let frames2 = drain_frames(&mut event_rx);
+
+        assert_eq!(
+            (outcome1.provider_name.as_str(), outcome1.model.as_str()),
+            ("custom.text", "text-model"),
+            "the text turn must report the configured entry as canonical"
+        );
+        assert_eq!(
+            (outcome2.provider_name.as_str(), outcome2.model.as_str()),
+            ("custom.vision", "vision-model"),
+            "the attachment turn must serve its usage under the vision route's identity"
+        );
+        assert_eq!(
+            frames1,
+            vec![("custom.text".to_string(), "text-model".to_string())]
+        );
+        assert_eq!(
+            frames2,
+            vec![("custom.vision".to_string(), "vision-model".to_string())],
+            "the attachment turn's usage must publish under the vision route"
+        );
+
+        let mut recorded = pairs.lock().unwrap().clone();
+        recorded.sort();
+        recorded.dedup();
+        assert_eq!(
+            recorded,
+            vec![
+                ("custom.text".to_string(), "text-model".to_string()),
+                ("custom.vision".to_string(), "vision-model".to_string())
+            ],
+            "the resolver must receive `<family>.<alias>` pair keys; a family-less key \
+             misses the configured entry and publishes fallback stub limits, got {recorded:?}"
+        );
+    }
 
     /// A reliable fallback that serves a DIFFERENT alias must report ITS
     /// capacity, not the requested route's.

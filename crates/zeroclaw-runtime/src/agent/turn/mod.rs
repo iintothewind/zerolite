@@ -1421,6 +1421,64 @@ fn resolve_context_limits_for_call(
         .unwrap_or(fallback)
 }
 
+/// Restore the `<type>.` prefix a leaf-only attribution alias is missing.
+///
+/// Provider leaves announce themselves by `Attributable::alias` — the bare
+/// `[providers.models.<type>.<alias>]` key. That string is not a config
+/// reference: `resolved_context_limits_for_route` splits on `.` to find the
+/// entry and, failing to, reports the 32k unconfigured-window stub. When the
+/// served reference is exactly the alias of the route this iteration
+/// dispatched to, the family is unambiguous, so qualify it and keep the
+/// configured capacity. Any other bare alias is left alone: borrowing this
+/// route's family for an unknown alias would advertise the wrong model's
+/// window.
+fn qualify_served_provider_ref<'a>(
+    dispatched_ref: &'a str,
+    served_ref: &'a str,
+) -> std::borrow::Cow<'a, str> {
+    if served_ref.contains('.') {
+        return std::borrow::Cow::Borrowed(served_ref);
+    }
+    match dispatched_ref.split_once('.') {
+        Some((family, alias)) if alias == served_ref => {
+            std::borrow::Cow::Owned(format!("{family}.{served_ref}"))
+        }
+        _ => std::borrow::Cow::Borrowed(served_ref),
+    }
+}
+
+#[cfg(test)]
+mod served_ref_qualification {
+    use super::qualify_served_provider_ref;
+
+    #[test]
+    fn a_leaf_alias_is_qualified_with_the_dispatched_family() {
+        assert_eq!(
+            qualify_served_provider_ref("custom.vision", "vision"),
+            "custom.vision"
+        );
+    }
+
+    #[test]
+    fn a_reference_that_already_names_its_family_is_untouched() {
+        assert_eq!(
+            qualify_served_provider_ref("custom.vision", "custom.backup"),
+            "custom.backup"
+        );
+    }
+
+    #[test]
+    fn a_foreign_or_familyless_bare_alias_keeps_its_unknown_route() {
+        // Borrowing this route's family would advertise the wrong capacity, and
+        // a dispatched ref without a family offers nothing to qualify with.
+        assert_eq!(
+            qualify_served_provider_ref("custom.vision", "backup"),
+            "backup"
+        );
+        assert_eq!(qualify_served_provider_ref("vision", "vision"), "vision");
+    }
+}
+
 /// Per-invocation turn state: owns the provider-visible transcript and
 /// the canonical current-turn buffer during one `run_tool_call_loop` call.
 ///
@@ -2769,6 +2827,11 @@ async fn run_tool_call_loop_impl<'a>(
                     provider_request_model.to_string(),
                 )
             });
+        // A leaf-only identity (`Attributable::alias`) is not a config
+        // reference; repair it when it names this iteration's own alias so the
+        // limits resolver can find `<type>.<alias>` instead of the 32k stub.
+        let served_provider =
+            qualify_served_provider_ref(active_model_provider_name, &served_provider);
 
         // A reliable fallback can serve a DIFFERENT configured alias than the
         // one this iteration resolved limits for at dispatch time. Capacity and
@@ -2801,14 +2864,14 @@ async fn run_tool_call_loop_impl<'a>(
             .strip_prefix("hint:")
             .map(|_| provider_request_model)
             .unwrap_or(served_model.as_str());
-        let served_route_changed = served_provider != active_model_provider_name
+        let served_route_changed = served_provider.as_ref() != active_model_provider_name
             || served_model_key != provider_request_model;
         let served_context_limits = if served_route_changed {
             resolve_context_limits_for_call(
                 context_limits_resolver.as_ref(),
                 config,
                 agent_alias,
-                &served_provider,
+                served_provider.as_ref(),
                 served_model_key,
                 active_context_limits,
             )
@@ -2819,7 +2882,11 @@ async fn run_tool_call_loop_impl<'a>(
         // frame, recovery arithmetic, and the terminal snapshot — reads limits
         // for the route that actually answered. A no-op when the alias did not
         // change, since `served_context_limits` is then the pair already bound.
-        let ctx = base_ctx.for_route(&served_provider, served_model_key, served_context_limits);
+        let ctx = base_ctx.for_route(
+            served_provider.as_ref(),
+            served_model_key,
+            served_context_limits,
+        );
 
         // Reliable providers classify this before retries and fallback. Keep
         // the turn-level guard for direct/unwrapped providers: a transport
@@ -2854,7 +2921,7 @@ async fn run_tool_call_loop_impl<'a>(
             Ok(resp) => {
                 let interpreted = interpret_chat_response(
                     &ctx,
-                    &served_provider,
+                    served_provider.as_ref(),
                     &served_model,
                     resp,
                     accepted_request_messages,
@@ -3079,7 +3146,7 @@ async fn run_tool_call_loop_impl<'a>(
             .await;
         record_accepted_chat_response(
             &ctx,
-            &served_provider,
+            served_provider.as_ref(),
             &served_model,
             &response_text,
             &native_tool_calls,
@@ -3106,7 +3173,7 @@ async fn run_tool_call_loop_impl<'a>(
             && let Some(sink) = served_route_sink.as_ref()
             && let Some(served) = sink.lock().expect("served-route sink lock").as_mut()
         {
-            served.provider_name = served_provider.clone();
+            served.provider_name = served_provider.to_string();
             // The normalized key, not the raw accepted model: the terminal
             // frame is attribution, and a `hint:` wire selector is not an
             // attribution name.
@@ -3559,7 +3626,7 @@ async fn run_tool_call_loop_impl<'a>(
         }
 
         pending_reported_usage = reported_input_tokens.map(|reported| ReportedRequestUsage {
-            provider_name: served_provider.clone(),
+            provider_name: served_provider.to_string(),
             model: served_model_key.to_string(),
             reported_tokens: reported as usize,
             estimated_tokens: reported_population_estimated,
