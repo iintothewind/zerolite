@@ -22,6 +22,11 @@
 - **R3 — Fork identity is visible, not just a version string.** The
   zerolite mark is the web logo and the release names are zerolite's.
   Upstream branding assets must not silently replace them in a merge.
+- **R4 — Chat images load over plain `http:` too.** Agents link images
+  served by LAN / private services (e.g. `http://10.x.x.x:port/...`). The
+  dashboard CSP `img-src` therefore admits `http:` beside `https:`; the
+  added tracking/exfiltration surface is nil because `https:` already
+  admits any host. Local file paths are not rendered (out of scope).
 
 ## Behaviors
 
@@ -32,6 +37,7 @@
 | 3 | Transcript-aligned composer stats in the InputBar toolbar | `feat(web): put transcript-aligned composer stats in the InputBar toolbar` |
 | 4 | Zerolite mark as web logo; zerolite release names | `9548ae163`, `31fb2d06b`, release notes in `docs/releases/` |
 | 5 | Zerocode keymap: QueueWiden / QueueNarrow | `apps/zerocode/src/keymap/actions.rs` |
+| 6 | Dashboard CSP `img-src 'self' data: https: http:` | `crates/zeroclaw-gateway/src/security_headers.rs` (+ `csp_permits_same_origin_dashboard_assets`) |
 
 ### Composer stats semantics (behavior #3)
 
@@ -73,7 +79,8 @@ from a single published `LiveStats` snapshot
 - **Upstream web refactors that touch the transcript store, the context
   bar, or branding assets are semantic changes here.** The web test
   files (`*.test.ts` beside each logic file) are fork tests; they must
-  survive the merge.
+  survive the merge. An upstream CSP rewrite that drops `http:` from
+  `img-src` conflicts with R4.
 
 ## Sources
 

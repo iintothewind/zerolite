@@ -13,7 +13,7 @@ const SECURITY_HEADERS: &[(&str, &str)] = &[
         "default-src 'self'; \
          script-src 'self' 'unsafe-inline'; \
          style-src 'self' 'unsafe-inline'; \
-         img-src 'self' data: https:; \
+         img-src 'self' data: https: http:; \
          font-src 'self'; \
          connect-src 'self' ws: wss:; \
          object-src 'none'; \
@@ -88,7 +88,7 @@ mod tests {
             .unwrap();
         assert!(csp.contains("default-src 'self'"));
         assert!(csp.contains("script-src 'self'"));
-        assert!(csp.contains("img-src 'self' data: https:"));
+        assert!(csp.contains("img-src 'self' data: https: http:"));
         assert!(csp.contains("connect-src 'self' ws: wss:"));
         assert!(csp.contains("frame-ancestors 'none'"));
     }
