@@ -70,3 +70,12 @@ their presence as approval. If a future merge touches them, report it.
 - Upstream context-management changes are not taken (owner decision
   2026-10-27, applied to v0.8.7): a pick that touches context management
   is left unmerged and reported (see `context-management.md`).
+- Tests that need inputs the fork's `zeroclaw-test` image cannot supply
+  are removed, not kept failing (owner decision 2026-11-02): the upstream
+  late ToolSearch namespace tests (`r5_namespace_tests.rs`
+  `late_tool_search_*`, which need upstream-CI fixture receipts) with their
+  test-only `late_tool_search_observer` hooks in `tools/mod.rs`,
+  `tools/scoped.rs`, `tools/skill_tool.rs` and `skills/mod.rs`, and the
+  `expect`-driven PTY test
+  `daemon_feedback_follows_foreground_job_control_transitions`. An
+  upstream hunk that re-adds them is dropped.

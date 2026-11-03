@@ -140,13 +140,6 @@ impl BuildRegistry {
         context: &mut Vec<Arc<dyn Tool>>,
         delegate_handle: Option<&DelegateParentToolsHandle>,
     ) {
-        #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
-        tools::late_tool_search_observer::record(
-            "claim",
-            "tool_search",
-            unfiltered.len(),
-            context.len(),
-        );
         for entry in &mut self.entries {
             let retired = match entry.value.as_ref() {
                 Some(BuildSlot::Ready(tool)) => is_search_guest(tool.as_ref()),
@@ -157,8 +150,6 @@ impl BuildRegistry {
                 _ => false,
             };
             if retired {
-                #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
-                tools::late_tool_search_observer::record("claim-retire", "slot", 0, 0);
                 entry.value = None;
                 entry.top_level = false;
             } else if matches!(entry.value.as_ref(), Some(BuildSlot::Pipeline(_)))
@@ -166,56 +157,21 @@ impl BuildRegistry {
             {
                 entry.value = Some(BuildSlot::Pipeline(tool.retain_context_tools(|child| {
                     let retired = is_search_guest(child);
-                    #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
-                    tools::late_tool_search_observer::record(
-                        "pipeline-child",
-                        if retired { "retire" } else { "keep" },
-                        tools::late_tool_search_observer::borrowed_id(child),
-                        0,
-                    );
                     !retired
                 })));
             }
         }
         unfiltered.retain(|tool| {
             let retired = is_search_guest(tool.as_ref());
-            #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
-            tools::late_tool_search_observer::record(
-                "unfiltered-child",
-                if retired { "retire" } else { "keep" },
-                tools::late_tool_search_observer::arc_id(tool),
-                0,
-            );
             !retired
         });
         context.retain(|tool| {
             let retired = is_search_guest(tool.as_ref());
-            #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
-            tools::late_tool_search_observer::record(
-                "context-child",
-                if retired { "retire" } else { "keep" },
-                tools::late_tool_search_observer::arc_id(tool),
-                0,
-            );
             !retired
         });
         if let Some(parent) = delegate_handle {
-            #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
-            tools::late_tool_search_observer::record(
-                "parent-handle",
-                "claim",
-                tools::late_tool_search_observer::arc_id(parent),
-                0,
-            );
             parent.write().retain(|tool| {
                 let retired = is_search_guest(tool.as_ref());
-                #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
-                tools::late_tool_search_observer::record(
-                    "parent-child",
-                    if retired { "retire" } else { "keep" },
-                    tools::late_tool_search_observer::arc_id(tool),
-                    0,
-                );
                 !retired
             });
         }
@@ -239,13 +195,6 @@ impl BuildRegistry {
         let pipeline = pipeline_id.and_then(|id| match self.entries[id.0].value.take() {
             Some(BuildSlot::Pipeline(tool)) if pipeline_needed => {
                 let tool = Arc::new(tool);
-                #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
-                tools::late_tool_search_observer::record(
-                    "pipeline-publish",
-                    "sole",
-                    id.0,
-                    tools::late_tool_search_observer::arc_id(&tool),
-                );
                 Some((id, tool))
             }
             _ => None,
@@ -258,13 +207,6 @@ impl BuildRegistry {
             if let Some((id, tool)) = &pipeline
                 && *id == SlotId(index)
             {
-                #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
-                tools::late_tool_search_observer::record(
-                    "pipeline-top",
-                    "same-arc",
-                    tools::late_tool_search_observer::arc_id(tool),
-                    0,
-                );
                 tools.push(Box::new(tools::ArcToolRef(
                     Arc::clone(tool) as Arc<dyn Tool>
                 )));
@@ -343,8 +285,6 @@ impl ScopedToolRegistry {
     }
 
     fn refresh_builtin_schemas(&self) {
-        #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
-        tools::late_tool_search_observer::record("phase", "post-seal-refresh", 8, 0);
         let Some(state) = &self.1 else { return };
         let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
         if self.0.iter().any(|tool| tool.name() == "tool_search") {
@@ -566,8 +506,6 @@ impl ScopedToolRegistry {
             mcp_registry: overrides_mcp_registry,
         } = spec;
 
-        #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
-        tools::late_tool_search_observer::record("phase", "factory", 1, 0);
         let AllToolsResult {
             tools: tools_registry,
             reserved_host_names: mut host_tool_names,
@@ -674,33 +612,9 @@ impl ScopedToolRegistry {
             .filter(|tool| tool_allowed_in_context(tool.name(), exclude_memory, acp_delivery))
             .cloned()
             .collect();
-        #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
-        {
-            tools::late_tool_search_observer::record(
-                "phase",
-                "context",
-                2,
-                context_filtered_tool_arcs.len(),
-            );
-            for tool in &context_filtered_tool_arcs {
-                tools::late_tool_search_observer::record(
-                    "context-entry",
-                    "original",
-                    tools::late_tool_search_observer::arc_id(tool),
-                    0,
-                );
-            }
-        }
         let pipeline_id = (config.pipeline.enabled
             && config.tools.is_enabled(tools::PipelineTool::NAME))
         .then(|| {
-            #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
-            tools::late_tool_search_observer::record(
-                "constructor-enter",
-                "pipeline",
-                context_filtered_tool_arcs.len(),
-                0,
-            );
             let tool = tools::PipelineTool::with_access_policy(
                 config.pipeline.clone(),
                 context_filtered_tool_arcs.clone(),
@@ -710,8 +624,6 @@ impl ScopedToolRegistry {
                     caller_allowed,
                 ),
             );
-            #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
-            tools::late_tool_search_observer::record("constructor-return", "pipeline", 0, 0);
             builtin_names.insert(tool.name().to_string());
             tools_registry.push(BuildSlot::Pipeline(tool))
         });
@@ -763,8 +675,6 @@ impl ScopedToolRegistry {
         // the `ScopedAssembled::mcp_tool_names` field doc for the contract.
         let mut mcp_tool_names: HashSet<String> = HashSet::new();
 
-        #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
-        tools::late_tool_search_observer::record("phase", "mcp", 3, 0);
         let agent_mcp_servers = if connect_mcp && config.mcp.enabled {
             config.mcp_servers_for_agent(agent_alias)
         } else {
@@ -789,22 +699,8 @@ impl ScopedToolRegistry {
             // CLI / one-shot / process_message path intact.
             let shared_registry: Option<Arc<tools::McpRegistry>> =
                 if let Some(shared) = overrides_mcp_registry.as_ref() {
-                    #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
-                    tools::late_tool_search_observer::record(
-                        "mcp-registry",
-                        "override",
-                        tools::late_tool_search_observer::arc_id(shared),
-                        0,
-                    );
                     Some(Arc::clone(shared))
                 } else {
-                    #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
-                    tools::late_tool_search_observer::record(
-                        "mcp-connect",
-                        "actual",
-                        agent_mcp_servers.len(),
-                        0,
-                    );
                     match tools::McpRegistry::connect_all(&agent_mcp_servers).await {
                         Ok(registry) => Some(Arc::new(registry)),
                         Err(err) => {
@@ -830,13 +726,6 @@ impl ScopedToolRegistry {
                     }
                 };
             if let Some(registry) = shared_registry {
-                #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
-                tools::late_tool_search_observer::record(
-                    "mcp-registry",
-                    "used",
-                    tools::late_tool_search_observer::arc_id(&registry),
-                    registry.server_count(),
-                );
                 // Origin set: every `<server>__<tool>` name the registry knows.
                 // Deferred stubs derive from the same `tool_names()` call, so
                 // one extension covers eager, deferred, and later activations.
@@ -981,22 +870,8 @@ impl ScopedToolRegistry {
                             mcp_policy.as_ref(),
                             &preactivated_names,
                         );
-                        #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
-                        tools::late_tool_search_observer::record(
-                            "constructor-enter",
-                            "mcp-search",
-                            allowed_stub_count,
-                            0,
-                        );
                         let mut tool_search =
                             tools::ToolSearchTool::new(filtered_deferred, activated);
-                        #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
-                        tools::late_tool_search_observer::record(
-                            "constructor-return",
-                            "mcp-search",
-                            0,
-                            0,
-                        );
                         tools_registry.claim_search(
                             &mut unfiltered_tool_arcs,
                             &mut context_filtered_tool_arcs,
@@ -1073,8 +948,6 @@ impl ScopedToolRegistry {
 
         // 5. Skills (uniform: the gateway used to skip them). Registered under the same
         //    `SecurityPolicy`, resolving builtin elevation against context-filtered arcs.
-        #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
-        tools::late_tool_search_observer::record("phase", "skills", 4, 0);
         let nat64_prefixes = match zeroclaw_infra::net_guard::parse_nat64_prefixes(
             &config.security.nat64_prefixes,
             "security.nat64_prefixes",
@@ -1110,13 +983,6 @@ impl ScopedToolRegistry {
                                 .chain(mcp_elevation_arcs.iter())
                                 .find(|target| target.name() == target_name)
                             {
-                                #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
-                                tools::late_tool_search_observer::record(
-                                    "skill-target",
-                                    "existing",
-                                    tools::late_tool_search_observer::arc_id(target),
-                                    0,
-                                );
                                 let target = Arc::clone(target);
                                 return Some(PreparedSkill::Elevated {
                                     prepared: PreparedSkillBuiltin::prepare(
@@ -1133,13 +999,6 @@ impl ScopedToolRegistry {
                                     Some(BuildSlot::Pipeline(target))
                                         if target.name() == target_name =>
                                     {
-                                        #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
-                                        tools::late_tool_search_observer::record(
-                                            "skill-target",
-                                            "pipeline",
-                                            id.0,
-                                            0,
-                                        );
                                         Some(PreparedSkill::Elevated {
                                             prepared: PreparedSkillBuiltin::prepare(
                                                 skill_name,
@@ -1156,13 +1015,6 @@ impl ScopedToolRegistry {
                         },
                     )
                 },
-            );
-            #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
-            tools::late_tool_search_observer::record(
-                "phase",
-                "skills-prepared",
-                5,
-                skill_tools.len(),
             );
             // The complete batch is prepared before the one fixed snapshot.
             let existing_names = tools_registry
@@ -1228,8 +1080,6 @@ impl ScopedToolRegistry {
         let search_admitted = search_policy
             .as_ref()
             .is_none_or(|policy| policy.is_tool_allowed("tool_search"));
-        #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
-        tools::late_tool_search_observer::record("phase", "specs", 6, 0);
         let mut builtin_schema_handle = None;
         if builtin_deferral && search_admitted {
             let captured_specs: Vec<_> = tools_registry
@@ -1239,22 +1089,9 @@ impl ScopedToolRegistry {
                         && !EAGER_BUILTINS.contains(&tool.name())
                         && tool.name() != "tool_search"
                 })
-                .map(|(id, tool)| {
-                    #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
-                    tools::late_tool_search_observer::record("spec-acquire", "assembly", id.0, 0);
-                    (id, tool.spec())
-                })
+                .map(|(id, tool)| (id, tool.spec()))
                 .collect();
             if !captured_specs.is_empty() {
-                #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
-                for (id, spec) in &captured_specs {
-                    tools::late_tool_search_observer::record(
-                        "captured-spec",
-                        &spec.name,
-                        id.0,
-                        tools::late_tool_search_observer::arc_id(&spec.parameters),
-                    );
-                }
                 // The original HashMap collection chooses the last duplicate.
                 // Retiring that origin must not promote an earlier loser.
                 let last_origins: std::collections::HashMap<_, _> = captured_specs
@@ -1275,22 +1112,8 @@ impl ScopedToolRegistry {
                     );
                 builtin_schema_handle = Some(Arc::clone(activated));
                 if tool_search_handle.is_none() {
-                    #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
-                    tools::late_tool_search_observer::record(
-                        "constructor-enter",
-                        "builtin-search",
-                        captured_specs.len(),
-                        0,
-                    );
                     let mut search =
                         tools::ToolSearchTool::for_builtin_schemas(Arc::clone(activated));
-                    #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
-                    tools::late_tool_search_observer::record(
-                        "constructor-return",
-                        "builtin-search",
-                        0,
-                        0,
-                    );
                     tools_registry.claim_search(
                         &mut unfiltered_tool_arcs,
                         &mut context_filtered_tool_arcs,
@@ -1323,8 +1146,6 @@ impl ScopedToolRegistry {
             }
         }
 
-        #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
-        tools::late_tool_search_observer::record("phase", "seal", 7, 0);
         ScopedAssembled {
             registry: ScopedToolRegistry(tools_registry.seal(pipeline_id), builtin_schema_handle),
             delegate_handle,

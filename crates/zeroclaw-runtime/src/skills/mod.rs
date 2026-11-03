@@ -1912,13 +1912,6 @@ pub(crate) fn prepare_skill_tools_with_runtime<T>(
     let mut tools = Vec::new();
     for skill in skills {
         for tool in &skill.tools {
-            #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
-            crate::tools::late_tool_search_observer::record(
-                "skill-constructor-enter",
-                &tool.kind,
-                0,
-                0,
-            );
             if !is_registered_skill_tool_kind(tool.kind.as_str()) {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -1942,13 +1935,6 @@ pub(crate) fn prepare_skill_tools_with_runtime<T>(
                     let wrapped =
                         zeroclaw_tools::wrappers::RateLimitedTool::new(inner, security.clone());
                     tools.push(ready(Box::new(wrapped)));
-                    #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
-                    crate::tools::late_tool_search_observer::record(
-                        "skill-constructor-return",
-                        &tool.kind,
-                        0,
-                        0,
-                    );
                 }
                 "http" => {
                     if let Some(nat64_prefixes) = nat64_prefixes {
@@ -1958,13 +1944,6 @@ pub(crate) fn prepare_skill_tools_with_runtime<T>(
                             nat64_prefixes,
                         );
                         tools.push(ready(Box::new(http)));
-                        #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
-                        crate::tools::late_tool_search_observer::record(
-                            "skill-constructor-return",
-                            "http",
-                            0,
-                            0,
-                        );
                     }
                 }
                 "builtin" => {

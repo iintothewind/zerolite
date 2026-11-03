@@ -339,21 +339,7 @@ impl PreparedSkillBuiltin {
             .into_iter()
             .map(|(k, v)| (k, serde_json::Value::String(v)))
             .collect();
-        #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
-        crate::tools::late_tool_search_observer::record(
-            "skill-schema-enter",
-            "prepare",
-            crate::tools::late_tool_search_observer::borrowed_id(target),
-            0,
-        );
         let advertised_schema = Arc::new(narrow_schema(target.parameters_schema(), &locked));
-        #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
-        crate::tools::late_tool_search_observer::record(
-            "skill-schema-return",
-            "prepare",
-            crate::tools::late_tool_search_observer::borrowed_id(target),
-            crate::tools::late_tool_search_observer::arc_id(&advertised_schema),
-        );
         Self {
             tool_name: composed_tool_name(skill_name, &tool.name),
             tool_description: tool.description.clone(),
@@ -363,13 +349,6 @@ impl PreparedSkillBuiltin {
     }
 
     pub(crate) fn bind(self, target_tool: Arc<dyn Tool>) -> SkillBuiltinTool {
-        #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
-        crate::tools::late_tool_search_observer::record(
-            "skill-bind",
-            &self.tool_name,
-            crate::tools::late_tool_search_observer::arc_id(&target_tool),
-            crate::tools::late_tool_search_observer::arc_id(&self.advertised_schema),
-        );
         SkillBuiltinTool {
             tool_name: self.tool_name,
             tool_description: self.tool_description,
