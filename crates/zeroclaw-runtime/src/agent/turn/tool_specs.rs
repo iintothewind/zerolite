@@ -374,6 +374,30 @@ mod tests {
     }
 
     #[test]
+    fn tool_specs_follow_name_order_not_registration_order() {
+        let names = |order: &[&str]| -> Vec<String> {
+            let invocations = Arc::new(AtomicUsize::new(0));
+            let registry: Vec<Box<dyn Tool>> = order
+                .iter()
+                .map(|name| {
+                    Box::new(CountingTool::new(name, Arc::clone(&invocations))) as Box<dyn Tool>
+                })
+                .collect();
+            build_iteration_tool_specs(&NativeToolsProvider, "test-model", &registry, &[], None)
+                .expect("specs build")
+                .tool_specs
+                .into_iter()
+                .map(|spec| spec.name)
+                .collect()
+        };
+        // A peripheral tool registered after the guests (upstream #11851) must not move
+        // the tools block: the prompt-cache prefix is name-ordered (prompt-cache-prefix R2).
+        let expected = ["alpha_host", "gpio_read", "zeta_plugin"];
+        assert_eq!(names(&["zeta_plugin", "alpha_host", "gpio_read"]), expected);
+        assert_eq!(names(&["gpio_read", "zeta_plugin", "alpha_host"]), expected);
+    }
+
+    #[test]
     fn iteration_tool_specs_recomputes_native_mode_for_active_provider() {
         let invocations = Arc::new(AtomicUsize::new(0));
         let tool = Box::new(CountingTool::new("read_file", invocations));
