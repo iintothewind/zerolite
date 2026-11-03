@@ -15,11 +15,14 @@
   adapted.** Upstream workflows, release-workflow parity checks, and
   unused upstream tooling are stripped from the fork. A merge that
   restores them reintroduces automation the fork deliberately does not
-  run.
-- **R3 — The docs site is not part of the fork.** The docs site and the
-  translations submodule were dropped; `docs/book/` remains as content,
-  but the site build is not a fork deliverable. A merge that restores
-  site tooling conflicts with this decision.
+  run. An upstream change to a stripped workflow (e.g.
+  `.github/workflows/ci.yml`) arrives as a modify/delete conflict and
+  its workflow side is dropped (`git rm`), never restored.
+- **R3 — The docs site is not part of the fork.** The docs site, its
+  translations submodule, and the `docs/book/` content are deleted. An
+  upstream commit that modifies a `docs/book/` file arrives as a
+  modify/delete conflict, and its docs side is dropped (`git rm`), never
+  restored.
 
 ## Where upstream conflicts
 
@@ -27,7 +30,7 @@
 |---|---|---|---|
 | 1 | Upstream release names, version, README | Zerolite release names, README, `1.x` version, `docs/releases/<version>.md` as release body | R1 |
 | 2 | Upstream CI workflows incl. sync-upstream automation | Workflows stripped; sync-upstream on manual dispatch only; release-workflow parity checks skipped when the workflow is absent | R2 |
-| 3 | Docs site + translations submodule | Dropped; book content kept, site build not a deliverable | R3 |
+| 3 | Docs site + translations submodule + `docs/book/` content | Deleted; upstream `docs/book/` edits dropped on modify/delete (`git rm`), never restored | R3 |
 
 ## Merge notes
 
@@ -47,3 +50,5 @@
   tooling), `81ddd2e7c` (strip upstream workflows),
   `2bdc9a951` (drop docs site and translations submodule),
   `78c0be38b` (release body from `docs/releases/<version>.md`).
+- v0.8.7 cherry-picks (`merge-v0.8.7`): `docs/book` and `ci.yml` sides
+  dropped.

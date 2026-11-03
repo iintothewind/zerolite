@@ -42,6 +42,10 @@ their presence as approval. If a future merge touches them, report it.
   `context-management.md` R6 (no summarization) until decided.
 - Turn parity over RPC (`#11132`).
 - The plugin cluster (incl. WASM plugin host in release artifacts).
+  The v0.8.7 plugin fixes (#11807, #11808, #11809, #11811, #11812,
+  #11814, #11851) were cherry-picked on the owner's approval as
+  bug/security fixes; this does not make the plugin cluster a decided
+  feature.
 - The OIDC cluster.
 
 ## Merge constraints (not features, but binding)
@@ -60,3 +64,9 @@ their presence as approval. If a future merge touches them, report it.
   this list touched by a conflict. A merge is not complete
   until its docs are updated; a new decision written back here becomes
   precedent for the next merge.
+- Cargo.lock is resolved per pick against the fork's lock, never copied
+  from upstream; only the versions a pick requires change, all other
+  fork pins stay.
+- Upstream context-management changes are not taken (owner decision
+  2026-10-27, applied to v0.8.7): a pick that touches context management
+  is left unmerged and reported (see `context-management.md`).
