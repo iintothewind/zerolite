@@ -1522,4 +1522,35 @@ mod tests {
         assert!(!json.contains("session_id"));
         assert!(!json.contains("agent_id"));
     }
+
+    #[test]
+    fn time_bounds_become_a_timestamp_range_filter() {
+        let mut must = Vec::new();
+        QdrantMemory::add_time_range_filter(
+            &mut must,
+            Some("2026-01-01T00:00:00Z"),
+            Some("2026-02-01T00:00:00Z"),
+        );
+        assert_eq!(
+            must,
+            vec![serde_json::json!({
+                "key": "timestamp",
+                "range": { "gte": "2026-01-01T00:00:00Z", "lte": "2026-02-01T00:00:00Z" }
+            })]
+        );
+
+        let mut must = Vec::new();
+        QdrantMemory::add_time_range_filter(&mut must, Some("2026-01-01T00:00:00Z"), None);
+        assert_eq!(
+            must,
+            vec![serde_json::json!({
+                "key": "timestamp",
+                "range": { "gte": "2026-01-01T00:00:00Z" }
+            })]
+        );
+
+        let mut must = Vec::new();
+        QdrantMemory::add_time_range_filter(&mut must, None, None);
+        assert!(must.is_empty(), "no bounds must add no filter clause");
+    }
 }
