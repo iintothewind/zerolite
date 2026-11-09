@@ -35,6 +35,7 @@
 | 5 | Webhook-started SOP agent steps are driven by the gateway | `fix(gateway): drive webhook-started SOP agent steps` |
 | 6 | WS memory is consolidated on the agent's own provider | `fix(gateway): consolidate WS memory on the agent's own provider` |
 | 7 | Daemon-hosted gateway carries the configured master code | See `master-pair-code.md` R3 |
+| 8 | WebSocket upgrades complete over the native TLS listener, as over plain HTTP | `fix(gateway): serve WebSocket upgrades over the native TLS listener` |
 
 ## Merge notes
 
@@ -50,6 +51,9 @@
   (one test command at a time, `--test-threads=1`, known shared-state
   set). An upstream change that makes a previously serial-safe test
   parallel-unsafe is a behavior change: report it.
+- **TLS WebSocket (row 8):** the TLS branch of the accept loop must keep
+  `serve_connection_with_upgrades`; the plain branch gets upgrades from
+  `axum::serve`. Test: `a_websocket_over_native_tls_stays_open`.
 - **Code anchors:** `crates/zeroclaw-gateway/src/`,
   `crates/zeroclaw-runtime/src/daemon/mod.rs`.
 

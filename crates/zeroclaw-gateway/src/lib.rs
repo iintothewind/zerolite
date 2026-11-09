@@ -2616,7 +2616,8 @@ pub async fn run_gateway_with_plugin_webhooks(
                         if let Err(e) = hyper_util::server::conn::auto::Builder::new(
                             hyper_util::rt::TokioExecutor::new(),
                         )
-                        .serve_connection(io, hyper_svc)
+                        // With upgrades, as over plain HTTP: WebSockets work over TLS too.
+                        .serve_connection_with_upgrades(io, hyper_svc)
                         .await
                         {
                             ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"error": format!("{}", e), "remote_addr": remote_addr})), "connection error from");
@@ -7225,6 +7226,154 @@ path = "{trigger_path}"
             ready_rx.borrow().is_none(),
             "failed post-bind setup must not report gateway readiness"
         );
+    }
+
+    async fn start_drain_test_gateway_with(
+        data: &std::path::Path,
+        port: u16,
+        tls: Option<(&std::path::Path, &std::path::Path)>,
+        event_bus: Option<zeroclaw_runtime::observability::EventBus>,
+    ) -> (
+        SocketAddr,
+        tokio::sync::watch::Sender<bool>,
+        tokio::task::JoinHandle<Result<()>>,
+    ) {
+        let mut config = Config {
+            data_dir: data.join("data"),
+            config_path: data.join("config.toml"),
+            ..Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        config.gateway.require_pairing = false;
+        config.memory.backend = "none".into();
+        if let Some((cert_path, key_path)) = tls {
+            // The process's rustls provider, as `main.rs` installs it: with both
+            // ring and aws-lc-rs compiled in (a workspace build), rustls picks none.
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            config.gateway.tls = Some(zeroclaw_config::schema::GatewayTlsConfig {
+                enabled: true,
+                cert_path: cert_path.display().to_string(),
+                key_path: key_path.display().to_string(),
+                ..Default::default()
+            });
+        }
+        let (ready_tx, mut ready_rx) = tokio::sync::watch::channel(None);
+        let readiness = zeroclaw_runtime::daemon::GatewayReadinessReporter::new(move |addr| {
+            let _ = ready_tx.send(Some(addr));
+        });
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (reload_tx, _) = tokio::sync::watch::channel(false);
+        let controls = zeroclaw_runtime::daemon::GatewayReloadControls::standalone(
+            shutdown_tx.clone(),
+            reload_tx,
+        );
+        let server = zeroclaw_spawn::spawn!(async move {
+            run_gateway(
+                "127.0.0.1",
+                port,
+                config,
+                event_bus,
+                Some(controls),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(readiness),
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            ready_rx.wait_for(Option::is_some).await.unwrap();
+        })
+        .await
+        .expect("the gateway becomes ready");
+        let addr = ready_rx.borrow().unwrap();
+        (addr, shutdown_tx, server)
+    }
+
+    async fn drain_test_tls_connect(
+        connector: &tokio_rustls::TlsConnector,
+        addr: SocketAddr,
+    ) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        connector.connect(name, tcp).await.expect("TLS handshake")
+    }
+
+    /// A certificate and key for `localhost` written under `dir`, and a
+    /// client that trusts them.
+    fn drain_test_tls(
+        dir: &std::path::Path,
+    ) -> (
+        std::path::PathBuf,
+        std::path::PathBuf,
+        tokio_rustls::TlsConnector,
+    ) {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["localhost".into()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let cert_path = dir.join("gateway.crt");
+        let key_path = dir.join("gateway.key");
+        std::fs::write(&cert_path, cert.pem()).unwrap();
+        std::fs::write(&key_path, key.serialize_pem()).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.der().clone()).unwrap();
+        let client = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        (
+            cert_path,
+            key_path,
+            tokio_rustls::TlsConnector::from(Arc::new(client)),
+        )
+    }
+
+    /// The native TLS listener serves WebSocket upgrades, as plain HTTP
+    /// does: a socket opened over TLS completes its upgrade, gets its
+    /// route's first frame, and stays open.
+    #[tokio::test]
+    async fn a_websocket_over_native_tls_stays_open() {
+        use futures_util::StreamExt;
+        let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (cert_path, key_path, connector) = drain_test_tls(tmp.path());
+        let (addr, shutdown_tx, server) = start_drain_test_gateway_with(
+            &tmp.path().join("tls-ws"),
+            0,
+            Some((cert_path.as_path(), key_path.as_path())),
+            None,
+        )
+        .await;
+        let tls = drain_test_tls_connect(&connector, addr).await;
+        let url = format!("ws://localhost:{}/ws/canvas/tls-upgrade", addr.port());
+        let (mut socket, response) = tokio_tungstenite::client_async(url, tls)
+            .await
+            .expect("the upgrade completes");
+        assert_eq!(response.status(), 101);
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+            .await
+            .expect("a first frame in time")
+            .expect("the upgraded TLS socket is still open")
+            .expect("a frame, not an error");
+        let text = first.into_text().expect("a text frame").to_string();
+        assert!(text.contains(r#""type":"connected""#), "{text}");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(500), socket.next())
+                .await
+                .is_err(),
+            "the upgraded TLS socket closed on its own"
+        );
+        drop(socket);
+        shutdown_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), server).await;
     }
 
     #[tokio::test]
