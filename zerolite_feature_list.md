@@ -93,3 +93,9 @@ their presence as approval. If a future merge touches them, report it.
   was reported and left out: it rewrites the turn loop in
   `agent/turn/mod.rs` where the fork's in-turn context guard lives, and
   writes the fork's trim breadcrumb.
+- Small security/Windows fixes taken 2026-11-09 as class (a): #12114
+  (X-Forwarded-For rate-limit key), #12177 (MCP tool listing sorted by
+  name, under `prompt-cache-prefix.md` R2), #11559 (bubblewrap rejection
+  reasons), #11656 (configured `firejail_args` applied), #11400 (model
+  cache replaced while a reader holds it, Windows), #11398 (JSONL session
+  rewrite replaced while a reader holds it, Windows).

@@ -50,3 +50,5 @@
   `llm_request`), `a4029fe3e` (provider sends through AppendOnlyLog).
 - Locked decisions in `context-management.md` (no wall-clock injection,
   session-frozen name-sorted catalogs, compact skills).
+- Upstream #12177 (MCP tool names sorted on listing) — consistent with R2
+  (name-sorted catalogs); taken 2026-11-09.
