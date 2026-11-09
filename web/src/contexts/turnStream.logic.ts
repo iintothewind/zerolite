@@ -181,18 +181,25 @@ export function attachToolResult(
   return { ...state, segments: { ...state.segments, steps } };
 }
 
-/** Turn the accumulated trajectory into the finished shape: the step that
- *  produced the final answer leaves `steps`, because it renders as the
- *  committed bubble rather than inside the group.
+/** Split the accumulated trajectory into the finished shape: the step that
+ *  produced the final answer leaves `steps` as `answer`, because it renders as
+ *  the committed bubble rather than inside the group.
  *
  *  Only a step with no tool calls can be the final answer — a turn that ends
  *  on a tool call has no answer text, and its step stays in the trajectory. */
-function finalizeSegments(state: TurnStreamState): TurnSegments {
+export function splitFinishedTurn(state: TurnStreamState): {
+  segments: TurnSegments;
+  answer: StepSegment | null;
+} {
   const closed = closeStep(state);
   const steps = [...closed.segments.steps];
   const last = steps[steps.length - 1];
-  if (last && last.toolCalls.length === 0) steps.pop();
-  return { steps };
+  const answer = last && last.toolCalls.length === 0 ? steps.pop()! : null;
+  return { segments: { steps }, answer };
+}
+
+function finalizeSegments(state: TurnStreamState): TurnSegments {
+  return splitFinishedTurn(state).segments;
 }
 
 /** Fold one frame into the turn state. For `done`/`message` the returned
@@ -259,8 +266,25 @@ export function reduceTurnFrame(
       // Turn is over: hand back fresh state so the next turn starts clean.
       return { state: initialTurnStreamState(), completion, segments };
     }
-    case 'aborted':
-    case 'error':
+    case 'aborted': {
+      // A stopped turn keeps what it streamed: the step being written when
+      // the user stopped is the partial answer, everything before it the group.
+      // `closeStep` never pushes an empty step, so an answer has text or thinking.
+      const { segments, answer } = splitFinishedTurn(state);
+      return {
+        state: initialTurnStreamState(),
+        completion: answer
+          ? { kind: 'commit', content: answer.text.trim(), thinking: answer.thinking || undefined }
+          : null,
+        segments,
+      };
+    }
+    case 'error': {
+      // A failed turn has no answer: the partial text stays inside the group
+      // as its last step.
+      const closed = closeStep(state);
+      return { state: initialTurnStreamState(), completion: null, segments: closed.segments };
+    }
     case 'turn_start':
     case 'reset': {
       // Keep whatever was accumulated for the caller to inspect, but the next

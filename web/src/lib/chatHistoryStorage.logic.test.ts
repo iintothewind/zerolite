@@ -5,6 +5,7 @@ import {
   mapServerMessagesToPersisted,
   parseNativeAssistantToolPayload,
   parseNativeToolResultEnvelope,
+  uiMessagesToPersisted,
 } from './chatHistoryStorage.logic.ts';
 
 test('parseNativeAssistantToolPayload extracts text and tool_calls', () => {
@@ -172,4 +173,25 @@ test('a tool round between two real turns keeps both turns', () => {
     bubbles.map((b) => `${b.role}:${b.content}`),
     ['user:first', 'agent:calling', 'agent:done', 'user:second', 'agent:done again'],
   );
+});
+
+test('uiMessagesToPersisted drops trajectory carriers but keeps reasoning-only bubbles', () => {
+  const timestamp = new Date(0);
+  const messages = [
+    {
+      id: 'carrier',
+      role: 'agent' as const,
+      content: '',
+      timestamp,
+      segments: { steps: [{ thinking: '', text: '', toolCalls: [{ name: 'shell', id: 'c1' }] }] },
+    },
+    { id: 'reasoning', role: 'agent' as const, content: '', thinking: 'why', timestamp },
+    { id: 'card', role: 'agent' as const, content: '', toolCall: { name: 'shell', id: 'c1' }, timestamp },
+  ];
+  const persisted = uiMessagesToPersisted(messages);
+  assert.deepEqual(
+    persisted.map((m) => m.id),
+    ['reasoning', 'card'],
+  );
+  assert.ok(persisted.every((m) => m.content !== '' || m.thinking || m.toolCall));
 });

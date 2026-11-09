@@ -8,6 +8,7 @@ import {
   groupMessages,
   splitLiveTurn,
   type FlowMessage,
+  type RenderBlock,
 } from './messageFlow.logic.ts';
 
 function msg(over: Partial<FlowMessage> & { id: string }): FlowMessage {
@@ -24,7 +25,13 @@ const toolStep = (id: string, text = '') => ({
   toolCalls: [{ name: 'shell', id }],
 });
 
-const kinds = (blocks: ReturnType<typeof groupMessages>) => blocks.map((b) => b.kind);
+const kinds = (blocks: RenderBlock[]) => blocks.map((b) => b.kind);
+const ids = (blocks: RenderBlock[]) =>
+  blocks.map((b) => (b.kind === 'group' ? b.id : b.message.id));
+const stepsOf = (block: RenderBlock | undefined) => {
+  assert.ok(block && (block.kind === 'turn' || block.kind === 'group'));
+  return block.segments;
+};
 
 // ── Turns with a trajectory ─────────────────────────────────────────────────
 
@@ -58,28 +65,103 @@ test('a turn with no tool calls stays a plain bubble', () => {
   assert.deepEqual(kinds(blocks), ['user', 'plain']);
 });
 
-// ── Everything that must render exactly as it does today ────────────────────
+// ── Turns folded from the message list ──────────────────────────────────────
 
-test('hydrated turns render plain: no group, no empty header', () => {
-  // A reloaded conversation carries no segments at all — the accepted
-  // live-only trade, asserted rather than tolerated.
+test('a hydrated turn folds into one group with its narration as a step', () => {
+  const card = { name: 'shell', id: 'c1', output: 'out' };
   const blocks = groupMessages([
     msg({ id: 'u1', role: 'user', content: 'hi' }),
     msg({ id: 'a1', content: 'hello', markdown: true }),
-    msg({ id: 't1', toolCall: { name: 'shell', id: 'c1', output: 'out' } }),
+    msg({ id: 't1', toolCall: card }),
     msg({ id: 'a2', content: 'done', markdown: true }),
   ]);
-  assert.deepEqual(kinds(blocks), ['user', 'plain', 'plain', 'plain']);
+  assert.deepEqual(kinds(blocks), ['user', 'turn']);
+  const turn = blocks[1]!;
+  assert.equal(turn.kind === 'turn' && turn.message.id, 'a2');
+  const segs = stepsOf(turn);
+  assert.deepEqual(segs.steps, [{ thinking: '', text: 'hello', toolCalls: [card] }]);
+  assert.equal(countToolCalls(segs), 1);
+  assert.equal(countGroupMessages(segs), 1);
 });
 
-test('tool cards with no following trajectory stay their own blocks', () => {
-  // A turn still streaming, or one that ended on a tool call.
+test('a turn with cards and no answer is one answer-less group', () => {
   const blocks = groupMessages([
     msg({ id: 'u1', role: 'user', content: 'hi' }),
     msg({ id: 't1', toolCall: { name: 'shell', id: 'c1' } }),
+    msg({ id: 't2', toolCall: { name: 'shell', id: 'c2' } }),
   ]);
-  assert.deepEqual(kinds(blocks), ['user', 'plain']);
-  assert.equal(blocks[1]!.kind === 'plain' && blocks[1]!.message.id, 't1');
+  assert.deepEqual(kinds(blocks), ['user', 'group']);
+  assert.equal(blocks[1]!.kind === 'group' && blocks[1]!.id, 't1');
+  assert.equal(countToolCalls(stepsOf(blocks[1])), 2);
+});
+
+test('a stopped or failed turn keeps its trajectory as a group', () => {
+  const carrier = msg({
+    id: 'c',
+    content: '',
+    segments: segments({
+      steps: [
+        { thinking: '', text: 'looking', toolCalls: [{ name: 'shell', id: 'c1' }] },
+        toolStep('c2'),
+      ],
+    }),
+  });
+  const blocks = groupMessages([
+    msg({ id: 'u1', role: 'user', content: 'hi' }),
+    msg({ id: 't1', toolCall: { name: 'shell', id: 'c1' } }),
+    msg({ id: 't2', toolCall: { name: 'shell', id: 'c2' } }),
+    carrier,
+  ]);
+  assert.deepEqual(kinds(blocks), ['user', 'group']);
+  // The absorbed cards are gone, so the carrier keys the group.
+  assert.equal(blocks[1]!.kind === 'group' && blocks[1]!.id, 'c');
+  assert.equal(countToolCalls(stepsOf(blocks[1])), 2);
+  assert.equal(countGroupMessages(stepsOf(blocks[1])), 1);
+});
+
+test('a notice inside a turn neither splits it nor duplicates its cards', () => {
+  const blocks = groupMessages([
+    msg({ id: 'u1', role: 'user', content: 'hi' }),
+    msg({ id: 't1', toolCall: { name: 'shell', id: 'c1' } }),
+    msg({ id: 't2', toolCall: { name: 'shell', id: 'c2' } }),
+    msg({ id: 'n1', content: 'context trimmed', notice: true }),
+    msg({ id: 't3', toolCall: { name: 'shell', id: 'c3' } }),
+    msg({
+      id: 'a1',
+      content: 'answer',
+      segments: segments({ steps: [toolStep('c1'), toolStep('c2'), toolStep('c3')] }),
+    }),
+  ]);
+  assert.deepEqual(kinds(blocks), ['user', 'notice', 'turn']);
+  assert.equal(stepsOf(blocks[2]).steps.length, 3);
+});
+
+test('an error bubble after a failed turn stays a plain bubble', () => {
+  const blocks = groupMessages([
+    msg({ id: 'u1', role: 'user', content: 'hi' }),
+    msg({ id: 't1', toolCall: { name: 'shell', id: 'c1' } }),
+    msg({ id: 'c', content: '', segments: segments({ steps: [toolStep('c1')] }) }),
+    msg({ id: 'err', content: 'Error: x' }),
+  ]);
+  assert.deepEqual(kinds(blocks), ['user', 'group', 'plain']);
+});
+
+test('narration from server rows loses the gateway timestamp prefix', () => {
+  const blocks = groupMessages([
+    msg({ id: 'u1', role: 'user', content: 'hi' }),
+    msg({ id: 'a1', content: '[2026-11-09 10:00:00 UTC] looking' }),
+    msg({ id: 't1', toolCall: { name: 'shell', id: 'c1' } }),
+    msg({ id: 'a2', content: 'done' }),
+  ]);
+  assert.equal(stepsOf(blocks[1]).steps[0]!.text, 'looking');
+});
+
+test('text-only runs stay plain even with several bubbles', () => {
+  const blocks = groupMessages([
+    msg({ id: 'a1', content: 'cron one' }),
+    msg({ id: 'a2', content: 'cron two' }),
+  ]);
+  assert.deepEqual(kinds(blocks), ['plain', 'plain']);
 });
 
 test('notice rows keep their own block kind', () => {
@@ -91,15 +173,19 @@ test('notice rows keep their own block kind', () => {
   assert.deepEqual(kinds(blocks), ['user', 'notice', 'plain']);
 });
 
-test('consecutive tool-only turns each keep their cards', () => {
+test('user-separated turns each fold their own cards', () => {
   const blocks = groupMessages([
+    msg({ id: 'u1', role: 'user', content: 'one' }),
     msg({ id: 't1', toolCall: { name: 'shell', id: 'c1' } }),
     msg({ id: 't2', toolCall: { name: 'shell', id: 'c2' } }),
     msg({ id: 'a1', content: 'first' }),
+    msg({ id: 'u2', role: 'user', content: 'two' }),
     msg({ id: 't3', toolCall: { name: 'shell', id: 'c3' } }),
     msg({ id: 'a2', content: 'second' }),
   ]);
-  assert.deepEqual(kinds(blocks), ['plain', 'plain', 'plain', 'plain', 'plain']);
+  assert.deepEqual(kinds(blocks), ['user', 'turn', 'user', 'turn']);
+  assert.equal(countToolCalls(stepsOf(blocks[1])), 2);
+  assert.equal(countToolCalls(stepsOf(blocks[3])), 1);
 });
 
 test('two live turns each get their own group', () => {
@@ -143,17 +229,13 @@ test('a card the live group already carries is not rendered twice', () => {
   ];
 
   const live = groupMessages(messages, { liveSteps: [toolStep('c1')] });
-  assert.deepEqual(
-    live.map((block) => block.message.id),
-    ['u1', 't2'],
-    'the claimed card is dropped, the unclaimed one is untouched',
-  );
+  assert.deepEqual(ids(live), ['u1', 't2'], 'the claimed card is dropped');
+  assert.deepEqual(kinds(live), ['user', 'group']);
 
-  // No live turn, nothing claimed: today's behaviour, unchanged.
-  assert.deepEqual(
-    groupMessages(messages).map((block) => block.message.id),
-    ['u1', 't1', 't2'],
-  );
+  // No live turn, nothing claimed: both cards fold into the turn's group.
+  const settled = groupMessages(messages);
+  assert.deepEqual(kinds(settled), ['user', 'group']);
+  assert.equal(countToolCalls(stepsOf(settled[1])), 2);
 });
 
 // ── The in-flight turn ──────────────────────────────────────────────────────

@@ -80,11 +80,11 @@ export interface ChatMessage {
   /** User-visible lifecycle notice, rendered distinctly from agent output. */
   notice?: boolean;
   /**
-   * The turn's step trajectory, attached when a turn commits. Live-only: it is
-   * built from the WebSocket stream, deliberately not persisted (see
-   * `docs/reports/webui-message-flow-plan.md`), and dropped by
-   * `uiMessagesToPersisted` — which is what makes a reloaded conversation
-   * render ungrouped. Absent on every hydrated message.
+   * The turn's step trajectory, attached when the turn ends (answer, abort,
+   * error, or tool-only). Built from the WebSocket stream and deliberately not
+   * persisted (see `docs/reports/webui-message-flow-plan.md`): it is dropped by
+   * `uiMessagesToPersisted`, so a reloaded turn's group is derived from its
+   * bubbles instead.
    */
   segments?: TurnSegments;
 }
@@ -470,6 +470,31 @@ export function AgentProvider({
     return result;
   }, []);
 
+  /** Append a finished turn in its committed layout: the answer bubble carrying
+   *  the trajectory, or a trajectory carrier (empty content + segments) when the
+   *  turn produced no answer. Nothing when there is neither. */
+  const commitTurn = useCallback(
+    (bubble: { content: string; thinking?: string } | null, segments: TurnSegments) => {
+      // An empty group would show a header reading `0 次工具调用`.
+      const trajectory = segments.steps.length > 0 ? segments : undefined;
+      if (!bubble && !trajectory) return;
+      localMessageMutationVersionRef.current += 1;
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: generateUUID(),
+          role: 'agent',
+          content: bubble?.content ?? '',
+          thinking: bubble?.thinking,
+          markdown: true,
+          timestamp: new Date(),
+          segments: trajectory,
+        },
+      ]);
+    },
+    [],
+  );
+
   // Centralised WebSocket message handler — reused across initial connect and reconnects.
   const handleWsMessage = useCallback((msg: WsMessage) => {
     // One place folds the context meter: numerator, label and the serving
@@ -548,29 +573,17 @@ export function AgentProvider({
           full_response: msg.full_response,
           content: msg.content,
         });
-        // A trajectory worth rendering is one that actually has steps; an empty
-        // group would show a header reading `0 次工具调用`.
-        const trajectory = segments.steps.length > 0 ? segments : undefined;
         if (outcome?.kind === 'commit') {
           // `commit` includes reasoning-only turns: empty content but present
           // thinking, so the turn renders instead of vanishing silently.
-          localMessageMutationVersionRef.current += 1;
-          setMessages((prev) => [
-            ...prev,
-            {
-              id: generateUUID(),
-              role: 'agent',
-              content: outcome.content,
-              thinking: outcome.thinking,
-              markdown: true,
-              timestamp: new Date(),
-              segments: trajectory,
-            },
-          ]);
+          commitTurn({ content: outcome.content, thinking: outcome.thinking }, segments);
+        } else if (outcome?.kind === 'skip') {
+          // Ended on a tool call: no answer, the trajectory is the record.
+          commitTurn(null, segments);
         } else if (outcome?.kind === 'diagnostic') {
           // Clean completion with nothing at all — surface a one-off notice so
           // the turn does not disappear. Mirrors zerocode's zc-turn-no-output
-          // fallback (#8779). `skip` (empty + tool calls ran) renders nothing.
+          // fallback (#8779).
           localMessageMutationVersionRef.current += 1;
           setMessages((prev) => [
             ...prev,
@@ -824,13 +837,27 @@ export function AgentProvider({
         tokenRateRef.current.end(undefined, Date.now());
         const _rateAborted = tokenRateRef.current.rate(Date.now());
         setTokenRateState((s) => ({ rate: _rateAborted, rateMuted: true, rateBilled: s.rateBilled }));
-        foldTurnStream({ type: 'aborted' });
+        const { completion, segments } = foldTurnStream({ type: 'aborted' });
+        // Same marker the gateway persists, so a reload shows the same bubble.
+        const marker = t('agent.turn_interrupted');
+        commitTurn(
+          completion?.kind === 'commit'
+            ? {
+                content: completion.content ? `${completion.content}\n\n${marker}` : marker,
+                thinking: completion.thinking,
+              }
+            : { content: marker },
+          segments,
+        );
         setTyping(false);
         setPendingApproval(null);
         break;
       }
 
-      case 'error':
+      case 'error': {
+        // The trajectory lands before the error bubble it explains.
+        const { segments } = foldTurnStream({ type: 'error' });
+        commitTurn(null, segments);
         const friendlyMessage = friendlyAgentError(msg.message);
         localMessageMutationVersionRef.current += 1;
         setMessages((prev) => [
@@ -848,11 +875,11 @@ export function AgentProvider({
           setError(`${t('agent.message_error')}: ${msg.message}`);
         }
         setTyping(false);
-        foldTurnStream({ type: 'error' });
         setPendingApproval(null);
         break;
+      }
     }
-  }, [foldTurnStream]);
+  }, [foldTurnStream, commitTurn]);
 
   // Wire up a WebSocketClient instance with version-guarded callbacks.
   const attachSocketCallbacks = useCallback((ws: SessionSocket) => {
