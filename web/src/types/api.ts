@@ -241,6 +241,7 @@ export interface WsMessage {
     | "context_usage"
     | "agent_start"
     | "safeguard_fallback"
+    | "output_truncated"
     | "aborted";
   content?: string;
   full_response?: string;
@@ -302,6 +303,8 @@ export interface WsMessage {
    * `calibrated` when a provider sample has corrected the local estimator.
    * Absent on older daemons. */
   input_tokens_source?: string;
+  // Also on "output_truncated" frames, where it is JSON null when the
+  // provider reported no usage for the cut reply.
   output_tokens?: number;
   // Emitted as JSON null when the accepted call reports no usage (stale
   // route protection); consumers must branch on null, not undefined.

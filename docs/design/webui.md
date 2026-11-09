@@ -38,6 +38,7 @@
 | 4 | Zerolite mark as web logo; zerolite release names | `9548ae163`, `31fb2d06b`, release notes in `docs/releases/` |
 | 5 | Zerocode keymap: QueueWiden / QueueNarrow | `apps/zerocode/src/keymap/actions.rs` |
 | 6 | Dashboard CSP `img-src 'self' data: https: http:` | `crates/zeroclaw-gateway/src/security_headers.rs` (+ `csp_permits_same_origin_dashboard_assets`) |
+| 7 | `output_truncated` frame renders an ephemeral notice below the cut reply ("not a context trim"); never persisted | `web/src/lib/outputTruncatedNotice.ts` (+ `.test.ts`), gateway sends it after `done` |
 
 ### Composer stats semantics (behavior #3)
 

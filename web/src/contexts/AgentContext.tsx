@@ -26,6 +26,7 @@ import { primeModelProviderCatalog, modelProviderDisplayName } from '@/lib/model
 import { resolveAvailableModels } from './modelPicker.logic';
 import { contextMeterStep, type ContextInputSource } from './contextMeter.logic';
 import { buildHistoryTrimmedNotice } from './historyTrimNotices.logic';
+import { formatOutputTruncatedNotice } from '@/lib/outputTruncatedNotice';
 import type { ToolCall } from '@/lib/toolCall';
 import { emptyLiveTurn, type LiveTurn, type TurnSegments } from '@/lib/turnSegments';
 import { resolveToolResultIndex } from '@/lib/toolCardMatch';
@@ -742,6 +743,27 @@ export function AgentProvider({
           const purged = purgeUiMessagesToKeptUserTurns(withoutNotices, keptTurns);
           return [...purged, notice];
         });
+        break;
+      }
+
+      case 'output_truncated': {
+        // Display-only, like `safeguard_fallback`: the provider stopped the
+        // reply at its output limit. The partial reply stays as streamed;
+        // this ephemeral bubble only says it is cut, and that this is not a
+        // context trim. Never persisted.
+        const content = formatOutputTruncatedNotice(msg, t);
+        localMessageMutationVersionRef.current += 1;
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: generateUUID(),
+            role: 'agent' as const,
+            content,
+            timestamp: new Date(),
+            ephemeral: true,
+            notice: true,
+          },
+        ]);
         break;
       }
 

@@ -447,6 +447,11 @@ pub enum StreamEvent {
     /// Token usage reported by the provider, typically just before [`StreamEvent::Final`].
     /// Providers that do not surface usage in streaming responses simply omit this event.
     Usage(TokenUsage),
+    /// The provider stopped generating because it hit an output limit
+    /// (chat-completions `finish_reason: "length"`), so the text and tool
+    /// calls of this response are incomplete. Emitted at most once, before
+    /// [`StreamEvent::Final`]. Carries the provider's stop reason verbatim.
+    OutputTruncated { reason: String },
     /// Stream has completed.
     Final,
 }

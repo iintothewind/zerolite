@@ -30,6 +30,7 @@
 | 6 | Signed reasoning kept intact on the seam sanitizers | `fix(providers): keep signed reasoning intact on the seam sanitizers` |
 | 7 | Tool-result images stay live for the current user turn (not inlined base64 into screenshots) | `fix(multimodal)`, `fix(tools): stop inlining base64 into screenshot results` |
 | 8 | Shell output encoding detection; PowerShell output initialized as UTF-8 | `fix(runtime): detect encoding for shell output`, `feat(shell): initialize PowerShell output as UTF-8` |
+| 9 | A chat-completions reply cut at the output limit (`finish_reason: "length"`) is reported, not passed off as finished: WARN `provider_output_truncated`, `StreamEvent::OutputTruncated`, WARN `turn_output_truncated`, and a display-only `output_truncated` WS frame for a text reply | `fix(providers): report replies cut at the output limit` |
 
 ## Merge notes
 
@@ -40,6 +41,14 @@
 - **Upstream provider changes that remove a shim are new semantics for
   that provider, even when the upstream code compiles.** Report them
   unless a design decision here already covers the removal (none does).
+- **Output-limit cut (row 9):** tests
+  `length_finish_reason_emits_output_truncated_before_final`,
+  `finished_replies_emit_no_output_truncated` (compatible.rs),
+  `a_reply_cut_at_the_output_limit_is_announced_and_kept`,
+  `a_cut_tool_call_response_and_a_finished_reply_are_not_announced`
+  (stream_consume.rs). Only the chat-completions wire maps it today;
+  Anthropic `max_tokens`, Gemini `MAX_TOKENS`, OpenAI Responses
+  `incomplete` and Ollama `done_reason: length` are not mapped yet.
 - **Code anchors:** `crates/zeroclaw-providers/src/`,
   `crates/zeroclaw-runtime/src/agent/turn/` (seam sanitizers, media).
 
