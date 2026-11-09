@@ -79,3 +79,7 @@ their presence as approval. If a future merge touches them, report it.
   `expect`-driven PTY test
   `daemon_feedback_follows_foreground_job_control_transitions`. An
   upstream hunk that re-adds them is dropped.
+- Upstream `028c50f5e` (#11925, container CA stores) is not taken
+  (2026-11-09): it changes Dockerfiles, container CI and their TLS
+  fixtures, and the fork publishes no container image; the Rust side is
+  already on `webpki-roots` 1.0.10.
