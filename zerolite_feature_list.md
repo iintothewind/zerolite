@@ -83,3 +83,10 @@ their presence as approval. If a future merge touches them, report it.
   (2026-11-09): it changes Dockerfiles, container CI and their TLS
   fixtures, and the fork publishes no container image; the Rust side is
   already on `webpki-roots` 1.0.10.
+- Upstream #11901 (gateway connection drain), #11900 (concurrent store
+  open), #11523 (settle turns a killed process left running) and #11822
+  (POSIX command splitting) were taken 2026-11-09 as hardening; no fork
+  semantics touched (`gateway-session.md` rows 8–9). #11507 (`fcc23a22f`)
+  was reported and left out: it rewrites the turn loop in
+  `agent/turn/mod.rs` where the fork's in-turn context guard lives, and
+  writes the fork's trim breadcrumb.

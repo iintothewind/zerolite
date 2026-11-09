@@ -36,6 +36,7 @@
 | 6 | WS memory is consolidated on the agent's own provider | `fix(gateway): consolidate WS memory on the agent's own provider` |
 | 7 | Daemon-hosted gateway carries the configured master code | See `master-pair-code.md` R3 |
 | 8 | WebSocket upgrades complete over the native TLS listener, as over plain HTTP | `fix(gateway): serve WebSocket upgrades over the native TLS listener` |
+| 9 | A stopped gateway admits no new request (503 `gateway_restarting`, GOAWAY on h2) and drains its connections within 300 ms; the next instance binds at once | upstream #11901 |
 
 ## Merge notes
 
@@ -51,9 +52,16 @@
   (one test command at a time, `--test-threads=1`, known shared-state
   set). An upstream change that makes a previously serial-safe test
   parallel-unsafe is a behavior change: report it.
-- **TLS WebSocket (row 8):** the TLS branch of the accept loop must keep
-  `serve_connection_with_upgrades`; the plain branch gets upgrades from
-  `axum::serve`. Test: `a_websocket_over_native_tls_stays_open`.
+- **TLS WebSocket (row 8):** since #11901 one accept loop serves both
+  listeners; both branches must call `serve_connection_with_upgrades`
+  (upstream's #11901 hunk still had `serve_connection` on the TLS branch;
+  #11965 fixed it later). Test: `a_websocket_over_native_tls_stays_open`.
+- **Connection drain (row 9):** tests
+  `a_stopped_tls_gateway_closes_its_connections_and_the_next_one_serves`,
+  `a_stopped_plain_gateway_closes_its_connections_and_the_next_one_serves`,
+  `a_stopped_gateway_releases_its_port_before_its_drain_ends`. Scenario:
+  `POST /admin/reload` with a chat socket open closes it `1001`, and the
+  next chat turn completes on the new instance.
 - **Code anchors:** `crates/zeroclaw-gateway/src/`,
   `crates/zeroclaw-runtime/src/daemon/mod.rs`.
 
