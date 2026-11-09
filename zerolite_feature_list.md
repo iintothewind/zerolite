@@ -46,6 +46,9 @@ their presence as approval. If a future merge touches them, report it.
   #11814, #11851) and the later plugin-host fixes (#11848, #12040,
   #11855) were cherry-picked on the owner's approval as bug/security
   fixes; this does not make the plugin cluster a decided feature.
+- Memory cluster. #11144 (credential-URL scan) and #11143 (qdrant time
+  bounds) were cherry-picked on the owner's approval (2026-11-09) as
+  hygiene fixes; this does not make memory a decided feature.
 - The OIDC cluster.
 
 ## Merge constraints (not features, but binding)
