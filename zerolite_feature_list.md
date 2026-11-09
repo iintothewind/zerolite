@@ -43,9 +43,9 @@ their presence as approval. If a future merge touches them, report it.
 - Turn parity over RPC (`#11132`).
 - The plugin cluster (incl. WASM plugin host in release artifacts).
   The v0.8.7 plugin fixes (#11807, #11808, #11809, #11811, #11812,
-  #11814, #11851) were cherry-picked on the owner's approval as
-  bug/security fixes; this does not make the plugin cluster a decided
-  feature.
+  #11814, #11851) and the later plugin-host fixes (#11848, #12040,
+  #11855) were cherry-picked on the owner's approval as bug/security
+  fixes; this does not make the plugin cluster a decided feature.
 - The OIDC cluster.
 
 ## Merge constraints (not features, but binding)
