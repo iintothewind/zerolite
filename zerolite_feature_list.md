@@ -107,3 +107,9 @@ their presence as approval. If a future merge touches them, report it.
   reasons), #11656 (configured `firejail_args` applied), #11400 (model
   cache replaced while a reader holds it, Windows), #11398 (JSONL session
   rewrite replaced while a reader holds it, Windows).
+- The test `acp_session_store::tests::legacy_null_trim_breadcrumb_is_inferred_once_then_recorded`
+  is removed (owner decision 2026-11-09): it required inferring a legacy
+  `NULL` trim-breadcrumb from message text, which contradicts the fork's
+  design (provenance is a canonical column, never inferred from text; see
+  `trim_breadcrumb_provenance_is_a_canonical_column_not_inferred_from_text`).
+  A merge or test restore that re-adds it is dropped.
