@@ -48,7 +48,15 @@ their presence as approval. If a future merge touches them, report it.
   fixes; this does not make the plugin cluster a decided feature.
 - Memory cluster. #11144 (credential-URL scan) and #11143 (qdrant time
   bounds) were cherry-picked on the owner's approval (2026-11-09) as
-  hygiene fixes; this does not make memory a decided feature.
+  hygiene fixes; this does not make memory a decided feature. #11225
+  (`c54e002a8`, owner kept through delegation) was attempted 2026-11-09
+  and dropped: its production blocks in `agent/agent.rs`
+  (`rebind_memory_tools`) and `tools/delegate.rs` (delegate memory
+  resolution) conflict with fork lines. #11266 (`72167d12e`, private
+  subagent/pipeline memory) was attempted and dropped: every conflict
+  block in `agent/agent.rs` (6) and `agent/turn/mod.rs` (12) holds fork
+  lines. Both need a memory design decision first; #11266 also needs the
+  composition API (#11174, not taken).
 - The OIDC cluster.
 
 ## Merge constraints (not features, but binding)
