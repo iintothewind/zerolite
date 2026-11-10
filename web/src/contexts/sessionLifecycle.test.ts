@@ -7,7 +7,13 @@ import {
   type ReactTestInstance,
   type ReactTestRenderer,
 } from 'react-test-renderer';
-import type { ApprovalDecision, SessionMessagesResponse, WsMessage } from '../types/api.ts';
+import type {
+  ApprovalDecision,
+  SessionMessageResponse,
+  SessionMessageRow,
+  SessionMessagesResponse,
+  WsMessage,
+} from '../types/api.ts';
 import type {
   AgentContextValue,
   AgentSessionRuntime,
@@ -200,6 +206,12 @@ class FakeSessionRuntime implements AgentSessionRuntime {
   readonly deleteCalls: string[] = [];
   readonly renameCalls: Array<{ id: string; name: string }> = [];
   readonly messageCalls: string[] = [];
+  readonly messageOptions: Array<{
+    sessionId: string;
+    options: { beforeTurn?: number; turns?: number } | undefined;
+  }> = [];
+  readonly getMessageCalls: Array<{ sessionId: string; messageId: number }> = [];
+  readonly storedRows = new Map<number, SessionMessageRow>();
   readonly messagePlans = new Map<string, MessageFactory[]>();
   readonly deletePlans = new Map<string, DeleteFactory[]>();
   readonly renameDeferred = new Map<string, Deferred<{ session_id: string; name: string }>>();
@@ -211,10 +223,22 @@ class FakeSessionRuntime implements AgentSessionRuntime {
     return socket;
   }
 
-  getMessages(sessionId: string): Promise<SessionMessagesResponse> {
+  getMessages(
+    sessionId: string,
+    options?: { beforeTurn?: number; turns?: number },
+  ): Promise<SessionMessagesResponse> {
     this.messageCalls.push(sessionId);
+    this.messageOptions.push({ sessionId, options });
     const plan = this.messagePlans.get(sessionId)?.shift();
     return plan ? plan() : Promise.resolve(messagesResponse(sessionId, true));
+  }
+
+  getMessage(sessionId: string, messageId: number): Promise<SessionMessageResponse> {
+    this.getMessageCalls.push({ sessionId, messageId });
+    const message = this.storedRows.get(messageId);
+    return message
+      ? Promise.resolve({ session_id: sessionId, message })
+      : Promise.reject(new Error('Message not found'));
   }
 
   delete(sessionId: string): Promise<{ deleted: boolean }> {
@@ -248,6 +272,19 @@ class FakeSessionRuntime implements AgentSessionRuntime {
   }
 }
 
+function row(fields: Partial<SessionMessageRow> & Pick<SessionMessageRow, 'id' | 'kind'>): SessionMessageRow {
+  return {
+    turn: 1,
+    role: fields.kind === 'tool_result' ? 'tool' : fields.kind === 'user' ? 'user' : 'assistant',
+    content: '',
+    content_bytes: 0,
+    tool_name: null,
+    tool_call_id: null,
+    created_at: null,
+    ...fields,
+  };
+}
+
 function messagesResponse(
   sessionId: string,
   sessionPersistence: boolean,
@@ -256,7 +293,8 @@ function messagesResponse(
   return {
     session_id: sessionId,
     session_persistence: sessionPersistence,
-    messages: contents.map((content) => ({ role: 'user', content, created_at: null })),
+    messages: contents.map((content, index) =>
+      row({ id: index + 1, turn: index + 1, kind: 'user', content })),
   };
 }
 
@@ -1768,17 +1806,15 @@ test('a hydrated conversation folds each tool turn into one collapsed group', as
       session_id: 'A',
       session_persistence: true,
       messages: [
-        { role: 'user', content: 'earlier prompt', created_at: null },
-        {
-          role: 'assistant',
-          content: '{"content":"looking around","tool_calls":[{"id":"c1","name":"shell","arguments":"{}"}]}',
-          created_at: null,
-        },
-        { role: 'tool', content: '{"content":"tool out","tool_call_id":"c1"}', created_at: null },
-        { role: 'assistant', content: 'the final answer', created_at: null },
+        row({ id: 1, turn: 1, kind: 'user', content: 'earlier prompt' }),
+        row({ id: 2, turn: 1, kind: 'step', content: 'looking around' }),
+        row({ id: 3, turn: 1, kind: 'tool_call', content: '{}', tool_name: 'shell', tool_call_id: 'c1' }),
+        row({ id: 4, turn: 1, kind: 'tool_result', content: null, content_bytes: 8, tool_name: 'shell', tool_call_id: 'c1' }),
+        row({ id: 5, turn: 1, kind: 'assistant', content: 'the final answer' }),
       ],
     }),
   );
+  runtime.storedRows.set(4, row({ id: 4, turn: 1, kind: 'tool_result', content: 'tool out', content_bytes: 8 }));
   storage.setItem('zeroclaw_show_tool_activity', '1');
   const mounted = await mountChat(runtime, true);
   storage.removeItem('zeroclaw_show_tool_activity');
@@ -1788,8 +1824,89 @@ test('a hydrated conversation folds each tool turn into one collapsed group', as
   const collapsed = renderedText(mounted);
   assert.match(collapsed, /1 tool calls · 1 messages/);
   assert.match(collapsed, /the final answer/);
-  assert.equal(collapsed.includes('tool out'), false, 'the card is folded, not loose');
   assert.equal(collapsed.includes('looking around'), false, 'narration sits inside the group');
+  assert.deepEqual(runtime.getMessageCalls, [], 'no output is fetched while the group is folded');
+
+  // Expanding the group fetches the output its card only references.
+  const expand = expandGroupButton(mounted);
+  assert.ok(expand);
+  await act(async () => { expand!.props.onClick(); });
+  await settle();
+  assert.deepEqual(runtime.getMessageCalls, [{ sessionId: 'A', messageId: 4 }]);
+  assert.match(renderedText(mounted), /tool out/);
+  await unmount(mounted.renderer);
+});
+
+test('hydration loads twenty turns and offers earlier ones only past turn 1', async () => {
+  const runtime = new FakeSessionRuntime();
+  runtime.queueMessages('A', () =>
+    Promise.resolve({
+      session_id: 'A',
+      session_persistence: true,
+      messages: [
+        row({ id: 10, turn: 3, kind: 'user', content: 'third' }),
+        row({ id: 11, turn: 3, kind: 'assistant', content: 'answer three' }),
+        row({ id: 12, turn: 4, kind: 'user', content: 'fourth' }),
+        row({ id: 13, turn: 4, kind: 'assistant', content: 'answer four' }),
+      ],
+    }),
+  );
+  runtime.queueMessages('A', () =>
+    Promise.resolve({
+      session_id: 'A',
+      session_persistence: true,
+      messages: [
+        row({ id: 1, turn: 1, kind: 'user', content: 'first' }),
+        row({ id: 2, turn: 1, kind: 'assistant', content: 'answer one' }),
+      ],
+    }),
+  );
+  const mounted = await mountChat(runtime, true);
+  await openSocket(runtime, 0);
+  await settle();
+
+  assert.deepEqual(runtime.messageOptions[0], { sessionId: 'A', options: { turns: 20 } });
+  assert.equal(mounted.context().hasEarlierTurns, true);
+  assert.ok(
+    mounted.renderer.root.findAllByType('button')
+      .some((button) => button.props['aria-label'] === 'Load earlier turns'),
+  );
+
+  await act(async () => { await mounted.context().loadEarlierTurns(); });
+  await settle();
+  assert.deepEqual(runtime.messageOptions[1], {
+    sessionId: 'A',
+    options: { beforeTurn: 3, turns: 20 },
+  });
+  assert.deepEqual(
+    mounted.context().messages.map((m) => m.content),
+    ['first', 'answer one', 'third', 'answer three', 'fourth', 'answer four'],
+  );
+  // Turn 1 is on screen: there is nothing earlier, so no button either.
+  assert.equal(mounted.context().hasEarlierTurns, false);
+  assert.equal(
+    mounted.renderer.root.findAllByType('button')
+      .some((button) => button.props['aria-label'] === 'Load earlier turns'),
+    false,
+  );
+  await unmount(mounted.renderer);
+});
+
+test('terminal frames stamp the turn onto the finished turn', async () => {
+  const { mounted, socket } = await mountLiveChat();
+  await act(async () => {
+    mounted.context().sendMessage('numbered');
+  });
+  await act(async () => {
+    socket.emitMessage({ type: 'chunk', content: 'the answer' });
+    socket.emitMessage({ type: 'done', full_response: 'the answer', turn: 7 });
+  });
+  await settle();
+  const messages = mounted.context().messages;
+  const user = messages.find((m) => m.role === 'user' && m.content === 'numbered');
+  const answer = messages.find((m) => m.role === 'agent' && m.content === 'the answer');
+  assert.equal(user?.turn, 7);
+  assert.equal(answer?.turn, 7);
   await unmount(mounted.renderer);
 });
 
