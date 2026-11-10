@@ -60,6 +60,117 @@ pub struct SessionQuery {
     pub limit: Option<usize>,
 }
 
+/// What a persisted transcript row is. `User`/`Assistant`/`Runtime` are the
+/// chat rows: `load` and `load_context` return exactly these. `Step`,
+/// `ToolCall` and `ToolResult` are the tool loop's record; they are read by
+/// the dashboard and the session tools and never enter a restored context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RowKind {
+    User,
+    Assistant,
+    Runtime,
+    Step,
+    ToolCall,
+    ToolResult,
+}
+
+impl RowKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Assistant => "assistant",
+            Self::Runtime => "runtime",
+            Self::Step => "step",
+            Self::ToolCall => "tool_call",
+            Self::ToolResult => "tool_result",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "user" => Self::User,
+            "assistant" => Self::Assistant,
+            "runtime" => Self::Runtime,
+            "step" => Self::Step,
+            "tool_call" => Self::ToolCall,
+            "tool_result" => Self::ToolResult,
+            _ => return None,
+        })
+    }
+
+    /// Kind for a row written through `append(&ChatMessage)`: "user" → User,
+    /// "assistant" → Assistant, anything else (system, tool, unknown) → Runtime.
+    pub fn from_role(role: &str) -> Self {
+        match role {
+            "user" => Self::User,
+            "assistant" => Self::Assistant,
+            _ => Self::Runtime,
+        }
+    }
+
+    pub fn is_chat(self) -> bool {
+        matches!(self, Self::User | Self::Assistant | Self::Runtime)
+    }
+}
+
+/// One row a turn adds. `role` is the provider role the row had in the
+/// agent's history ("user", "assistant", "tool").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptRow {
+    pub kind: RowKind,
+    pub role: String,
+    pub content: String,
+    pub tool_name: Option<String>,
+    pub tool_call_id: Option<String>,
+}
+
+/// A persisted row read back. `content` is empty and `content_bytes` is the
+/// stored size when the reader asked for tool output to be omitted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredRow {
+    pub message_id: i64,
+    /// Dense per-session turn number from 1; 0 when the backend has none.
+    pub turn: i64,
+    pub kind: RowKind,
+    pub role: String,
+    pub content: String,
+    pub content_bytes: usize,
+    pub tool_name: Option<String>,
+    pub tool_call_id: Option<String>,
+    pub created_at: Option<DateTime<Utc>>,
+}
+
+impl StoredRow {
+    /// A row from a backend without row ids or turns (`load()` fallback).
+    fn from_chat(message: ChatMessage) -> Self {
+        Self {
+            message_id: 0,
+            turn: 0,
+            kind: RowKind::from_role(&message.role),
+            content_bytes: message.content.len(),
+            role: message.role,
+            content: message.content,
+            tool_name: None,
+            tool_call_id: None,
+            created_at: None,
+        }
+    }
+}
+
+/// What `append_turn` wrote. Both are `None` on a backend without row ids.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppendedTurn {
+    pub turn: Option<i64>,
+    pub last_message_id: Option<i64>,
+}
+
+/// The newest rows of a session plus how many rows matched the filter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptTail {
+    pub rows: Vec<StoredRow>,
+    pub total: usize,
+}
+
 /// One full-text hit inside a persisted message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MessageHit {
@@ -69,7 +180,13 @@ pub struct MessageHit {
     pub session_key: String,
     /// Message role (`user`, `assistant`, ...).
     pub role: String,
-    /// FTS5 snippet around the match.
+    /// What the row is.
+    pub kind: RowKind,
+    /// Turn the row belongs to; 0 when unknown.
+    pub turn: i64,
+    /// Tool name on `tool_call`/`tool_result` rows.
+    pub tool_name: Option<String>,
+    /// Excerpt around the match, terms wrapped in `<b>…</b>`.
     pub snippet: String,
     /// Raw `created_at` text from the sessions row.
     pub created_at: String,
@@ -93,28 +210,12 @@ pub struct MessageQuery {
     pub owner_channel_ids: Vec<String>,
 }
 
-/// A persisted message located by its backend row id.
-#[derive(Debug, Clone)]
-pub struct LocatedMessage {
-    /// `sessions.id` for backends that have one.
-    pub message_id: i64,
-    /// The message body.
-    pub message: ChatMessage,
-}
-
-/// One persisted message with the optional `created_at` the backend
-/// stamped on it. JSONL / in-memory backends return `None`; SQLite
-/// returns the row's `created_at` column.
-#[derive(Debug, Clone)]
-pub struct TimestampedMessage {
-    pub message: ChatMessage,
-    pub created_at: Option<DateTime<Utc>>,
-}
-
 /// Trait for session persistence backends.
 /// Implementations must be `Send + Sync` for sharing across async tasks.
 pub trait SessionBackend: Send + Sync {
     /// Load all messages for a session. Returns empty vec if session doesn't exist.
+    /// Chat-kind rows only; tool rows are read through
+    /// `load_turn_page`/`load_tail`/`load_around`.
     fn load(&self, session_key: &str) -> Vec<ChatMessage>;
 
     /// Like `load`, but distinguishes an unreadable transcript from a genuinely
@@ -128,21 +229,106 @@ pub trait SessionBackend: Send + Sync {
         Ok(self.load(session_key))
     }
 
-    /// Same as `load`, but each row carries its persisted `created_at`
-    /// when the backend has one. Default impl falls back to `load`
-    /// without timestamps so non-SQLite backends keep working.
-    fn load_with_timestamps(&self, session_key: &str) -> Vec<TimestampedMessage> {
+    /// Append a single message to a session.
+    fn append(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()>;
+
+    /// Append one finished turn as a block of rows. `rows` must not be empty
+    /// (`Err(InvalidInput)`); `Ok(None)` when the session no longer exists, in
+    /// which case nothing is written and no session row is recreated (the same
+    /// delete race `replace_conversation_state_if_exists` closes).
+    fn append_turn(
+        &self,
+        session_key: &str,
+        rows: &[TranscriptRow],
+    ) -> std::io::Result<Option<AppendedTurn>> {
+        if rows.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "append_turn needs at least one row",
+            ));
+        }
+        if !self.session_exists(session_key) {
+            return Ok(None);
+        }
+        for row in rows.iter().filter(|row| row.kind.is_chat()) {
+            self.append(
+                session_key,
+                &ChatMessage {
+                    role: row.role.clone(),
+                    content: row.content.clone(),
+                },
+            )?;
+        }
+        Ok(Some(AppendedTurn {
+            turn: None,
+            last_message_id: None,
+        }))
+    }
+
+    /// The rows a restored agent is seeded from: chat-kind rows from the
+    /// recorded context start on.
+    fn load_context(&self, session_key: &str) -> std::io::Result<Vec<ChatMessage>> {
+        self.try_load(session_key)
+    }
+
+    /// Record the agent's post-turn context: its newest `retained_chat_rows`
+    /// chat-kind rows are the context, older rows stay history only. Also
+    /// records `breadcrumb_present` (same fact as
+    /// `set_session_trim_breadcrumb`). `Ok(false)` when the session no longer
+    /// exists. The default records the breadcrumb only.
+    fn set_context_start(
+        &self,
+        session_key: &str,
+        _retained_chat_rows: usize,
+        breadcrumb_present: bool,
+    ) -> std::io::Result<bool> {
+        if !self.session_exists(session_key) {
+            return Ok(false);
+        }
+        self.set_session_trim_breadcrumb(session_key, breadcrumb_present)?;
+        Ok(true)
+    }
+
+    /// Greatest row id in the session, `None` when empty or when the backend
+    /// has no row ids.
+    fn last_message_id(&self, _session_key: &str) -> Option<i64> {
+        None
+    }
+
+    /// The rows of the newest `turns` turns with `turn < before_turn` (every
+    /// turn when `before_turn` is `None`), in id order. `tool_result` content
+    /// is replaced by "" unless `include_tool_output`. The default returns
+    /// every `load()` row (ids/turns 0), paging ignored.
+    fn load_turn_page(
+        &self,
+        session_key: &str,
+        _before_turn: Option<i64>,
+        _turns: usize,
+        _include_tool_output: bool,
+    ) -> Vec<StoredRow> {
         self.load(session_key)
             .into_iter()
-            .map(|message| TimestampedMessage {
-                message,
-                created_at: None,
-            })
+            .map(StoredRow::from_chat)
             .collect()
     }
 
-    /// Append a single message to a session.
-    fn append(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()>;
+    /// One row with its full content.
+    fn load_message(&self, _session_key: &str, _message_id: i64) -> Option<StoredRow> {
+        None
+    }
+
+    /// The newest `limit` rows (chat kinds only unless `include_tools`) plus
+    /// the total count under the same filter.
+    fn load_tail(&self, session_key: &str, limit: usize, _include_tools: bool) -> TranscriptTail {
+        let messages = self.load(session_key);
+        let total = messages.len();
+        let rows = messages
+            .into_iter()
+            .skip(total.saturating_sub(limit))
+            .map(StoredRow::from_chat)
+            .collect();
+        TranscriptTail { rows, total }
+    }
 
     /// Replace the entire transcript for `session_key` with `messages`
     /// (atomic where the backend supports it). Used after durable history
@@ -239,8 +425,10 @@ pub trait SessionBackend: Send + Sync {
         Vec::new()
     }
 
-    /// Load a bounded window around `message_id` within `session_key`.
-    /// The anchor is included. Default returns empty: only backends with
+    /// Window of `before`/`after` rows around `message_id` within
+    /// `session_key`, the anchor always included; other tool rows only with
+    /// `include_tools`. The `user` row of the anchor's turn is prepended when
+    /// it is older than the window. Default returns empty: only backends with
     /// stable message ids can honor the anchor.
     fn load_around(
         &self,
@@ -248,7 +436,8 @@ pub trait SessionBackend: Send + Sync {
         _message_id: i64,
         _before: usize,
         _after: usize,
-    ) -> Vec<LocatedMessage> {
+        _include_tools: bool,
+    ) -> Vec<StoredRow> {
         Vec::new()
     }
 

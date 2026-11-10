@@ -24,6 +24,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::channel::ChannelApprovalResponse;
 use zeroclaw_api::ingress::{IngressContext, SourceClass, Transport, TrustClass, TurnOrigin};
+use zeroclaw_infra::session_backend::{AppendedTurn, RowKind, SessionBackend, TranscriptRow};
 use zeroclaw_runtime::agent::SteeringInput;
 use zeroclaw_runtime::sop::approval::{
     ApprovalDecision as SopApprovalDecision, ApprovalPrincipal as SopApprovalPrincipal,
@@ -518,13 +519,19 @@ async fn handle_socket(
     let mut resumed = false;
     let mut message_count: usize = 0;
     let mut effective_name: Option<String> = None;
-    let mut stored_messages = Vec::new();
-    if let Some(ref backend) = state.session_backend {
-        // Fail closed: an unreadable transcript must not become an empty
-        // history that a later turn authoritatively persists over the
-        // existing durable session. Terminate this connection instead.
-        let messages = match backend.try_load(&session_key) {
-            Ok(messages) => messages,
+    let mut stored_context = Vec::new();
+    // How much of the persisted transcript this connection's history
+    // reflects. Read before loading so a write landing in between shows up as
+    // a changed watermark on the next turn, which is the safe direction.
+    let connect_generation = state.session_queue.generation(&session_key);
+    let mut connect_last_id = None;
+    if let Some(backend) = &state.session_backend {
+        connect_last_id = backend.last_message_id(&session_key);
+        // Fail closed: an unreadable context must not become an empty
+        // history the agent then runs on as if the session were new.
+        // Terminate this connection instead.
+        let context = match backend.load_context(&session_key) {
+            Ok(context) => context,
             Err(e) => {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -545,9 +552,9 @@ async fn handle_socket(
                 return;
             }
         };
-        if !messages.is_empty() {
-            message_count = messages.len();
-            stored_messages = messages;
+        if !context.is_empty() {
+            message_count = context.len();
+            stored_context = context;
             resumed = true;
         }
         // Resolve the requested/stored name for the initial frame. Publishing
@@ -743,35 +750,21 @@ async fn handle_socket(
     // what lets ask_user/poll/escalate_to_human default to this conversation.
     agent.set_channel_name(WS_CHANNEL_KEY.to_string());
     agent.set_memory_session_id(Some(memory_session_id));
-    // How much of the persisted transcript this connection's history reflects.
-    // Read the generation before seeding so a write landing in between shows
-    // up as a changed generation on the next turn, which is the safe direction.
-    let connect_generation = state.session_queue.generation(&session_key);
-    let restored = match restore_agent_history(
-        state.session_backend.as_deref(),
-        &mut agent,
-        &session_key,
-        &stored_messages,
-    ) {
-        Ok(restored) => restored,
-        Err(()) => {
-            let err = serde_json::json!({
-                "type": "error",
-                "message": "session restore unavailable; retry the connection",
-                "code": "SESSION_RESTORE_UNAVAILABLE"
-            });
-            let _ = sender.send(Message::Text(err.to_string().into())).await;
-            return;
-        }
-    };
-    let restore_trim_event = restored.trim_event;
-    let mut persisted_watermark = if restored.persisted {
-        note_own_transcript_write(&state.session_queue, &session_key, &agent)
-    } else {
-        PersistedWatermark {
-            generation: connect_generation,
-            len: stored_messages.len(),
-        }
+    if let Some(backend) = &state.session_backend
+        && restore_agent_history(backend.as_ref(), &mut agent, &session_key, &stored_context)
+            .is_err()
+    {
+        let err = serde_json::json!({
+            "type": "error",
+            "message": "session restore unavailable; retry the connection",
+            "code": "SESSION_RESTORE_UNAVAILABLE"
+        });
+        let _ = sender.send(Message::Text(err.to_string().into())).await;
+        return;
+    }
+    let mut persisted_watermark = PersistedWatermark {
+        generation: connect_generation,
+        last_id: connect_last_id,
     };
 
     let (approval_event_tx, mut approval_event_rx) =
@@ -807,13 +800,6 @@ async fn handle_socket(
     // Construction is complete. Keep only the generation token for future
     // turns so an idle socket does not block agent deletion.
     drop(construction_reservation);
-
-    // Seeding happens before the connection's agent setup is complete. Forward
-    // its one-shot trim outcome only after channels are registered, so restore
-    // notifications cannot race setup or be emitted twice.
-    if let Some(frame) = restore_trim_event.and_then(history_trimmed_frame_for) {
-        let _ = sender.send(Message::Text(frame.to_string().into())).await;
-    }
 
     // Process the first message if it was not a connect frame
     if let Some(ref text) = first_msg_fallback {
@@ -1170,122 +1156,185 @@ fn session_queue_ws_error_code(error: &crate::session_queue::SessionQueueError) 
     }
 }
 
-/// Replace the session's durable transcript and breadcrumb flag with
-/// `durable`/`breadcrumb_present`, unless the session was deleted between the
-/// turn starting and this post-turn persistence — in which case the
-/// `aborted` / `done` / `error` frames are still sent to the client, but the
-/// row `DELETE /api/sessions/{id}` just wiped is not re-created.
-///
-/// The existence probe and the replacement run inside the backend's guarded
-/// `replace_conversation_state_if_exists`, not as two separate operations: a
-/// bare `session_exists` check followed by a replace is a check-then-act
-/// race, and a delete committing between the two would be silently undone by
-/// the replace recreating the session row/files.
-///
-/// Returns `false` when the durable write itself failed (logged with session
-/// context), so the caller does not report the turn as durably persisted
-/// when the store disagrees. A skipped write (session already gone) returns
-/// `true`: there is nothing left to persist.
-fn replace_conversation_state_unless_deleted(
-    backend: &dyn zeroclaw_infra::session_backend::SessionBackend,
-    session_key: &str,
-    durable: &[zeroclaw_providers::ChatMessage],
-    breadcrumb_present: bool,
-) -> bool {
-    match backend.replace_conversation_state_if_exists(session_key, durable, breadcrumb_present) {
-        Ok(_) => true,
-        Err(e) => {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({
-                        "session_key": session_key,
-                        "error": format!("{}", e),
-                    })),
-                "Failed to persist authoritative post-turn conversation state"
-            );
-            false
+/// The rows one turn adds to the durable transcript, in history order. System
+/// messages are never persisted; `reasoning_content` is not persisted.
+fn transcript_rows(new_messages: &[zeroclaw_providers::ConversationMessage]) -> Vec<TranscriptRow> {
+    use zeroclaw_providers::ConversationMessage;
+
+    let mut rows: Vec<TranscriptRow> = Vec::new();
+    for message in new_messages {
+        match message {
+            ConversationMessage::Chat(chat) => {
+                let kind = match chat.role.as_str() {
+                    "system" => continue,
+                    "user"
+                        if zeroclaw_runtime::agent::history_trim::is_synthetic_user_message(
+                            chat,
+                        ) =>
+                    {
+                        RowKind::Runtime
+                    }
+                    "user" => RowKind::User,
+                    "assistant" => RowKind::Assistant,
+                    _ => RowKind::Runtime,
+                };
+                rows.push(TranscriptRow {
+                    kind,
+                    role: chat.role.clone(),
+                    content: chat.content.clone(),
+                    tool_name: None,
+                    tool_call_id: None,
+                });
+            }
+            ConversationMessage::AssistantToolCalls {
+                text, tool_calls, ..
+            } => {
+                if let Some(text) = text.as_deref().filter(|text| !text.trim().is_empty()) {
+                    rows.push(TranscriptRow {
+                        kind: RowKind::Step,
+                        role: "assistant".into(),
+                        content: text.to_string(),
+                        tool_name: None,
+                        tool_call_id: None,
+                    });
+                }
+                rows.extend(tool_calls.iter().map(|call| TranscriptRow {
+                    kind: RowKind::ToolCall,
+                    role: "assistant".into(),
+                    content: call.arguments.clone(),
+                    tool_name: Some(call.name.clone()),
+                    tool_call_id: Some(call.id.clone()),
+                }));
+            }
+            ConversationMessage::ToolResults(results) => {
+                for result in results {
+                    let tool_name = if result.tool_name.is_empty() {
+                        rows.iter()
+                            .rev()
+                            .find(|row| {
+                                row.kind == RowKind::ToolCall
+                                    && row.tool_call_id.as_deref()
+                                        == Some(result.tool_call_id.as_str())
+                            })
+                            .and_then(|row| row.tool_name.clone())
+                    } else {
+                        Some(result.tool_name.clone())
+                    };
+                    rows.push(TranscriptRow {
+                        kind: RowKind::ToolResult,
+                        role: "tool".into(),
+                        content: result.content.clone(),
+                        tool_name,
+                        tool_call_id: Some(result.tool_call_id.clone()),
+                    });
+                }
+            }
         }
     }
+    rows
 }
 
-/// Replace the session's durable transcript and breadcrumb flag with the
-/// agent's own authoritative post-turn history, as one state. Appending only
-/// the turn's delta on top of a transcript the agent's loop already trimmed
-/// underneath it can resurrect turns the live agent dropped; replacing with
-/// `agent.history()` keeps the store in sync with what the agent actually
-/// retains.
-fn persist_agent_conversation_state(
-    backend: &dyn zeroclaw_infra::session_backend::SessionBackend,
-    session_key: &str,
-    agent: &zeroclaw_runtime::agent::Agent,
-) -> bool {
-    let durable = zeroclaw_providers::durable_chat_messages(agent.history());
-    replace_conversation_state_unless_deleted(
-        backend,
-        session_key,
-        &durable,
-        agent.history_has_trim_breadcrumb(),
-    )
+/// Chat rows the agent still holds after the turn — its durable context —
+/// excluding the breadcrumb, which is a flag in the store, not a row.
+fn retained_chat_rows(
+    history: &[zeroclaw_providers::ConversationMessage],
+    breadcrumb_present: bool,
+) -> usize {
+    zeroclaw_providers::durable_chat_messages(history)
+        .len()
+        .saturating_sub(usize::from(breadcrumb_present))
 }
 
 /// What a connection's execution history reflects: the session's transcript
-/// generation when it last synced, and how many persisted messages it covers.
+/// generation when it last synced, and the newest row it covers.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct PersistedWatermark {
     generation: u64,
-    len: usize,
+    last_id: Option<i64>,
 }
 
-/// Record that this connection just wrote `agent`'s history as the session's
-/// transcript, and return the watermark that write leaves behind.
-fn note_own_transcript_write(
+/// Append a finished turn and record where the agent's context now starts.
+///
+/// The transcript is append-only: a trim never deletes rows, it moves the
+/// context start. That relies on one invariant: the agent's non-system `Chat`
+/// messages map 1:1, in order, onto the session's chat-kind rows. Restore
+/// seeds exactly those rows (from the context start on), and every turn
+/// persists exactly its `Chat` messages as chat-kind rows, while
+/// `AssistantToolCalls`/`ToolResults` become tool rows that never count. So
+/// the agent's newest `retained_chat_rows` chat messages are the session's
+/// newest that many chat-kind rows.
+///
+/// Empty `rows` (a turn that failed before its user message was pushed)
+/// writes nothing. Failures are logged at WARN. Returns what was appended:
+/// `None` when nothing was, or the session was deleted meanwhile, in which
+/// case no session row is recreated.
+fn persist_turn(
+    backend: &dyn SessionBackend,
     queue: &crate::session_queue::SessionActorQueue,
     session_key: &str,
-    agent: &zeroclaw_runtime::agent::Agent,
-) -> PersistedWatermark {
-    PersistedWatermark {
-        generation: queue.advance_generation(session_key),
-        len: zeroclaw_providers::durable_chat_messages(agent.history()).len(),
+    rows: &[TranscriptRow],
+    retained_chat_rows: usize,
+    breadcrumb_present: bool,
+    watermark: &mut PersistedWatermark,
+) -> Option<AppendedTurn> {
+    if rows.is_empty() {
+        return None;
     }
+    let warn = |error: &std::io::Error, what: &str| {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "session_key": session_key,
+                    "step": what,
+                    "error": format!("{}", error),
+                })),
+            "Failed to persist the WS turn transcript"
+        );
+    };
+    let appended = match backend.append_turn(session_key, rows) {
+        Ok(Some(appended)) => appended,
+        Ok(None) => return None,
+        Err(error) => {
+            warn(&error, "append_turn");
+            return None;
+        }
+    };
+    if let Err(error) =
+        backend.set_context_start(session_key, retained_chat_rows, breadcrumb_present)
+    {
+        warn(&error, "set_context_start");
+    }
+    *watermark = PersistedWatermark {
+        generation: queue.advance_generation(session_key),
+        last_id: appended.last_message_id,
+    };
+    Some(appended)
 }
 
-/// Outcome of seeding an agent from a persisted transcript.
-struct RestoredHistory {
-    /// Trim notice produced by seeding, to forward to the client.
-    trim_event: Option<zeroclaw_api::agent::TurnEvent>,
-    /// Whether seeding trimmed and the retained projection was written back.
-    persisted: bool,
-}
-
-/// Seed `agent` from a persisted transcript the way a fresh connection does.
-/// `Err` means the history cannot be trusted and the caller must not run on
-/// it; the reason has already been logged.
+/// Seed `agent` from the session's restored context the way a fresh
+/// connection does: the breadcrumb (when the store records one) followed by
+/// `context`. `Err` means the history cannot be trusted and the caller must
+/// not run on it; the reason has already been logged.
 fn restore_agent_history(
-    backend: Option<&dyn zeroclaw_infra::session_backend::SessionBackend>,
+    backend: &dyn SessionBackend,
     agent: &mut zeroclaw_runtime::agent::Agent,
     session_key: &str,
-    messages: &[zeroclaw_providers::ChatMessage],
-) -> Result<RestoredHistory, ()> {
-    if messages.is_empty() {
-        return Ok(RestoredHistory {
-            trim_event: None,
-            persisted: false,
-        });
+    context: &[zeroclaw_providers::ChatMessage],
+) -> Result<(), ()> {
+    if context.is_empty() {
+        return Ok(());
     }
     // Breadcrumb provenance is the backend's own canonical record alongside
     // the transcript, never inferred from message text: a genuine first user
     // turn that happens to equal the localized breadcrumb string must keep its
-    // turn-boundary role, and a crumb persisted under another locale must stay
+    // turn-boundary role, and a crumb recorded under another locale must stay
     // classified as synthetic. Sessions from before this was tracked (`None`)
-    // restore as `false`, matching the fallback for backends that don't
-    // support it. Ownership must be set BEFORE seeding: seeding trims
-    // immediately if the restored transcript is over the structured cap, and
-    // that seed-time trim reads the agent's current breadcrumb flag to decide
-    // whether a leading synthetic marker counts as a real turn.
-    let trim_event = match backend.map(|backend| backend.get_session_trim_breadcrumb(session_key)) {
-        Some(Err(e)) => {
+    // restore as `false`.
+    let crumb = match backend.get_session_trim_breadcrumb(session_key) {
+        Ok(crumb) => crumb.unwrap_or(false),
+        Err(e) => {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -1298,59 +1347,39 @@ fn restore_agent_history(
             );
             return Err(());
         }
-        Some(Ok(opt)) => {
-            agent.set_history_has_trim_breadcrumb(opt.unwrap_or(false));
-            agent.seed_history_with_event(messages)
-        }
-        None => {
-            agent.set_history_has_trim_breadcrumb(false);
-            agent.seed_history_with_event(messages)
-        }
     };
-    // Seed-time trim only fires when the restored history exceeded the
-    // structured cap, so it dropped rows, not just relabeled them. Mirror the
-    // ACP restore contract: persist the retained projection and corrected
-    // breadcrumb before the session goes live, or a reconnect/restart before
-    // the next prompt reloads the untrimmed durable prefix and repeats the
-    // trim, leaving the live agent and the durable session disagreeing.
-    let mut persisted = false;
-    if trim_event.is_some()
-        && let Some(backend) = backend
-        && backend.session_exists(session_key)
-    {
-        if !persist_agent_conversation_state(backend, session_key, agent) {
-            return Err(());
-        }
-        persisted = true;
+    agent.set_history_has_trim_breadcrumb(crumb);
+    if crumb {
+        let mut seed = Vec::with_capacity(context.len() + 1);
+        seed.push(zeroclaw_runtime::agent::history_trim::breadcrumb());
+        seed.extend_from_slice(context);
+        agent.seed_history(&seed);
+    } else {
+        agent.seed_history(context);
     }
-    Ok(RestoredHistory {
-        trim_event,
-        persisted,
-    })
+    Ok(())
 }
 
-/// Rebuild a connection's execution history from the persisted transcript
-/// when another writer advanced it since this connection last synced:
+/// Rebuild a connection's execution history from the persisted context when
+/// another writer advanced the transcript since this connection last synced:
 /// typically the detached turn a reconnecting socket queued behind, or a
 /// delete and recreation under the same key. Runs while holding the session
 /// permit, which every gateway transcript writer takes, so the transcript
 /// cannot move again before the turn that follows. Clears before re-seeding
-/// so nothing is duplicated; returns the trim notice re-seeding may produce.
+/// so nothing is duplicated.
 fn refresh_history_if_advanced(
-    backend: &dyn zeroclaw_infra::session_backend::SessionBackend,
+    backend: &dyn SessionBackend,
     queue: &crate::session_queue::SessionActorQueue,
     agent: &mut zeroclaw_runtime::agent::Agent,
     session_key: &str,
     persisted_watermark: &mut PersistedWatermark,
-) -> Result<Option<zeroclaw_api::agent::TurnEvent>, ()> {
-    let generation = queue.generation(session_key);
-    let persisted = backend.load(session_key);
+) -> Result<(), ()> {
     let current = PersistedWatermark {
-        generation,
-        len: persisted.len(),
+        generation: queue.generation(session_key),
+        last_id: backend.last_message_id(session_key),
     };
     if current == *persisted_watermark {
-        return Ok(None);
+        return Ok(());
     }
     ::zeroclaw_log::record!(
         INFO,
@@ -1358,21 +1387,33 @@ fn refresh_history_if_advanced(
             ::serde_json::json!({
                 "session_key": session_key,
                 "known_generation": persisted_watermark.generation,
-                "known_messages": persisted_watermark.len,
+                "known_last_id": persisted_watermark.last_id,
                 "current_generation": current.generation,
-                "persisted_messages": current.len,
+                "current_last_id": current.last_id,
             })
         ),
         "session transcript moved since this connection synced; rebuilding execution history"
     );
-    agent.clear_history();
-    let restored = restore_agent_history(Some(backend), agent, session_key, &persisted)?;
-    *persisted_watermark = if restored.persisted {
-        note_own_transcript_write(queue, session_key, agent)
-    } else {
-        current
+    let context = match backend.load_context(session_key) {
+        Ok(context) => context,
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "session_key": session_key,
+                        "error": format!("{}", e),
+                    })),
+                "Failed to load WS session context; refusing to run on unverified history"
+            );
+            return Err(());
+        }
     };
-    Ok(restored.trim_event)
+    agent.clear_history();
+    restore_agent_history(backend, agent, session_key, &context)?;
+    *persisted_watermark = current;
+    Ok(())
 }
 
 /// The `history_trimmed` frame for a trim notice, or `None` for any other event.
@@ -1913,6 +1954,8 @@ struct DoneFrameMeta<'a> {
     /// LLM calls the turn made. The web client counts steps from this rather
     /// than from the frames that happened to carry numbers.
     steps: u64,
+    /// Stored turn number, when the turn was persisted.
+    turn: Option<i64>,
 }
 
 /// Build the `done`-frame JSON.
@@ -1954,6 +1997,9 @@ fn build_done_frame_json(
     if let Some(window) = meta.effective_context_window {
         done["effective_context_window"] = serde_json::Value::from(window);
     }
+    if let Some(turn) = meta.turn {
+        done["turn"] = serde_json::Value::from(turn);
+    }
     done
 }
 
@@ -1961,15 +2007,20 @@ fn build_done_frame_json(
 ///
 /// Carries the same totals as `done`, because a cancelled turn still spent
 /// what it spent: the client's live session row counts those steps and tokens
-/// instead of dropping the turn on the floor.
-fn aborted_frame(fold: &UsageFold) -> serde_json::Value {
-    serde_json::json!({
+/// instead of dropping the turn on the floor. `turn` is the stored turn
+/// number, when the turn was persisted.
+fn aborted_frame(fold: &UsageFold, turn: Option<i64>) -> serde_json::Value {
+    let mut frame = serde_json::json!({
         "type": "aborted",
         "input_tokens": fold.total_input_tokens,
         "output_tokens": fold.total_output_tokens,
         "cached_input_tokens": fold.cached_input_tokens,
         "steps": fold.steps,
-    })
+    });
+    if let Some(turn) = turn {
+        frame["turn"] = serde_json::Value::from(turn);
+    }
+    frame
 }
 
 /// The turn-boundary frame the gateway broadcasts when a turn starts.
@@ -2025,29 +2076,23 @@ async fn process_chat_message(
     // running, or whose session was deleted and recreated since, seeded its
     // history from a transcript that has since moved; rebuild from the
     // persisted transcript before running on the stale snapshot.
-    if let Some(ref backend) = state.session_backend {
-        match refresh_history_if_advanced(
+    if let Some(backend) = &state.session_backend
+        && refresh_history_if_advanced(
             backend.as_ref(),
             &state.session_queue,
             agent,
             session_key,
             persisted_watermark,
-        ) {
-            Ok(trim_event) => {
-                if let Some(frame) = trim_event.and_then(history_trimmed_frame_for) {
-                    let _ = sender.send(Message::Text(frame.to_string().into())).await;
-                }
-            }
-            Err(()) => {
-                let err = serde_json::json!({
-                    "type": "error",
-                    "message": "session restore unavailable; retry the connection",
-                    "code": "SESSION_RESTORE_UNAVAILABLE"
-                });
-                let _ = sender.send(Message::Text(err.to_string().into())).await;
-                return false;
-            }
-        }
+        )
+        .is_err()
+    {
+        let err = serde_json::json!({
+            "type": "error",
+            "message": "session restore unavailable; retry the connection",
+            "code": "SESSION_RESTORE_UNAVAILABLE"
+        });
+        let _ = sender.send(Message::Text(err.to_string().into())).await;
+        return false;
     }
 
     let (turn_alias, turn_provider, turn_model) = agent.attribution_fields();
@@ -2419,20 +2464,21 @@ async fn process_chat_message(
     };
 
     if was_cancelled {
-        if let Some(ref backend) = state.session_backend
+        let mut appended = None;
+        if let Some(backend) = &state.session_backend
             && backend.session_exists(session_key)
         {
-            // Persist the agent's authoritative post-turn history as one state,
-            // even when the turn produced noDelta or was hard-cancelled. The
-            // live agent may have already trimmed older turns before the
-            // cancellation was observed; persisting only a delta marker would
-            // leave the durable store with the pre-trim transcript that the
-            // next restore would resurrect.
-            let needs_marker = match &result {
-                Err(error) => !has_assistant_chat_message(&error.new_messages),
-                Ok(_) => false,
+            // Append what the turn produced, even when it produced no
+            // assistant text or was hard-cancelled. Without an assistant
+            // message the turn gets an interruption marker row, so the
+            // transcript never ends on a bare user message.
+            let new_messages = match &result {
+                Err(error) => error.new_messages.as_slice(),
+                Ok(_) => &[],
             };
-            let durable = if needs_marker {
+            let mut rows = transcript_rows(new_messages);
+            let needs_marker = result.is_err() && !has_assistant_chat_message(new_messages);
+            if needs_marker {
                 let marker =
                     zeroclaw_runtime::i18n::get_required_cli_string("turn-interrupted-by-user");
                 let truncated = if accumulated_text.is_empty() {
@@ -2440,27 +2486,36 @@ async fn process_chat_message(
                 } else {
                     format!("{accumulated_text}\n\n{marker}")
                 };
-                let mut d = zeroclaw_providers::durable_chat_messages(agent.history());
-                d.push(zeroclaw_providers::ChatMessage::assistant(&truncated));
-                d
-            } else {
-                zeroclaw_providers::durable_chat_messages(agent.history())
-            };
+                rows.push(TranscriptRow {
+                    kind: RowKind::Assistant,
+                    role: "assistant".into(),
+                    content: truncated,
+                    tool_name: None,
+                    tool_call_id: None,
+                });
+            }
             let crumb = agent.history_has_trim_breadcrumb();
-            replace_conversation_state_unless_deleted(
+            // The marker row is in the store but not in the agent's history.
+            let retained = retained_chat_rows(agent.history(), crumb) + usize::from(needs_marker);
+            appended = persist_turn(
                 backend.as_ref(),
+                &state.session_queue,
                 session_key,
-                &durable,
+                &rows,
+                retained,
                 crumb,
+                persisted_watermark,
             );
-            *persisted_watermark = PersistedWatermark {
-                generation: state.session_queue.advance_generation(session_key),
-                len: durable.len(),
-            };
+            if needs_marker && appended.is_some() {
+                // Leave the watermark behind the store so the next turn
+                // re-seeds from it and the agent holds the marker too; the
+                // agent's chat messages and the context rows then agree again.
+                persisted_watermark.last_id = None;
+            }
         }
 
         // Inform the client the turn was aborted
-        let aborted = aborted_frame(&usage_fold);
+        let aborted = aborted_frame(&usage_fold, appended.and_then(|a| a.turn));
         let _ = sender.send(Message::Text(aborted.to_string().into())).await;
 
         if let Some(ref backend) = state.session_backend
@@ -2505,11 +2560,18 @@ async fn process_chat_message(
 
     match result {
         Ok(outcome) => {
-            if let Some(ref backend) = state.session_backend {
-                persist_agent_conversation_state(backend.as_ref(), session_key, agent);
-                *persisted_watermark =
-                    note_own_transcript_write(&state.session_queue, session_key, agent);
-            }
+            let appended = state.session_backend.as_ref().and_then(|backend| {
+                let crumb = agent.history_has_trim_breadcrumb();
+                persist_turn(
+                    backend.as_ref(),
+                    &state.session_queue,
+                    session_key,
+                    &transcript_rows(&outcome.new_messages),
+                    retained_chat_rows(agent.history(), crumb),
+                    crumb,
+                    persisted_watermark,
+                )
+            });
 
             // Fire-and-forget memory consolidation so facts from WS sessions
             // are extracted to long-term memory (Daily + Core categories).
@@ -2635,6 +2697,7 @@ async fn process_chat_message(
                 last_serving_model: usage_fold.last_model.as_deref(),
                 cached_input_tokens: usage_fold.cached_input_tokens,
                 steps: usage_fold.steps,
+                turn: appended.and_then(|a| a.turn),
             };
             // Surface an at-most-one safety-safeguard downgrade notice just
             // before the terminal `done` frame, so the web chat shows the
@@ -2688,11 +2751,18 @@ async fn process_chat_message(
             );
         }
         Err(e) => {
-            if let Some(ref backend) = state.session_backend {
-                persist_agent_conversation_state(backend.as_ref(), session_key, agent);
-                *persisted_watermark =
-                    note_own_transcript_write(&state.session_queue, session_key, agent);
-            }
+            let appended = state.session_backend.as_ref().and_then(|backend| {
+                let crumb = agent.history_has_trim_breadcrumb();
+                persist_turn(
+                    backend.as_ref(),
+                    &state.session_queue,
+                    session_key,
+                    &transcript_rows(&e.new_messages),
+                    retained_chat_rows(agent.history(), crumb),
+                    crumb,
+                    persisted_watermark,
+                )
+            });
 
             // Set session state to error
             if let Some(ref backend) = state.session_backend {
@@ -2708,7 +2778,13 @@ async fn process_chat_message(
             );
             let user_message =
                 zeroclaw_runtime::agent::terminal_completion_error_message(&e.error, None);
-            let err = send_ws_turn_failure(sender, &e.error, user_message.as_deref()).await;
+            let err = send_ws_turn_failure(
+                sender,
+                &e.error,
+                user_message.as_deref(),
+                appended.and_then(|a| a.turn),
+            )
+            .await;
 
             // Broadcast error event
             let _ = state.event_tx.send(serde_json::json!({
@@ -2773,11 +2849,15 @@ async fn send_ws_turn_failure<S>(
     sender: &mut S,
     error: &anyhow::Error,
     user_message: Option<&str>,
+    turn: Option<i64>,
 ) -> serde_json::Value
 where
     S: futures_util::Sink<Message> + Unpin,
 {
-    let frame = ws_turn_failure_frame(&error.to_string(), user_message, user_message.is_some());
+    let mut frame = ws_turn_failure_frame(&error.to_string(), user_message, user_message.is_some());
+    if let Some(turn) = turn {
+        frame["turn"] = serde_json::Value::from(turn);
+    }
     let _ = sender.send(Message::Text(frame.to_string().into())).await;
     frame
 }
@@ -3812,19 +3892,58 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         .expect("close frame deadline")
     }
 
-    /// Run one turn on `client` to its `done` frame.
+    /// Run one turn on `client` to its `done` frame and return that frame.
     async fn run_turn_to_done(
         fixture: &mut ParkedTurnFixture,
         client: &mut WsClient,
         content: &str,
-    ) {
+    ) -> serde_json::Value {
         fixture.start_parked_turn(client, content).await;
         fixture.release_next();
         loop {
-            if next_text_frame(client).await["type"] == "done" {
-                break;
+            let frame = next_text_frame(client).await;
+            if frame["type"] == "done" {
+                break frame;
             }
         }
+    }
+
+    #[test]
+    fn finished_turns_are_appended_with_their_turn_number() {
+        run_ws_regression(
+            "ws-turn-numbers",
+            finished_turns_are_appended_with_their_turn_number_inner,
+        );
+    }
+
+    async fn finished_turns_are_appended_with_their_turn_number_inner() {
+        use zeroclaw_infra::session_backend::RowKind;
+
+        let mut fixture = ParkedTurnFixture::spawn().await;
+        let session_id = "turn-numbers";
+        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+        let (mut client, _) = fixture.connect(session_id).await;
+
+        let done = run_turn_to_done(&mut fixture, &mut client, "first").await;
+        assert_eq!(done["turn"], 1);
+        let page = fixture.backend.load_turn_page(&session_key, None, 1, true);
+        assert_eq!(
+            page.iter().map(|row| row.kind).collect::<Vec<_>>(),
+            [RowKind::User, RowKind::Assistant]
+        );
+        assert!(page.iter().all(|row| row.turn == 1));
+        assert_eq!(page[1].content, PARKED_TURN_RESPONSE);
+        let first_last_id = fixture.backend.last_message_id(&session_key).unwrap();
+
+        let done = run_turn_to_done(&mut fixture, &mut client, "second").await;
+        assert_eq!(done["turn"], 2);
+        let page = fixture.backend.load_turn_page(&session_key, None, 1, true);
+        assert!(page.iter().all(|row| row.turn == 2));
+        assert_eq!(page[0].content, "second");
+        assert!(fixture.backend.last_message_id(&session_key).unwrap() > first_last_id);
+        // No trim happened, so every chat row is still the agent's context.
+        assert_eq!(fixture.backend.load_context(&session_key).unwrap().len(), 4);
+        fixture.shutdown();
     }
 
     #[test]
@@ -5218,32 +5337,58 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         }
     }
 
+    fn chat_row(kind: RowKind, role: &str, content: &str) -> TranscriptRow {
+        TranscriptRow {
+            kind,
+            role: role.into(),
+            content: content.into(),
+            tool_name: None,
+            tool_call_id: None,
+        }
+    }
+
+    fn test_queue() -> crate::session_queue::SessionActorQueue {
+        crate::session_queue::SessionActorQueue::new(8, 30, 600)
+    }
+
     #[test]
-    fn replace_conversation_state_skips_deleted_session() {
+    fn persist_turn_skips_deleted_session() {
         let backend = DeletedSessionBackend {
             append_calls: std::sync::Mutex::new(Vec::new()),
             rewrite_calls: std::sync::Mutex::new(Vec::new()),
         };
-        let durable = vec![
-            zeroclaw_providers::ChatMessage::user("hi"),
-            zeroclaw_providers::ChatMessage::assistant("[interrupted by user]"),
+        let rows = [
+            chat_row(RowKind::User, "user", "hi"),
+            chat_row(RowKind::Assistant, "assistant", "[interrupted by user]"),
         ];
+        let mut watermark = PersistedWatermark::default();
 
-        replace_conversation_state_unless_deleted(&backend, "gw_deleted", &durable, false);
+        let appended = persist_turn(
+            &backend,
+            &test_queue(),
+            "gw_deleted",
+            &rows,
+            2,
+            false,
+            &mut watermark,
+        );
 
+        assert_eq!(appended, None);
+        assert_eq!(watermark, PersistedWatermark::default());
         assert!(
-            backend.rewrite_calls.lock().unwrap().is_empty(),
-            "replacing durable state must not resurrect a session whose \
+            backend.append_calls.lock().unwrap().is_empty(),
+            "appending a turn must not resurrect a session whose \
              session_exists() returned false"
         );
     }
 
     /// A backend that implements only the required `SessionBackend`
-    /// primitives (`load`/`append`/`remove_last`/`list_sessions`) and does
-    /// NOT override `rewrite_messages`, exercising the trait's default
-    /// replacement implementation built from those primitives.
+    /// primitives (`load`/`append`/`remove_last`/`list_sessions`) plus the
+    /// breadcrumb flag, exercising the trait's default `append_turn` and
+    /// `set_context_start`.
     struct AppendOnlyBackend {
         messages: std::sync::Mutex<Vec<zeroclaw_providers::ChatMessage>>,
+        crumb: std::sync::Mutex<Option<bool>>,
     }
 
     impl zeroclaw_infra::session_backend::SessionBackend for AppendOnlyBackend {
@@ -5264,48 +5409,73 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         fn list_sessions(&self) -> Vec<String> {
             Vec::new()
         }
+        fn set_session_trim_breadcrumb(
+            &self,
+            _session_key: &str,
+            present: bool,
+        ) -> std::io::Result<()> {
+            *self.crumb.lock().unwrap() = Some(present);
+            Ok(())
+        }
     }
 
     #[test]
-    fn append_only_backend_durably_replaces_state_through_the_websocket_persistence_boundary() {
-        // A production `SessionBackend` that only implements the required
-        // append/remove_last primitives must still durably persist the
-        // agent's authoritative post-turn history through the WebSocket
-        // completion path — the default `rewrite_messages` must not
-        // silently no-op and drop the caller's replacement.
+    fn append_only_backend_appends_the_turn_through_the_websocket_persistence_boundary() {
+        // A backend with only the required primitives still durably records
+        // the turn's chat rows (tool rows have nowhere to go) and the
+        // breadcrumb flag, without rewriting the earlier transcript.
         let backend = AppendOnlyBackend {
             messages: std::sync::Mutex::new(vec![
-                zeroclaw_providers::ChatMessage::user("stale first turn"),
-                zeroclaw_providers::ChatMessage::assistant("stale reply"),
+                zeroclaw_providers::ChatMessage::user("first turn"),
+                zeroclaw_providers::ChatMessage::assistant("first reply"),
             ]),
+            crumb: std::sync::Mutex::new(None),
         };
-        let authoritative = vec![
-            zeroclaw_providers::ChatMessage::user("trimmed second turn"),
-            zeroclaw_providers::ChatMessage::assistant("final reply"),
+        let rows = [
+            chat_row(RowKind::User, "user", "second turn"),
+            TranscriptRow {
+                kind: RowKind::ToolCall,
+                role: "assistant".into(),
+                content: "{}".into(),
+                tool_name: Some("shell".into()),
+                tool_call_id: Some("c1".into()),
+            },
+            chat_row(RowKind::Assistant, "assistant", "final reply"),
         ];
+        let queue = test_queue();
+        let mut watermark = PersistedWatermark::default();
 
-        replace_conversation_state_unless_deleted(&backend, "gw_append_only", &authoritative, true);
-
-        let persisted = backend.messages.lock().unwrap().clone();
-        assert_eq!(
-            persisted
-                .iter()
-                .map(|m| m.content.clone())
-                .collect::<Vec<_>>(),
-            authoritative
-                .iter()
-                .map(|m| m.content.clone())
-                .collect::<Vec<_>>(),
-            "replacement must durably overwrite the stale transcript, not silently no-op"
+        let appended = persist_turn(
+            &backend,
+            &queue,
+            "gw_append_only",
+            &rows,
+            2,
+            true,
+            &mut watermark,
         );
+
+        assert!(appended.is_some());
+        let persisted: Vec<_> = backend
+            .messages
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|m| m.content.clone())
+            .collect();
+        assert_eq!(
+            persisted,
+            ["first turn", "first reply", "second turn", "final reply"]
+        );
+        assert_eq!(*backend.crumb.lock().unwrap(), Some(true));
+        assert_eq!(watermark.generation, queue.generation("gw_append_only"));
     }
 
-    /// A backend whose durable replacement always fails, standing in for a
-    /// disk or other operational failure at the WebSocket persistence
-    /// boundary.
-    struct FailingReplaceBackend;
+    /// A backend whose durable append always fails, standing in for a disk
+    /// or other operational failure at the WebSocket persistence boundary.
+    struct FailingAppendBackend;
 
-    impl zeroclaw_infra::session_backend::SessionBackend for FailingReplaceBackend {
+    impl zeroclaw_infra::session_backend::SessionBackend for FailingAppendBackend {
         fn load(&self, _session_key: &str) -> Vec<zeroclaw_providers::ChatMessage> {
             Vec::new()
         }
@@ -5314,7 +5484,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             _session_key: &str,
             _message: &zeroclaw_providers::ChatMessage,
         ) -> std::io::Result<()> {
-            Ok(())
+            Err(std::io::Error::other("simulated durable append failure"))
         }
         fn remove_last(&self, _session_key: &str) -> std::io::Result<bool> {
             Ok(false)
@@ -5327,30 +5497,94 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             // only the durable write itself fails.
             true
         }
-        fn rewrite_messages(
-            &self,
-            _session_key: &str,
-            _messages: &[zeroclaw_providers::ChatMessage],
-        ) -> std::io::Result<()> {
-            Err(std::io::Error::other(
-                "simulated durable replacement failure",
-            ))
-        }
     }
 
     #[test]
-    fn replace_conversation_state_unless_deleted_reports_durable_failure() {
-        // The WebSocket completion path must not claim the turn's history
-        // was durably persisted when the backend actually failed the write:
-        // the caller uses this to decide whether the authoritative-history
-        // guarantee held for this turn.
-        let backend = FailingReplaceBackend;
-        let durable = vec![zeroclaw_providers::ChatMessage::user("hi")];
-
-        assert!(
-            !replace_conversation_state_unless_deleted(&backend, "gw_failing", &durable, false),
-            "a failed durable replacement must be reported to the caller, not swallowed"
+    fn persist_turn_reports_a_failed_append_without_advancing_the_watermark() {
+        let mut watermark = PersistedWatermark::default();
+        let appended = persist_turn(
+            &FailingAppendBackend,
+            &test_queue(),
+            "gw_failing",
+            &[chat_row(RowKind::User, "user", "hi")],
+            1,
+            false,
+            &mut watermark,
         );
+        assert_eq!(appended, None);
+        assert_eq!(watermark, PersistedWatermark::default());
+    }
+
+    #[test]
+    fn transcript_rows_classifies_every_history_variant() {
+        use zeroclaw_providers::{ChatMessage, ConversationMessage, ToolCall, ToolResultMessage};
+
+        let history = [
+            ConversationMessage::Chat(ChatMessage::system("prompt")),
+            ConversationMessage::Chat(ChatMessage::user("go")),
+            ConversationMessage::AssistantToolCalls {
+                text: Some("looking".into()),
+                tool_calls: vec![ToolCall {
+                    id: "c1".into(),
+                    name: "shell".into(),
+                    arguments: "{\"command\":\"ls\"}".into(),
+                    extra_content: None,
+                }],
+                reasoning_content: Some("hidden".into()),
+            },
+            ConversationMessage::ToolResults(vec![ToolResultMessage {
+                tool_call_id: "c1".into(),
+                content: "one".into(),
+                tool_name: String::new(),
+            }]),
+            ConversationMessage::Chat(ChatMessage::user(format!(
+                "{}\n<tool_result>ok</tool_result>",
+                zeroclaw_api::tool_carrier::TOOL_RESULTS_PREFIX
+            ))),
+            ConversationMessage::Chat(ChatMessage::assistant("done")),
+        ];
+
+        let rows = transcript_rows(&history);
+        assert_eq!(
+            rows.iter().map(|row| row.kind).collect::<Vec<_>>(),
+            [
+                RowKind::User,
+                RowKind::Step,
+                RowKind::ToolCall,
+                RowKind::ToolResult,
+                RowKind::Runtime,
+                RowKind::Assistant
+            ]
+        );
+        assert_eq!(rows[1].content, "looking");
+        assert_eq!(rows[2].tool_name.as_deref(), Some("shell"));
+        assert_eq!(rows[2].content, "{\"command\":\"ls\"}");
+        assert_eq!(rows[3].tool_name.as_deref(), Some("shell"));
+        assert_eq!(rows[3].tool_call_id.as_deref(), Some("c1"));
+        assert_eq!(rows[3].role, "tool");
+    }
+
+    #[test]
+    fn retained_chat_rows_excludes_the_breadcrumb_and_tool_rows() {
+        use zeroclaw_providers::{ChatMessage, ConversationMessage, ToolResultMessage};
+
+        let history = [
+            ConversationMessage::Chat(ChatMessage::system("prompt")),
+            ConversationMessage::Chat(zeroclaw_runtime::agent::history_trim::breadcrumb()),
+            ConversationMessage::Chat(ChatMessage::user("go")),
+            ConversationMessage::AssistantToolCalls {
+                text: None,
+                tool_calls: Vec::new(),
+                reasoning_content: None,
+            },
+            ConversationMessage::ToolResults(vec![ToolResultMessage {
+                tool_call_id: "c1".into(),
+                content: "one".into(),
+                tool_name: "shell".into(),
+            }]),
+            ConversationMessage::Chat(ChatMessage::assistant("done")),
+        ];
+        assert_eq!(retained_chat_rows(&history, true), 2);
     }
 
     /// A `Sink<Message>` that just collects the text frames sent to it, so a handler
@@ -5533,6 +5767,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
                 last_serving_model: Some("glm-5.2"),
                 cached_input_tokens: None,
                 steps: 0,
+                turn: None,
             };
             let done = build_done_frame_json(&meta, &[]);
             let v: serde_json::Value = serde_json::from_str(&done.to_string()).unwrap();
@@ -5653,6 +5888,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
                 last_serving_model: Some("glm-5.2"),
                 cached_input_tokens: None,
                 steps: 0,
+                turn: None,
             };
             let done = build_done_frame_json(&meta, &[]);
             let v: serde_json::Value = serde_json::from_str(&done.to_string()).unwrap();
@@ -5773,6 +6009,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             last_serving_model: Some(effective_model),
             cached_input_tokens: None,
             steps: 0,
+            turn: None,
         };
         let done = build_done_frame_json(&meta, &[]);
         let v: serde_json::Value = serde_json::from_str(&done.to_string()).unwrap();
@@ -6034,6 +6271,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             last_serving_model: Some("model-a"),
             cached_input_tokens: None,
             steps: 0,
+            turn: None,
         };
         let done = build_done_frame_json(&meta, &entries);
         let v: serde_json::Value = serde_json::from_str(&done.to_string()).unwrap();
@@ -6141,6 +6379,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             last_serving_model: Some("model-b"),
             cached_input_tokens: None,
             steps: 0,
+            turn: None,
         };
         let done = build_done_frame_json(&meta, &entries);
         let v: serde_json::Value = serde_json::from_str(&done.to_string()).unwrap();
@@ -6184,6 +6423,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             last_serving_model: Some("model-a"),
             cached_input_tokens: None,
             steps: 0,
+            turn: None,
         };
         let done = build_done_frame_json(&meta, &entries);
         let v: serde_json::Value = serde_json::from_str(&done.to_string()).unwrap();
@@ -6467,24 +6707,28 @@ data: {{\"type\":\"message_stop\"}}\n\n"
     #[test]
     fn aborted_frame_carries_the_turn_totals() {
         assert_eq!(
-            aborted_frame(&UsageFold {
-                steps: 3,
-                total_input_tokens: Some(120),
-                total_output_tokens: Some(7),
-                cached_input_tokens: Some(64),
-                last_input_tokens: Some(120),
-                ..Default::default()
-            }),
+            aborted_frame(
+                &UsageFold {
+                    steps: 3,
+                    total_input_tokens: Some(120),
+                    total_output_tokens: Some(7),
+                    cached_input_tokens: Some(64),
+                    last_input_tokens: Some(120),
+                    ..Default::default()
+                },
+                Some(4)
+            ),
             serde_json::json!({
                 "type": "aborted",
                 "input_tokens": 120,
                 "output_tokens": 7,
                 "cached_input_tokens": 64,
                 "steps": 3,
+                "turn": 4,
             })
         );
         assert_eq!(
-            aborted_frame(&UsageFold::default()),
+            aborted_frame(&UsageFold::default(), None),
             serde_json::json!({
                 "type": "aborted",
                 "input_tokens": null,

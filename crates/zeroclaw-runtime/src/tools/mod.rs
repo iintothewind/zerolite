@@ -141,8 +141,9 @@ pub use zeroclaw_tools::send_via::{
     AgentPeerGroupResolver, SendViaTool, TURN_ROUTING, TurnRoutingHandle,
 };
 pub use zeroclaw_tools::sessions::{
-    AcpSessionReadView, SessionDeleteTool, SessionResetTool, SessionsCurrentTool,
-    SessionsHistoryTool, SessionsListTool, SessionsSendTool,
+    AcpSessionReadView, SessionDeleteTool, SessionOwnershipScope, SessionResetTool,
+    SessionSearchTool, SessionsCurrentTool, SessionsHistoryTool, SessionsListTool,
+    SessionsSendTool,
 };
 #[cfg(feature = "tools-external")]
 pub use zeroclaw_tools::text_browser::TextBrowserTool;
@@ -2508,6 +2509,7 @@ fn all_tools_with_runtime_on_thread(
         "sessions_current",
         "sessions_list",
         "sessions_history",
+        "session_search",
         "sessions_send",
     ]
     .iter()
@@ -2516,6 +2518,22 @@ fn all_tools_with_runtime_on_thread(
         && let Ok(backend) =
             zeroclaw_infra::make_session_backend(&config.data_dir, &config.channels.session_backend)
     {
+        // History reads and keyword search see only this agent's own
+        // sessions and the sessions of the channels it is bound to.
+        let session_ownership = SessionOwnershipScope::with_channels(
+            agent_alias,
+            root_config
+                .agents
+                .get(agent_alias)
+                .map(|agent| {
+                    agent
+                        .channels
+                        .iter()
+                        .map(|channel| channel.as_str().to_string())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default(),
+        );
         if let Some(acp_sessions) = acp_sessions {
             register_tool!(
                 "sessions_current",
@@ -2533,9 +2551,19 @@ fn all_tools_with_runtime_on_thread(
             );
             register_tool!(
                 "sessions_history",
-                Arc::new(SessionsHistoryTool::with_acp_sessions_unscoped(
+                Arc::new(SessionsHistoryTool::with_acp_sessions(
                     backend.clone(),
                     security.clone(),
+                    session_ownership.clone(),
+                    acp_sessions.clone(),
+                ))
+            );
+            register_tool!(
+                "session_search",
+                Arc::new(SessionSearchTool::with_acp_sessions(
+                    backend.clone(),
+                    security.clone(),
+                    session_ownership,
                     acp_sessions.clone(),
                 ))
             );
@@ -2558,7 +2586,19 @@ fn all_tools_with_runtime_on_thread(
             );
             register_tool!(
                 "sessions_history",
-                Arc::new(SessionsHistoryTool::new(backend.clone(), security.clone(),))
+                Arc::new(SessionsHistoryTool::for_agent(
+                    backend.clone(),
+                    security.clone(),
+                    session_ownership.clone(),
+                ))
+            );
+            register_tool!(
+                "session_search",
+                Arc::new(SessionSearchTool::for_agent(
+                    backend.clone(),
+                    security.clone(),
+                    session_ownership,
+                ))
             );
             register_tool!(
                 "sessions_send",
@@ -6942,6 +6982,48 @@ permissions = ["http_client"]
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"delegate"));
+    }
+
+    #[test]
+    fn all_tools_registers_session_search_with_the_session_tools() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let cfg = test_config(&tmp);
+        let config = Config {
+            data_dir: tmp.path().join("data"),
+            ..Config::default()
+        };
+
+        let tools = all_tools(
+            Arc::new(config),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
+            mem,
+            None,
+            None,
+            &BrowserConfig::default(),
+            &zeroclaw_config::schema::HttpRequestConfig::default(),
+            &zeroclaw_config::schema::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+            false,
+            None,
+        )
+        .expect("tool registry builds")
+        .tools;
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(names.contains(&"session_search"), "{names:?}");
+        assert!(names.contains(&"sessions_history"), "{names:?}");
     }
 
     #[test]

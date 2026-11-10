@@ -300,6 +300,11 @@ pub const BUILTIN_TOOLS: &[BuiltinToolSpec] = &[
         compilation: BuiltinToolCompilation::Always,
     },
     BuiltinToolSpec {
+        name: "session_search",
+        tier: ToolTier::Host,
+        compilation: BuiltinToolCompilation::Always,
+    },
+    BuiltinToolSpec {
         name: "sessions_send",
         tier: ToolTier::Host,
         compilation: BuiltinToolCompilation::Always,
