@@ -39,6 +39,7 @@
 | 5 | Zerocode keymap: QueueWiden / QueueNarrow | `apps/zerocode/src/keymap/actions.rs` |
 | 6 | Dashboard CSP `img-src 'self' data: https: http:` | `crates/zeroclaw-gateway/src/security_headers.rs` (+ `csp_permits_same_origin_dashboard_assets`) |
 | 7 | `output_truncated` frame renders an ephemeral notice below the cut reply ("not a context trim"); never persisted | `web/src/lib/outputTruncatedNotice.ts` (+ `.test.ts`), gateway sends it after `done` |
+| 8 | Transcript hydrates by turn page (newest 20 turns), `Load earlier turns` prepends older pages and keeps the reader's place; hydrated tool rows fold into the turn group, and a card's output is fetched (`GET …/messages/{id}`) when its group is expanded. The composer row counts the turns on screen, not the session total | `web/src/lib/chatHistoryStorage.logic.ts` (`mapServerMessagesToPersisted`), `messageFlow.logic.ts` (`pendingOutputIds`), `AgentContext.tsx` (`loadEarlierTurns`, `loadToolOutputs`); `sessionLifecycle.test.ts` hydration/paging cases |
 
 ### Composer stats semantics (behavior #3)
 

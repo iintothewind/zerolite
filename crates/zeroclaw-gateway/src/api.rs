@@ -1875,17 +1875,60 @@ fn gateway_display_session_id(session_key: &str) -> &str {
     session_key.strip_prefix("gw_").unwrap_or(session_key)
 }
 
-/// GET /api/sessions/{id}/messages — load persisted gateway WebSocket chat transcript
+/// Query of `GET /api/sessions/{id}/messages`: a page of whole turns.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct SessionMessagesQuery {
+    /// Only turns numbered below this one; the newest turns when absent.
+    pub before_turn: Option<i64>,
+    /// How many turns the page holds (default 20, at most 200).
+    pub turns: Option<usize>,
+}
+
+/// Turns in a transcript page when the caller does not say.
+const SESSION_PAGE_TURNS: usize = 20;
+/// Most turns one transcript page may hold.
+const SESSION_PAGE_TURNS_MAX: usize = 200;
+
+/// A transcript row on the wire. `content` is `null` only on a `tool_result`
+/// row read from a page, whose output is fetched on its own.
+fn session_row_json(
+    row: &zeroclaw_infra::session_backend::StoredRow,
+    with_tool_output: bool,
+) -> serde_json::Value {
+    let content =
+        if row.kind == zeroclaw_infra::session_backend::RowKind::ToolResult && !with_tool_output {
+            serde_json::Value::Null
+        } else {
+            serde_json::Value::String(row.content.clone())
+        };
+    serde_json::json!({
+        "id": row.message_id,
+        "turn": row.turn,
+        "kind": row.kind.as_str(),
+        "role": row.role,
+        "content": content,
+        "content_bytes": row.content_bytes,
+        "tool_name": row.tool_name,
+        "tool_call_id": row.tool_call_id,
+        "created_at": row.created_at.map(|dt| dt.to_rfc3339()),
+    })
+}
+
+/// GET /api/sessions/{id}/messages — a page of the persisted gateway
+/// WebSocket transcript: every row of the newest `turns` turns below
+/// `before_turn`, tool output omitted.
 pub async fn handle_api_session_messages(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
+    Query(query): Query<SessionMessagesQuery>,
 ) -> impl IntoResponse {
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
 
-    let Some(ref backend) = state.session_backend else {
+    let Some(backend) = &state.session_backend else {
         return Json(serde_json::json!({
             "session_id": id,
             "messages": [],
@@ -1895,23 +1938,14 @@ pub async fn handle_api_session_messages(
     };
 
     let session_key = resolve_gateway_session_key(&id, |key| backend.session_exists(key));
-    let msgs = backend.load_with_timestamps(&session_key);
-    let messages: Vec<serde_json::Value> = msgs
-        .into_iter()
-        .map(|m| {
-            serde_json::json!({
-                "role": m.message.role,
-                "content": m.message.content,
-                // Machinery the runtime wrote into the transcript as a user
-                // message (tool rounds, trim breadcrumb). The dashboard must
-                // not render these as operator bubbles, and only the runtime
-                // can tell them apart — see `is_synthetic_user_message`.
-                "synthetic": zeroclaw_runtime::agent::history_trim::is_synthetic_user_message(
-                    &m.message,
-                ),
-                "created_at": m.created_at.map(|dt| dt.to_rfc3339()),
-            })
-        })
+    let turns = query
+        .turns
+        .unwrap_or(SESSION_PAGE_TURNS)
+        .clamp(1, SESSION_PAGE_TURNS_MAX);
+    let messages: Vec<serde_json::Value> = backend
+        .load_turn_page(&session_key, query.before_turn, turns, false)
+        .iter()
+        .map(|row| session_row_json(row, false))
         .collect();
 
     Json(serde_json::json!({
@@ -1920,6 +1954,40 @@ pub async fn handle_api_session_messages(
         "session_persistence": true,
     }))
     .into_response()
+}
+
+/// GET /api/sessions/{id}/messages/{message_id} — one transcript row with its
+/// full content (how the dashboard fetches a tool call's output).
+pub async fn handle_api_session_message(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, message_id)): Path<(String, i64)>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let Some(backend) = &state.session_backend else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "Session persistence is disabled"})),
+        )
+            .into_response();
+    };
+
+    let session_key = resolve_gateway_session_key(&id, |key| backend.session_exists(key));
+    match backend.load_message(&session_key, message_id) {
+        Some(row) => Json(serde_json::json!({
+            "session_id": id,
+            "message": session_row_json(&row, true),
+        }))
+        .into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Message not found"})),
+        )
+            .into_response(),
+    }
 }
 
 /// POST /api/sessions/{id}/messages — push a visible notification into a gateway session
@@ -6379,11 +6447,9 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn session_messages_flags_runtime_machinery_as_synthetic() {
-        // The dashboard drops these rows rather than rendering them as operator
-        // bubbles, and it cannot tell them apart on its own: both carriers are
-        // `user` rows, one of the two strings is localized, and either could
-        // change in the runtime without the web client noticing.
+    async fn session_messages_pages_turns_and_omits_tool_output() {
+        use zeroclaw_infra::session_backend::{RowKind, TranscriptRow};
+
         let tmp = tempfile::TempDir::new().unwrap();
         let config = zeroclaw_config::schema::Config {
             data_dir: tmp.path().join("workspace"),
@@ -6391,46 +6457,92 @@ pub(crate) mod tests {
             ..zeroclaw_config::schema::Config::default()
         };
         std::fs::create_dir_all(&config.data_dir).unwrap();
-        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
-        for message in [
-            zeroclaw_providers::ChatMessage::user("read the build script"),
-            zeroclaw_providers::ChatMessage::assistant("calling"),
-            zeroclaw_providers::ChatMessage::user("[Tool results]\n<tool_result>ok</tool_result>"),
-            zeroclaw_runtime::agent::history_trim::breadcrumb(),
-        ] {
-            backend.append("gw_operator-1", &message).unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+        );
+        let key = "gw_operator-1";
+        backend.set_session_agent_alias(key, "default").unwrap();
+        let row = |kind, role: &str, content: &str, tool: bool| TranscriptRow {
+            kind,
+            role: role.into(),
+            content: content.into(),
+            tool_name: tool.then(|| "shell".to_string()),
+            tool_call_id: tool.then(|| "call_1".to_string()),
+        };
+        for question in ["q1", "q2", "q3"] {
+            backend
+                .append_turn(
+                    key,
+                    &[
+                        row(RowKind::User, "user", question, false),
+                        row(RowKind::ToolCall, "assistant", "{}", true),
+                        row(RowKind::ToolResult, "tool", "out", true),
+                        row(RowKind::Assistant, "assistant", "answer", false),
+                    ],
+                )
+                .unwrap()
+                .unwrap();
         }
         let state = test_state_with_session_backend(config, backend);
+        let page = |before_turn, turns| {
+            let state = state.clone();
+            async move {
+                let response = handle_api_session_messages(
+                    State(state),
+                    HeaderMap::new(),
+                    Path("operator-1".to_string()),
+                    Query(SessionMessagesQuery { before_turn, turns }),
+                )
+                .await
+                .into_response();
+                assert_eq!(response.status(), StatusCode::OK);
+                response_json(response).await["messages"]
+                    .as_array()
+                    .expect("messages is a list")
+                    .clone()
+            }
+        };
 
-        let response = handle_api_session_messages(
-            State(state),
-            HeaderMap::new(),
-            Path("operator-1".to_string()),
-        )
-        .await
-        .into_response();
+        let newest = page(None, Some(2)).await;
+        assert_eq!(newest.len(), 8);
+        assert!(newest.iter().all(|m| m["turn"] == 2 || m["turn"] == 3));
+        let results: Vec<_> = newest
+            .iter()
+            .filter(|m| m["kind"] == "tool_result")
+            .collect();
+        assert_eq!(results.len(), 2);
+        for result in &results {
+            assert!(result["content"].is_null());
+            assert_eq!(result["content_bytes"], 3);
+            assert_eq!(result["tool_name"], "shell");
+            assert_eq!(result["tool_call_id"], "call_1");
+        }
+        assert_eq!(newest[0]["kind"], "user");
+        assert_eq!(newest[0]["content"], "q2");
+        assert!(newest[0]["created_at"].is_string());
 
+        let earlier = page(Some(2), Some(5)).await;
+        assert_eq!(earlier.len(), 4);
+        assert!(earlier.iter().all(|m| m["turn"] == 1));
+
+        let result_id = results[0]["id"].as_i64().unwrap();
+        let single = |message_id| {
+            let state = state.clone();
+            async move {
+                handle_api_session_message(
+                    State(state),
+                    HeaderMap::new(),
+                    Path(("operator-1".to_string(), message_id)),
+                )
+                .await
+                .into_response()
+            }
+        };
+        let response = single(result_id).await;
         assert_eq!(response.status(), StatusCode::OK);
         let json = response_json(response).await;
-        let messages = json["messages"].as_array().expect("messages is a list");
-        let flagged: Vec<(&str, bool)> = messages
-            .iter()
-            .map(|m| {
-                (
-                    m["role"].as_str().expect("role is a string"),
-                    m["synthetic"].as_bool().expect("synthetic is a bool"),
-                )
-            })
-            .collect();
-        assert_eq!(
-            flagged,
-            vec![
-                ("user", false),
-                ("assistant", false),
-                ("user", true),
-                ("user", true),
-            ],
-            "the tool round and the breadcrumb are machinery; the real turn is not"
-        );
+        assert_eq!(json["message"]["content"], "out");
+        assert_eq!(json["message"]["kind"], "tool_result");
+        assert_eq!(single(9_000_000).await.status(), StatusCode::NOT_FOUND);
     }
 }

@@ -11,6 +11,7 @@ import type {
   HealthSnapshot,
   Session,
   ChannelDetail,
+  SessionMessageResponse,
   SessionMessagesResponse,
   TuiEntry,
 } from "../types/api";
@@ -2139,12 +2140,29 @@ export function getSession(id: string): Promise<Session> {
   return apiFetch<Session>(`/api/sessions/${encodeURIComponent(id)}`);
 }
 
-/** Load persisted gateway WebSocket chat transcript for the dashboard Agent Chat. */
+/** Load a page of the persisted gateway WebSocket chat transcript for the
+ *  dashboard Agent Chat: the newest `turns` turns (server default 20) below
+ *  `beforeTurn`. Tool output is omitted; fetch it with `getSessionMessage`. */
 export function getSessionMessages(
   id: string,
+  options: { beforeTurn?: number; turns?: number } = {},
 ): Promise<SessionMessagesResponse> {
+  const params = new URLSearchParams();
+  if (options.beforeTurn !== undefined) params.set("before_turn", String(options.beforeTurn));
+  if (options.turns !== undefined) params.set("turns", String(options.turns));
+  const query = params.toString();
   return apiFetch<SessionMessagesResponse>(
-    `/api/sessions/${encodeURIComponent(id)}/messages`,
+    `/api/sessions/${encodeURIComponent(id)}/messages${query ? `?${query}` : ""}`,
+  );
+}
+
+/** One persisted transcript row with its full content (a tool call's output). */
+export function getSessionMessage(
+  id: string,
+  messageId: number,
+): Promise<SessionMessageResponse> {
+  return apiFetch<SessionMessageResponse>(
+    `/api/sessions/${encodeURIComponent(id)}/messages/${messageId}`,
   );
 }
 

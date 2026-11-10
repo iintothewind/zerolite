@@ -1,9 +1,9 @@
-import type { ToolCall } from './toolCall.ts';
+import { isPendingCall, type ToolCall } from './toolCall.ts';
 
 /** The fields a `tool_result` frame is matched against, on either carrier: a
  *  loose tool card or a call inside a step. Derived from {@link ToolCall} so
  *  `output`/`id` stay single-sourced. */
-export type ToolCallLike = Pick<ToolCall, 'output' | 'id'>;
+export type ToolCallLike = Pick<ToolCall, 'output' | 'id' | 'storedOutput'>;
 
 interface ToolCardLike {
   toolCall?: ToolCallLike;
@@ -19,16 +19,17 @@ interface StepLike {
  * correlated to its card by the gateway `tool_call_id` rather than by position.
  * When the frame carries no id (legacy/non-gateway paths) or no id-keyed
  * pending card exists, fall back to the first unresolved card so id-less
- * streams still resolve. Returns -1 when nothing is pending. */
+ * streams still resolve. A card whose output is stored on the server is
+ * resolved. Returns -1 when nothing is pending. */
 export function resolveToolResultIndex<T extends ToolCardLike>(
   messages: readonly T[],
   resultId: string | undefined,
 ): number {
   const firstUnresolved = () =>
-    messages.findIndex((m) => m.toolCall && m.toolCall.output === undefined);
+    messages.findIndex((m) => m.toolCall && isPendingCall(m.toolCall));
   if (!resultId) return firstUnresolved();
   const byId = messages.findIndex(
-    (m) => m.toolCall && m.toolCall.output === undefined && m.toolCall.id === resultId,
+    (m) => m.toolCall && isPendingCall(m.toolCall) && m.toolCall.id === resultId,
   );
   return byId === -1 ? firstUnresolved() : byId;
 }

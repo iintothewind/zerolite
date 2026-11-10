@@ -1,9 +1,10 @@
 //! SQLite-backed session persistence with FTS5 search.
 
 use crate::session_backend::{
-    LocatedMessage, MessageHit, MessageQuery, SessionBackend, SessionContext, SessionMetadata,
-    SessionQuery, SessionState,
+    AppendedTurn, MessageHit, MessageQuery, RowKind, SessionBackend, SessionContext,
+    SessionMetadata, SessionQuery, SessionState, StoredRow, TranscriptRow, TranscriptTail,
 };
+use crate::session_fts;
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Duration, Utc};
 use parking_lot::Mutex;
@@ -140,11 +141,15 @@ impl SqliteSessionBackend {
             .context("Failed to lock the session DB for schema setup")?;
         tx.execute_batch(
             "CREATE TABLE IF NOT EXISTS sessions (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_key TEXT NOT NULL,
-                role        TEXT NOT NULL,
-                content     TEXT NOT NULL,
-                created_at  TEXT NOT NULL
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_key  TEXT NOT NULL,
+                role         TEXT NOT NULL,
+                content      TEXT NOT NULL,
+                created_at   TEXT NOT NULL,
+                kind         TEXT NOT NULL DEFAULT 'user',
+                turn         INTEGER,
+                tool_name    TEXT,
+                tool_call_id TEXT
              );
              CREATE INDEX IF NOT EXISTS idx_sessions_key ON sessions(session_key);
              CREATE INDEX IF NOT EXISTS idx_sessions_key_id ON sessions(session_key, id);
@@ -163,26 +168,7 @@ impl SqliteSessionBackend {
                 source_hash  TEXT NOT NULL,
                 source_len   INTEGER NOT NULL,
                 imported_at  TEXT NOT NULL
-             );
-
-             CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(
-                session_key, content, content=sessions, content_rowid=id
-             );
-
-             CREATE TRIGGER IF NOT EXISTS sessions_ai AFTER INSERT ON sessions BEGIN
-                INSERT INTO sessions_fts(rowid, session_key, content)
-                VALUES (new.id, new.session_key, new.content);
-             END;
-             CREATE TRIGGER IF NOT EXISTS sessions_ad AFTER DELETE ON sessions BEGIN
-                INSERT INTO sessions_fts(sessions_fts, rowid, session_key, content)
-                VALUES ('delete', old.id, old.session_key, old.content);
-             END;
-             CREATE TRIGGER IF NOT EXISTS sessions_au AFTER UPDATE ON sessions BEGIN
-                INSERT INTO sessions_fts(sessions_fts, rowid, session_key, content)
-                VALUES ('delete', old.id, old.session_key, old.content);
-                INSERT INTO sessions_fts(rowid, session_key, content)
-                VALUES (new.id, new.session_key, new.content);
-             END;",
+             );",
         )
         .context("Failed to initialize session schema")?;
 
@@ -224,6 +210,10 @@ impl SqliteSessionBackend {
                 "trim_breadcrumb",
                 "ALTER TABLE session_metadata ADD COLUMN trim_breadcrumb INTEGER NOT NULL DEFAULT 0",
             ),
+            (
+                "context_start_id",
+                "ALTER TABLE session_metadata ADD COLUMN context_start_id INTEGER",
+            ),
         ] {
             Self::ensure_metadata_column(&tx, column, ddl)?;
         }
@@ -252,6 +242,7 @@ impl SqliteSessionBackend {
             tx.execute(ddl, [])
                 .with_context(|| format!("Failed to create session index {index}"))?;
         }
+        Self::migrate_to_v2(&tx)?;
         tx.commit().context("Failed to commit the session schema")?;
 
         Ok(Self {
@@ -286,6 +277,83 @@ impl SqliteSessionBackend {
         }
     }
 
+    /// Bring a store to schema version 2 (`PRAGMA user_version`): rows carry
+    /// `kind`/`turn`/`tool_name`/`tool_call_id`, and the full-text index is a
+    /// contentless table fed by the writers with per-character CJK text
+    /// (`session_fts`). A store from before has its kinds and turns
+    /// backfilled from roles and its index rebuilt; a fresh store gets the
+    /// index created empty.
+    fn migrate_to_v2(conn: &Connection) -> Result<()> {
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .context("Failed to read the session schema version")?;
+        if version >= 2 {
+            return Ok(());
+        }
+        // The old index and its triggers go first, so the backfill below does
+        // not rewrite the old index row by row.
+        conn.execute_batch(
+            "DROP TRIGGER IF EXISTS sessions_ai;
+             DROP TRIGGER IF EXISTS sessions_ad;
+             DROP TRIGGER IF EXISTS sessions_au;
+             DROP TABLE IF EXISTS sessions_fts;",
+        )
+        .context("Failed to drop the old session full-text index")?;
+        let has_kind: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('sessions') WHERE name = 'kind'",
+                [],
+                |row| row.get(0),
+            )
+            .context("Failed to inspect the sessions table")?;
+        if !has_kind {
+            conn.execute_batch(
+                "ALTER TABLE sessions ADD COLUMN kind TEXT NOT NULL DEFAULT 'user';
+                 ALTER TABLE sessions ADD COLUMN turn INTEGER;
+                 ALTER TABLE sessions ADD COLUMN tool_name TEXT;
+                 ALTER TABLE sessions ADD COLUMN tool_call_id TEXT;
+                 UPDATE sessions SET kind = CASE role
+                     WHEN 'assistant' THEN 'assistant' WHEN 'user' THEN 'user' ELSE 'runtime' END;
+                 UPDATE sessions SET turn = t.turn FROM (
+                     SELECT id, SUM(role = 'user') OVER (PARTITION BY session_key ORDER BY id) AS turn
+                     FROM sessions) AS t
+                 WHERE t.id = sessions.id;
+                 UPDATE sessions SET turn = 1 WHERE turn = 0;",
+            )
+            .context("Failed to backfill session row kinds and turns")?;
+        }
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE sessions_fts USING fts5(
+                content, content='', contentless_delete=1, tokenize='unicode61'
+             );
+             CREATE TRIGGER sessions_ad AFTER DELETE ON sessions BEGIN
+                DELETE FROM sessions_fts WHERE rowid = old.id;
+             END;",
+        )
+        .context("Failed to create the session full-text index")?;
+        {
+            let mut select = conn.prepare("SELECT id, kind, tool_name, content FROM sessions")?;
+            let mut insert =
+                conn.prepare("INSERT INTO sessions_fts(rowid, content) VALUES (?1, ?2)")?;
+            let mut rows = select.query([])?;
+            while let Some(row) = rows.next()? {
+                let id: i64 = row.get(0)?;
+                let kind: String = row.get(1)?;
+                let tool_name: Option<String> = row.get(2)?;
+                let content: String = row.get(3)?;
+                let kind = RowKind::parse(&kind).unwrap_or(RowKind::Runtime);
+                let source = session_fts::index_source(kind, tool_name.as_deref(), &content);
+                insert.execute(params![id, session_fts::index_text(&source)])?;
+            }
+        }
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_sessions_key_turn ON sessions(session_key, turn);
+             PRAGMA user_version = 2;",
+        )
+        .context("Failed to finish the session schema migration")?;
+        Ok(())
+    }
+
     fn ensure_metadata_column(conn: &Connection, column: &str, ddl: &str) -> Result<()> {
         let present: bool = conn
             .query_row(
@@ -308,11 +376,7 @@ impl SqliteSessionBackend {
         message: &ChatMessage,
         now: &str,
     ) -> rusqlite::Result<()> {
-        conn.execute(
-            "INSERT INTO sessions (session_key, role, content, created_at)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![session_key, message.role, message.content, now],
-        )?;
+        Self::insert_legacy_row(conn, session_key, message, now)?;
         conn.execute(
             "INSERT INTO session_metadata (session_key, created_at, last_activity, message_count)
              VALUES (?1, ?2, ?3, 1)
@@ -322,6 +386,74 @@ impl SqliteSessionBackend {
             params![session_key, now, now],
         )?;
         Ok(())
+    }
+
+    /// Insert one `append(&ChatMessage)` row: its kind follows its role, a
+    /// user row opens a new turn, anything else joins the current one, and
+    /// numbering starts at 1.
+    fn insert_legacy_row(
+        conn: &Connection,
+        session_key: &str,
+        message: &ChatMessage,
+        now: &str,
+    ) -> rusqlite::Result<i64> {
+        let kind = RowKind::from_role(&message.role);
+        let current: i64 = conn
+            .prepare_cached("SELECT COALESCE(MAX(turn), 0) FROM sessions WHERE session_key = ?1")?
+            .query_row(params![session_key], |row| row.get(0))?;
+        let turn = if kind == RowKind::User {
+            current + 1
+        } else {
+            current.max(1)
+        };
+        let row = RowInsert {
+            kind,
+            role: &message.role,
+            content: &message.content,
+            tool_name: None,
+            tool_call_id: None,
+        };
+        Self::insert_row(conn, session_key, &row, turn, now)
+    }
+
+    /// Insert a transcript row and its full-text index entry; returns its id.
+    fn insert_row(
+        conn: &Connection,
+        session_key: &str,
+        row: &RowInsert<'_>,
+        turn: i64,
+        now: &str,
+    ) -> rusqlite::Result<i64> {
+        conn.prepare_cached(
+            "INSERT INTO sessions
+                (session_key, role, content, created_at, kind, turn, tool_name, tool_call_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        )?
+        .execute(params![
+            session_key,
+            row.role,
+            row.content,
+            now,
+            row.kind.as_str(),
+            turn,
+            row.tool_name,
+            row.tool_call_id
+        ])?;
+        let id = conn.last_insert_rowid();
+        let source = session_fts::index_source(row.kind, row.tool_name, row.content);
+        conn.prepare_cached("INSERT INTO sessions_fts(rowid, content) VALUES (?1, ?2)")?
+            .execute(params![id, session_fts::index_text(&source)])?;
+        Ok(id)
+    }
+
+    fn session_row_exists(conn: &Connection, session_key: &str) -> rusqlite::Result<bool> {
+        conn.query_row(
+            "SELECT 1 FROM session_metadata WHERE session_key = ?1",
+            params![session_key],
+            |_| Ok(()),
+        )
+        .optional()
+        .map(|row| row.is_some())
     }
 
     fn source_fingerprint(path: &Path, name: &str) -> Result<(String, i64)> {
@@ -733,36 +865,26 @@ impl SqliteSessionBackend {
                 let now = Utc::now().to_rfc3339();
                 let mut inserted = 0_i64;
                 let mut has_non_whitespace_source = false;
-                {
-                    let mut insert = tx
-                        .prepare(
-                            "INSERT INTO sessions (session_key, role, content, created_at) \
-                             VALUES (?1, ?2, ?3, ?4)",
-                        )
-                        .with_context(|| format!("Failed to prepare JSONL import for {name}"))?;
-                    for line in io::BufReader::new(file).split(b'\n') {
-                        let line = line.with_context(|| {
-                            format!("Failed to read staged JSONL session {name}")
-                        })?;
-                        let line = match std::str::from_utf8(&line) {
-                            Ok(line) => line.trim(),
-                            Err(_) => {
-                                has_non_whitespace_source = true;
-                                continue;
-                            }
-                        };
-                        if line.is_empty() {
+                for line in io::BufReader::new(file).split(b'\n') {
+                    let line = line
+                        .with_context(|| format!("Failed to read staged JSONL session {name}"))?;
+                    let line = match std::str::from_utf8(&line) {
+                        Ok(line) => line.trim(),
+                        Err(_) => {
+                            has_non_whitespace_source = true;
                             continue;
                         }
-                        has_non_whitespace_source = true;
-                        let Ok(message) = serde_json::from_str::<ChatMessage>(line) else {
-                            continue;
-                        };
-                        insert
-                            .execute(params![key, message.role, message.content, now])
-                            .with_context(|| format!("Failed to import JSONL session {name}"))?;
-                        inserted += 1;
+                    };
+                    if line.is_empty() {
+                        continue;
                     }
+                    has_non_whitespace_source = true;
+                    let Ok(message) = serde_json::from_str::<ChatMessage>(line) else {
+                        continue;
+                    };
+                    Self::insert_legacy_row(&tx, &key, &message, &now)
+                        .with_context(|| format!("Failed to import JSONL session {name}"))?;
+                    inserted += 1;
                 }
 
                 if inserted == 0 && has_non_whitespace_source {
@@ -863,33 +985,125 @@ impl SqliteSessionBackend {
     }
 }
 
-/// Quote each whitespace-separated token and join with `OR`.
-///
-/// This is the query construction `search()` has always used.
-fn fts_or_query(keyword: &str) -> String {
-    keyword
-        .split_whitespace()
-        .map(|word| format!("\"{word}\""))
-        .collect::<Vec<_>>()
-        .join(" OR ")
+/// Columns `read_stored_row` reads, in its order.
+const STORED_ROW_COLUMNS: &str = "id, turn, kind, role, content, \
+     length(CAST(content AS BLOB)), tool_name, tool_call_id, created_at";
+
+/// Predicate selecting chat-kind rows (the ones `load`/`load_context` see).
+const CHAT_KINDS: &str = "kind IN ('user', 'assistant', 'runtime')";
+
+fn read_stored_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredRow> {
+    let role: String = row.get(3)?;
+    let kind = row
+        .get::<_, Option<String>>(2)?
+        .as_deref()
+        .and_then(RowKind::parse)
+        .unwrap_or_else(|| RowKind::from_role(&role));
+    let content_bytes = row.get::<_, Option<i64>>(5)?.unwrap_or(0);
+    let created_at = row
+        .get::<_, Option<String>>(8)?
+        .as_deref()
+        .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
+        .map(|dt| dt.with_timezone(&Utc));
+    Ok(StoredRow {
+        message_id: row.get(0)?,
+        turn: row.get::<_, Option<i64>>(1)?.unwrap_or(0),
+        kind,
+        role,
+        content: row.get(4)?,
+        content_bytes: usize::try_from(content_bytes).unwrap_or(0),
+        tool_name: row.get(6)?,
+        tool_call_id: row.get(7)?,
+        created_at,
+    })
 }
 
-fn read_located_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<LocatedMessage> {
-    Ok(LocatedMessage {
-        message_id: row.get(0)?,
-        message: ChatMessage {
-            role: row.get(1)?,
-            content: row.get(2)?,
-        },
-    })
+/// SQL and bindings for `search_messages`; `None` when the keyword has no
+/// terms. Hits are read in descending FTS rowid order (= `sessions.id`), so
+/// SQLite walks the index backwards and stops at the limit instead of
+/// sorting every match.
+fn search_messages_sql(query: &MessageQuery) -> Option<(String, Vec<rusqlite::types::Value>)> {
+    use rusqlite::types::Value;
+
+    let fts_query = session_fts::match_query(&query.keyword);
+    if fts_query.is_empty() {
+        return None;
+    }
+    let limit = i64::try_from(query.limit.unwrap_or(20)).unwrap_or(i64::MAX);
+    let scoped = query.owner_agent_alias.is_some() || !query.owner_channel_ids.is_empty();
+
+    let mut sql = String::from(
+        "SELECT s.id, s.session_key, s.role, s.created_at, s.kind, s.turn, s.tool_name, s.content
+         FROM sessions_fts
+         JOIN sessions s ON s.id = sessions_fts.rowid",
+    );
+    if scoped {
+        sql.push_str(" JOIN session_metadata m ON m.session_key = s.session_key");
+    }
+    sql.push_str(
+        " WHERE sessions_fts MATCH ?1
+           AND (?2 IS NULL OR s.session_key = ?2)",
+    );
+
+    let mut bind: Vec<Value> = vec![
+        Value::Text(fts_query),
+        query.session_key.clone().map_or(Value::Null, Value::Text),
+    ];
+    let mut next = 3_usize;
+    let push_channels = |sql: &mut String, bind: &mut Vec<Value>, next: &mut usize| {
+        for (i, channel) in query.owner_channel_ids.iter().enumerate() {
+            if i > 0 {
+                sql.push(',');
+            }
+            sql.push_str(&format!("?{next}"));
+            bind.push(Value::Text(channel.clone()));
+            *next += 1;
+        }
+    };
+    if scoped {
+        match query.owner_agent_alias.as_deref() {
+            Some(alias) if query.owner_channel_ids.is_empty() => {
+                sql.push_str(&format!(" AND m.agent_alias = ?{next}"));
+                bind.push(Value::Text(alias.to_string()));
+                next += 1;
+            }
+            Some(alias) => {
+                sql.push_str(&format!(
+                    " AND (m.agent_alias = ?{next} OR m.channel_id IN ("
+                ));
+                bind.push(Value::Text(alias.to_string()));
+                next += 1;
+                push_channels(&mut sql, &mut bind, &mut next);
+                sql.push_str("))");
+            }
+            None => {
+                sql.push_str(" AND m.channel_id IN (");
+                push_channels(&mut sql, &mut bind, &mut next);
+                sql.push(')');
+            }
+        }
+    }
+    sql.push_str(&format!(" ORDER BY sessions_fts.rowid DESC LIMIT ?{next}"));
+    bind.push(Value::Integer(limit));
+    Some((sql, bind))
+}
+
+/// A row to insert, borrowed from a `TranscriptRow` or a legacy `ChatMessage`.
+struct RowInsert<'a> {
+    kind: RowKind,
+    role: &'a str,
+    content: &'a str,
+    tool_name: Option<&'a str>,
+    tool_call_id: Option<&'a str>,
 }
 
 impl SessionBackend for SqliteSessionBackend {
     fn load(&self, session_key: &str) -> Vec<ChatMessage> {
         let conn = self.conn.lock();
-        let mut stmt = match conn
-            .prepare("SELECT role, content FROM sessions WHERE session_key = ?1 ORDER BY id ASC")
-        {
+        let mut stmt = match conn.prepare(&format!(
+            "SELECT role, content FROM sessions WHERE session_key = ?1 AND {CHAT_KINDS}
+             ORDER BY id ASC"
+        )) {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
@@ -898,39 +1112,6 @@ impl SessionBackend for SqliteSessionBackend {
             Ok(ChatMessage {
                 role: row.get(0)?,
                 content: row.get(1)?,
-            })
-        }) {
-            Ok(r) => r,
-            Err(_) => return Vec::new(),
-        };
-
-        rows.filter_map(|r| r.ok()).collect()
-    }
-
-    fn load_with_timestamps(
-        &self,
-        session_key: &str,
-    ) -> Vec<crate::session_backend::TimestampedMessage> {
-        use crate::session_backend::TimestampedMessage;
-        let conn = self.conn.lock();
-        let mut stmt = match conn.prepare(
-            "SELECT role, content, created_at FROM sessions WHERE session_key = ?1 ORDER BY id ASC",
-        ) {
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
-        };
-
-        let rows = match stmt.query_map(params![session_key], |row| {
-            let role: String = row.get(0)?;
-            let content: String = row.get(1)?;
-            let created_at_raw: Option<String> = row.get(2).ok();
-            let created_at = created_at_raw
-                .as_deref()
-                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                .map(|dt| dt.with_timezone(&Utc));
-            Ok(TimestampedMessage {
-                message: ChatMessage { role, content },
-                created_at,
             })
         }) {
             Ok(r) => r,
@@ -961,8 +1142,10 @@ impl SessionBackend for SqliteSessionBackend {
         )
         .map_err(std::io::Error::other)?;
         let now = Utc::now().to_rfc3339();
+        // A replaced transcript is wholly the context.
         tx.execute(
-            "UPDATE session_metadata SET message_count = 0, last_activity = ?1 WHERE session_key = ?2",
+            "UPDATE session_metadata SET message_count = 0, last_activity = ?1,
+                context_start_id = NULL WHERE session_key = ?2",
             params![now, session_key],
         )
         .map_err(std::io::Error::other)?;
@@ -988,28 +1171,30 @@ impl SessionBackend for SqliteSessionBackend {
     fn remove_last(&self, session_key: &str) -> std::io::Result<bool> {
         let conn = self.conn.lock();
 
-        let last_id: Option<i64> = conn
+        let last: Option<(i64, String)> = conn
             .query_row(
-                "SELECT id FROM sessions WHERE session_key = ?1 ORDER BY id DESC LIMIT 1",
+                "SELECT id, kind FROM sessions WHERE session_key = ?1 ORDER BY id DESC LIMIT 1",
                 params![session_key],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .ok();
 
-        let Some(id) = last_id else {
+        let Some((id, kind)) = last else {
             return Ok(false);
         };
 
         conn.execute("DELETE FROM sessions WHERE id = ?1", params![id])
             .map_err(std::io::Error::other)?;
 
-        // Update metadata count
-        conn.execute(
-            "UPDATE session_metadata SET message_count = MAX(0, message_count - 1)
-             WHERE session_key = ?1",
-            params![session_key],
-        )
-        .map_err(std::io::Error::other)?;
+        // `message_count` counts chat rows only.
+        if RowKind::parse(&kind).is_none_or(RowKind::is_chat) {
+            conn.execute(
+                "UPDATE session_metadata SET message_count = MAX(0, message_count - 1)
+                 WHERE session_key = ?1",
+                params![session_key],
+            )
+            .map_err(std::io::Error::other)?;
+        }
 
         Ok(true)
     }
@@ -1031,16 +1216,22 @@ impl SessionBackend for SqliteSessionBackend {
             return Ok(false);
         };
 
+        let kind = RowKind::from_role(&message.role);
         conn.execute(
-            "UPDATE sessions SET role = ?1, content = ?2 WHERE id = ?3",
-            params![message.role, message.content, id],
+            "UPDATE sessions SET role = ?1, content = ?2, kind = ?3 WHERE id = ?4",
+            params![message.role, message.content, kind.as_str(), id],
         )
         .map_err(std::io::Error::other)?;
-
-        // NOTE: FTS index becomes stale here (no UPDATE trigger, only
-        // INSERT/DELETE triggers). This is acceptable — update_last is
-        // used for transient streaming snapshots. The final content will
-        // be correct in the sessions table for load().
+        conn.execute("DELETE FROM sessions_fts WHERE rowid = ?1", params![id])
+            .map_err(std::io::Error::other)?;
+        conn.execute(
+            "INSERT INTO sessions_fts(rowid, content) VALUES (?1, ?2)",
+            params![
+                id,
+                session_fts::index_text(&session_fts::index_source(kind, None, &message.content))
+            ],
+        )
+        .map_err(std::io::Error::other)?;
 
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
@@ -1158,8 +1349,10 @@ impl SessionBackend for SqliteSessionBackend {
         let count = conn.changes() as usize;
 
         if count > 0 {
+            // A cleared transcript has no trimmed-away head.
             conn.execute(
-                "UPDATE session_metadata SET message_count = 0, last_activity = ?1 WHERE session_key = ?2",
+                "UPDATE session_metadata SET message_count = 0, last_activity = ?1,
+                    context_start_id = NULL WHERE session_key = ?2",
                 params![Utc::now().to_rfc3339(), session_key],
             )
             .map_err(std::io::Error::other)?;
@@ -1470,18 +1663,21 @@ impl SessionBackend for SqliteSessionBackend {
         #[allow(clippy::cast_possible_wrap)]
         let limit = query.limit.unwrap_or(50) as i64;
 
-        // FTS5 search
+        let fts_query = session_fts::match_query(keyword);
+        if fts_query.is_empty() {
+            return Vec::new();
+        }
+        // A contentless index cannot return columns: join back to the rows.
         let mut stmt = match conn.prepare(
-            "SELECT DISTINCT f.session_key
-             FROM sessions_fts f
+            "SELECT DISTINCT s.session_key
+             FROM sessions_fts
+             JOIN sessions s ON s.id = sessions_fts.rowid
              WHERE sessions_fts MATCH ?1
              LIMIT ?2",
         ) {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
-
-        let fts_query = fts_or_query(keyword);
 
         let keys: Vec<String> = match stmt.query_map(params![fts_query, limit], |row| row.get(0)) {
             Ok(r) => r.filter_map(|r| r.ok()).collect(),
@@ -1529,91 +1725,34 @@ impl SessionBackend for SqliteSessionBackend {
     }
 
     fn search_messages(&self, query: &MessageQuery) -> Vec<MessageHit> {
-        if query.keyword.trim().is_empty() {
+        let Some((sql, bind)) = search_messages_sql(query) else {
             return Vec::new();
-        }
-        let fts_query = fts_or_query(&query.keyword);
-        if fts_query.is_empty() {
-            return Vec::new();
-        }
-
+        };
         let conn = self.conn.lock();
-        let limit = i64::try_from(query.limit.unwrap_or(20)).unwrap_or(i64::MAX);
-        let session_key = query.session_key.clone();
-        let scoped = query.owner_agent_alias.is_some() || !query.owner_channel_ids.is_empty();
-
-        let mut sql = String::from(
-            "SELECT s.id, s.session_key, s.role, s.created_at,
-                    snippet(sessions_fts, 1, '<b>', '</b>', '…', 10)
-             FROM sessions_fts
-             JOIN sessions s ON s.id = sessions_fts.rowid",
-        );
-        if scoped {
-            sql.push_str(" JOIN session_metadata m ON m.session_key = s.session_key");
-        }
-        sql.push_str(
-            " WHERE sessions_fts MATCH ?1
-               AND (?2 IS NULL OR s.session_key = ?2)",
-        );
-
-        let mut bind: Vec<rusqlite::types::Value> = vec![
-            rusqlite::types::Value::Text(fts_query),
-            session_key.map_or(rusqlite::types::Value::Null, rusqlite::types::Value::Text),
-        ];
-        let mut next = 3_usize;
-        if scoped {
-            let channels = query.owner_channel_ids.as_slice();
-            match query.owner_agent_alias.as_deref() {
-                Some(alias) if channels.is_empty() => {
-                    sql.push_str(&format!(" AND m.agent_alias = ?{next}"));
-                    bind.push(rusqlite::types::Value::Text(alias.to_string()));
-                    next += 1;
-                }
-                Some(alias) => {
-                    sql.push_str(&format!(
-                        " AND (m.agent_alias = ?{next} OR m.channel_id IN ("
-                    ));
-                    bind.push(rusqlite::types::Value::Text(alias.to_string()));
-                    next += 1;
-                    for (i, channel) in channels.iter().enumerate() {
-                        if i > 0 {
-                            sql.push(',');
-                        }
-                        sql.push_str(&format!("?{next}"));
-                        bind.push(rusqlite::types::Value::Text(channel.clone()));
-                        next += 1;
-                    }
-                    sql.push_str("))");
-                }
-                None => {
-                    sql.push_str(" AND m.channel_id IN (");
-                    for (i, channel) in channels.iter().enumerate() {
-                        if i > 0 {
-                            sql.push(',');
-                        }
-                        sql.push_str(&format!("?{next}"));
-                        bind.push(rusqlite::types::Value::Text(channel.clone()));
-                        next += 1;
-                    }
-                    sql.push(')');
-                }
-            }
-        }
-        sql.push_str(&format!(" ORDER BY s.id DESC LIMIT ?{next}"));
-        bind.push(rusqlite::types::Value::Integer(limit));
-
         let mut stmt = match conn.prepare(&sql) {
             Ok(stmt) => stmt,
             Err(_) => return Vec::new(),
         };
 
         let rows = match stmt.query_map(rusqlite::params_from_iter(bind), |row| {
+            let role: String = row.get(2)?;
+            let kind = row
+                .get::<_, Option<String>>(4)?
+                .as_deref()
+                .and_then(RowKind::parse)
+                .unwrap_or_else(|| RowKind::from_role(&role));
+            let tool_name: Option<String> = row.get(6)?;
+            let content: String = row.get(7)?;
+            let source = session_fts::index_source(kind, tool_name.as_deref(), &content);
             Ok(MessageHit {
                 message_id: row.get(0)?,
                 session_key: row.get(1)?,
-                role: row.get(2)?,
+                role,
                 created_at: row.get(3)?,
-                snippet: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                kind,
+                turn: row.get::<_, Option<i64>>(5)?.unwrap_or(0),
+                snippet: session_fts::snippet(&source, &query.keyword),
+                tool_name,
             })
         }) {
             Ok(rows) => rows,
@@ -1629,26 +1768,29 @@ impl SessionBackend for SqliteSessionBackend {
         message_id: i64,
         before: usize,
         after: usize,
-    ) -> Vec<LocatedMessage> {
+        include_tools: bool,
+    ) -> Vec<StoredRow> {
         let conn = self.conn.lock();
+        let include = i64::from(include_tools);
         let before_limit = i64::try_from(before.saturating_add(1)).unwrap_or(i64::MAX);
-        let mut before_stmt = match conn.prepare(
-            "SELECT id, role, content FROM sessions
+        let mut before_stmt = match conn.prepare(&format!(
+            "SELECT {STORED_ROW_COLUMNS} FROM sessions
              WHERE session_key = ?1 AND id <= ?2
+               AND (?4 = 1 OR {CHAT_KINDS} OR id = ?2)
              ORDER BY id DESC
-             LIMIT ?3",
-        ) {
+             LIMIT ?3"
+        )) {
             Ok(stmt) => stmt,
             Err(_) => return Vec::new(),
         };
         let before_rows = match before_stmt.query_map(
-            params![session_key, message_id, before_limit],
-            read_located_message,
+            params![session_key, message_id, before_limit, include],
+            read_stored_row,
         ) {
             Ok(rows) => rows,
             Err(_) => return Vec::new(),
         };
-        let mut window: Vec<LocatedMessage> = before_rows.filter_map(|row| row.ok()).collect();
+        let mut window: Vec<StoredRow> = before_rows.filter_map(|row| row.ok()).collect();
         // DESC order: the first row is the greatest id <= anchor. It is the
         // anchor only when that id belongs to this session.
         if window.first().map(|row| row.message_id) != Some(message_id) {
@@ -1656,28 +1798,272 @@ impl SessionBackend for SqliteSessionBackend {
         }
         window.reverse();
 
-        if after == 0 {
-            return window;
+        if after > 0 {
+            let after_limit = i64::try_from(after).unwrap_or(i64::MAX);
+            if let Ok(mut after_stmt) = conn.prepare(&format!(
+                "SELECT {STORED_ROW_COLUMNS} FROM sessions
+                 WHERE session_key = ?1 AND id > ?2 AND (?4 = 1 OR {CHAT_KINDS})
+                 ORDER BY id ASC
+                 LIMIT ?3"
+            )) && let Ok(after_rows) = after_stmt.query_map(
+                params![session_key, message_id, after_limit, include],
+                read_stored_row,
+            ) {
+                window.extend(after_rows.filter_map(|row| row.ok()));
+            }
         }
-        let after_limit = i64::try_from(after).unwrap_or(i64::MAX);
-        let mut after_stmt = match conn.prepare(
-            "SELECT id, role, content FROM sessions
-             WHERE session_key = ?1 AND id > ?2
-             ORDER BY id ASC
-             LIMIT ?3",
+
+        // The turn's opening user row gives the window its question.
+        let opener = conn
+            .query_row(
+                &format!(
+                    "SELECT {STORED_ROW_COLUMNS} FROM sessions
+                     WHERE session_key = ?1 AND kind = 'user'
+                       AND turn = (SELECT turn FROM sessions WHERE id = ?2)
+                     ORDER BY id LIMIT 1"
+                ),
+                params![session_key, message_id],
+                read_stored_row,
+            )
+            .optional();
+        if let Ok(Some(opener)) = opener
+            && opener.message_id < window[0].message_id
+        {
+            window.insert(0, opener);
+        }
+        window
+    }
+
+    fn append_turn(
+        &self,
+        session_key: &str,
+        rows: &[TranscriptRow],
+    ) -> std::io::Result<Option<AppendedTurn>> {
+        if rows.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "append_turn needs at least one row",
+            ));
+        }
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(std::io::Error::other)?;
+        if !Self::session_row_exists(&tx, session_key).map_err(std::io::Error::other)? {
+            return Ok(None);
+        }
+        let turn: i64 = tx
+            .query_row(
+                "SELECT COALESCE(MAX(turn), 0) + 1 FROM sessions WHERE session_key = ?1",
+                params![session_key],
+                |row| row.get(0),
+            )
+            .map_err(std::io::Error::other)?;
+        let now = Utc::now().to_rfc3339();
+        let mut last_id = 0;
+        for row in rows {
+            let insert = RowInsert {
+                kind: row.kind,
+                role: &row.role,
+                content: &row.content,
+                tool_name: row.tool_name.as_deref(),
+                tool_call_id: row.tool_call_id.as_deref(),
+            };
+            last_id = Self::insert_row(&tx, session_key, &insert, turn, &now)
+                .map_err(std::io::Error::other)?;
+        }
+        let chat_rows = rows.iter().filter(|row| row.kind.is_chat()).count();
+        tx.execute(
+            "UPDATE session_metadata SET last_activity = ?1, message_count = message_count + ?2
+             WHERE session_key = ?3",
+            params![
+                now,
+                i64::try_from(chat_rows).unwrap_or(i64::MAX),
+                session_key
+            ],
+        )
+        .map_err(std::io::Error::other)?;
+        tx.commit().map_err(std::io::Error::other)?;
+        Ok(Some(AppendedTurn {
+            turn: Some(turn),
+            last_message_id: Some(last_id),
+        }))
+    }
+
+    fn load_context(&self, session_key: &str) -> std::io::Result<Vec<ChatMessage>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT role, content FROM sessions
+                 WHERE session_key = ?1 AND {CHAT_KINDS}
+                   AND id >= COALESCE(
+                       (SELECT context_start_id FROM session_metadata WHERE session_key = ?1), 0)
+                 ORDER BY id"
+            ))
+            .map_err(std::io::Error::other)?;
+        let rows = stmt
+            .query_map(params![session_key], |row| {
+                Ok(ChatMessage {
+                    role: row.get(0)?,
+                    content: row.get(1)?,
+                })
+            })
+            .map_err(std::io::Error::other)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(std::io::Error::other)
+    }
+
+    fn set_context_start(
+        &self,
+        session_key: &str,
+        retained_chat_rows: usize,
+        breadcrumb_present: bool,
+    ) -> std::io::Result<bool> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(std::io::Error::other)?;
+        if !Self::session_row_exists(&tx, session_key).map_err(std::io::Error::other)? {
+            return Ok(false);
+        }
+        // NULL (no start) when nothing is retained or every chat row is: the
+        // whole transcript is the context.
+        let start_id: Option<i64> = match retained_chat_rows.checked_sub(1) {
+            None => None,
+            Some(offset) => tx
+                .query_row(
+                    &format!(
+                        "SELECT id FROM sessions WHERE session_key = ?1 AND {CHAT_KINDS}
+                         ORDER BY id DESC LIMIT 1 OFFSET ?2"
+                    ),
+                    params![session_key, i64::try_from(offset).unwrap_or(i64::MAX)],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(std::io::Error::other)?,
+        };
+        tx.execute(
+            "UPDATE session_metadata SET context_start_id = ?1, trim_breadcrumb = ?2
+             WHERE session_key = ?3",
+            params![start_id, i64::from(breadcrumb_present), session_key],
+        )
+        .map_err(std::io::Error::other)?;
+        tx.commit().map_err(std::io::Error::other)?;
+        Ok(true)
+    }
+
+    fn last_message_id(&self, session_key: &str) -> Option<i64> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT MAX(id) FROM sessions WHERE session_key = ?1",
+            params![session_key],
+            |row| row.get(0),
+        )
+        .ok()
+        .flatten()
+    }
+
+    fn load_turn_page(
+        &self,
+        session_key: &str,
+        before_turn: Option<i64>,
+        turns: usize,
+        include_tool_output: bool,
+    ) -> Vec<StoredRow> {
+        if turns == 0 {
+            return Vec::new();
+        }
+        let conn = self.conn.lock();
+        let min_turn: Option<i64> = conn
+            .query_row(
+                "SELECT MIN(turn) FROM (
+                    SELECT DISTINCT turn FROM sessions
+                    WHERE session_key = ?1 AND turn IS NOT NULL AND (?2 IS NULL OR turn < ?2)
+                    ORDER BY turn DESC LIMIT ?3)",
+                params![
+                    session_key,
+                    before_turn,
+                    i64::try_from(turns).unwrap_or(i64::MAX)
+                ],
+                |row| row.get(0),
+            )
+            .ok()
+            .flatten();
+        let Some(min_turn) = min_turn else {
+            return Vec::new();
+        };
+        let mut stmt = match conn.prepare(
+            "SELECT id, turn, kind, role,
+                    CASE WHEN kind = 'tool_result' AND ?4 = 0 THEN '' ELSE content END,
+                    length(CAST(content AS BLOB)), tool_name, tool_call_id, created_at
+             FROM sessions
+             WHERE session_key = ?1 AND turn >= ?3 AND (?2 IS NULL OR turn < ?2)
+             ORDER BY id",
         ) {
             Ok(stmt) => stmt,
-            Err(_) => return window,
+            Err(_) => return Vec::new(),
         };
-        let after_rows = match after_stmt.query_map(
-            params![session_key, message_id, after_limit],
-            read_located_message,
+        let rows = match stmt.query_map(
+            params![
+                session_key,
+                before_turn,
+                min_turn,
+                i64::from(include_tool_output)
+            ],
+            read_stored_row,
         ) {
             Ok(rows) => rows,
-            Err(_) => return window,
+            Err(_) => return Vec::new(),
         };
-        window.extend(after_rows.filter_map(|row| row.ok()));
-        window
+        rows.filter_map(|row| row.ok()).collect()
+    }
+
+    fn load_message(&self, session_key: &str, message_id: i64) -> Option<StoredRow> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            &format!(
+                "SELECT {STORED_ROW_COLUMNS} FROM sessions WHERE session_key = ?1 AND id = ?2"
+            ),
+            params![session_key, message_id],
+            read_stored_row,
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    fn load_tail(&self, session_key: &str, limit: usize, include_tools: bool) -> TranscriptTail {
+        let conn = self.conn.lock();
+        let filter = if include_tools {
+            String::new()
+        } else {
+            format!(" AND {CHAT_KINDS}")
+        };
+        let total: i64 = conn
+            .query_row(
+                &format!("SELECT COUNT(*) FROM sessions WHERE session_key = ?1{filter}"),
+                params![session_key],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        let mut rows: Vec<StoredRow> = match conn.prepare(&format!(
+            "SELECT {STORED_ROW_COLUMNS} FROM sessions WHERE session_key = ?1{filter}
+             ORDER BY id DESC LIMIT ?2"
+        )) {
+            Ok(mut stmt) => stmt
+                .query_map(
+                    params![session_key, i64::try_from(limit).unwrap_or(i64::MAX)],
+                    read_stored_row,
+                )
+                .map(|rows| rows.filter_map(|row| row.ok()).collect())
+                .unwrap_or_default(),
+            Err(_) => Vec::new(),
+        };
+        rows.reverse();
+        TranscriptTail {
+            rows,
+            total: usize::try_from(total).unwrap_or(0),
+        }
     }
 
     fn set_session_agent_alias(&self, session_key: &str, agent_alias: &str) -> std::io::Result<()> {
@@ -1904,7 +2290,7 @@ mod tests {
     }
 
     #[test]
-    fn fts5_update_trigger_syncs_index() {
+    fn fts5_update_last_refreshes_index() {
         let tmp = TempDir::new().unwrap();
         let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
 
@@ -1920,15 +2306,10 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].key, "chat");
 
-        // Directly update the session content (simulates update_last behavior)
-        {
-            let conn = backend.conn.lock();
-            conn.execute(
-                "UPDATE sessions SET content = ?1 WHERE session_key = ?2",
-                params!["goodbye world", "chat"],
-            )
+        // `update_last` refreshes the row's index entry.
+        backend
+            .update_last("chat", &ChatMessage::user("goodbye world"))
             .unwrap();
-        }
 
         // Old keyword should no longer match
         let results = backend.search(&SessionQuery {
@@ -1937,7 +2318,7 @@ mod tests {
         });
         assert!(results.is_empty());
 
-        // New keyword should match after UPDATE trigger syncs FTS index
+        // New keyword matches through the refreshed index row
         let results = backend.search(&SessionQuery {
             keyword: Some("goodbye".into()),
             limit: Some(10),
@@ -3436,13 +3817,11 @@ mod tests {
 
         let alpha = hits.iter().find(|hit| hit.session_key == "alpha").unwrap();
         assert_eq!(alpha.role, "user");
-        let window = backend.load_around(&alpha.session_key, alpha.message_id, 0, 0);
+        assert_eq!(alpha.kind, RowKind::User);
+        let window = backend.load_around(&alpha.session_key, alpha.message_id, 0, 0, false);
         assert_eq!(window.len(), 1);
         assert_eq!(window[0].message_id, alpha.message_id);
-        assert_eq!(
-            window[0].message.content,
-            "please remember gammaanchor today"
-        );
+        assert_eq!(window[0].content, "please remember gammaanchor today");
     }
 
     #[test]
@@ -3496,11 +3875,8 @@ mod tests {
         let anchor = message_hits(&backend, "w2", Some("alpha"), None);
         assert_eq!(anchor.len(), 1);
 
-        let window = backend.load_around("alpha", anchor[0].message_id, 1, 1);
-        let contents: Vec<_> = window
-            .iter()
-            .map(|row| row.message.content.as_str())
-            .collect();
+        let window = backend.load_around("alpha", anchor[0].message_id, 1, 1, false);
+        let contents: Vec<_> = window.iter().map(|row| row.content.as_str()).collect();
         assert_eq!(contents, ["w1", "w2", "w3"]);
         assert_eq!(window[1].message_id, anchor[0].message_id);
     }
@@ -3517,18 +3893,12 @@ mod tests {
         let first = message_hits(&backend, "w0", Some("alpha"), None)[0].message_id;
         let last = message_hits(&backend, "w4", Some("alpha"), None)[0].message_id;
 
-        let head = backend.load_around("alpha", first, 5, 1);
-        let head_contents: Vec<_> = head
-            .iter()
-            .map(|row| row.message.content.as_str())
-            .collect();
+        let head = backend.load_around("alpha", first, 5, 1, false);
+        let head_contents: Vec<_> = head.iter().map(|row| row.content.as_str()).collect();
         assert_eq!(head_contents, ["w0", "w1"]);
 
-        let tail = backend.load_around("alpha", last, 1, 5);
-        let tail_contents: Vec<_> = tail
-            .iter()
-            .map(|row| row.message.content.as_str())
-            .collect();
+        let tail = backend.load_around("alpha", last, 1, 5, false);
+        let tail_contents: Vec<_> = tail.iter().map(|row| row.content.as_str()).collect();
         assert_eq!(tail_contents, ["w3", "w4"]);
     }
 
@@ -3596,7 +3966,410 @@ mod tests {
             .unwrap();
         let beta_id = message_hits(&backend, "beta", Some("beta"), None)[0].message_id;
 
-        assert!(backend.load_around("alpha", beta_id, 2, 2).is_empty());
-        assert!(backend.load_around("alpha", 9_000_000, 2, 2).is_empty());
+        assert!(
+            backend
+                .load_around("alpha", beta_id, 2, 2, false)
+                .is_empty()
+        );
+        assert!(
+            backend
+                .load_around("alpha", 9_000_000, 2, 2, false)
+                .is_empty()
+        );
+    }
+
+    fn row(kind: RowKind, role: &str, content: &str, tool: Option<&str>) -> TranscriptRow {
+        TranscriptRow {
+            kind,
+            role: role.into(),
+            content: content.into(),
+            tool_name: tool.map(str::to_string),
+            tool_call_id: tool.map(|_| "call_1".to_string()),
+        }
+    }
+
+    fn tool_turn(user: &str, output: &str, answer: &str) -> Vec<TranscriptRow> {
+        vec![
+            row(RowKind::User, "user", user, None),
+            row(RowKind::Step, "assistant", "checking", None),
+            row(
+                RowKind::ToolCall,
+                "assistant",
+                "{\"command\":\"ls\"}",
+                Some("shell"),
+            ),
+            row(RowKind::ToolResult, "tool", output, Some("shell")),
+            row(RowKind::Assistant, "assistant", answer, None),
+        ]
+    }
+
+    fn kinds(rows: &[StoredRow]) -> Vec<RowKind> {
+        rows.iter().map(|row| row.kind).collect()
+    }
+
+    #[test]
+    fn append_turn_numbers_the_turn_and_keeps_tool_rows_out_of_load() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        backend.set_session_agent_alias("s", "default").unwrap();
+
+        let first = backend
+            .append_turn("s", &tool_turn("q1", "out one", "a1"))
+            .unwrap()
+            .unwrap();
+        let second = backend
+            .append_turn("s", &tool_turn("q2", "out one", "a2"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.turn, Some(1));
+        assert_eq!(second.turn, Some(2));
+
+        let chat: Vec<_> = backend.load("s").into_iter().map(|m| m.content).collect();
+        assert_eq!(chat, ["q1", "a1", "q2", "a2"]);
+
+        let page = backend.load_turn_page("s", None, 1, false);
+        assert_eq!(
+            kinds(&page),
+            [
+                RowKind::User,
+                RowKind::Step,
+                RowKind::ToolCall,
+                RowKind::ToolResult,
+                RowKind::Assistant
+            ]
+        );
+        assert!(page.iter().all(|row| row.turn == 2));
+        let result = &page[3];
+        assert_eq!(result.content, "");
+        assert_eq!(result.content_bytes, 7);
+        assert_eq!(result.tool_name.as_deref(), Some("shell"));
+        assert_eq!(result.tool_call_id.as_deref(), Some("call_1"));
+        assert!(result.created_at.is_some());
+
+        let full = backend.load_turn_page("s", None, 1, true);
+        assert_eq!(full[3].content, "out one");
+        assert_eq!(
+            backend
+                .load_message("s", result.message_id)
+                .unwrap()
+                .content,
+            "out one"
+        );
+        assert!(backend.load_message("other", result.message_id).is_none());
+
+        let earlier = backend.load_turn_page("s", Some(2), 5, false);
+        assert!(earlier.iter().all(|row| row.turn == 1));
+        assert_eq!(earlier.len(), 5);
+
+        assert_eq!(backend.get_session_metadata("s").unwrap().message_count, 4);
+        assert_eq!(backend.last_message_id("s"), second.last_message_id);
+        assert_eq!(second.last_message_id, Some(page[4].message_id));
+
+        assert_eq!(
+            backend
+                .append_turn("ghost", &tool_turn("q", "o", "a"))
+                .unwrap(),
+            None
+        );
+        assert!(!backend.session_exists("ghost"));
+        assert!(backend.append_turn("s", &[]).is_err());
+    }
+
+    #[test]
+    fn legacy_append_assigns_turns_by_user_rows() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        backend
+            .append("s", &ChatMessage::assistant("hello"))
+            .unwrap();
+        backend.append("s", &ChatMessage::user("q1")).unwrap();
+        backend.append("s", &ChatMessage::assistant("a1")).unwrap();
+        backend.append("s", &ChatMessage::user("q2")).unwrap();
+
+        let turns: Vec<i64> = backend
+            .load_turn_page("s", None, 10, true)
+            .iter()
+            .map(|row| row.turn)
+            .collect();
+        assert_eq!(turns, [1, 2, 2, 3]);
+    }
+
+    #[test]
+    fn context_start_bounds_load_context() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        backend.set_session_agent_alias("s", "default").unwrap();
+        for (question, answer) in [("q1", "a1"), ("q2", "a2"), ("q3", "a3")] {
+            backend
+                .append_turn("s", &tool_turn(question, "out", answer))
+                .unwrap()
+                .unwrap();
+        }
+
+        assert!(backend.set_context_start("s", 2, true).unwrap());
+        let context: Vec<_> = backend
+            .load_context("s")
+            .unwrap()
+            .into_iter()
+            .map(|m| m.content)
+            .collect();
+        assert_eq!(context, ["q3", "a3"]);
+        assert_eq!(
+            backend.get_session_trim_breadcrumb("s").unwrap(),
+            Some(true)
+        );
+        // History is untouched.
+        assert_eq!(backend.load("s").len(), 6);
+
+        assert!(backend.set_context_start("s", 50, false).unwrap());
+        assert_eq!(backend.load_context("s").unwrap().len(), 6);
+        assert_eq!(
+            backend.get_session_trim_breadcrumb("s").unwrap(),
+            Some(false)
+        );
+
+        backend.delete_session("s").unwrap();
+        assert!(!backend.set_context_start("s", 2, true).unwrap());
+        assert!(!backend.session_exists("s"));
+    }
+
+    #[test]
+    fn fts_matches_cjk_substrings_and_tool_output() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        backend.set_session_agent_alias("s", "default").unwrap();
+        backend
+            .append_turn(
+                "s",
+                &[
+                    row(RowKind::User, "user", "我们讨论数据库查询效率的问题", None),
+                    row(
+                        RowKind::ToolCall,
+                        "assistant",
+                        "{\"path\":\"notes/needle.md\"}",
+                        Some("file_read"),
+                    ),
+                    row(RowKind::ToolResult, "tool", "exit code 127", Some("shell")),
+                ],
+            )
+            .unwrap()
+            .unwrap();
+
+        let hits = message_hits(&backend, "查询", None, None);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].kind, RowKind::User);
+        assert_eq!(hits[0].turn, 1);
+        assert!(
+            hits[0].snippet.contains("<b>查询</b>"),
+            "{}",
+            hits[0].snippet
+        );
+
+        let hits = message_hits(&backend, "127", None, None);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].kind, RowKind::ToolResult);
+        assert_eq!(hits[0].tool_name.as_deref(), Some("shell"));
+
+        // A tool call is found by its name and by anything in its arguments.
+        for keyword in ["file_read", "needle", "notes/needle.md"] {
+            let hits = message_hits(&backend, keyword, None, None);
+            assert_eq!(hits.len(), 1, "{keyword}");
+            assert_eq!(hits[0].kind, RowKind::ToolCall, "{keyword}");
+            assert_eq!(hits[0].tool_name.as_deref(), Some("file_read"));
+        }
+        let hits = message_hits(&backend, "file_read", None, None);
+        assert!(
+            hits[0].snippet.contains("<b>file_read</b> {"),
+            "{}",
+            hits[0].snippet
+        );
+
+        let sessions = backend.search(&SessionQuery {
+            keyword: Some("查询".into()),
+            limit: None,
+        });
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].key, "s");
+
+        backend.delete_session("s").unwrap();
+        assert!(message_hits(&backend, "查询", None, None).is_empty());
+        assert!(message_hits(&backend, "127", None, None).is_empty());
+        assert!(
+            backend
+                .search(&SessionQuery {
+                    keyword: Some("查询".into()),
+                    limit: None,
+                })
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn search_messages_reads_hits_in_rowid_order_without_a_sort() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        for scoped in [false, true] {
+            let (sql, bind) = search_messages_sql(&crate::session_backend::MessageQuery {
+                keyword: "anything".into(),
+                session_key: None,
+                limit: Some(20),
+                owner_agent_alias: scoped.then(|| "rowan".to_string()),
+                owner_channel_ids: Vec::new(),
+            })
+            .unwrap();
+            let conn = backend.conn.lock();
+            let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            let plan: Vec<String> = stmt
+                .query_map(rusqlite::params_from_iter(bind), |row| row.get(3))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert!(
+                plan.iter().all(|step| !step.contains("TEMP B-TREE")),
+                "{plan:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn load_around_prepends_the_turns_user_row_and_filters_tool_rows() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        backend.set_session_agent_alias("s", "default").unwrap();
+        backend
+            .append_turn(
+                "s",
+                &[
+                    row(RowKind::User, "user", "question", None),
+                    row(RowKind::ToolCall, "assistant", "{}", Some("shell")),
+                    row(RowKind::ToolResult, "tool", "output", Some("shell")),
+                    row(RowKind::Assistant, "assistant", "answer", None),
+                ],
+            )
+            .unwrap()
+            .unwrap();
+        let anchor = backend.last_message_id("s").unwrap();
+
+        let window = backend.load_around("s", anchor, 1, 0, false);
+        assert_eq!(kinds(&window), [RowKind::User, RowKind::Assistant]);
+
+        let window = backend.load_around("s", anchor, 1, 0, true);
+        assert_eq!(
+            kinds(&window),
+            [RowKind::User, RowKind::ToolResult, RowKind::Assistant]
+        );
+        assert_eq!(window[1].content, "output");
+    }
+
+    #[test]
+    fn load_tail_counts_under_the_same_filter() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        backend.set_session_agent_alias("s", "default").unwrap();
+        backend
+            .append_turn("s", &tool_turn("q", "out", "a"))
+            .unwrap()
+            .unwrap();
+
+        let chat = backend.load_tail("s", 1, false);
+        assert_eq!(chat.total, 2);
+        assert_eq!(kinds(&chat.rows), [RowKind::Assistant]);
+        let all = backend.load_tail("s", 2, true);
+        assert_eq!(all.total, 5);
+        assert_eq!(kinds(&all.rows), [RowKind::ToolResult, RowKind::Assistant]);
+    }
+
+    #[test]
+    fn opening_a_v1_store_migrates_rows_and_rebuilds_the_index() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = SqliteSessionBackend::db_path(tmp.path());
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sessions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_key TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                 );
+                 CREATE TABLE session_metadata (
+                    session_key TEXT PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    last_activity TEXT NOT NULL,
+                    message_count INTEGER NOT NULL DEFAULT 0,
+                    name TEXT
+                 );
+                 CREATE VIRTUAL TABLE sessions_fts USING fts5(
+                    session_key, content, content=sessions, content_rowid=id
+                 );
+                 CREATE TRIGGER sessions_ai AFTER INSERT ON sessions BEGIN
+                    INSERT INTO sessions_fts(rowid, session_key, content)
+                    VALUES (new.id, new.session_key, new.content);
+                 END;
+                 CREATE TRIGGER sessions_ad AFTER DELETE ON sessions BEGIN
+                    INSERT INTO sessions_fts(sessions_fts, rowid, session_key, content)
+                    VALUES ('delete', old.id, old.session_key, old.content);
+                 END;
+                 CREATE TRIGGER sessions_au AFTER UPDATE ON sessions BEGIN
+                    INSERT INTO sessions_fts(sessions_fts, rowid, session_key, content)
+                    VALUES ('delete', old.id, old.session_key, old.content);
+                    INSERT INTO sessions_fts(rowid, session_key, content)
+                    VALUES (new.id, new.session_key, new.content);
+                 END;
+                 INSERT INTO sessions (session_key, role, content, created_at) VALUES
+                    ('a', 'user', 'oldquestion one', '2026-01-01T00:00:00+00:00'),
+                    ('b', 'user', 'other session', '2026-01-01T00:00:00+00:00'),
+                    ('a', 'assistant', 'oldanswer one', '2026-01-01T00:00:00+00:00'),
+                    ('a', 'user', 'oldquestion two', '2026-01-01T00:00:00+00:00'),
+                    ('a', 'assistant', 'oldanswer two', '2026-01-01T00:00:00+00:00');
+                 INSERT INTO session_metadata VALUES
+                    ('a', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00', 4, NULL),
+                    ('b', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00', 1, NULL);",
+            )
+            .unwrap();
+        }
+
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        let version: i64 = backend
+            .conn
+            .lock()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
+
+        let rows = backend.load_turn_page("a", None, 10, true);
+        assert_eq!(
+            rows.iter().map(|row| row.turn).collect::<Vec<_>>(),
+            [1, 1, 2, 2]
+        );
+        assert_eq!(
+            kinds(&rows),
+            [
+                RowKind::User,
+                RowKind::Assistant,
+                RowKind::User,
+                RowKind::Assistant
+            ]
+        );
+        let page = backend.load_turn_page("a", None, 1, false);
+        assert_eq!(page.len(), 2);
+        assert!(page.iter().all(|row| row.turn == 2));
+
+        let hits = message_hits(&backend, "oldanswer", None, None);
+        assert_eq!(hits.len(), 2);
+        assert!(hits.iter().all(|hit| hit.session_key == "a"));
+
+        // The rebuilt index stays in step with writers.
+        backend
+            .append("a", &ChatMessage::user("newquestion"))
+            .unwrap();
+        assert_eq!(message_hits(&backend, "newquestion", None, None).len(), 1);
+        assert_eq!(backend.load_turn_page("a", None, 1, true)[0].turn, 3);
+        drop(backend);
+        // Reopening a v2 store keeps the index.
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        assert_eq!(message_hits(&backend, "oldquestion", None, None).len(), 2);
     }
 }

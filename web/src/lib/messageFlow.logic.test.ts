@@ -6,6 +6,7 @@ import {
   countGroupMessages,
   countToolCalls,
   groupMessages,
+  pendingOutputIds,
   splitLiveTurn,
   type FlowMessage,
   type RenderBlock,
@@ -311,6 +312,25 @@ test('the header counts calls and messages', () => {
 test('an empty group counts zero', () => {
   assert.equal(countToolCalls(segments()), 0);
   assert.equal(countGroupMessages(segments()), 0);
+});
+
+test('pendingOutputIds lists stored outputs that are not fetched yet', () => {
+  const seg = segments({
+    steps: [
+      {
+        thinking: '',
+        text: 'checking',
+        toolCalls: [
+          { name: 'shell', id: 'c1', storedOutput: { messageId: 11, bytes: 4 } },
+          { name: 'shell', id: 'c2', output: 'live', storedOutput: { messageId: 12, bytes: 4 } },
+          { name: 'shell', id: 'c3', storedOutput: { messageId: 13, bytes: 4, failed: true } },
+          { name: 'shell', id: 'c4' },
+        ],
+      },
+      { thinking: '', text: '', toolCalls: [{ name: 'shell', storedOutput: { messageId: 14, bytes: 1 } }] },
+    ],
+  });
+  assert.deepEqual(pendingOutputIds(seg), [11, 13, 14]);
 });
 
 test('grouping does not mutate the input list', () => {

@@ -6,7 +6,7 @@ import {
 } from 'lucide-react';
 import { Card, Badge } from '@/components/ui';
 import { t } from '@/lib/i18n';
-import type { ToolCall } from '@/lib/toolCall';
+import { isPendingCall, type ToolCall } from '@/lib/toolCall';
 
 interface ToolCallCardProps {
   toolCall: ToolCall;
@@ -47,7 +47,8 @@ function truncate(text: string, max: number): string {
 
 export default function ToolCallCard({ toolCall }: ToolCallCardProps) {
   const Icon = getIcon(toolCall.name);
-  const resolved = toolCall.output !== undefined;
+  // A call whose output is stored on the server is finished, fetched or not.
+  const resolved = !isPendingCall(toolCall);
 
   const argsStr = toolCall.args != null
     ? JSON.stringify(toolCall.args, null, 2)
@@ -87,7 +88,13 @@ export default function ToolCallCard({ toolCall }: ToolCallCardProps) {
         </details>
       )}
 
-      {resolved && (
+      {toolCall.output === undefined && toolCall.storedOutput ? (
+        <div className="mt-2 text-[11px] text-pc-text-muted">
+          {toolCall.storedOutput.failed
+            ? t('tool_call.output_unavailable')
+            : t('tool_call.output_loading')}
+        </div>
+      ) : resolved && (
         isInline ? (
           output && (
             <div className="mt-2 overflow-auto rounded-[var(--radius-sm)] bg-pc-code p-2 font-mono text-[11px] leading-relaxed text-pc-text-secondary">

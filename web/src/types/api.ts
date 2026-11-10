@@ -323,6 +323,9 @@ export interface WsMessage {
   /** LLM calls in the finished turn. Present on `done` and `aborted` only, and
    * used to reconcile a turn the page observed only partly. */
   steps?: number | null;
+  /** Stored turn number of the finished turn. Present on `done`, `aborted`
+   * and turn `error` frames when the gateway persisted the turn. */
+  turn?: number;
   // Turn boundary (broadcast, session-scoped). See the composer plan.
   model_provider?: string;
   model?: string;
@@ -339,14 +342,26 @@ export interface PendingApproval {
   receivedAt: number;
 }
 
-/** Row from GET /api/sessions/{id}/messages */
+export type SessionRowKind =
+  | "user"
+  | "assistant"
+  | "runtime"
+  | "step"
+  | "tool_call"
+  | "tool_result";
+
+/** Row from GET /api/sessions/{id}/messages (a page of whole turns). */
 export interface SessionMessageRow {
+  id: number;
+  /** Dense per-session turn number from 1; 0 on backends without turns. */
+  turn: number;
+  kind: SessionRowKind;
   role: string;
-  content: string;
-  /** The runtime wrote this row as machinery (a prompt-mode tool round, the
-   * trim breadcrumb) rather than the operator typing it. The gateway decides;
-   * the dashboard must not re-derive it from the text. */
-  synthetic?: boolean;
+  /** null only on tool_result rows in a page: the output is fetched on demand. */
+  content: string | null;
+  content_bytes: number;
+  tool_name: string | null;
+  tool_call_id: string | null;
   /** RFC 3339 timestamp recorded when the row was persisted. `null` for
    * backends that don't stamp per-row timestamps (JSONL / in-memory). */
   created_at: string | null;
@@ -356,6 +371,12 @@ export interface SessionMessagesResponse {
   session_id: string;
   messages: SessionMessageRow[];
   session_persistence: boolean;
+}
+
+/** GET /api/sessions/{id}/messages/{message_id}: one row, content included. */
+export interface SessionMessageResponse {
+  session_id: string;
+  message: SessionMessageRow;
 }
 
 export interface TuiEntry {

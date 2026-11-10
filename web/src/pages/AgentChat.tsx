@@ -1,4 +1,4 @@
-import { memo, useState, useEffect, useMemo, useRef, useCallback } from 'react';
+import { memo, useState, useEffect, useLayoutEffect, useMemo, useRef, useCallback } from 'react';
 import { Link, Navigate, useParams } from 'react-router-dom';
 import { Bot, User, AlertCircle, Copy, Check, X, Trash2, Minimize2, Maximize2, ChevronDown, Wrench, FolderOpen, MoreVertical } from 'lucide-react';
 import ReactMarkdown, { type Components } from 'react-markdown';
@@ -34,7 +34,12 @@ import { hasChatImage, stepsHaveChatImage } from '@/components/chatImage.logic';
 import ApprovalBanner from '@/components/ApprovalBanner';
 import SessionPicker from '@/components/SessionPicker';
 import InputBar from '@/components/InputBar';
-import { groupMessages, splitLiveTurn, type RenderBlock } from '@/lib/messageFlow.logic';
+import {
+  groupMessages,
+  pendingOutputIds,
+  splitLiveTurn,
+  type RenderBlock,
+} from '@/lib/messageFlow.logic';
 import type { TurnSegments } from '@/lib/turnSegments';
 
 const DRAFT_KEY_PREFIX = 'agent-chat';
@@ -115,6 +120,10 @@ export function AgentChatInner({
     contextInputSource,
     liveStats,
     liveTurn,
+    hasEarlierTurns,
+    loadingEarlier,
+    loadEarlierTurns,
+    loadToolOutputs,
   } = useAgent();
 
   // Keyed by conversation, not just alias: with the same agent open in two
@@ -219,6 +228,16 @@ export function AgentChatInner({
     });
   }, [pinToTail]);
 
+  // Toggle a finished turn's group; opening it fetches the tool output its
+  // hydrated cards only reference.
+  const openGroup = useCallback((groupId: string, segments: TurnSegments) => {
+    const opening = !expandedGroups[groupId];
+    toggleGroup(groupId);
+    if (!opening) return;
+    const ids = pendingOutputIds(segments);
+    if (ids.length > 0) void loadToolOutputs(ids);
+  }, [expandedGroups, toggleGroup, loadToolOutputs]);
+
   // The in-flight turn's group is expanded while it streams and collapses once
   // the committed message takes over (D1). That is also why no toggle carries
   // over: the only toggle the reader can make on a live group is "collapse",
@@ -319,6 +338,27 @@ export function AgentChatInner({
     if (!el || !followRef.current.following) return;
     el.scrollTop = el.scrollHeight;
   }, [messages, typing, liveTurn]);
+
+  // Prepending earlier turns grows the transcript above the reader. Record the
+  // scroll offset and height before the load, then shift by the growth once
+  // the new turns are laid out, so the turn at the top stays put.
+  const prependAnchorRef = useRef<{ top: number; height: number } | null>(null);
+  const handleLoadEarlier = useCallback(async () => {
+    const el = scrollerRef.current;
+    if (el) prependAnchorRef.current = { top: el.scrollTop, height: el.scrollHeight };
+    await loadEarlierTurns();
+    // A load that prepended nothing must not shift a later update.
+    requestAnimationFrame(() => {
+      prependAnchorRef.current = null;
+    });
+  }, [loadEarlierTurns]);
+  useLayoutEffect(() => {
+    const anchor = prependAnchorRef.current;
+    const el = scrollerRef.current;
+    if (!anchor || !el) return;
+    prependAnchorRef.current = null;
+    el.scrollTop = anchor.top + (el.scrollHeight - anchor.height);
+  }, [messages]);
 
   // Re-pin when the transcript grows on its own, without an update of its own
   // to react to. The effect above only runs when `messages`/`typing`/`liveTurn`
@@ -885,6 +925,20 @@ export function AgentChatInner({
           </div>
         )}
 
+        {hasEarlierTurns && (
+          <div className="flex justify-center">
+            <button
+              type="button"
+              onClick={() => void handleLoadEarlier()}
+              disabled={loadingEarlier}
+              aria-label={t('agentchat.load_earlier')}
+              className="rounded-[var(--radius-md)] px-3 py-1 text-xs text-pc-text-muted hover:text-pc-text hover:bg-pc-accent/10 disabled:opacity-60"
+            >
+              {loadingEarlier ? t('agentchat.loading_earlier') : t('agentchat.load_earlier')}
+            </button>
+          </div>
+        )}
+
         {blocks.map((block, idx) =>
           block.kind === 'group' ? (
             <GroupItem
@@ -893,7 +947,7 @@ export function AgentChatInner({
               idx={idx}
               compact={compact}
               collapsed={!expandedGroups[block.id]}
-              onToggle={() => toggleGroup(block.id)}
+              onToggle={() => openGroup(block.id, block.segments)}
             />
           ) : (
             <MessageItem
@@ -906,7 +960,11 @@ export function AgentChatInner({
               onDelete={handleDeleteMessage}
               segments={block.kind === 'turn' ? block.segments : undefined}
               groupCollapsed={!expandedGroups[block.message.id]}
-              onToggleGroup={() => toggleGroup(block.message.id)}
+              onToggleGroup={
+                block.kind === 'turn'
+                  ? () => openGroup(block.message.id, block.segments)
+                  : undefined
+              }
             />
           ),
         )}

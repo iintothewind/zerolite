@@ -230,3 +230,14 @@ export function countToolCalls(segments: TurnSegments): number {
 export function countGroupMessages(segments: TurnSegments): number {
   return segments.steps.filter((step) => step.thinking.trim() || step.text.trim()).length;
 }
+
+/** Server rows whose tool output the group needs before it can show it:
+ *  hydrated calls whose output is stored but not fetched. A fetch that failed
+ *  before is listed again, so expanding the group retries it. */
+export function pendingOutputIds(segments: TurnSegments): number[] {
+  return segments.steps.flatMap((step) =>
+    step.toolCalls.flatMap((call) =>
+      call.output === undefined && call.storedOutput ? [call.storedOutput.messageId] : [],
+    ),
+  );
+}

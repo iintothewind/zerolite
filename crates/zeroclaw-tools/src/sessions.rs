@@ -11,7 +11,7 @@ use zeroclaw_config::policy::ToolOperation;
 use zeroclaw_infra::acp_session_store::{
     AcpSessionAccess, AcpSessionData, AcpSessionStore, AcpSessionSummary,
 };
-use zeroclaw_infra::session_backend::{MessageQuery, SessionBackend};
+use zeroclaw_infra::session_backend::{MessageQuery, RowKind, SessionBackend, StoredRow};
 
 static SESSIONS_SEND_DESCRIPTION: OnceLock<String> = OnceLock::new();
 
@@ -417,7 +417,7 @@ impl Tool for SessionSearchTool {
     }
 
     fn description(&self) -> &str {
-        "Search message content in this agent's own conversation sessions by keyword. Returns matching message IDs with their session key and a text snippet. Read surrounding context with sessions_history using session_id and around_message_id."
+        "Search message content in this agent's own conversation sessions by keyword. Returns matching message IDs with their session key, turn, kind and a text snippet. Tool calls and tool results are searched too; read around a hit with sessions_history (include_tools: true shows the tool rows)."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -509,10 +509,13 @@ impl Tool for SessionSearchTool {
         for hit in &hits {
             let _ = writeln!(
                 output,
-                "- message_id={} session_key={} role={} created_at={} snippet={}",
+                "- message_id={} session_key={} turn={} kind={} role={} tool={} created_at={} snippet={}",
                 hit.message_id,
                 hit.session_key,
+                hit.turn,
+                hit.kind.as_str(),
                 hit.role,
+                hit.tool_name.as_deref().unwrap_or("-"),
                 hit.created_at,
                 one_line(&hit.snippet),
             );
@@ -593,21 +596,6 @@ impl SessionsHistoryTool {
             ownership_scope: Some(ownership_scope),
         }
     }
-
-    /// Construction without an ownership scope: the tool reads whatever the
-    /// ACP session view exposes, as the upstream call site expects.
-    pub fn with_acp_sessions_unscoped(
-        backend: Arc<dyn SessionBackend>,
-        security: Arc<SecurityPolicy>,
-        acp_sessions: AcpSessionReadView,
-    ) -> Self {
-        Self {
-            backend,
-            security,
-            acp_sessions: Some(acp_sessions),
-            ownership_scope: None,
-        }
-    }
 }
 
 #[async_trait]
@@ -617,7 +605,7 @@ impl Tool for SessionsHistoryTool {
     }
 
     fn description(&self) -> &str {
-        "Read the message history of one of this agent's own sessions by session ID. Returns the last N messages, or the messages around around_message_id when that anchor is set."
+        "Read the message history of one of this agent's own sessions by session ID. Returns the last N messages, or the messages around around_message_id when that anchor is set; an anchored read starts with the user message of the anchor's turn. Tool calls and tool results are left out unless include_tools is true; their bodies are shown 50 lines at a time (line_offset / line_limit)."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -643,6 +631,18 @@ impl Tool for SessionsHistoryTool {
                 "after": {
                     "type": "integer",
                     "description": "Messages after the anchor to include (default: 5)"
+                },
+                "include_tools": {
+                    "type": "boolean",
+                    "description": "Include tool calls and tool results (default: false). The anchor message is always included."
+                },
+                "line_offset": {
+                    "type": "integer",
+                    "description": "First line (0-based) to show of each tool call's arguments and each tool result's output (default: 0). A cut output ends with the line_offset that continues it; to page one output, read it alone: around_message_id=<its id>, before=0, after=0, include_tools=true."
+                },
+                "line_limit": {
+                    "type": "integer",
+                    "description": "Max lines to show of each tool call's arguments and each tool result's output (default: 50). Each line is cut at 2000 characters. Chat messages are never cut."
                 }
             },
             "required": ["session_id"]
@@ -688,6 +688,11 @@ impl Tool for SessionsHistoryTool {
             Ok(message_id) => message_id,
             Err(error) => return Ok(error),
         };
+        let include_tools = args
+            .get("include_tools")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let lines = LineWindow::from_args(&args);
 
         let mut require_existing_chat_session = false;
         if let Some(view) = &self.acp_sessions {
@@ -701,7 +706,7 @@ impl Tool for SessionsHistoryTool {
                     let Some(session) = view.load_owned(session_id)? else {
                         return Ok(session_not_found(session_id));
                     };
-                    return Ok(render_acp_history(&session, limit));
+                    return Ok(render_acp_history(&session, limit, lines));
                 }
                 AcpTargetAccess::Foreign => return Ok(session_not_found(session_id)),
                 AcpTargetAccess::Inactive => {}
@@ -732,12 +737,16 @@ impl Tool for SessionsHistoryTool {
                 session_id,
                 &resolved_session_id,
                 message_id,
+                include_tools,
+                lines,
                 &args,
             ));
         }
-        let messages = self.backend.load(&resolved_session_id);
+        let tail = self
+            .backend
+            .load_tail(&resolved_session_id, limit, include_tools);
 
-        if messages.is_empty() {
+        if tail.rows.is_empty() {
             return Ok(ToolResult {
                 success: true,
                 output: format!("No messages found for session '{session_id}'.").into(),
@@ -745,16 +754,12 @@ impl Tool for SessionsHistoryTool {
             });
         }
 
-        // Take the last `limit` messages
-        let start = messages.len().saturating_sub(limit);
-        let tail = &messages[start..];
-
         let mut output = format!(
             "{}\n",
-            session_history_header(session_id, tail.len(), messages.len())
+            session_history_header(session_id, tail.rows.len(), tail.total)
         );
-        for msg in tail {
-            let _ = writeln!(output, "[{}] {}", msg.role, msg.content);
+        for row in &tail.rows {
+            let _ = writeln!(output, "{}", render_row(row, lines));
         }
 
         Ok(ToolResult {
@@ -770,6 +775,8 @@ fn render_anchored_history(
     session_id: &str,
     resolved_session_id: &str,
     message_id: i64,
+    include_tools: bool,
+    lines: LineWindow,
     args: &serde_json::Value,
 ) -> ToolResult {
     #[allow(clippy::cast_possible_truncation)]
@@ -782,7 +789,13 @@ fn render_anchored_history(
         .get("after")
         .and_then(serde_json::Value::as_u64)
         .map_or(5, |value| value as usize);
-    let window = backend.load_around(resolved_session_id, message_id, before, after);
+    let window = backend.load_around(
+        resolved_session_id,
+        message_id,
+        before,
+        after,
+        include_tools,
+    );
     if window.is_empty() {
         return ToolResult {
             success: true,
@@ -798,12 +811,8 @@ fn render_anchored_history(
         "{}\n",
         session_history_header(session_id, window.len(), window.len())
     );
-    for located in &window {
-        let _ = writeln!(
-            output,
-            "[{}] [{}] {}",
-            located.message_id, located.message.role, located.message.content
-        );
+    for row in &window {
+        let _ = writeln!(output, "[{}] {}", row.message_id, render_row(row, lines));
     }
     ToolResult {
         success: true,
@@ -812,7 +821,94 @@ fn render_anchored_history(
     }
 }
 
-fn render_acp_history(session: &AcpSessionData, limit: usize) -> ToolResult {
+/// One transcript row as a history line, without its id. A tool row's body
+/// (call arguments, result output) is cut to `lines`; chat rows are whole.
+fn render_row(row: &StoredRow, lines: LineWindow) -> String {
+    let tool = || row.tool_name.as_deref().unwrap_or("?");
+    match row.kind {
+        RowKind::User | RowKind::Assistant | RowKind::Runtime => {
+            format!("[{}] {}", row.role, row.content)
+        }
+        RowKind::Step => format!("[assistant] {}", row.content),
+        RowKind::ToolCall => format!("[tool_call {}] {}", tool(), lines.apply(&row.content)),
+        RowKind::ToolResult => {
+            format!("[tool_result {}] {}", tool(), lines.apply(&row.content))
+        }
+    }
+}
+
+/// Lines of a tool row's body shown when the caller does not say.
+const TOOL_LINE_LIMIT: usize = 50;
+/// Most characters shown of one line of a tool row's body.
+const TOOL_LINE_MAX_CHARS: usize = 2000;
+
+/// Which lines of each tool row's body a history read shows
+/// (`line_offset` / `line_limit`). Tool output can be megabytes; a read
+/// returns one window of it and says how to get the next.
+#[derive(Debug, Clone, Copy)]
+struct LineWindow {
+    offset: usize,
+    limit: usize,
+}
+
+impl LineWindow {
+    #[allow(clippy::cast_possible_truncation)]
+    fn from_args(args: &serde_json::Value) -> Self {
+        let read = |name: &str| args.get(name).and_then(serde_json::Value::as_u64);
+        Self {
+            offset: read("line_offset").map_or(0, |value| value as usize),
+            limit: read("line_limit").map_or(TOOL_LINE_LIMIT, |value| (value as usize).max(1)),
+        }
+    }
+
+    /// `body` cut to this window, each line to `TOOL_LINE_MAX_CHARS`. A
+    /// cut is always marked: a shortened line with how many characters were
+    /// dropped, a partial window with its line range, the total, and the
+    /// `line_offset` that continues it.
+    fn apply(self, body: &str) -> String {
+        let total = body.lines().count();
+        if total == 0 {
+            return String::new();
+        }
+        if self.offset >= total {
+            return format!(
+                "… [no lines at line_offset={}; {total} lines in total]",
+                self.offset
+            );
+        }
+        let end = self.offset.saturating_add(self.limit).min(total);
+        let mut out = String::new();
+        for (index, line) in body
+            .lines()
+            .skip(self.offset)
+            .take(end - self.offset)
+            .enumerate()
+        {
+            if index > 0 {
+                out.push('\n');
+            }
+            match line.char_indices().nth(TOOL_LINE_MAX_CHARS) {
+                Some((cut, _)) => {
+                    out.push_str(&line[..cut]);
+                    let _ = write!(out, "… [+{} chars]", line[cut..].chars().count());
+                }
+                None => out.push_str(line),
+            }
+        }
+        if end < total {
+            let _ = write!(
+                out,
+                "\n… [lines {}-{end} of {total}; line_offset={end} to continue]",
+                self.offset + 1
+            );
+        } else if self.offset > 0 {
+            let _ = write!(out, "\n… [lines {}-{end} of {total}]", self.offset + 1);
+        }
+        out
+    }
+}
+
+fn render_acp_history(session: &AcpSessionData, limit: usize, lines: LineWindow) -> ToolResult {
     let start = session.messages.len().saturating_sub(limit);
     let tail = &session.messages[start..];
     let mut output = format!(
@@ -838,7 +934,12 @@ fn render_acp_history(session: &AcpSessionData, limit: usize) -> ToolResult {
             }
             zeroclaw_api::model_provider::ConversationMessage::ToolResults(results) => {
                 for result in results {
-                    let _ = writeln!(output, "[tool {}] {}", result.tool_name, result.content);
+                    let _ = writeln!(
+                        output,
+                        "[tool {}] {}",
+                        result.tool_name,
+                        lines.apply(&result.content)
+                    );
                 }
             }
         }
@@ -1465,21 +1566,24 @@ mod tests {
             message_id: i64,
             _before: usize,
             _after: usize,
-        ) -> Vec<zeroclaw_infra::session_backend::LocatedMessage> {
+            _include_tools: bool,
+        ) -> Vec<StoredRow> {
+            let row = |message_id, kind, role: &str, content: &str| StoredRow {
+                message_id,
+                turn: 1,
+                kind,
+                role: role.into(),
+                content: content.into(),
+                content_bytes: content.len(),
+                tool_name: None,
+                tool_call_id: None,
+                created_at: None,
+            };
             if session_key == "telegram__alice" && message_id == self.window_for {
                 vec![
-                    zeroclaw_infra::session_backend::LocatedMessage {
-                        message_id: 6,
-                        message: ChatMessage::user("before anchor"),
-                    },
-                    zeroclaw_infra::session_backend::LocatedMessage {
-                        message_id: 7,
-                        message: ChatMessage::assistant("the anchor"),
-                    },
-                    zeroclaw_infra::session_backend::LocatedMessage {
-                        message_id: 8,
-                        message: ChatMessage::user("after anchor"),
-                    },
+                    row(6, RowKind::User, "user", "before anchor"),
+                    row(7, RowKind::Assistant, "assistant", "the anchor"),
+                    row(8, RowKind::User, "user", "after anchor"),
                 ]
             } else {
                 Vec::new()
@@ -1802,6 +1906,168 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn anchored_read_includes_the_turns_user_row_and_tool_rows_on_request() {
+        use zeroclaw_infra::session_backend::TranscriptRow;
+
+        let tmp = TempDir::new().unwrap();
+        let backend = zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path())
+            .expect("sqlite backend");
+        let key = "telegram__alice";
+        backend.set_session_agent_alias(key, "rowan").unwrap();
+        let row = |kind, role: &str, content: &str, tool: bool| TranscriptRow {
+            kind,
+            role: role.into(),
+            content: content.into(),
+            tool_name: tool.then(|| "shell".to_string()),
+            tool_call_id: tool.then(|| "call_1".to_string()),
+        };
+        let appended = backend
+            .append_turn(
+                key,
+                &[
+                    row(RowKind::User, "user", "list the files", false),
+                    row(RowKind::ToolCall, "assistant", "{\"command\":\"ls\"}", true),
+                    row(RowKind::ToolResult, "tool", "a.txt b.txt", true),
+                    row(RowKind::Assistant, "assistant", "two files", false),
+                ],
+            )
+            .unwrap()
+            .unwrap();
+        let anchor = appended.last_message_id.unwrap();
+        let tool = SessionsHistoryTool::new(Arc::new(backend), test_security());
+
+        let plain = tool
+            .execute(
+                json!({"session_id": key, "around_message_id": anchor, "before": 1, "after": 0}),
+            )
+            .await
+            .unwrap();
+        assert!(plain.success);
+        let lines: Vec<&str> = plain.output.lines().skip(1).collect();
+        assert_eq!(lines.len(), 2, "{}", plain.output);
+        assert!(
+            lines[0].ends_with("[user] list the files"),
+            "{}",
+            plain.output
+        );
+        assert_eq!(lines[1], format!("[{anchor}] [assistant] two files"));
+
+        let with_tools = tool
+            .execute(json!({
+                "session_id": key,
+                "around_message_id": anchor,
+                "before": 1,
+                "after": 0,
+                "include_tools": true
+            }))
+            .await
+            .unwrap();
+        assert!(
+            with_tools
+                .output
+                .contains("] [tool_result shell] a.txt b.txt"),
+            "{}",
+            with_tools.output
+        );
+        assert!(with_tools.output.contains("[user] list the files"));
+    }
+
+    #[tokio::test]
+    async fn tool_output_is_read_fifty_lines_at_a_time() {
+        use zeroclaw_infra::session_backend::TranscriptRow;
+
+        let tmp = TempDir::new().unwrap();
+        let backend = zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path())
+            .expect("sqlite backend");
+        let key = "telegram__alice";
+        backend.set_session_agent_alias(key, "rowan").unwrap();
+        let long_line = "x".repeat(2500);
+        let listing: String = (1..=120).map(|n| format!("line {n}\n")).collect();
+        let chat: String = (1..=60).map(|n| format!("chat {n}\n")).collect();
+        let row = |kind, role: &str, content: &str, tool: bool| TranscriptRow {
+            kind,
+            role: role.into(),
+            content: content.into(),
+            tool_name: tool.then(|| "shell".to_string()),
+            tool_call_id: tool.then(|| "call_1".to_string()),
+        };
+        backend
+            .append_turn(
+                key,
+                &[
+                    row(RowKind::User, "user", &chat, false),
+                    row(RowKind::ToolCall, "assistant", "{\"command\":\"ls\"}", true),
+                    row(RowKind::ToolResult, "tool", &listing, true),
+                    row(RowKind::ToolResult, "tool", &long_line, true),
+                    row(RowKind::Assistant, "assistant", "done", false),
+                ],
+            )
+            .unwrap()
+            .unwrap();
+        let rows = backend.load_turn_page(key, None, 1, true);
+        let listing_id = rows[2].message_id;
+        let tool = SessionsHistoryTool::new(Arc::new(backend), test_security());
+
+        let first = tool
+            .execute(json!({"session_id": key, "include_tools": true}))
+            .await
+            .unwrap()
+            .output
+            .to_string();
+        // The chat row is whole; the tool output stops after 50 lines and says
+        // how to continue.
+        assert!(first.contains("[user] chat 1\n"), "{first}");
+        assert!(first.contains("chat 60\n"));
+        assert!(!first.contains("line 51\n"));
+        assert!(first.contains("[tool_result shell] line 1\nline 2\n"));
+        assert!(first.contains("line 50\n… [lines 1-50 of 120; line_offset=50 to continue]\n"));
+        // A single long line is cut at 2000 characters, with the remainder counted.
+        assert!(first.contains(&format!("{}… [+500 chars]\n", "x".repeat(2000))));
+        assert!(!first.contains(&"x".repeat(2001)));
+        // Short bodies carry no marker.
+        assert!(first.contains("[tool_call shell] {\"command\":\"ls\"}\n"));
+
+        let page = |line_offset: u64, line_limit: Option<u64>| {
+            let mut args = json!({
+                "session_id": key,
+                "around_message_id": listing_id,
+                "before": 0,
+                "after": 0,
+                "include_tools": true,
+                "line_offset": line_offset
+            });
+            if let Some(limit) = line_limit {
+                args["line_limit"] = json!(limit);
+            }
+            let tool = &tool;
+            async move { tool.execute(args).await.unwrap().output.to_string() }
+        };
+
+        let second = page(50, None).await;
+        assert!(second.contains(&format!("[{listing_id}] [tool_result shell] line 51\n")));
+        assert!(
+            second.contains("line 100\n… [lines 51-100 of 120; line_offset=100 to continue]\n")
+        );
+        assert!(!second.contains("line 50\n"));
+
+        let last = page(100, None).await;
+        assert!(
+            last.contains("line 120\n… [lines 101-120 of 120]\n"),
+            "{last}"
+        );
+
+        let narrow = page(118, Some(1)).await;
+        assert!(
+            narrow.contains(
+                "shell] line 119\n… [lines 119-119 of 120; line_offset=119 to continue]\n"
+            )
+        );
+
+        let past = page(500, None).await;
+        assert!(past.contains("… [no lines at line_offset=500; 120 lines in total]"));
+    }
+
     // ── SessionSearchTool tests ─────────────────────────────────────
 
     #[test]
@@ -1833,7 +2099,10 @@ mod tests {
                 hits: vec![zeroclaw_infra::session_backend::MessageHit {
                     message_id: 7,
                     session_key: "telegram__alice".into(),
-                    role: "user".into(),
+                    role: "tool".into(),
+                    kind: RowKind::ToolResult,
+                    turn: 3,
+                    tool_name: Some("shell".into()),
                     snippet: "hello <b>world</b>\nnext".into(),
                     created_at: "2026-01-01T00:00:00Z".into(),
                 }],
@@ -1847,7 +2116,7 @@ mod tests {
             .unwrap();
         assert!(result.success);
         assert!(result.output.contains(
-            "message_id=7 session_key=telegram__alice role=user created_at=2026-01-01T00:00:00Z snippet=hello <b>world</b> next"
+            "message_id=7 session_key=telegram__alice turn=3 kind=tool_result role=tool tool=shell created_at=2026-01-01T00:00:00Z snippet=hello <b>world</b> next"
         ));
     }
 

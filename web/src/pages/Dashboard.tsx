@@ -1440,7 +1440,7 @@ function SessionsTab() {
                         className="text-[10px] uppercase tracking-wider font-mono"
                         style={{ color: "var(--pc-text-faint)" }}
                       >
-                        {m.role}
+                        {m.tool_name ? `${m.kind} ${m.tool_name}` : m.role}
                       </p>
                       {m.created_at && (
                         <p
@@ -1456,7 +1456,7 @@ function SessionsTab() {
                       className="text-sm whitespace-pre-wrap break-words"
                       style={{ color: "var(--pc-text-primary)" }}
                     >
-                      {m.content}
+                      {m.content ?? `(${m.content_bytes} bytes)`}
                     </p>
                   </div>
                 ))

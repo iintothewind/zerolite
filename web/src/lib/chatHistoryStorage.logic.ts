@@ -14,21 +14,13 @@ export interface PersistedChatBubble {
    *  bubble skips stripServerTimestamp for it. (Server rows omit this.) */
   local?: boolean;
   toolCall?: ToolCall;
+  /** Server turn number the bubble belongs to, when known. */
+  turn?: number;
   timestamp: string;
 }
 
-function toolResultOutput(value: unknown): string {
-  if (typeof value === 'string') return value;
-  if (value == null) return '';
-  try {
-    return JSON.stringify(value);
-  } catch {
-    return String(value);
-  }
-}
-
-function parseToolArgs(raw: unknown): unknown {
-  if (typeof raw !== 'string') return raw ?? {};
+function parseToolArgs(raw: string | null): unknown {
+  if (raw == null) return {};
   try {
     return JSON.parse(raw);
   } catch {
@@ -36,192 +28,84 @@ function parseToolArgs(raw: unknown): unknown {
   }
 }
 
-/**
- * Native dispatcher persists AssistantToolCalls as a JSON assistant row:
- * `{"content": "...", "tool_calls": [{id,name,arguments}], ...}`.
- * Returns null when the row is ordinary assistant text.
- */
-export function parseNativeAssistantToolPayload(content: string): {
-  text: string;
-  thinking?: string;
-  toolCalls: Array<{ id?: string; name: string; args?: unknown }>;
-} | null {
-  const trimmed = content.trim();
-  if (!trimmed.startsWith('{')) return null;
-  try {
-    const parsed = JSON.parse(trimmed) as Record<string, unknown>;
-    if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.tool_calls)) {
-      return null;
-    }
-    const text =
-      typeof parsed.content === 'string'
-        ? parsed.content
-        : parsed.content == null
-          ? ''
-          : toolResultOutput(parsed.content);
-    const thinking =
-      typeof parsed.reasoning_content === 'string' ? parsed.reasoning_content : undefined;
-    const toolCalls: Array<{ id?: string; name: string; args?: unknown }> = [];
-    for (const raw of parsed.tool_calls) {
-      if (!raw || typeof raw !== 'object') continue;
-      const tc = raw as Record<string, unknown>;
-      const name = typeof tc.name === 'string' ? tc.name : '';
-      if (!name) continue;
-      toolCalls.push({
-        id: typeof tc.id === 'string' ? tc.id : undefined,
-        name,
-        args: parseToolArgs(tc.arguments),
-      });
-    }
-    return { text, thinking, toolCalls };
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Native ToolResults rows are `role: tool` with
- * `{"tool_call_id":"...","content":"..."}`. Non-JSON carriers fall back to
- * the raw string as output.
- */
-export function parseNativeToolResultEnvelope(content: string): {
-  toolCallId?: string;
-  output: string;
-} {
-  const trimmed = content.trim();
-  if (!trimmed.startsWith('{')) {
-    return { output: content };
-  }
-  try {
-    const parsed = JSON.parse(trimmed) as Record<string, unknown>;
-    if (!parsed || typeof parsed !== 'object') {
-      return { output: content };
-    }
-    const hasEnvelope = 'tool_call_id' in parsed || 'content' in parsed;
-    if (!hasEnvelope) {
-      return { output: content };
-    }
-    return {
-      toolCallId: typeof parsed.tool_call_id === 'string' ? parsed.tool_call_id : undefined,
-      output: toolResultOutput(parsed.content),
-    };
-  } catch {
-    return { output: content };
-  }
-}
-
-/** Map server-persisted rows into UI messages (timestamps are synthetic for ordering). */
+/** Map a page of server rows into bubbles: chat rows become bubbles, tool
+ *  rows become cards (a result fills its call's card), runtime rows (tool
+ *  rounds, the trim breadcrumb) are machinery and are skipped. */
 export function mapServerMessagesToPersisted(rows: SessionMessageRow[]): PersistedChatBubble[] {
-  // Placeholder timestamp — rewritten after expand so base uses bubble count,
-  // not row count (one assistant row can become text + N tool cards).
-  const PLACEHOLDER_TS = new Date(0).toISOString();
   const out: PersistedChatBubble[] = [];
+  // Rows without a stored timestamp (JSONL) get synthetic, ordered ones below.
+  const stamped: boolean[] = [];
 
-  const push = (bubble: Omit<PersistedChatBubble, 'timestamp'>) => {
-    out.push({ ...bubble, timestamp: PLACEHOLDER_TS });
+  const push = (bubble: Omit<PersistedChatBubble, 'timestamp'>, row: SessionMessageRow) => {
+    out.push({ ...bubble, turn: row.turn, timestamp: row.created_at ?? '' });
+    stamped.push(row.created_at != null);
   };
 
   for (const row of rows) {
-    if (row.role === 'system') continue;
-
-    if (row.role === 'user') {
-      // Machinery the runtime wrote, not operator input: rendering it as a user
-      // bubble would show every prompt-mode tool round, and the trim
-      // breadcrumb, as if the operator had typed it.
-      if (row.synthetic) continue;
-      push({
-        id: generateUUID(),
-        role: 'user',
-        content: row.content,
-      });
-      continue;
-    }
-
-    if (row.role === 'assistant') {
-      const native = parseNativeAssistantToolPayload(row.content);
-      if (native) {
-        if (native.text.trim()) {
-          push({
-            id: generateUUID(),
-            role: 'agent',
-            content: native.text,
-            thinking: native.thinking,
-            markdown: true,
-          });
-        } else if (native.thinking) {
-          push({
-            id: generateUUID(),
-            role: 'agent',
-            content: '',
-            thinking: native.thinking,
-            markdown: true,
-          });
-        }
-        for (const tc of native.toolCalls) {
-          push({
+    switch (row.kind) {
+      case 'runtime':
+        continue;
+      case 'user':
+        push({ id: generateUUID(), role: 'user', content: row.content ?? '' }, row);
+        continue;
+      case 'assistant':
+      case 'step':
+        push(
+          { id: generateUUID(), role: 'agent', content: row.content ?? '', markdown: true },
+          row,
+        );
+        continue;
+      case 'tool_call':
+        push(
+          {
             id: generateUUID(),
             role: 'agent',
             content: '',
             toolCall: {
-              name: tc.name,
-              args: tc.args,
-              id: tc.id,
+              name: row.tool_name ?? 'tool',
+              args: parseToolArgs(row.content),
+              id: row.tool_call_id ?? undefined,
             },
-          });
+          },
+          row,
+        );
+        continue;
+      case 'tool_result': {
+        const storedOutput = { messageId: row.id, bytes: row.content_bytes };
+        const output = row.content ?? undefined;
+        const matchIdx = resolveToolResultIndex(out, row.tool_call_id ?? undefined);
+        if (matchIdx >= 0) {
+          const existing = out[matchIdx]!;
+          out[matchIdx] = {
+            ...existing,
+            toolCall: { ...existing.toolCall!, storedOutput, output },
+          };
+        } else {
+          // Orphan result (its call row is missing) — still a card.
+          push(
+            {
+              id: generateUUID(),
+              role: 'agent',
+              content: '',
+              toolCall: {
+                name: row.tool_name ?? 'tool',
+                id: row.tool_call_id ?? undefined,
+                storedOutput,
+                output,
+              },
+            },
+            row,
+          );
         }
         continue;
       }
-      push({
-        id: generateUUID(),
-        role: 'agent',
-        content: row.content,
-        markdown: true,
-      });
-      continue;
     }
-
-    if (row.role === 'tool') {
-      const { toolCallId, output } = parseNativeToolResultEnvelope(row.content);
-      const matchIdx = resolveToolResultIndex(out, toolCallId);
-      if (matchIdx >= 0) {
-        const existing = out[matchIdx]!;
-        out[matchIdx] = {
-          ...existing,
-          toolCall: {
-            ...existing.toolCall!,
-            output,
-          },
-        };
-      } else {
-        // Orphan tool result (assistant tool_calls row missing) — still a card,
-        // never a raw JSON bubble.
-        push({
-          id: generateUUID(),
-          role: 'agent',
-          content: '',
-          toolCall: {
-            name: 'tool',
-            id: toolCallId,
-            output,
-          },
-        });
-      }
-      continue;
-    }
-
-    // Unknown roles: keep as plain agent text (legacy / future carriers).
-    push({
-      id: generateUUID(),
-      role: 'agent',
-      content: row.content,
-      markdown: false,
-    });
   }
 
-  // Stamp after expand: last bubble ≈ now - 1s, never in the future.
+  // Unstamped bubbles: last ≈ now - 1s, one second apart, never in the future.
   const base = Date.now() - Math.max(out.length, 1) * 1000;
   for (let i = 0; i < out.length; i++) {
-    out[i]!.timestamp = new Date(base + i * 1000).toISOString();
+    if (!stamped[i]) out[i]!.timestamp = new Date(base + i * 1000).toISOString();
   }
   return out;
 }
@@ -236,6 +120,7 @@ export function persistedToUiMessages(
   markdown?: boolean;
   local?: boolean;
   toolCall?: ToolCall;
+  turn?: number;
   timestamp: Date;
 }> {
   return rows.map((m) => ({
@@ -246,6 +131,7 @@ export function persistedToUiMessages(
     markdown: m.markdown,
     local: m.local,
     toolCall: m.toolCall,
+    turn: m.turn,
     timestamp: new Date(m.timestamp),
   }));
 }
@@ -260,6 +146,7 @@ export function uiMessagesToPersisted(
     local?: boolean;
     ephemeral?: boolean;
     toolCall?: ToolCall;
+    turn?: number;
     timestamp: Date;
   }>,
 ): PersistedChatBubble[] {
@@ -281,6 +168,7 @@ export function uiMessagesToPersisted(
       // server-timestamp stripping.
       local: m.local,
       toolCall: m.toolCall,
+      turn: m.turn,
       timestamp: m.timestamp.toISOString(),
     }));
 }

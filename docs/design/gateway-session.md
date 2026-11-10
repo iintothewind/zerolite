@@ -37,6 +37,7 @@
 | 7 | Daemon-hosted gateway carries the configured master code | See `master-pair-code.md` R3 |
 | 8 | WebSocket upgrades complete over the native TLS listener, as over plain HTTP | `fix(gateway): serve WebSocket upgrades over the native TLS listener` |
 | 9 | A stopped gateway admits no new request (503 `gateway_restarting`, GOAWAY on h2) and drains its connections within 300 ms; the next instance binds at once | upstream #11901 |
+| 10 | A gateway turn appends its rows (chat and tool rows, one dense `turn` number) at turn end and moves the session's context start; a trim never deletes history, and a reconnect restores only the chat rows from the context start on. `GET /api/sessions/{id}/messages` pages whole turns (`?before_turn=&turns=`, default 20) with tool output omitted; `GET /api/sessions/{id}/messages/{message_id}` returns one row in full | `ws.rs` tests `transcript_rows_classifies_every_history_variant`, `retained_chat_rows_excludes_the_breadcrumb_and_tool_rows`, `finished_turns_are_appended_with_their_turn_number`, `persist_turn_skips_deleted_session`; `api.rs` `session_messages_pages_turns_and_omits_tool_output`; `session_sqlite.rs` `context_start_bounds_load_context`. See `session-search.md` R3 |
 
 ## Merge notes
 

@@ -7,8 +7,6 @@ export type {
 
 export {
   mapServerMessagesToPersisted,
-  parseNativeAssistantToolPayload,
-  parseNativeToolResultEnvelope,
   persistedToUiMessages,
   uiMessagesToPersisted,
 } from './chatHistoryStorage.logic';

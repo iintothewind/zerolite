@@ -2,6 +2,7 @@ import { createContext, useContext, useEffect, useRef, useState, useCallback, us
 import type {
   ApprovalDecision,
   PendingApproval,
+  SessionMessageResponse,
   SessionMessagesResponse,
   WsMessage,
 } from '@/types/api';
@@ -18,6 +19,7 @@ import {
   listProps,
   getStatus,
   getSessionMessages,
+  getSessionMessage,
   abortSession,
   deleteSession,
   renameSession,
@@ -27,7 +29,7 @@ import { resolveAvailableModels } from './modelPicker.logic';
 import { contextMeterStep, type ContextInputSource } from './contextMeter.logic';
 import { buildHistoryTrimmedNotice } from './historyTrimNotices.logic';
 import { formatOutputTruncatedNotice } from '@/lib/outputTruncatedNotice';
-import type { ToolCall } from '@/lib/toolCall';
+import { isPendingCall, type ToolCall } from '@/lib/toolCall';
 import { emptyLiveTurn, type LiveTurn, type TurnSegments } from '@/lib/turnSegments';
 import { resolveToolResultIndex } from '@/lib/toolCardMatch';
 import {
@@ -87,6 +89,9 @@ export interface ChatMessage {
    * bubbles instead.
    */
   segments?: TurnSegments;
+  /** Server turn number: set on hydrated rows and stamped from the terminal
+   *  frame of a turn finished on this page. Undefined while unknown. */
+  turn?: number;
 }
 
 /**
@@ -188,6 +193,14 @@ export interface AgentContextValue {
    *  Empty between turns, and the transcript renders it as the live trajectory
    *  group plus the answer still arriving. */
   liveTurn: LiveTurn;
+  /** The server holds turns older than the oldest one on screen. */
+  hasEarlierTurns: boolean;
+  /** A `loadEarlierTurns` request is in flight. */
+  loadingEarlier: boolean;
+  /** Prepend the next page of older turns. */
+  loadEarlierTurns: () => Promise<void>;
+  /** Fetch the stored output of the given transcript rows into their cards. */
+  loadToolOutputs: (messageIds: readonly number[]) => Promise<void>;
 }
 
 const AgentContext = createContext<AgentContextValue | null>(null);
@@ -254,7 +267,11 @@ export interface SessionSocket {
 
 export interface AgentSessionRuntime {
   createSocket(options: { agentAlias: string; sessionId: string }): SessionSocket;
-  getMessages(sessionId: string): Promise<SessionMessagesResponse>;
+  getMessages(
+    sessionId: string,
+    options?: { beforeTurn?: number; turns?: number },
+  ): Promise<SessionMessagesResponse>;
+  getMessage(sessionId: string, messageId: number): Promise<SessionMessageResponse>;
   delete(sessionId: string): Promise<{ deleted: boolean }>;
   rename(sessionId: string, name: string): Promise<{ session_id: string; name: string }>;
   mintId(): string;
@@ -263,10 +280,14 @@ export interface AgentSessionRuntime {
 const defaultSessionRuntime: AgentSessionRuntime = {
   createSocket: (options) => new WebSocketClient(options),
   getMessages: getSessionMessages,
+  getMessage: getSessionMessage,
   delete: deleteSession,
   rename: renameSession,
   mintId: newSessionId,
 };
+
+/** Turns one transcript page holds, on hydration and per "load earlier". */
+const HISTORY_PAGE_TURNS = 20;
 
 /** Shared empty array so panes with no siblings keep a stable context value. */
 const NO_RESERVED_SESSIONS: readonly string[] = [];
@@ -299,6 +320,10 @@ export function AgentProvider({
   // conversation, so switching away from one strands it — the picker uses this
   // to withhold the controls that would do that.
   const [sessionPersistence, setSessionPersistence] = useState<boolean | null>(null);
+  // Transcript paging: the hydration loads the newest turns, `loadEarlierTurns`
+  // prepends older ones. `earlierExhausted` is set when a page came back empty.
+  const [earlierExhausted, setEarlierExhausted] = useState(false);
+  const [loadingEarlier, setLoadingEarlier] = useState(false);
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [typing, setTyping] = useState(false);
@@ -398,10 +423,12 @@ export function AgentProvider({
     // the transition actions.
     setSessionPersistence(null);
     setHydratedSessionId(null);
+    setEarlierExhausted(false);
+    setLoadingEarlier(false);
 
     (async () => {
       try {
-        const res = await sessionRuntime.getMessages(sid);
+        const res = await sessionRuntime.getMessages(sid, { turns: HISTORY_PAGE_TURNS });
         if (cancelled) return;
         setSessionPersistence(res.session_persistence);
         if (res.session_persistence) {
@@ -472,25 +499,50 @@ export function AgentProvider({
 
   /** Append a finished turn in its committed layout: the answer bubble carrying
    *  the trajectory, or a trajectory carrier (empty content + segments) when the
-   *  turn produced no answer. Nothing when there is neither. */
+   *  turn produced no answer. `turn` is the stored turn number from the
+   *  terminal frame: it lands on the committed bubble and on the turn's user
+   *  bubble, even when nothing else is committed. */
   const commitTurn = useCallback(
-    (bubble: { content: string; thinking?: string } | null, segments: TurnSegments) => {
+    (
+      bubble: { content: string; thinking?: string } | null,
+      segments: TurnSegments,
+      turn?: number,
+    ) => {
       // An empty group would show a header reading `0 次工具调用`.
       const trajectory = segments.steps.length > 0 ? segments : undefined;
-      if (!bubble && !trajectory) return;
+      const committed = bubble || trajectory;
+      if (!committed && turn === undefined) return;
       localMessageMutationVersionRef.current += 1;
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: generateUUID(),
-          role: 'agent',
-          content: bubble?.content ?? '',
-          thinking: bubble?.thinking,
-          markdown: true,
-          timestamp: new Date(),
-          segments: trajectory,
-        },
-      ]);
+      setMessages((prev) => {
+        let next = prev;
+        if (turn !== undefined) {
+          let userIndex = -1;
+          for (let i = prev.length - 1; i >= 0; i--) {
+            if (prev[i]!.role === 'user' && prev[i]!.turn === undefined) {
+              userIndex = i;
+              break;
+            }
+          }
+          if (userIndex !== -1) {
+            next = [...prev];
+            next[userIndex] = { ...prev[userIndex]!, turn };
+          }
+        }
+        if (!committed) return next;
+        return [
+          ...next,
+          {
+            id: generateUUID(),
+            role: 'agent',
+            content: bubble?.content ?? '',
+            thinking: bubble?.thinking,
+            markdown: true,
+            timestamp: new Date(),
+            segments: trajectory,
+            turn,
+          },
+        ];
+      });
     },
     [],
   );
@@ -576,14 +628,15 @@ export function AgentProvider({
         if (outcome?.kind === 'commit') {
           // `commit` includes reasoning-only turns: empty content but present
           // thinking, so the turn renders instead of vanishing silently.
-          commitTurn({ content: outcome.content, thinking: outcome.thinking }, segments);
+          commitTurn({ content: outcome.content, thinking: outcome.thinking }, segments, msg.turn);
         } else if (outcome?.kind === 'skip') {
           // Ended on a tool call: no answer, the trajectory is the record.
-          commitTurn(null, segments);
+          commitTurn(null, segments, msg.turn);
         } else if (outcome?.kind === 'diagnostic') {
           // Clean completion with nothing at all — surface a one-off notice so
           // the turn does not disappear. Mirrors zerocode's zc-turn-no-output
-          // fallback (#8779).
+          // fallback (#8779). The turn number still lands on its user bubble.
+          commitTurn(null, segments, msg.turn);
           localMessageMutationVersionRef.current += 1;
           setMessages((prev) => [
             ...prev,
@@ -643,7 +696,7 @@ export function AgentProvider({
           if (streamedText(state)) {
             const isDuplicate = prev.some(
               (m) => m.toolCall
-                && m.toolCall.output === undefined
+                && isPendingCall(m.toolCall)
                 && m.toolCall.name === toolName
                 && JSON.stringify(m.toolCall.args ?? {}) === argsKey,
             );
@@ -848,6 +901,7 @@ export function AgentProvider({
               }
             : { content: marker },
           segments,
+          msg.turn,
         );
         setTyping(false);
         setPendingApproval(null);
@@ -857,7 +911,7 @@ export function AgentProvider({
       case 'error': {
         // The trajectory lands before the error bubble it explains.
         const { segments } = foldTurnStream({ type: 'error' });
-        commitTurn(null, segments);
+        commitTurn(null, segments, msg.turn);
         const friendlyMessage = friendlyAgentError(msg.message);
         localMessageMutationVersionRef.current += 1;
         setMessages((prev) => [
@@ -1441,6 +1495,77 @@ export function AgentProvider({
     });
   }, []);
 
+  // Turns are dense from 1, so a loaded transcript whose oldest turn is past 1
+  // has earlier turns on the server; no server flag is needed.
+  const oldestLoadedTurn = useMemo(() => {
+    let oldest: number | null = null;
+    for (const m of messages) {
+      if (m.turn !== undefined && m.turn > 0 && (oldest === null || m.turn < oldest)) {
+        oldest = m.turn;
+      }
+    }
+    return oldest;
+  }, [messages]);
+  const hasEarlierTurns =
+    sessionPersistence === true
+    && oldestLoadedTurn !== null
+    && oldestLoadedTurn > 1
+    && !earlierExhausted;
+
+  const loadEarlierTurns = useCallback(async () => {
+    if (!hasEarlierTurns || loadingEarlier || oldestLoadedTurn === null) return;
+    const sid = activeSessionIdRef.current;
+    setLoadingEarlier(true);
+    try {
+      const res = await sessionRuntimeRef.current.getMessages(sid, {
+        beforeTurn: oldestLoadedTurn,
+        turns: HISTORY_PAGE_TURNS,
+      });
+      if (activeSessionIdRef.current !== sid) return;
+      if (res.messages.length === 0) {
+        setEarlierExhausted(true);
+        return;
+      }
+      const earlier = persistedToUiMessages(mapServerMessagesToPersisted(res.messages));
+      localMessageMutationVersionRef.current += 1;
+      setMessages((prev) => [...earlier, ...prev]);
+    } catch {
+      if (activeSessionIdRef.current === sid) setError(t('agent.history_load_failed'));
+    } finally {
+      setLoadingEarlier(false);
+    }
+  }, [hasEarlierTurns, loadingEarlier, oldestLoadedTurn]);
+
+  const loadToolOutputs = useCallback(async (messageIds: readonly number[]) => {
+    if (messageIds.length === 0) return;
+    const sid = activeSessionIdRef.current;
+    const results = await Promise.allSettled(
+      messageIds.map((id) => sessionRuntimeRef.current.getMessage(sid, id)),
+    );
+    if (activeSessionIdRef.current !== sid) return;
+    const outcome = new Map<number, string | null>();
+    results.forEach((result, index) => {
+      outcome.set(
+        messageIds[index]!,
+        result.status === 'fulfilled' ? (result.value.message.content ?? '') : null,
+      );
+    });
+    localMessageMutationVersionRef.current += 1;
+    setMessages((prev) =>
+      prev.map((m) => {
+        const stored = m.toolCall?.storedOutput;
+        if (!stored || !outcome.has(stored.messageId)) return m;
+        const output = outcome.get(stored.messageId);
+        return {
+          ...m,
+          toolCall: output == null
+            ? { ...m.toolCall!, storedOutput: { ...stored, failed: true } }
+            : { ...m.toolCall!, output, storedOutput: { ...stored, failed: undefined } },
+        };
+      }),
+    );
+  }, []);
+
   const value: AgentContextValue = {
     messages,
     sendMessage,
@@ -1484,6 +1609,10 @@ export function AgentProvider({
     contextInputSource,
     liveStats,
     liveTurn,
+    hasEarlierTurns,
+    loadingEarlier,
+    loadEarlierTurns,
+    loadToolOutputs,
   };
 
   return <AgentContext.Provider value={value}>{children}</AgentContext.Provider>;
