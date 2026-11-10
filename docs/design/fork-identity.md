@@ -52,3 +52,5 @@
   `78c0be38b` (release body from `docs/releases/<version>.md`).
 - v0.8.7 cherry-picks (`merge-v0.8.7`): `docs/book` and `ci.yml` sides
   dropped.
+- 2026-11-09 cherry-picks (`merge-2026-11-09`, release 1.3.1): `docs/book`
+  sides dropped (#11855, #11523, #12114).

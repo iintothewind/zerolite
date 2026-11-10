@@ -97,6 +97,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.tool_result_prefix': '[工具结果]',
     'agent.error_prefix': '[错误]',
     'agent.turn_no_output': '本轮已完成，但没有输出。',
+    'agent.turn_interrupted': '[已被用户中断]',
     'agent.context_usage': '上下文',
     'agent.unknown_error': '未知错误',
     'agent.send_error': '发送消息失败，请重试。',
@@ -476,6 +477,8 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.context.ring_detail_percent': '占用 {percent}%',
 
     'agent.context.ring_detail_source': '来源：{source}',
+    'agent.output_truncated': '✂️ 回复被 provider 在输出上限处截断（finish_reason: {reason}，{model} 输出 {tokens} tokens）。这不是上下文裁剪。',
+    'agent.output_truncated_no_tokens': '✂️ 回复被 provider 在输出上限处截断（finish_reason: {reason}，{model}）。这不是上下文裁剪。',
     // Message-flow group header. `{calls}` counts tool calls, `{messages}` the
     // steps carrying thinking or text — see lib/messageFlow.logic.ts.
     'agentchat.tool_group_summary': '{calls} 次工具调用 · {messages} 条消息',
@@ -1573,7 +1576,10 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.safeguard_fallback_client': '🛡️ Safety safeguards flagged this request — switched to {served} (requested {requested}).',
     'agent.safeguard_fallback_server': '🛡️ Safety safeguards flagged this request — Anthropic served the response with {served} (requested {requested}).',
     'agent.safeguard_fallback_client_server': '🛡️ Safety safeguards flagged this request — switched through a fallback chain to {served} (requested {requested}).',
+    'agent.output_truncated': '✂️ The provider cut this reply at its output limit (finish_reason: {reason}; {tokens} output tokens from {model}). This is not a context trim.',
+    'agent.output_truncated_no_tokens': '✂️ The provider cut this reply at its output limit (finish_reason: {reason}; {model}). This is not a context trim.',
     'agent.turn_no_output': 'Turn completed with no output.',
+    'agent.turn_interrupted': '[interrupted by user]',
     'agent.unknown_error': 'Unknown error',
     'agent.send_error': 'Failed to send message. Please try again.',
     'agent.copy_message': 'Copy message',

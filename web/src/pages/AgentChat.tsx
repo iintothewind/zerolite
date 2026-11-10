@@ -885,20 +885,31 @@ export function AgentChatInner({
           </div>
         )}
 
-        {blocks.map((block, idx) => (
-          <MessageItem
-            key={block.message.id}
-            msg={block.message}
-            idx={idx}
-            compact={compact}
-            isCopied={copiedId === block.message.id}
-            onCopy={handleCopy}
-            onDelete={handleDeleteMessage}
-            segments={block.kind === 'turn' ? block.segments : undefined}
-            groupCollapsed={!expandedGroups[block.message.id]}
-            onToggleGroup={() => toggleGroup(block.message.id)}
-          />
-        ))}
+        {blocks.map((block, idx) =>
+          block.kind === 'group' ? (
+            <GroupItem
+              key={block.id}
+              segments={block.segments}
+              idx={idx}
+              compact={compact}
+              collapsed={!expandedGroups[block.id]}
+              onToggle={() => toggleGroup(block.id)}
+            />
+          ) : (
+            <MessageItem
+              key={block.message.id}
+              msg={block.message}
+              idx={idx}
+              compact={compact}
+              isCopied={copiedId === block.message.id}
+              onCopy={handleCopy}
+              onDelete={handleDeleteMessage}
+              segments={block.kind === 'turn' ? block.segments : undefined}
+              groupCollapsed={!expandedGroups[block.message.id]}
+              onToggleGroup={() => toggleGroup(block.message.id)}
+            />
+          ),
+        )}
 
         {typing && (
           <div className={`flex items-start animate-fade-in ${compact ? 'gap-1.5' : 'gap-2'}`}>
@@ -1020,9 +1031,9 @@ interface MessageItemProps {
   isCopied: boolean;
   onCopy: (id: string, content: string) => void;
   onDelete: (id: string) => void;
-  /** The turn's step trajectory, when this message is a live turn's final
-   *  answer. Rendered as a collapsed group above the answer; the answer itself
-   *  never goes inside the group. Absent for every hydrated turn. */
+  /** The turn's step trajectory, when this message is a turn's answer — live
+   *  or derived from a reloaded turn's bubbles. Rendered as a collapsed group
+   *  above the answer; the answer itself never goes inside the group. */
   segments?: TurnSegments;
   /** Whether that group is collapsed. */
   groupCollapsed?: boolean;
@@ -1164,6 +1175,39 @@ const MessageItem = memo(function MessageItem({
             </button>
           </div>
         </div>
+      </div>
+    </div>
+  );
+});
+
+/** A turn with tool calls and no answer bubble (stopped, failed, or ended on
+ *  a tool call): the group alone, in the agent row layout. No copy/delete
+ *  strip — there is no bubble to act on. */
+const GroupItem = memo(function GroupItem({
+  segments,
+  idx,
+  compact,
+  collapsed,
+  onToggle,
+}: {
+  segments: TurnSegments;
+  idx: number;
+  compact: boolean;
+  collapsed: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <div
+      className={`flex items-start pb-3 animate-slide-in-left ${compact ? 'gap-1.5' : 'gap-2'}`}
+      style={{ animationDelay: `${Math.min(idx * 30, 200)}ms` }}
+    >
+      {!compact && (
+        <div className="flex-shrink-0 w-6 h-6 rounded-[var(--radius-md)] flex items-center justify-center border bg-pc-elevated border-pc-border">
+          <Bot className="h-3.5 w-3.5 text-pc-accent" />
+        </div>
+      )}
+      <div className={`relative min-w-0 ${stepsHaveChatImage(segments.steps) ? 'msg-has-image max-w-[85%]' : 'max-w-[85%]'}`}>
+        <ToolCallGroup segments={segments} compact={compact} collapsed={collapsed} onToggle={onToggle} />
       </div>
     </div>
   );

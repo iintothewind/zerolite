@@ -170,6 +170,9 @@ pub(crate) async fn consume_provider_streaming_response_with_policy(
             policy,
         );
     let mut outcome = StreamedChatOutcome::default();
+    // The provider's stop reason when it cut this response at an output
+    // limit (`StreamEvent::OutputTruncated`); `None` for a finished reply.
+    let mut output_truncated: Option<String> = None;
     let mut delta_sender = on_delta;
     let mut think_stripper = StreamThinkTagStripper::default();
     let mut marker_stripper = StreamTerminalMarkerStripper::new();
@@ -326,6 +329,9 @@ pub(crate) async fn consume_provider_streaming_response_with_policy(
             StreamEvent::Final => break,
             StreamEvent::Usage(usage) => {
                 outcome.usage = Some(usage);
+            }
+            StreamEvent::OutputTruncated { reason } => {
+                output_truncated = Some(reason);
             }
             StreamEvent::ToolCall(tool_call) => {
                 replay_blocking_activity = true;
@@ -563,6 +569,43 @@ pub(crate) async fn consume_provider_streaming_response_with_policy(
             usage: outcome.usage,
         }
         .into());
+    }
+
+    if let Some(reason) = output_truncated {
+        let output_tokens = outcome.usage.as_ref().and_then(|usage| usage.output_tokens);
+        // A reply the provider cut at its output limit. Text the user already
+        // saw stays as is; this record and frame only make the cut visible,
+        // so a truncated answer is never mistaken for a finished one (or for
+        // a context trim, which removes input, not output).
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_category(::zeroclaw_log::EventCategory::Provider)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "model": model,
+                    "finish_reason": &reason,
+                    "output_tokens": output_tokens,
+                    "tool_calls": outcome.tool_calls.len(),
+                })),
+            "turn_output_truncated"
+        );
+        // A response carrying native tool calls is not the reply the user
+        // reads; its cut shows up as the tool call's own failure.
+        if outcome.tool_calls.is_empty()
+            && let Some(tx) = event_tx
+        {
+            let _ = send_turn_event(
+                tx,
+                TurnEvent::OutputTruncated {
+                    reason,
+                    model: model.to_string(),
+                    output_tokens,
+                },
+                cancellation_token,
+            )
+            .await;
+        }
     }
 
     Ok(outcome)
@@ -1971,5 +2014,159 @@ mod tests {
             }
         }
         assert_eq!(chunks, vec!["Visible partial text before refusal"]);
+    }
+
+    /// Replays a fixed event script, as a provider stream would.
+    struct ScriptedStreamProvider {
+        events: Vec<StreamEvent>,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ScriptedStreamProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "ScriptedStreamProvider"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for ScriptedStreamProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                native_tool_calling: true,
+                vision: false,
+                prompt_caching: false,
+                extended_thinking: false,
+            }
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            anyhow::bail!("unused")
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn supports_streaming_tool_events(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            let events: Vec<StreamResult<StreamEvent>> =
+                self.events.iter().cloned().map(Ok).collect();
+            Box::pin(futures_util::stream::iter(events))
+        }
+    }
+
+    async fn consume_scripted(events: Vec<StreamEvent>) -> (StreamedChatOutcome, Vec<TurnEvent>) {
+        let provider = ScriptedStreamProvider { events };
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(64);
+        let outcome = consume_provider_streaming_response(
+            &provider,
+            &[ChatMessage::user("go")],
+            None,
+            "mock-model",
+            Some(0.0),
+            None,
+            None,
+            Some(&event_tx),
+            false,
+            StreamReasoningMode::Status,
+            None,
+        )
+        .await
+        .expect("a truncated stream still completes");
+        drop(event_tx);
+        let mut turn_events = Vec::new();
+        while let Some(event) = event_rx.recv().await {
+            turn_events.push(event);
+        }
+        (outcome, turn_events)
+    }
+
+    #[tokio::test]
+    async fn a_reply_cut_at_the_output_limit_is_announced_and_kept() {
+        let (outcome, events) = consume_scripted(vec![
+            StreamEvent::TextDelta(StreamChunk::delta("引用块样式可加左")),
+            StreamEvent::Usage(TokenUsage {
+                output_tokens: Some(890),
+                ..TokenUsage::default()
+            }),
+            StreamEvent::OutputTruncated {
+                reason: "length".into(),
+            },
+            StreamEvent::Final,
+        ])
+        .await;
+        assert_eq!(outcome.response_text, "引用块样式可加左");
+        let truncated: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                TurnEvent::OutputTruncated {
+                    reason,
+                    model,
+                    output_tokens,
+                } => Some((reason.as_str(), model.as_str(), *output_tokens)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(truncated, vec![("length", "mock-model", Some(890))]);
+    }
+
+    #[tokio::test]
+    async fn a_cut_tool_call_response_and_a_finished_reply_are_not_announced() {
+        let (_, cut_tool_call) = consume_scripted(vec![
+            StreamEvent::ToolCall(ToolCall {
+                id: "call_1".into(),
+                name: "shell".into(),
+                arguments: "{\"command\":\"ls".into(),
+                extra_content: None,
+            }),
+            StreamEvent::OutputTruncated {
+                reason: "length".into(),
+            },
+            StreamEvent::Final,
+        ])
+        .await;
+        let (_, finished) = consume_scripted(vec![
+            StreamEvent::TextDelta(StreamChunk::delta("done")),
+            StreamEvent::Final,
+        ])
+        .await;
+        for events in [cut_tool_call, finished] {
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, TurnEvent::OutputTruncated { .. })),
+                "{events:?}"
+            );
+        }
     }
 }

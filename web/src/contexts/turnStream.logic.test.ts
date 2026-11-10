@@ -405,3 +405,37 @@ test('the trajectory is live-only: a fresh turn starts empty', () => {
     thinking: undefined,
   });
 });
+
+test('aborted keeps the partial answer and the trajectory', () => {
+  const { state, completions, last } = runSegments([
+    { type: 'chunk', content: 'checking' },
+    { type: 'usage' },
+    { type: 'tool_call', hasName: true, call: { name: 'shell', id: 't1' } },
+    { type: 'chunk', content: 'partial' },
+    { type: 'aborted' },
+  ]);
+  assert.deepEqual(completions, [{ kind: 'commit', content: 'partial', thinking: undefined }]);
+  assert.equal(last.steps.length, 1);
+  assert.equal(last.steps[0]!.text, 'checking');
+  assert.equal(last.steps[0]!.toolCalls.length, 1);
+  assert.deepEqual(state, initialTurnStreamState());
+});
+
+test('aborted with nothing streamed commits nothing', () => {
+  const { completions, last } = runSegments([{ type: 'aborted' }]);
+  assert.equal(completions.length, 0);
+  assert.equal(last.steps.length, 0);
+});
+
+test('error keeps the whole trajectory in the group and commits nothing', () => {
+  const { completions, last } = runSegments([
+    { type: 'chunk', content: 'checking' },
+    { type: 'usage' },
+    { type: 'tool_call', hasName: true, call: { name: 'shell', id: 't1' } },
+    { type: 'chunk', content: 'partial' },
+    { type: 'error' },
+  ]);
+  assert.equal(completions.length, 0);
+  assert.equal(last.steps.length, 2);
+  assert.equal(last.steps[1]!.text, 'partial');
+});

@@ -3912,6 +3912,7 @@ data: {\"type\":\"message_stop\"}\n\n"
                 Ok(StreamEvent::PreExecutedToolCall { .. }) => "pre_tool_call",
                 Ok(StreamEvent::PreExecutedToolResult { .. }) => "pre_tool_result",
                 Ok(StreamEvent::Usage(_)) => "usage",
+                Ok(StreamEvent::OutputTruncated { .. }) => "output_truncated",
                 Ok(StreamEvent::Final) => "final",
                 Err(_) => "err",
             })

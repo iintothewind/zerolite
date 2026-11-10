@@ -43,9 +43,20 @@ their presence as approval. If a future merge touches them, report it.
 - Turn parity over RPC (`#11132`).
 - The plugin cluster (incl. WASM plugin host in release artifacts).
   The v0.8.7 plugin fixes (#11807, #11808, #11809, #11811, #11812,
-  #11814, #11851) were cherry-picked on the owner's approval as
-  bug/security fixes; this does not make the plugin cluster a decided
-  feature.
+  #11814, #11851) and the later plugin-host fixes (#11848, #12040,
+  #11855) were cherry-picked on the owner's approval as bug/security
+  fixes; this does not make the plugin cluster a decided feature.
+- Memory cluster. #11144 (credential-URL scan) and #11143 (qdrant time
+  bounds) were cherry-picked on the owner's approval (2026-11-09) as
+  hygiene fixes; this does not make memory a decided feature. #11225
+  (`c54e002a8`, owner kept through delegation) was attempted 2026-11-09
+  and dropped: its production blocks in `agent/agent.rs`
+  (`rebind_memory_tools`) and `tools/delegate.rs` (delegate memory
+  resolution) conflict with fork lines. #11266 (`72167d12e`, private
+  subagent/pipeline memory) was attempted and dropped: every conflict
+  block in `agent/agent.rs` (6) and `agent/turn/mod.rs` (12) holds fork
+  lines. Both need a memory design decision first; #11266 also needs the
+  composition API (#11174, not taken).
 - The OIDC cluster.
 
 ## Merge constraints (not features, but binding)
@@ -79,3 +90,26 @@ their presence as approval. If a future merge touches them, report it.
   `expect`-driven PTY test
   `daemon_feedback_follows_foreground_job_control_transitions`. An
   upstream hunk that re-adds them is dropped.
+- Upstream `028c50f5e` (#11925, container CA stores) is not taken
+  (2026-11-09): it changes Dockerfiles, container CI and their TLS
+  fixtures, and the fork publishes no container image; the Rust side is
+  already on `webpki-roots` 1.0.10.
+- Upstream #11901 (gateway connection drain), #11900 (concurrent store
+  open), #11523 (settle turns a killed process left running) and #11822
+  (POSIX command splitting) were taken 2026-11-09 as hardening; no fork
+  semantics touched (`gateway-session.md` rows 8–9). #11507 (`fcc23a22f`)
+  was reported and left out: it rewrites the turn loop in
+  `agent/turn/mod.rs` where the fork's in-turn context guard lives, and
+  writes the fork's trim breadcrumb.
+- Small security/Windows fixes taken 2026-11-09 as class (a): #12114
+  (X-Forwarded-For rate-limit key), #12177 (MCP tool listing sorted by
+  name, under `prompt-cache-prefix.md` R2), #11559 (bubblewrap rejection
+  reasons), #11656 (configured `firejail_args` applied), #11400 (model
+  cache replaced while a reader holds it, Windows), #11398 (JSONL session
+  rewrite replaced while a reader holds it, Windows).
+- The test `acp_session_store::tests::legacy_null_trim_breadcrumb_is_inferred_once_then_recorded`
+  is removed (owner decision 2026-11-09): it required inferring a legacy
+  `NULL` trim-breadcrumb from message text, which contradicts the fork's
+  design (provenance is a canonical column, never inferred from text; see
+  `trim_breadcrumb_provenance_is_a_canonical_column_not_inferred_from_text`).
+  A merge or test restore that re-adds it is dropped.

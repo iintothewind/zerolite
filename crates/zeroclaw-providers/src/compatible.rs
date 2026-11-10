@@ -2073,6 +2073,27 @@ fn normalize_token_count_float(value: f64) -> Option<u64> {
 #[derive(Debug, Deserialize)]
 struct Choice {
     message: ResponseMessage,
+    #[serde(default)]
+    finish_reason: Option<String>,
+}
+
+/// Chat-completions `finish_reason` for a reply the provider cut at an
+/// output limit. Any other reason (`stop`, `tool_calls`, a provider's own
+/// token) is a finished reply.
+const OUTPUT_LIMIT_FINISH_REASON: &str = "length";
+
+fn record_output_truncated(model_provider: Option<&str>, reason: &str, streaming: bool) {
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+            .with_attrs(::serde_json::json!({
+                "model_provider": model_provider,
+                "finish_reason": reason,
+                "streaming": streaming,
+            })),
+        "provider_output_truncated"
+    );
 }
 
 /// OpenAI Chat Completions may return assistant `message.content` as a string,
@@ -2836,6 +2857,9 @@ fn sse_bytes_to_events_for_contract(
         let mut used_tool_call_ids = std::collections::HashSet::new();
         let mut emitted_tool_calls = false;
         let mut saw_completion = false;
+        // The last finish_reason the provider sent; `length` means the reply
+        // was cut at an output limit rather than finished.
+        let mut finish_reason: Option<String> = None;
 
         match response.error_for_status_ref() {
             Ok(_) => {}
@@ -2909,8 +2933,9 @@ fn sse_bytes_to_events_for_contract(
 
                         let mut should_emit_tool_calls = false;
                         for choice in &chunk.choices {
-                            if choice.finish_reason.is_some() {
+                            if let Some(reason) = choice.finish_reason.as_deref() {
                                 saw_completion = true;
+                                finish_reason = Some(reason.to_string());
                             }
                             if let Some(reasoning_delta) = extract_sse_reasoning_delta(choice) {
                                 let reasoning_chunk = StreamChunk::reasoning(reasoning_delta);
@@ -2999,6 +3024,21 @@ fn sse_bytes_to_events_for_contract(
                 }
             }
         }
+        if let Some(reason) = finish_reason
+            .as_deref()
+            .filter(|reason| *reason == OUTPUT_LIMIT_FINISH_REASON)
+        {
+            record_output_truncated(None, reason, true);
+            if tx
+                .send(Ok(StreamEvent::OutputTruncated {
+                    reason: reason.to_string(),
+                }))
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
 
         crate::stream_guard::finish_sse_stream(&tx, saw_completion, "[DONE] or finish_reason")
             .await;
@@ -3012,7 +3052,7 @@ fn sse_bytes_to_events_for_contract(
 }
 
 fn parse_chat_response_body(name: &str, body: &str) -> anyhow::Result<ApiChatResponse> {
-    serde_json::from_str::<ApiChatResponseEnvelope>(body)
+    let parsed = serde_json::from_str::<ApiChatResponseEnvelope>(body)
         .map(ApiChatResponseEnvelope::into_response)
         .map_err(|_| {
             let sanitized = super::sanitize_api_error(body);
@@ -3029,7 +3069,16 @@ fn parse_chat_response_body(name: &str, body: &str) -> anyhow::Result<ApiChatRes
             anyhow::Error::msg(format!(
                 "{name} API returned an unexpected chat-completions payload; body={sanitized}"
             ))
-        })
+        })?;
+    if let Some(reason) = parsed
+        .choices
+        .iter()
+        .find_map(|choice| choice.finish_reason.as_deref())
+        .filter(|reason| *reason == OUTPUT_LIMIT_FINISH_REASON)
+    {
+        record_output_truncated(Some(name), reason, false);
+    }
+    Ok(parsed)
 }
 
 impl OpenAiCompatibleModelProvider {
@@ -9903,6 +9952,51 @@ mod tests {
             matches!(events.last(), Some(Ok(StreamEvent::Final))),
             "got: {events:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn length_finish_reason_emits_output_truncated_before_final() {
+        // The shape include_usage providers send: the cut reply, its
+        // `finish_reason`, then a choice-less usage chunk and [DONE].
+        let events = collect_stream_events(concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"可加左\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":890}}\n\n",
+            "data: [DONE]\n\n",
+        ))
+        .await;
+        let truncated: Vec<usize> = events
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| matches!(e, Ok(StreamEvent::OutputTruncated { reason }) if reason == "length"))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            truncated.len(),
+            1,
+            "exactly one truncation event: {events:?}"
+        );
+        assert!(
+            matches!(events.last(), Some(Ok(StreamEvent::Final))),
+            "the stream still finishes: {events:?}"
+        );
+        assert!(truncated[0] < events.len() - 1, "truncation precedes Final");
+    }
+
+    #[tokio::test]
+    async fn finished_replies_emit_no_output_truncated() {
+        for body in [
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n",
+        ] {
+            let events = collect_stream_events(body).await;
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, Ok(StreamEvent::OutputTruncated { .. }))),
+                "{body}: {events:?}"
+            );
+        }
     }
 
     #[tokio::test]

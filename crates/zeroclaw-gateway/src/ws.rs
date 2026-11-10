@@ -2136,6 +2136,9 @@ async fn process_chat_message(
     // and we relay them over WebSocket. Track streamed chunks so we
     // can reconstruct partial content on cancellation.
     let mut accumulated_text = String::new();
+    // An `output_truncated` frame is held back and sent after `done`, so the
+    // notice lands below the cut reply the web client materializes at `done`.
+    let mut output_truncated_frame: Option<serde_json::Value> = None;
 
     // Aggregate token usage across all LLM calls in this turn.
     // The agent emits TurnEvent::Usage once per LLM call when the provider
@@ -2368,6 +2371,22 @@ async fn process_chat_message(
                             "type": "plan",
                             "entries": entries,
                         }),
+                        // Display-only, like `safeguard_fallback`: never part
+                        // of the transcript. It marks a reply the provider cut
+                        // at its output limit, which is not a context trim.
+                        TurnEvent::OutputTruncated {
+                            reason,
+                            model,
+                            output_tokens,
+                        } => {
+                            output_truncated_frame = Some(serde_json::json!({
+                                "type": "output_truncated",
+                                "reason": reason,
+                                "model": model,
+                                "output_tokens": output_tokens,
+                            }));
+                            continue;
+                        }
                         _ => continue,
                     };
                     if client_gone {
@@ -2626,7 +2645,10 @@ async fn process_chat_message(
             // classifier `category` (and any refusal explanation) never do.
             let safeguard_notice = outcome.safeguard_fallback.as_ref();
             let done = build_done_frame_json(&meta, &usage_by_provider_vec);
-            for frame in success_terminal_ws_frames(safeguard_notice, done) {
+            for frame in success_terminal_ws_frames(safeguard_notice, done)
+                .into_iter()
+                .chain(output_truncated_frame.take())
+            {
                 let _ = sender.send(Message::Text(frame.to_string().into())).await;
             }
 

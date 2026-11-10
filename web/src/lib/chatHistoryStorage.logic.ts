@@ -267,7 +267,10 @@ export function uiMessagesToPersisted(
     // Skip messages flagged `ephemeral: true` (web slash-command output like
     // /help, /model banners, unknown-command notices). They are throwaway UI
     // feedback and must not be re-hydrated as fake assistant replies on reload. #7137
-    .filter((m) => !m.ephemeral)
+    // Also skip trajectory carriers (empty content, no reasoning, no card): their
+    // only payload is the unpersisted `segments`, so they would reload as an
+    // empty bubble.
+    .filter((m) => !m.ephemeral && (m.content !== '' || m.thinking || m.toolCall))
     .map((m) => ({
       id: m.id,
       role: m.role,

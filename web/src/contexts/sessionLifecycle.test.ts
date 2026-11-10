@@ -1469,9 +1469,11 @@ test('a cancelled turn still keeps tokens; turns/steps follow the list', async (
     });
   });
   const stats = mounted.context().liveStats;
-  // No committed assistant bubble on abort → steps stay 0; user bubble remains.
+  // Abort commits the interrupted-marker bubble (the gateway persists the same
+  // marker), so it counts as a step; the user bubble remains.
   assert.equal(stats.turns, 1);
-  assert.equal(stats.steps, 0);
+  assert.equal(stats.steps, 1);
+  assert.match(renderedText(mounted), /\[interrupted by user\]/);
   assert.equal(stats.input, 120);
   assert.equal(stats.cached, 64);
   await unmount(mounted.renderer);
@@ -1757,29 +1759,37 @@ test('a turn with no tool calls renders as a plain bubble, with no empty group',
   await unmount(mounted.renderer);
 });
 
-test('a hydrated conversation renders ungrouped: the trajectory is live-only', async () => {
+test('a hydrated conversation folds each tool turn into one collapsed group', async () => {
+  // Reloaded rows carry no live trajectory: the group is derived from the
+  // bubbles, and the cards never render loose.
   const runtime = new FakeSessionRuntime();
-  runtime.queueMessages('A', () => Promise.resolve(messagesResponse('A', true, ['earlier prompt'])));
+  runtime.queueMessages('A', () =>
+    Promise.resolve({
+      session_id: 'A',
+      session_persistence: true,
+      messages: [
+        { role: 'user', content: 'earlier prompt', created_at: null },
+        {
+          role: 'assistant',
+          content: '{"content":"looking around","tool_calls":[{"id":"c1","name":"shell","arguments":"{}"}]}',
+          created_at: null,
+        },
+        { role: 'tool', content: '{"content":"tool out","tool_call_id":"c1"}', created_at: null },
+        { role: 'assistant', content: 'the final answer', created_at: null },
+      ],
+    }),
+  );
+  storage.setItem('zeroclaw_show_tool_activity', '1');
   const mounted = await mountChat(runtime, true);
+  storage.removeItem('zeroclaw_show_tool_activity');
   await openSocket(runtime, 0);
   await settle();
 
-  // Hydrated list: one user prompt, no assistant yet → 1 turn 0 steps.
-  assert.equal(mounted.context().liveStats.turns, 1);
-  assert.equal(mounted.context().liveStats.steps, 0);
-  assert.match(renderedText(mounted), /1 turns 0 steps/);
-
-  await act(async () => {
-    runtime.sockets[0]!.emitMessage({
-      type: 'message',
-      content: '{"content":null,"tool_calls":[{"id":"c1","name":"shell","arguments":"{}"}]}',
-    });
-  });
-  await settle();
-  assert.equal(/tool calls/.test(renderedText(mounted)), false);
-  assert.equal(mounted.context().messages.some((message) => message.segments), false);
-  // The `message` frame still commits an agent bubble (no segments) → +1 step.
-  assert.equal(mounted.context().liveStats.steps, 1);
+  const collapsed = renderedText(mounted);
+  assert.match(collapsed, /1 tool calls · 1 messages/);
+  assert.match(collapsed, /the final answer/);
+  assert.equal(collapsed.includes('tool out'), false, 'the card is folded, not loose');
+  assert.equal(collapsed.includes('looking around'), false, 'narration sits inside the group');
   await unmount(mounted.renderer);
 });
 

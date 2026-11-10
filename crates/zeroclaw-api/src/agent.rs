@@ -202,6 +202,19 @@ pub enum TurnEvent {
         /// The meter denominator: capacity clamped by the input ceiling.
         effective_context_window: Option<u64>,
     },
+    /// The provider ended the turn's final reply because it hit an output
+    /// limit (`finish_reason: "length"` on the chat-completions wire), not
+    /// because the model finished. The reply text that arrived is kept as
+    /// is; this event only makes the cut visible. It is unrelated to
+    /// [`Self::HistoryTrimmed`]: nothing was removed from the input.
+    OutputTruncated {
+        /// The provider's stop reason, verbatim (e.g. `"length"`).
+        reason: String,
+        /// Model that produced the truncated reply.
+        model: String,
+        /// Output tokens the provider reported for that reply, if any.
+        output_tokens: Option<u64>,
+    },
     /// Per-LLM-call token usage and cost; a turn may emit several, one per
     /// model call. `None` means "unavailable for this call", not zero.
     /// The `provider_ref` and `model` identify the provider and model used
