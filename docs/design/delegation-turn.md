@@ -31,6 +31,19 @@
   consecutive empty reply fails the turn with the explicit semantic-empty
   error. Observed cause: a local model that writes `.` beside every tool
   call ended turns silently whenever the tool call was missing.
+- **R6 — A message the runtime writes into a turn is never an operator
+  turn.** Text the runtime appends in the `user` role mid-turn — the R5
+  nudge, the max-iteration / execution-tree summary prompt, the
+  `[Tool call parse error]` feedback — rides a `[Tool results]` prompt
+  carrier (`render_prompt_tool_carrier(text, &[])`): the gateway stores it
+  as a `runtime` row the dashboard hides, and trim, vision routing and
+  provider truncation do not count it as a turn boundary, so `kept_turns`
+  matches the user bubbles the dashboard counts. A live SOP step context is
+  the exception in shape, not in rule: it stays a plain `user` message and a
+  turn boundary (a long SOP run trims on it) and is classified as machinery
+  by its `[SOP: ` prefix. Observed cause: after a reload the summary prompt
+  rendered as a user bubble and split one turn into a tool group and a
+  detached answer.
 
 ## Where upstream conflicts
 
@@ -41,6 +54,7 @@
 | 3 | Delegate settlement tied to worker lifetime | Settlement recovered after worker exit | R3 |
 | 4 | Peer inbox turns transient or unbounded | Peer-agent inbox turns persisted with a bounded lifecycle | R4 |
 | 5 | Semantic-empty is empty/whitespace/think-only text; exhaustion fails the turn (#9421) | A lone `.` is semantic-empty too; exhaustion gets one bounded continuation nudge per empty streak (≤3 per turn) before the explicit failure | R5 |
+| 6 | Summary prompt and parser feedback are plain `user` messages; a live SOP step context is stored as an operator row | Summary prompt and parser feedback ride the `[Tool results]` prompt carrier; a live SOP step context is stored as a `runtime` row and stays a turn boundary | R6 |
 
 ## Merge notes
 
@@ -50,7 +64,7 @@
   pending peer turn and confirm it is still there and bounded.
 - **Upstream runtime/turn refactors are semantic changes here even when
   they are framed as cleanups.** If a refactor moves turn ownership, it
-  must preserve R1–R5 or be reported as new semantics.
+  must preserve R1–R6 or be reported as new semantics.
 - **Code anchors:** `crates/zeroclaw-runtime/src/agent/` (turn, delegate
   settlement, peer inbox), `crates/zeroclaw-tools/src/` (peer send);
   R5: `zeroclaw-api/src/model_provider.rs::is_semantically_empty_text`,
@@ -63,6 +77,14 @@
   `empty_nudge::tests::*`,
   `run_tool_call_loop_nudges_after_filler_only_reply_then_completes`,
   `run_tool_call_loop_fails_semantic_empty_when_nudge_is_answered_with_filler`
+  (zeroclaw-runtime).
+- **R6 code anchors:** `agent/turn/max_iter.rs` (`summary_prompt`); the
+  `[Tool call parse error]` block in `agent/turn/mod.rs`;
+  `agent/history_trim.rs::is_synthetic_user_message`;
+  `sop/engine.rs::STEP_CONTEXT_PREFIX`.
+- **R6 tests:** `safety_net_graceful_summary_persists_assistant_summary`,
+  `run_tool_call_loop_retries_malformed_tool_protocol_without_leaking_json`,
+  `a_step_context_is_runtime_machinery_and_still_a_turn_boundary`
   (zeroclaw-runtime).
 
 ## Sources

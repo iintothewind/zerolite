@@ -11,6 +11,7 @@ use std::time::Duration;
 use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
 use zeroclaw_api::agent::TurnEvent;
+use zeroclaw_api::tool_carrier::render_prompt_tool_carrier;
 use zeroclaw_api::turn_stop::{TurnStop, TurnStopCode};
 use zeroclaw_config::schema::{Config, MultimodalConfig, PacingConfig, ResolvedContextLimits};
 use zeroclaw_providers::{ChatMessage, ModelProvider};
@@ -167,9 +168,15 @@ pub(crate) async fn finish_after_max_iterations(
         ),
         None => (model_provider, provider_name, model, dispatch_model),
     };
-    let summary_prompt = ChatMessage::user(format!(
-        "{exhaustion}. Please provide your best answer based on the work completed so far. \
-         Summarize what you accomplished and what remains to be done."
+    // ZeroLite (delegation-turn R6): runtime-written, so it rides the
+    // `[Tool results]` prompt carrier — stored as a `runtime` transcript row
+    // and never counted as a turn boundary.
+    let summary_prompt = ChatMessage::user(render_prompt_tool_carrier(
+        &format!(
+            "{exhaustion}. Please provide your best answer based on the work completed so far. \
+             Summarize what you accomplished and what remains to be done."
+        ),
+        &[],
     ));
     let summary_prompt_mirror = summary_prompt.clone();
 

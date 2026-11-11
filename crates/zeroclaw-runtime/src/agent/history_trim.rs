@@ -42,11 +42,12 @@ fn is_system(msg: &ChatMessage) -> bool {
 }
 
 /// Whether a `user`-roled message is machinery the runtime wrote rather than
-/// something the operator typed: a prompt-mode `[Tool results]` round, or the
-/// trim breadcrumb. Answering "is this ours" is a different question from
-/// [`is_turn_boundary`]'s "does a turn start here", so the two are kept apart:
-/// the breadcrumb is machinery AND still a turn boundary, while a tool round
-/// is machinery and explicitly not one.
+/// something the operator typed: a prompt-mode `[Tool results]` round, the
+/// trim breadcrumb, or a live SOP step context, which like the breadcrumb is
+/// machinery AND still a turn boundary. Answering "is this ours" is a
+/// different question from [`is_turn_boundary`]'s "does a turn start here",
+/// so the two are kept apart: the breadcrumb is machinery AND still a turn
+/// boundary, while a tool round is machinery and explicitly not one.
 pub fn is_synthetic_user_message(msg: &ChatMessage) -> bool {
     if msg.role != "user" {
         return false;
@@ -54,6 +55,7 @@ pub fn is_synthetic_user_message(msg: &ChatMessage) -> bool {
     let trimmed = msg.content.trim_start();
     trimmed.starts_with(zeroclaw_api::tool_carrier::TOOL_RESULTS_PREFIX)
         || trimmed.starts_with(breadcrumb_text().as_str())
+        || trimmed.starts_with(crate::sop::engine::STEP_CONTEXT_PREFIX)
 }
 
 /// The breadcrumb's localized text, kept in one place so the writer, the

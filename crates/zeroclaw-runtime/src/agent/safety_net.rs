@@ -1811,6 +1811,33 @@ async fn safety_net_graceful_summary_persists_assistant_summary() {
         ("assistant", "wrap-up summary"),
         "the persisted transcript must end with the assistant summary, not the synthetic user prompt"
     );
+    // ZeroLite (delegation-turn R6): the summary prompt is persisted, and as
+    // runtime machinery — the operator's message is the turn's only opener.
+    assert!(
+        outcome.new_messages.iter().any(|m| matches!(
+            m,
+            ConversationMessage::Chat(c)
+                if c.role == "user"
+                    && c.content.contains("Agent exceeded maximum tool iterations (2)")
+        )),
+        "a successful summary keeps its prompt in the transcript"
+    );
+    let operator_turns = outcome
+        .new_messages
+        .iter()
+        .filter(|m| {
+            matches!(
+                m,
+                ConversationMessage::Chat(c)
+                    if c.role == "user"
+                        && !crate::agent::history_trim::is_synthetic_user_message(c)
+            )
+        })
+        .count();
+    assert_eq!(
+        operator_turns, 1,
+        "the summary prompt must persist as runtime machinery, not as a second operator turn"
+    );
 }
 
 // ACP and other event-driven channels render message content exclusively

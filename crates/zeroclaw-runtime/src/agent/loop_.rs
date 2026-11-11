@@ -11242,6 +11242,19 @@ mod tests {
                 .any(|msg| msg.role == "user" && msg.content.contains("[Tool call parse error]")),
             "history should include internal parser feedback for the model"
         );
+        let feedback = history
+            .iter()
+            .find(|msg| msg.content.contains("[Tool call parse error]"))
+            .expect("parser feedback stays in history");
+        assert!(
+            crate::agent::history_trim::is_synthetic_user_message(feedback),
+            "parser feedback is runtime machinery, stored as a runtime row"
+        );
+        assert_eq!(
+            crate::agent::history_trim::count_turns(&history),
+            1,
+            "parser feedback must not open a turn"
+        );
     }
 
     #[tokio::test]
@@ -18695,8 +18708,8 @@ Let me check the result."#;
                         parallel_tools: false,
                         max_tool_result_chars: 0,
                         context_limits: zeroclaw_config::schema::ResolvedContextLimits {
-                            model_context_window: 100,
-                            context_token_budget: 100,
+                            model_context_window: 120,
+                            context_token_budget: 120,
                             model_context_window_source:
                                 zeroclaw_config::schema::ModelContextWindowSource::Configured,
                             keep_recent_turns:
@@ -21829,7 +21842,7 @@ Let me check the result."#;
                     tail.next()
                         .unwrap()
                         .content
-                        .starts_with("Agent exceeded maximum tool iterations")
+                        .contains("Agent exceeded maximum tool iterations")
                 );
                 assert!(
                     next.messages
@@ -21854,9 +21867,9 @@ Let me check the result."#;
                     .any(|m| m.content.contains(&"r".repeat(4000)))
             );
             assert!(
-                !history.iter().any(|m| m
-                    .content
-                    .starts_with("Agent exceeded maximum tool iterations")),
+                !history
+                    .iter()
+                    .any(|m| m.content.contains("Agent exceeded maximum tool iterations")),
                 "failed summary must not append a synthetic user turn"
             );
         }

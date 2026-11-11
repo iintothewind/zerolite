@@ -6748,10 +6748,15 @@ fn execute_step_action(
 
 // ── Step context formatting ─────────────────────────────────────
 
+/// Opening of every step context `format_step_context` renders. Shared with
+/// `agent::history_trim::is_synthetic_user_message` so the writer and the
+/// machinery predicate cannot drift apart.
+pub(crate) const STEP_CONTEXT_PREFIX: &str = "[SOP: ";
+
 /// Build the structured context message that gets injected into the agent.
 fn format_step_context(sop: &Sop, run: &SopRun, step: &SopStep, config: &SopConfig) -> String {
     let mut ctx = format!(
-        "[SOP: {} (run {}) — Step {} of {}]\n\n",
+        "{STEP_CONTEXT_PREFIX}{} (run {}) — Step {} of {}]\n\n",
         sop.name, run.run_id, step.number, run.total_steps
     );
 
@@ -7866,6 +7871,27 @@ mod tests {
         assert!(run_id.starts_with("run-"));
         assert!(matches!(action, SopRunAction::ExecuteStep { .. }));
         assert_eq!(engine.active_runs().len(), 1);
+    }
+
+    /// The live executor writes a step context into a running turn as a
+    /// `user` message: the gateway stores it as runtime machinery, and the
+    /// trim still counts it as the step's turn opener.
+    #[test]
+    fn a_step_context_is_runtime_machinery_and_still_a_turn_boundary() {
+        let mut engine = engine_with_sops(vec![test_sop(
+            "s1",
+            SopExecutionMode::Auto,
+            SopPriority::Normal,
+        )]);
+        let action = engine.start_run("s1", manual_event()).unwrap();
+        let SopRunAction::ExecuteStep { context, .. } = action else {
+            panic!("an auto SOP starts at ExecuteStep, got {action:?}");
+        };
+        let message = zeroclaw_providers::ChatMessage::user(context);
+        assert!(crate::agent::history_trim::is_synthetic_user_message(
+            &message
+        ));
+        assert_eq!(crate::agent::history_trim::count_turns(&[message]), 1);
     }
 
     #[test]
