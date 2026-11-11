@@ -902,14 +902,18 @@ async fn xml_dispatcher_does_not_send_tool_specs() {
 // 11. Empty / whitespace-only LLM responses
 // ═══════════════════════════════════════════════════════════════════════════
 
+// R5: the first empty reply earns one continuation nudge, so a turn fails
+// only when the reply to that nudge is empty too.
+
 #[tokio::test]
 async fn turn_rejects_empty_text_response() {
-    let model_provider = Box::new(ScriptedModelProvider::new(vec![ChatResponse {
+    let empty = || ChatResponse {
         text: Some(String::new()),
         tool_calls: vec![],
         usage: None,
         reasoning_content: None,
-    }]));
+    };
+    let model_provider = Box::new(ScriptedModelProvider::new(vec![empty(), empty()]));
 
     let mut agent = build_agent_with(model_provider, vec![], Box::new(NativeToolDispatcher));
 
@@ -925,12 +929,13 @@ async fn turn_rejects_empty_text_response() {
 
 #[tokio::test]
 async fn turn_rejects_none_text_response() {
-    let model_provider = Box::new(ScriptedModelProvider::new(vec![ChatResponse {
+    let missing = || ChatResponse {
         text: None,
         tool_calls: vec![],
         usage: None,
         reasoning_content: None,
-    }]));
+    };
+    let model_provider = Box::new(ScriptedModelProvider::new(vec![missing(), missing()]));
 
     let mut agent = build_agent_with(model_provider, vec![], Box::new(NativeToolDispatcher));
 
@@ -951,7 +956,7 @@ async fn turn_rejects_think_tag_only_response_and_records_usage() {
         TurnUsage,
     };
 
-    let model_provider = Box::new(ScriptedModelProvider::new(vec![ChatResponse {
+    let think_only = || ChatResponse {
         text: Some("<think>internal reasoning</think>".to_string()),
         tool_calls: vec![],
         usage: Some(zeroclaw_providers::traits::TokenUsage {
@@ -961,7 +966,8 @@ async fn turn_rejects_think_tag_only_response_and_records_usage() {
             cache_creation_input_tokens: None,
         }),
         reasoning_content: None,
-    }]));
+    };
+    let model_provider = Box::new(ScriptedModelProvider::new(vec![think_only(), think_only()]));
     let mut agent = build_agent_with(model_provider, vec![], Box::new(NativeToolDispatcher));
     let cost_context = ToolLoopCostTrackingContext::usage_only();
     let turn_usage = Arc::new(parking_lot::Mutex::new(TurnUsage::default()));
@@ -978,9 +984,11 @@ async fn turn_rejects_think_tag_only_response_and_records_usage() {
         error.to_string(),
         "provider completed without final text or tool calls"
     );
+    // Both rejected attempts were billed: the one before the nudge and the
+    // one answering it.
     let recorded = *turn_usage.lock();
-    assert_eq!(recorded.input_tokens, 10);
-    assert_eq!(recorded.output_tokens, 5);
+    assert_eq!(recorded.input_tokens, 20);
+    assert_eq!(recorded.output_tokens, 10);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
