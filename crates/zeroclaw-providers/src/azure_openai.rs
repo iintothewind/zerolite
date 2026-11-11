@@ -63,7 +63,7 @@ impl ResponseMessage {
 /// reasoning-only result is therefore a typed terminal failure, not a valid
 /// string result for direct callers that do not use the structured chat API.
 fn require_terminal_text(content: String) -> anyhow::Result<String> {
-    if zeroclaw_api::model_provider::strip_think_tags(&content).is_empty() {
+    if zeroclaw_api::model_provider::is_semantically_empty_text(&content) {
         return Err(anyhow::Error::new(
             zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion,
         ));

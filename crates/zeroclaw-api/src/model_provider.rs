@@ -225,8 +225,20 @@ impl ChatResponse {
     /// A response containing one or more tool calls remains valid even when
     /// its text is empty.
     pub fn is_semantically_empty_terminal(&self) -> bool {
-        strip_think_tags(self.text_or_empty()).is_empty() && self.tool_calls.is_empty()
+        is_semantically_empty_text(self.text_or_empty()) && self.tool_calls.is_empty()
     }
+}
+
+/// Replies that carry no content even though they are not blank. Some local
+/// models write a lone `.` as assistant content beside every tool call; when
+/// the tool call is missing, that filler is the entire response.
+const CONTENT_FILLER_REPLIES: [&str; 1] = ["."];
+
+/// Whether terminal response text carries no answer: after think-tag
+/// stripping (which also trims) it is empty or exactly a content filler.
+pub fn is_semantically_empty_text(text: &str) -> bool {
+    let visible = strip_think_tags(text);
+    visible.is_empty() || CONTENT_FILLER_REPLIES.contains(&visible.as_str())
 }
 
 /// Remove inline `<think>...</think>` reasoning before terminal-response
@@ -1371,6 +1383,38 @@ mod turn_order_tests {
         };
 
         assert!(!response.is_semantically_empty_terminal());
+    }
+
+    #[test]
+    fn lone_period_filler_is_semantically_empty_only_without_tool_calls() {
+        let terminal = |text: &str, tool_calls: Vec<ToolCall>| ChatResponse {
+            text: Some(text.to_string()),
+            tool_calls,
+            usage: None,
+            reasoning_content: None,
+        };
+        for text in [".", " .\n", "<think>plan</think>."] {
+            assert!(
+                terminal(text, Vec::new()).is_semantically_empty_terminal(),
+                "{text:?}"
+            );
+        }
+        for text in ["..", "...", "。", "ok.", "1."] {
+            assert!(
+                !terminal(text, Vec::new()).is_semantically_empty_terminal(),
+                "{text:?}"
+            );
+        }
+        let beside_tool_call = terminal(
+            ".",
+            vec![ToolCall {
+                id: "call_1".to_string(),
+                name: "read_file".to_string(),
+                arguments: "{}".to_string(),
+                extra_content: None,
+            }],
+        );
+        assert!(!beside_tool_call.is_semantically_empty_terminal());
     }
 
     #[test]

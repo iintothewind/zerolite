@@ -6,6 +6,7 @@ pub(crate) mod context;
 pub(crate) mod context_pipeline;
 pub(crate) mod context_recovery;
 pub(crate) mod delivery_defaults;
+pub(crate) mod empty_nudge;
 pub(crate) mod events;
 pub(crate) mod execution;
 pub(crate) mod history_append;
@@ -1857,6 +1858,7 @@ async fn run_tool_call_loop_impl<'a>(
     let mut accumulated_display_text = String::new();
     let mut single_tool_limitation_reported = false;
     let mut malformed_tool_protocol_retries: usize = 0;
+    let mut empty_completion_nudge = empty_nudge::EmptyCompletionNudge::default();
     // Text withheld by the streaming text guard on a previous attempt,
     // stored with its trailing whitespace trimmed. A repeat that is
     // identical up to trailing whitespace means the model produced the same
@@ -2970,6 +2972,27 @@ async fn run_tool_call_loop_impl<'a>(
                 if recovered {
                     continue;
                 }
+                // ZeroLite (delegation-turn R5): a semantic-empty terminal
+                // completion that already consumed the provider retry policy gets
+                // one bounded continuation nudge before it fails the turn.
+                if let Some(nudge) = empty_completion_nudge.admit(&e) {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_category(::zeroclaw_log::EventCategory::Agent)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "model": active_model,
+                                "iteration": iteration + 1,
+                                "nudge": empty_completion_nudge.sent(),
+                                "max_nudges": empty_nudge::MAX_EMPTY_COMPLETION_NUDGES_PER_TURN,
+                                "trace_id": turn_id,
+                            })),
+                        "empty_completion_nudge"
+                    );
+                    turn_state.push_dual(nudge);
+                    continue;
+                }
                 // A stream that died after caller-visible output: persist the
                 // partial with the interruption marker so wrappers/channels
                 // can commit what the consumer already saw.
@@ -3290,6 +3313,9 @@ async fn run_tool_call_loop_impl<'a>(
             *history_has_trim_breadcrumb = turn_state.crumb_present;
             return Ok(accumulated_display_text);
         }
+
+        // A response with tool calls is progress: re-arm the empty-completion nudge.
+        empty_completion_nudge.record_tool_round();
 
         // Relay only the portion of narration the live stream did not already
         // deliver: re-sending the whole thing duplicates it.

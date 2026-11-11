@@ -1724,7 +1724,7 @@ fn is_empty_completion(resp: &ChatResponse) -> bool {
 }
 
 fn is_empty_text_completion(text: &str) -> bool {
-    zeroclaw_api::model_provider::strip_think_tags(text).is_empty()
+    zeroclaw_api::model_provider::is_semantically_empty_text(text)
 }
 
 fn is_semantic_empty_completion_error(error: &anyhow::Error) -> bool {

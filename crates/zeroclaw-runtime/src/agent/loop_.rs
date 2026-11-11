@@ -11548,6 +11548,109 @@ mod tests {
         assert_eq!(draft_text, vec![fallback]);
     }
 
+    async fn run_scripted_text_loop(
+        responses: Vec<&str>,
+        history: &mut Vec<ChatMessage>,
+    ) -> anyhow::Result<String> {
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let provider = ScriptedModelProvider::from_text_responses(responses);
+        let tools_registry = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]);
+        let observer = NoopObserver;
+        run_tool_call_loop(ToolLoop {
+            context_anchor_seed: None,
+            context_anchor_sink: None,
+            history_was_trimmed: None,
+            parent_agent_alias: None,
+            served_route_sink: None,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    dispatch_model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
+                max_tool_iterations: 6,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+                security: None,
+            },
+            history,
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
+            channel_name: "matrix",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            memory: None,
+            ingress: IngressContext::sub_turn(),
+            agent_alias: None,
+            turn_id: &turn_id,
+        })
+        .await
+    }
+
+    fn empty_nudge_count(history: &[ChatMessage]) -> usize {
+        history
+            .iter()
+            .filter(|msg| msg.role == "user" && msg.content.contains("[Empty response]"))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_nudges_after_filler_only_reply_then_completes() {
+        let mut history = vec![ChatMessage::system("test-system"), ChatMessage::user("go")];
+        let result = run_scripted_text_loop(vec![".", "final answer"], &mut history)
+            .await
+            .expect("the nudged retry answers");
+        assert_eq!(result, "final answer");
+        assert_eq!(empty_nudge_count(&history), 1);
+        assert!(
+            !history
+                .iter()
+                .any(|msg| msg.role == "assistant" && msg.content == "."),
+            "the rejected filler reply must not be persisted: {history:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_fails_semantic_empty_when_nudge_is_answered_with_filler() {
+        let mut history = vec![ChatMessage::system("test-system"), ChatMessage::user("go")];
+        let err = run_scripted_text_loop(vec![".", "."], &mut history)
+            .await
+            .expect_err("a second consecutive empty reply fails the turn");
+        assert!(
+            crate::agent::is_semantic_empty_terminal_completion(&err),
+            "{err:#}"
+        );
+        assert_eq!(empty_nudge_count(&history), 1);
+    }
+
     /// The streaming text guard suppressed a whole-message tool-result
     /// envelope twice in a row: the second suppression, which differs from
     /// the first only by one trailing newline, must still end the turn with

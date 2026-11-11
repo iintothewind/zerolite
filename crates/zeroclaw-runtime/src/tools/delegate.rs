@@ -2999,9 +2999,7 @@ impl DelegateTool {
         result: anyhow::Result<String>,
     ) -> ToolResult {
         match result {
-            Ok(response)
-                if zeroclaw_api::model_provider::strip_think_tags(&response).is_empty() =>
-            {
+            Ok(response) if zeroclaw_api::model_provider::is_semantically_empty_text(&response) => {
                 ToolResult {
                     success: false,
                     output: ToolOutput::default(),
@@ -9827,10 +9825,12 @@ mod tests {
     #[tokio::test]
     async fn background_agentic_delegate_persists_localized_semantic_empty_error() {
         // The configured Reliable wrapper retries a semantic-empty completion
-        // twice before terminal delivery. Supply one empty response per
-        // attempt so this boundary test proves the final semantic-empty cause,
-        // not a connection error after the fixture exhausts its responses.
-        let server = start_final_chat_server(vec!["", "", ""]).await;
+        // twice before terminal delivery, and the turn loop then spends one
+        // continuation nudge (delegation-turn R5) that runs a second Reliable
+        // cycle. Supply one empty response per attempt across both cycles so
+        // this boundary test proves the final semantic-empty cause, not a
+        // connection error after the fixture exhausts its responses.
+        let server = start_final_chat_server(vec!["", "", "", "", "", ""]).await;
         let fixture = delegate_memory_fixture(Some(server.uri.clone())).await;
 
         let result = fixture

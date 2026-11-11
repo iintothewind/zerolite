@@ -547,7 +547,9 @@ pub(crate) async fn consume_provider_streaming_response_with_policy(
         );
     }
 
-    if outcome.response_text.trim().is_empty() && outcome.tool_calls.is_empty() {
+    if zeroclaw_api::model_provider::is_semantically_empty_text(&outcome.response_text)
+        && outcome.tool_calls.is_empty()
+    {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -2168,5 +2170,48 @@ mod tests {
                 "{events:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_filler_only_stream_is_rejected_but_filler_beside_a_tool_call_is_kept() {
+        let filler_only = ScriptedStreamProvider {
+            events: vec![
+                StreamEvent::TextDelta(StreamChunk::delta(".")),
+                StreamEvent::Final,
+            ],
+        };
+        let err = consume_provider_streaming_response(
+            &filler_only,
+            &[ChatMessage::user("go")],
+            None,
+            "mock-model",
+            Some(0.0),
+            None,
+            None,
+            None,
+            false,
+            StreamReasoningMode::Status,
+            None,
+        )
+        .await
+        .expect_err("a lone filler is not a final answer");
+        assert!(
+            err.downcast_ref::<StreamSemanticEmptyCompletion>()
+                .is_some(),
+            "{err:#}"
+        );
+
+        let (outcome, _) = consume_scripted(vec![
+            StreamEvent::TextDelta(StreamChunk::delta(".")),
+            StreamEvent::ToolCall(ToolCall {
+                id: "call_1".into(),
+                name: "shell".into(),
+                arguments: "{\"command\":\"ls\"}".into(),
+                extra_content: None,
+            }),
+            StreamEvent::Final,
+        ])
+        .await;
+        assert_eq!(outcome.tool_calls.len(), 1);
     }
 }
