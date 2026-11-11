@@ -14,8 +14,9 @@
  * - A backwards move (scrollTop decreasing) is deliberate. Only a person can
  *   move the pane away from the tail, so it suspends following immediately.
  *   The exception is a clamp: when the transcript itself gets shorter (an
- *   image settling under its max height, a collapsed group) the browser pulls
- *   scrollTop down with it. That is still the tail, not a person leaving it.
+ *   image settling under its max height, a collapsed group) or the pane gets
+ *   taller (the on-screen keyboard closing) the browser pulls scrollTop down
+ *   with it. That is still the tail, not a person leaving it.
  * - Returning near the bottom resumes following.
  * - Anything else leaves the decision untouched.
  *
@@ -41,11 +42,13 @@ export interface FollowState {
   /** Scroll offset observed last time, used to detect a backwards move. */
   lastScrollTop: number;
   /**
-   * `scrollHeight` observed last time. A drop here, together with a drop in
-   * `scrollTop`, is the browser clamping the offset after the transcript
-   * shrank — not the reader scrolling up.
+   * `scrollHeight` and `clientHeight` observed last time. Their difference is
+   * the furthest offset the pane can reach; when that drops together with
+   * `scrollTop`, the browser clamped the offset — the transcript shrank or
+   * the scrollport grew — and the reader did not scroll up.
    */
   lastScrollHeight: number;
+  lastClientHeight: number;
 }
 
 /**
@@ -60,8 +63,9 @@ export interface FollowState {
 export function createFollowState(
   lastScrollTop: number = 0,
   lastScrollHeight: number = 0,
+  lastClientHeight: number = 0,
 ): FollowState {
-  return { following: true, lastScrollTop, lastScrollHeight };
+  return { following: true, lastScrollTop, lastScrollHeight, lastClientHeight };
 }
 
 /**
@@ -107,12 +111,16 @@ export function foldScroll(
   const observed = {
     lastScrollTop: metrics.scrollTop,
     lastScrollHeight: metrics.scrollHeight,
+    lastClientHeight: metrics.clientHeight,
   };
   if (metrics.scrollTop < state.lastScrollTop) {
-    // The transcript shrank under the reader and the browser clamped the
-    // offset down onto the new tail. They did not scroll away.
-    const contentShrank = metrics.scrollHeight < state.lastScrollHeight;
-    if (contentShrank && isNearBottom(metrics, threshold)) {
+    // The tail moved up under the reader — the transcript shrank, or the
+    // scrollport grew (on-screen keyboard closing, composer collapsing) — and
+    // the browser clamped the offset down onto it. They did not scroll away.
+    const tailMovedUp =
+      metrics.scrollHeight - metrics.clientHeight <
+      state.lastScrollHeight - state.lastClientHeight;
+    if (tailMovedUp && isNearBottom(metrics, threshold)) {
       return { ...state, ...observed };
     }
     return { following: false, ...observed };

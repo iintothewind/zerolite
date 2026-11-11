@@ -117,7 +117,16 @@
   --pc-font-size-mono: 14px;
 }
 
+/* The app is a fixed shell; only its inner panes scroll.
+   `overscroll-behavior` stops a drag on the header or composer from
+   rubber-banding the whole page (iOS) or triggering pull-to-refresh
+   (Android). `touch-action` leaves panning to the inner scrollers and drops
+   pinch and double-tap zoom: a zoomed page pans sideways, the one horizontal
+   movement no overflow rule can stop. Text size stays adjustable in
+   Settings. */
 html {
+  overscroll-behavior: none;
+  touch-action: pan-x pan-y;
 }
 
 body {
@@ -130,10 +139,16 @@ body {
   margin: 0;
   overflow-x: hidden;
   max-width: 100vw;
+  overscroll-behavior: none;
 }
 
+/* Nothing inside the app may widen the document. `clip` cuts horizontal
+   overflow without turning this box into a scroll container, so the page
+   has no sideways extent to pan, or to be scrolled into when the browser
+   reveals a focused control. */
 #root {
-  min-height: 100vh;
+  min-height: 100dvh;
+  overflow-x: clip;
 }
 
 /* Focus ring — solid accent for a strong, legible, WCAG-friendly ring
@@ -194,6 +209,18 @@ textarea {
   overflow-y: auto;
   overflow-wrap: break-word;
   word-break: break-word;
+}
+
+/* iOS Safari zooms the page when a focused control's text is under 16px and
+   never zooms back. Touch devices get 16px controls; `1em` keeps a larger
+   size inherited from Settings → font size. Unlayered on purpose: it has to
+   beat the text-size utilities set on the controls themselves. */
+@media (pointer: coarse) {
+  input,
+  textarea,
+  select {
+    font-size: max(16px, 1em);
+  }
 }
 
 code, kbd, pre {

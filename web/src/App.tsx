@@ -221,7 +221,7 @@ function PairingDialog({
 
   return (
     <div
-      className="min-h-screen flex items-center justify-center"
+      className="min-h-dvh flex items-center justify-center"
       style={{ background: "var(--pc-bg-base)" }}
     >
       {/* Ambient glow */}
@@ -392,7 +392,7 @@ function AppContent() {
   if (loading) {
     return (
       <div
-        className="min-h-screen flex items-center justify-center"
+        className="min-h-dvh flex items-center justify-center"
         style={{ background: "var(--pc-bg-base)" }}
       >
         <div className="flex flex-col items-center gap-4 animate-fade-in">

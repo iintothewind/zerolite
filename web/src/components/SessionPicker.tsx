@@ -262,7 +262,7 @@ export function SessionPicker({
     : `${t('agent.session_untitled')} ${sessionId.slice(0, 8)}`;
 
   return (
-    <div className="relative" ref={containerRef}>
+    <div className="static sm:relative min-w-0" ref={containerRef}>
       <button
         ref={triggerRef}
         type="button"
@@ -277,19 +277,22 @@ export function SessionPicker({
         aria-expanded={open}
         aria-controls={open ? panelId : undefined}
         title={t('agent.sessions')}
-        className="flex items-center gap-2 px-3 h-7 rounded-[var(--radius-md)] text-xs font-medium border border-pc-border bg-pc-elevated text-pc-text-secondary transition-colors hover:text-pc-text hover:border-pc-border-strong focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]"
+        className="flex max-w-full min-w-0 items-center gap-1.5 sm:gap-2 px-2 sm:px-3 h-7 rounded-[var(--radius-md)] text-xs font-medium border border-pc-border bg-pc-elevated text-pc-text-secondary transition-colors hover:text-pc-text hover:border-pc-border-strong focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]"
       >
-        <MessagesSquare className="h-3.5 w-3.5" />
+        <MessagesSquare className="h-3.5 w-3.5 shrink-0" />
         <span className={`truncate ${labelClassName}`}>{activeLabel}</span>
-        <ChevronDown className="h-3 w-3" />
+        <ChevronDown className="h-3 w-3 shrink-0" />
       </button>
 
       {open && (
+        // Below sm the menu spans the nearest positioned ancestor (the chat
+        // toolbar row) rather than hanging off the trigger: 300px anchored to
+        // a trigger that sits mid-row runs off the left edge of a phone.
         <div
           id={panelId}
           role="group"
           aria-label={t('agent.sessions')}
-          className="absolute right-0 mt-1.5 rounded-[var(--radius-md)] border border-pc-border bg-pc-elevated shadow-[var(--pc-shadow-md)] z-50 py-1 w-[300px] max-h-80 overflow-y-auto"
+          className="absolute left-3 right-3 top-full mt-1 sm:left-auto sm:right-0 sm:mt-1.5 sm:w-[300px] rounded-[var(--radius-md)] border border-pc-border bg-pc-elevated shadow-[var(--pc-shadow-md)] z-50 py-1 max-h-80 overflow-y-auto"
         >
           {storesConversations ? (
             <button

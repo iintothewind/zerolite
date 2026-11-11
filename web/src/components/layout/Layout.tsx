@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { Outlet, useLocation } from 'react-router-dom';
 import Sidebar from '@/components/layout/Sidebar';
 import Header from '@/components/layout/Header';
@@ -7,6 +7,7 @@ import UnsavedChangesBanner from '@/components/layout/UnsavedChangesBanner';
 import CommandPalette, { useCommandPalette } from '@/components/CommandPalette';
 import { ErrorBoundary } from '@/App';
 import { t } from '@/lib/i18n';
+import { fitToVisualViewport } from '@/lib/visualViewportFit';
 
 // First-path-segment → i18n title key, so the browser tab/history/bookmark
 // reflects the current page instead of a constant "ZeroClaw".
@@ -53,14 +54,29 @@ export default function Layout() {
     document.title = name ? `${name} — ZeroClaw` : 'ZeroClaw';
   }, [pathname]);
 
+  // Keep the shell above the on-screen keyboard (see fitToVisualViewport).
+  const shellRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const el = shellRef.current;
+    if (!el) return;
+    return fitToVisualViewport(el);
+  }, []);
+
   return (
-    <div className="min-h-screen bg-pc-base text-pc-text">
+    // flow-root: the shell's keyboard offset is a margin-top
+    // (fitToVisualViewport); without a formatting context of its own that
+    // margin collapses through this box and lengthens the document instead
+    // of moving the shell.
+    <div className="min-h-dvh flow-root bg-pc-base text-pc-text">
       {/* Fixed slim icon rail (desktop) + drawer (mobile). */}
       <Sidebar open={sidebarOpen} onClose={() => setSidebarOpen(false)} />
 
       {/* Main area — offset by the fixed 56px rail on desktop, full-width on
-          mobile. The rail is always slim, so the offset is constant. */}
-      <div className="flex flex-col flex-1 min-w-0 h-screen md:ml-14 ml-0">
+          mobile. The rail is always slim, so the offset is constant. `dvh`,
+          not `vh`: on phones `100vh` is the toolbar-retracted height, which
+          made the shell taller than the visible area and the whole page
+          scrollable. */}
+      <div ref={shellRef} className="flex flex-col flex-1 min-w-0 h-dvh md:ml-14 ml-0">
         <Header
           onMenuToggle={() => setSidebarOpen((v) => !v)}
           onOpenPalette={openPalette}

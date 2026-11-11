@@ -207,6 +207,7 @@ export function AgentChatInner({
         ...followRef.current,
         lastScrollTop: el.scrollTop,
         lastScrollHeight: el.scrollHeight,
+        lastClientHeight: el.clientHeight,
       };
     });
   }, []);
@@ -386,6 +387,26 @@ export function AgentChatInner({
       pinToTail();
     });
     observer.observe(content);
+    return () => observer.disconnect();
+  }, [pinToTail]);
+
+  // Re-pin when the scrollport itself gets shorter: the on-screen keyboard
+  // opening, or the composer growing a line. The offset stays where it was, so
+  // the tail slides out under the composer and no scroll event says so. A
+  // taller port needs nothing: the browser clamps the offset onto the tail and
+  // `foldScroll` reads that clamp as the pane's own doing.
+  useEffect(() => {
+    const el = scrollerRef.current;
+    if (!el || typeof ResizeObserver === 'undefined') return;
+
+    let lastHeight = el.clientHeight;
+    const observer = new ResizeObserver(() => {
+      const next = el.clientHeight;
+      const shrank = next < lastHeight;
+      lastHeight = next;
+      if (followRef.current.following && shrank) pinToTail();
+    });
+    observer.observe(el);
     return () => observer.disconnect();
   }, [pinToTail]);
 
@@ -744,10 +765,10 @@ export function AgentChatInner({
       {/* Header: agent + Files + chat actions + session/model (one row).
           Actions always visible (previously only when messages.length > 0,
           which made the merge look like a no-op on empty chats). */}
-      <div className="flex min-w-0 items-center justify-between gap-2 px-3 sm:px-4 py-2 border-b border-pc-border bg-pc-surface">
-        <div className="flex min-w-0 items-center gap-1.5 sm:gap-2">
+      <div className="relative flex min-w-0 items-center justify-between gap-2 px-3 sm:px-4 py-2 border-b border-pc-border bg-pc-surface">
+        <div className="flex min-w-0 shrink-0 sm:shrink items-center gap-1.5 sm:gap-2">
           <Bot className="h-4 w-4 shrink-0 text-pc-accent" />
-          <span className="min-w-0 max-w-[7rem] sm:max-w-[12rem] truncate text-sm font-medium text-pc-text" title={agentAlias}>
+          <span className="min-w-0 max-w-[5.5rem] sm:max-w-[12rem] truncate text-sm font-medium text-pc-text" title={agentAlias}>
             {agentAlias}
           </span>
           <Link
@@ -851,7 +872,7 @@ export function AgentChatInner({
               type="button"
               onClick={() => setShowModelDropdown((v) => !v)}
               disabled={modelLoading || typing || (availableModels.length === 0 && currentModel === null)}
-              className="flex min-w-0 items-center gap-1.5 sm:gap-2 px-2 sm:px-3 h-7 rounded-[var(--radius-md)] text-xs font-medium border border-pc-border bg-pc-elevated text-pc-text-secondary transition-colors hover:text-pc-text hover:border-pc-border-strong disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]"
+              className="flex max-w-full min-w-0 items-center gap-1.5 sm:gap-2 px-2 sm:px-3 h-7 rounded-[var(--radius-md)] text-xs font-medium border border-pc-border bg-pc-elevated text-pc-text-secondary transition-colors hover:text-pc-text hover:border-pc-border-strong disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]"
             >
               <span className="max-w-[90px] sm:max-w-[180px] truncate">
                 {modelLoading
@@ -896,14 +917,20 @@ export function AgentChatInner({
 
       {/* Messages area. `min-h-0` lets this flex child shrink below a tall
           image's min-content size, so the overflow stays inside this
-          scrollport instead of spilling out and getting clipped. */}
+          scrollport instead of spilling out and getting clipped.
+          `overflow-x-hidden` because `overflow-y: auto` alone computes the
+          other axis to `auto`. The content wrapper's `overflow-x-clip` then
+          removes the sideways extent itself (a user bubble slides in from
+          `translateX(16px)`), so neither a touch nor a focus can move the
+          pane sideways. Wide code blocks and tables scroll inside their own
+          box. */}
       <div
         ref={scrollerRef}
-        className="flex-1 min-h-0 overflow-y-auto"
+        className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden"
       >
         <div
           ref={contentRef}
-          className={`chat-transcript flex min-h-full flex-col ${compact ? 'space-y-1 p-2.5' : 'space-y-2 p-3'}`}
+          className={`chat-transcript flex min-h-full flex-col overflow-x-clip ${compact ? 'space-y-1 p-2.5' : 'space-y-2 p-3'}`}
         >
         {messages.length === 0 && (
           <div className="flex flex-1 flex-col items-center justify-center text-center animate-fade-in text-pc-text-muted">

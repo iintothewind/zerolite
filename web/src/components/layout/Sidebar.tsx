@@ -359,7 +359,7 @@ export default function Sidebar({ open, onClose }: SidebarProps) {
           toggle: the rail is the navigation. Grouping is expressed as thin
           divider rules between the icon clusters. */}
       <aside
-        className="hidden md:flex fixed top-0 left-0 h-screen w-14 flex-col border-r z-50"
+        className="hidden md:flex fixed top-0 left-0 h-dvh w-14 flex-col border-r z-50"
         style={railAsideStyle}
         aria-label={t('nav.aria.primary')}
       >
@@ -392,7 +392,7 @@ export default function Sidebar({ open, onClose }: SidebarProps) {
       {/* Mobile drawer — labelled full version (icons + labels), slides in/out. */}
       <aside
         className={[
-          'md:hidden fixed top-0 left-0 h-screen w-60 flex flex-col border-r z-50 transition-transform duration-200 ease-out',
+          'md:hidden fixed top-0 left-0 h-dvh w-60 flex flex-col border-r z-50 transition-transform duration-200 ease-out',
           open ? 'translate-x-0' : '-translate-x-full',
         ].join(' ')}
         style={{ background: 'var(--pc-bg-sidebar)', borderColor: 'var(--pc-border)' }}

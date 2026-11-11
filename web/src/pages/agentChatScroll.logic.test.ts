@@ -59,6 +59,7 @@ test('a fresh pane follows the tail', () => {
     following: true,
     lastScrollTop: 0,
     lastScrollHeight: 0,
+    lastClientHeight: 0,
   });
 });
 
@@ -68,6 +69,7 @@ test('createFollowState can be seeded with the pane’s live offset', () => {
     following: true,
     lastScrollTop: 840,
     lastScrollHeight: 0,
+    lastClientHeight: 0,
   });
 });
 
@@ -202,6 +204,24 @@ test('a shrink that lands a suspended reader on the tail does not resume', () =>
   state = foldScroll(state, metrics(200));
   assert.equal(state.following, false);
   state = foldScroll(state, { scrollTop: 0, scrollHeight: 500, clientHeight: VIEWPORT });
+  assert.equal(state.following, false);
+});
+
+test('a clamp after the scrollport grows does not suspend a follower', () => {
+  // The on-screen keyboard closes (or the composer collapses after a send):
+  // the pane gets taller, the furthest offset drops, and the browser clamps
+  // scrollTop down onto it. The reader never moved.
+  let state = foldScroll(createFollowState(), { scrollTop: 1700, scrollHeight: CONTENT, clientHeight: 300 });
+  state = foldScroll(state, metrics(MAX_SCROLL));
+  assert.equal(state.following, true);
+  assert.equal(state.lastClientHeight, VIEWPORT);
+});
+
+test('scrolling up while the scrollport grows still suspends', () => {
+  // Growth only excuses a move that ends on the tail. Landing far above it
+  // is the reader leaving, whatever the pane did at the same moment.
+  let state = foldScroll(createFollowState(), { scrollTop: 1700, scrollHeight: CONTENT, clientHeight: 300 });
+  state = foldScroll(state, metrics(900));
   assert.equal(state.following, false);
 });
 

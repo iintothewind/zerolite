@@ -317,7 +317,10 @@ export default function ChatWorkspace({ initialAlias }: ChatWorkspaceProps) {
   }, [tabs]);
 
   return (
-    <div translate="no" className="notranslate flex flex-col h-full min-h-0">
+    <div translate="no" className="notranslate flex flex-col h-full min-h-0 overflow-x-clip">
+      {/* overflow-x-clip: nothing in a chat pane may give Layout's <main> a
+          sideways extent. <main> is overflow-x hidden, and hidden overflow
+          still scrolls when the browser reveals a focused control. */}
       {/* Single-pane users rarely need tabs / split / "+ agent". Hide the whole
           chrome row until a second pane exists — reclaim ~40px for messages.
           Opening another agent via the sidebar (or deep link) adds a tab and

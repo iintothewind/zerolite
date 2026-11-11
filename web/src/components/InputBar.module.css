@@ -33,6 +33,7 @@
 .scroll {
   max-height: 200px;
   overflow-y: auto;
+  overflow-x: hidden;
   padding: 0 14px 0 16px;
   margin-right: 4px;
 }
@@ -52,6 +53,14 @@
   display: block;
   overflow-wrap: break-word;
   word-break: break-word;
+}
+
+/* Same touch-device floor as the control rule in index.css; this class
+   outranks that element selector, so it needs its own copy. */
+@media (pointer: coarse) {
+  .input {
+    font-size: max(16px, 1em);
+  }
 }
 
 .input::placeholder {
