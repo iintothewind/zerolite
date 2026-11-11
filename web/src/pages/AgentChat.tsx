@@ -797,7 +797,9 @@ export function AgentChatInner({
               variant="ghost"
               size="sm"
               onClick={toggleToolActivity}
-              className="h-6 w-6 !p-0"
+              // Pressed = tool activity shown. The icon alone never changes,
+              // so the state has to read from the button's own colour.
+              className="h-6 w-6 !p-0 aria-pressed:border-pc-accent/40 aria-pressed:bg-pc-accent/15 aria-pressed:text-pc-accent"
               aria-label={showToolActivity ? t('agent.tool_activity_hide') : t('agent.tool_activity_show')}
               aria-pressed={showToolActivity}
               title={showToolActivity ? t('agent.tool_activity_hide') : t('agent.tool_activity_show')}
@@ -845,8 +847,9 @@ export function AgentChatInner({
                   className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs text-pc-text transition-colors hover:bg-[var(--pc-hover)]"
                   aria-pressed={showToolActivity}
                 >
-                  <Wrench className="h-3.5 w-3.5" />
+                  <Wrench className={`h-3.5 w-3.5 ${showToolActivity ? 'text-pc-accent' : ''}`} />
                   {showToolActivity ? t('agent.tool_activity_hide') : t('agent.tool_activity_show')}
+                  {showToolActivity && <Check className="ml-auto h-3.5 w-3.5 text-pc-accent" aria-hidden="true" />}
                 </button>
                 <button
                   type="button"
