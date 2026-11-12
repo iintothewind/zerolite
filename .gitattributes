@@ -40,6 +40,7 @@ LICENSE* text eol=lf
 
 # Rust-specific
 Cargo.lock text eol=lf linguist-generated
+docs/book/src/architecture/zeroclaw-rpc.openrpc.json linguist-generated
 Cargo.toml text eol=lf
 
 # PowerShell and VS solutions also use LF to keep a single EOL policy

@@ -6,6 +6,7 @@ pub mod container;
 pub mod container_base;
 pub mod docker_tags;
 pub mod install_sh;
+pub mod openrpc;
 pub mod packaging;
 pub mod runtime_locales;
 pub mod setup_bat;
