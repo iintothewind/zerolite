@@ -417,6 +417,12 @@ impl SessionSearchTool {
 
 #[async_trait]
 impl Tool for SessionSearchTool {
+    fn requires_unrestricted_principal(&self) -> bool {
+        // ZeroLite (session-search R2): ownership scoping is by agent/channel,
+        // not by principal, so a non-admin principal must not reach it.
+        true
+    }
+
     fn name(&self) -> &str {
         "session_search"
     }

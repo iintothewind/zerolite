@@ -264,4 +264,25 @@ mod session_tool_marker_guard {
             "sessions_current addresses only the caller's own session"
         );
     }
+
+    /// ZeroLite (D6, session-search R2): `session_search` scopes hits by the
+    /// calling agent and channel, never by principal, so it is withheld from a
+    /// non-admin principal like the upstream cross-session tools — also when it
+    /// is built for an agent with an ownership scope.
+    #[test]
+    fn session_search_is_withheld_from_non_admin_principals() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        let security = Arc::new(SecurityPolicy::default());
+        let unscoped = crate::sessions::SessionSearchTool::new(backend.clone(), security.clone());
+        let scoped = crate::sessions::SessionSearchTool::for_agent(
+            backend,
+            security,
+            crate::sessions::SessionOwnershipScope::with_channels("agent-a", Vec::<String>::new()),
+        );
+        for tool in [&unscoped, &scoped] {
+            assert_eq!(tool.name(), "session_search");
+            assert!(tool.requires_unrestricted_principal());
+        }
+    }
 }
