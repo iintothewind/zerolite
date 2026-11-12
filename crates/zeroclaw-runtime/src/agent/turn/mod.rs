@@ -3774,7 +3774,13 @@ async fn run_tool_call_loop_impl<'a>(
                 *history_has_trim_breadcrumb = turn_state.crumb_present;
                 return Ok(accumulated_display_text);
             }
-            turn_state.push_dual(ChatMessage::system(reason));
+            // ZeroLite (delegation-turn R6): a correction the runtime writes
+            // mid-turn rides the `[Tool results]` prompt carrier, so it stays
+            // runtime machinery (a hidden `runtime` row, not a turn boundary)
+            // and the system prefix stays byte-stable.
+            turn_state.push_dual(ChatMessage::user(
+                zeroclaw_api::tool_carrier::render_prompt_tool_carrier(&reason, &[]),
+            ));
         }
 
         let queued_sop_actions = crate::sop::executor::drain_live_actions(&live_sop_queue);

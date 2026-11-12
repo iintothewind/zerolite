@@ -262,11 +262,15 @@ async fn repeated_failures_close_both_agent_apis_after_correction_and_preserve_p
                     .iter()
                     .all(|message| !message.content.contains(&correction))
             }));
-            assert!(
-                requests[3].iter().any(
-                    |message| message.role == "system" && message.content.contains(&correction)
-                )
-            );
+            // ZeroLite (delegation-turn R6): the correction is a `[Tool
+            // results]` carrier row, never a `system` row.
+            assert!(requests[3].iter().any(|message| {
+                message.role == "user"
+                    && message
+                        .content
+                        .starts_with(zeroclaw_api::tool_carrier::TOOL_RESULTS_PREFIX)
+                    && message.content.contains(&correction)
+            }));
             assert!(response.contains(&stop));
             assert_eq!(
                 result_ids(&agent.agent),
@@ -692,4 +696,64 @@ async fn activated_aliases_share_recovery_admission_and_canonical_ignore() {
             }
         }
     }
+}
+
+/// The rows of `request` that carry the repeated-failure correction.
+fn correction_rows(request: &[ChatMessage]) -> Vec<&ChatMessage> {
+    let correction = crate::i18n::get_required_cli_string("turn-repeated-failure-recovery");
+    request
+        .iter()
+        .filter(|message| message.content.contains(&correction))
+        .collect()
+}
+
+/// The correction the runtime writes after the configured repeat count rides
+/// the `[Tool results]` prompt carrier: exactly one `user` row with that
+/// prefix, and no `system` row anywhere past the system prompt.
+#[tokio::test]
+async fn repeated_failure_correction_rides_the_tool_results_carrier() {
+    for streamed in [false, true] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (mut agent, requests) = agent_for(script(8), failing(&calls), Some(Default::default()));
+        let _ = run(&mut agent, streamed).await;
+        let requests = requests.lock();
+        let after_correction = &requests[3];
+        let rows = correction_rows(after_correction);
+        assert_eq!(rows.len(), 1, "one correction row: {after_correction:?}");
+        assert_eq!(rows[0].role, "user");
+        assert!(
+            rows[0]
+                .content
+                .starts_with(zeroclaw_api::tool_carrier::TOOL_RESULTS_PREFIX),
+            "the correction rides the carrier: {:?}",
+            rows[0].content
+        );
+        assert!(
+            after_correction
+                .iter()
+                .skip(1)
+                .all(|message| message.role != "system"),
+            "no system row after the system prompt: {after_correction:?}"
+        );
+    }
+}
+
+/// The correction row is runtime machinery: trim does not count it as a turn
+/// boundary, so the kept-turn count matches what the operator sent.
+#[tokio::test]
+async fn repeated_failure_correction_is_machinery_and_not_a_turn_boundary() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (mut agent, requests) = agent_for(script(8), failing(&calls), Some(Default::default()));
+    let _ = run(&mut agent, false).await;
+    let requests = requests.lock();
+    let rows = correction_rows(&requests[3]);
+    assert_eq!(rows.len(), 1);
+    assert!(crate::agent::history_trim::is_synthetic_user_message(
+        rows[0]
+    ));
+    assert_eq!(
+        crate::agent::history_trim::count_turns(&requests[3]),
+        crate::agent::history_trim::count_turns(&requests[0]),
+        "the correction must not open a turn"
+    );
 }
