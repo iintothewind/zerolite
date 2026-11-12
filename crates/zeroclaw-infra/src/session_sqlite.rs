@@ -446,6 +446,24 @@ impl SqliteSessionBackend {
         Ok(id)
     }
 
+    /// Chat rows of a session: the rows `load` returns (session-search R3).
+    fn chat_row_count_on(conn: &Connection, session_key: &str) -> rusqlite::Result<usize> {
+        conn.query_row(
+            &format!("SELECT COUNT(*) FROM sessions WHERE session_key = ?1 AND {CHAT_KINDS}"),
+            params![session_key],
+            |row| row.get(0),
+        )
+    }
+
+    /// Delete every transcript row of a session. The `sessions_ad` trigger
+    /// removes their full-text index entries with them.
+    fn delete_rows_on(conn: &Connection, session_key: &str) -> rusqlite::Result<usize> {
+        conn.execute(
+            "DELETE FROM sessions WHERE session_key = ?1",
+            params![session_key],
+        )
+    }
+
     fn session_row_exists(conn: &Connection, session_key: &str) -> rusqlite::Result<bool> {
         conn.query_row(
             "SELECT 1 FROM session_metadata WHERE session_key = ?1",
@@ -1126,7 +1144,10 @@ impl SessionBackend for SqliteSessionBackend {
     fn try_load(&self, session_key: &str) -> std::io::Result<Vec<ChatMessage>> {
         let conn = self.conn.lock();
         let mut stmt = conn
-            .prepare("SELECT role, content FROM sessions WHERE session_key = ?1 ORDER BY id ASC")
+            .prepare(&format!(
+                "SELECT role, content FROM sessions WHERE session_key = ?1 AND {CHAT_KINDS}
+                 ORDER BY id ASC"
+            ))
             .map_err(std::io::Error::other)?;
         let rows = stmt
             .query_map(params![session_key], |row| {
@@ -1166,15 +1187,11 @@ impl SessionBackend for SqliteSessionBackend {
             )
             .map_err(std::io::Error::other)?;
         let _authority = authorize(owner.as_deref())?;
+        // ZeroLite (session-search R3): the fork's row writer classifies the
+        // row, numbers its turn and indexes it, inside this transaction.
         Self::append_on(&tx, session_key, message, &Utc::now().to_rfc3339())
             .map_err(std::io::Error::other)?;
-        let count: usize = tx
-            .query_row(
-                "SELECT COUNT(*) FROM sessions WHERE session_key = ?1",
-                params![session_key],
-                |row| row.get(0),
-            )
-            .map_err(std::io::Error::other)?;
+        let count = Self::chat_row_count_on(&tx, session_key).map_err(std::io::Error::other)?;
         tx.commit().map_err(std::io::Error::other)?;
         committed();
         Ok(count)
@@ -1457,12 +1474,8 @@ impl SessionBackend for SqliteSessionBackend {
             return Ok(false);
         }
 
-        // Delete messages (FTS5 trigger handles sessions_fts cleanup)
-        conn.execute(
-            "DELETE FROM sessions WHERE session_key = ?1",
-            params![session_key],
-        )
-        .map_err(std::io::Error::other)?;
+        // Delete messages (the `sessions_ad` trigger clears their index rows)
+        Self::delete_rows_on(&conn, session_key).map_err(std::io::Error::other)?;
 
         // Delete metadata
         conn.execute(
@@ -1517,11 +1530,7 @@ impl SessionBackend for SqliteSessionBackend {
         {
             return Ok(false);
         }
-        tx.execute(
-            "DELETE FROM sessions WHERE session_key = ?1",
-            params![session_key],
-        )
-        .map_err(std::io::Error::other)?;
+        Self::delete_rows_on(&tx, session_key).map_err(std::io::Error::other)?;
         tx.execute(
             "DELETE FROM session_metadata WHERE session_key = ?1 AND principal_id IS ?2",
             params![session_key, expected_owner],
@@ -4482,6 +4491,80 @@ mod tests {
         backend.delete_session("s").unwrap();
         assert!(!backend.set_context_start("s", 2, true).unwrap());
         assert!(!backend.session_exists("s"));
+    }
+
+    /// An authorizing guard that admits every owner.
+    fn admit_all(
+        _owner: Option<&str>,
+    ) -> std::io::Result<Box<dyn crate::session_backend::SessionEffectGuard + 'static>> {
+        Ok(Box::new(()))
+    }
+
+    /// ZeroLite (session-search R3): a row appended through upstream's
+    /// authorized effect is written by the fork's writer — classified, in a
+    /// turn, and searchable by a CJK substring — like an `append_turn` row.
+    #[test]
+    fn authorized_append_is_classified_and_searchable_like_append_turn() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        backend.set_session_agent_alias("s", "default").unwrap();
+        backend
+            .append_turn("s", &[row(RowKind::User, "user", "先问一句", None)])
+            .unwrap()
+            .unwrap();
+        let mut committed = false;
+        let count = backend
+            .append_authorized(
+                "s",
+                &ChatMessage::assistant("我们讨论数据库查询效率的问题"),
+                &admit_all,
+                &mut || committed = true,
+            )
+            .unwrap();
+        assert!(committed);
+        assert_eq!(count, 2, "chat rows, as `load` counts them");
+
+        let page = backend.load_turn_page("s", None, 1, true);
+        let appended = page.last().expect("the appended row");
+        assert_eq!(appended.kind, RowKind::Assistant);
+        assert_eq!(appended.turn, 1);
+        let hits = message_hits(&backend, "查询", None, None);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].kind, RowKind::Assistant);
+        assert_eq!(hits[0].message_id, appended.message_id);
+    }
+
+    /// ZeroLite (session-search R3): deleting through the authorized effect
+    /// removes the index entries with the rows, as `delete_session` does.
+    #[test]
+    fn authorized_delete_leaves_no_search_hit() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        backend.set_session_agent_alias("s", "default").unwrap();
+        backend
+            .append_turn(
+                "s",
+                &[
+                    row(RowKind::User, "user", "我们讨论数据库查询效率的问题", None),
+                    row(RowKind::ToolResult, "tool", "exit code 127", Some("shell")),
+                ],
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(message_hits(&backend, "查询", None, None).len(), 1);
+
+        assert!(
+            backend
+                .delete_session_authorized("s", None, &admit_all)
+                .unwrap()
+        );
+        assert!(message_hits(&backend, "查询", None, None).is_empty());
+        assert!(message_hits(&backend, "127", None, None).is_empty());
+        let conn = backend.conn.lock();
+        let indexed: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sessions_fts", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(indexed, 0, "no index row outlives its transcript row");
     }
 
     #[test]
