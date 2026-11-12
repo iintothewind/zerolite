@@ -92,8 +92,7 @@ pub fn is_tool_loop_cancelled(err: &anyhow::Error) -> bool {
 /// The complete provider-facing request cannot fit the active model's capacity.
 #[derive(Debug)]
 pub struct ContextWindowExceeded {
-    /// The count the refusal was decided on: the raw estimate, scaled up by
-    /// the calibration ratio when provider-reported usage supplied one.
+    /// The pre-send size the guard decided on: the provider-anchored size plus the margined tail, or the margined estimate (context-management R5).
     pub estimated_tokens: usize,
     pub model_context_window: usize,
     /// The same request's raw estimate, before calibration. The shares below
@@ -606,6 +605,33 @@ mod tests {
             tool_schema_tokens: 80,
         };
         assert!(exceeded.breakdown().contains("conversation ~0"));
+    }
+
+    /// ZeroLite (D5): the breakdown is diagnostics on the fork's number. The
+    /// raw shares are reported beside it, and `estimated_tokens` — the size the
+    /// guard decided on — comes back unchanged, never replaced by the raw sum.
+    #[test]
+    fn breakdown_reports_raw_shares_and_never_changes_the_decided_total() {
+        let exceeded = ContextWindowExceeded {
+            estimated_tokens: 40_150,
+            model_context_window: 32_768,
+            raw_estimated_tokens: 36_500,
+            system_tokens: 9_000,
+            tool_schema_tokens: 7_500,
+        };
+        let line = exceeded.breakdown();
+        for expected in [
+            "~40150 tokens",
+            "32768-token window",
+            "system prompt ~9000",
+            "tool schemas ~7500",
+            "conversation ~20000",
+            "calibration +3650",
+        ] {
+            assert!(line.contains(expected), "missing {expected:?} in {line:?}");
+        }
+        assert_eq!(exceeded.estimated_tokens, 40_150);
+        assert_eq!(exceeded.raw_estimated_tokens, 36_500);
     }
 
     #[test]
