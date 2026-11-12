@@ -40,8 +40,13 @@
   when they look cosmetic.** A "harmless" reorder is a cache regression.
   If a change is covered by R1–R3, apply the fork behavior (precedent
   lane); if it introduces a new prefix-affecting mechanism, report it.
-- **Code anchors:** tool-spec sorting, skill/catalog rendering, provider
-  send path (append-only log), `llm_request` fingerprinting.
+- **Code anchors:** tool-spec name sort —
+  `crates/zeroclaw-runtime/src/agent/turn/tool_specs.rs` (test
+  `tool_specs_follow_name_order_not_registration_order`); skill name sort —
+  `crates/zeroclaw-runtime/src/skills/mod.rs`; prefix fingerprint
+  (`system_sha256`, `tools_sha256` on `llm_request`) —
+  `crates/zeroclaw-runtime/src/agent/turn/provider_call.rs`; append-only send
+  log — `crates/zeroclaw-context/src/log.rs` (`AppendOnlyLog`).
 
 ## Sources
 

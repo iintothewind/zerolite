@@ -69,7 +69,5 @@
 
 - Fork commits `775c0aab3` (message-level FTS search + anchored history
   read), `2f246a59d` (ownership scoping by caller agent/channel).
-- Feature ticket: `zeroclaw-sessions-search-ticket.md` (message-level
-  search + anchor-read loop, FTS5 `sessions_fts`).
 - Gateway transcript rework (2026-11-10): append-only history with tool
   rows, turn paging, CJK search.

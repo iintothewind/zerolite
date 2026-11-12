@@ -67,7 +67,7 @@ criterion, so a merge with green tests and stale docs is still open.
 
 ## 1. Pre-check
 
-Read `zerolite_feature_list.md` and every design doc in `docs/design/`
+Read `zerolite_feature_list.md` (features, standing merge decisions, pick log) and every design doc in `docs/design/`
 before touching upstream code. Classify each upstream change:
 
 - (a) no semantics touched → may merge;
@@ -113,9 +113,9 @@ close the feature.
 ## 5. Post-merge docs — part of the merge, not follow-up
 
 After merge tests pass, update every design doc and the feature list touched
-by a conflict. Record
-each new decision in the design doc it belongs to; once written back, it is
-precedent for the next merge.
+by a conflict, and add a pick-log row to the feature list for every upstream
+change taken, dropped or left out. Record each new decision in the design doc
+it belongs to; once written back, it is precedent for the next merge.
 
 A merge is not complete until its docs are updated.
 

@@ -31,7 +31,7 @@ keep_recent_turns = 5           # default, clamped 1–10
 ```
 
 - Past the budget, keep the newest `keep_recent_turns` whole turns in one cut, then drop older ones one at a time down to one. A turn is never split. If the newest turn still does not fit the model window, the turn fails.
-- A trim rewrites stored history and refreshes the meter. The meter is a script-aware estimate priced with the tool definitions the request carries; a provider `input_tokens` report anchors it and the anchor is carried across turns, labelled `calibrated`.
+- A trim drops whole turns from what is replayed to the model and refreshes the meter; the dashboard transcript keeps every turn. The meter is a script-aware estimate priced with the tool definitions the request carries; a provider `input_tokens` report anchors it and the anchor is carried across turns, labelled `calibrated`.
 - Sends keep the longest byte-stable prefix. Cache hits are `zeroclaw_tokens_cached_input_total` and the composer's cache-hit percent. A child's context budget cannot exceed its parent's.
 - Stable prefix: no dates or clocks in the system prompt, channel turn context, or history. `HEARTBEAT.md` loads only for heartbeat. Skill and deferred catalogs are frozen for the session and sorted by name.
 
@@ -40,15 +40,16 @@ keep_recent_turns = 5           # default, clamped 1–10
 ### Web chat
 
 - Context ring, plus `N turns · M steps · … tok · cache hit …%`. The ring moves at turn start, and every number says where it came from (`estimate`, `calibrated`, `provider`).
-- A turn is ordered steps. Earlier steps collapse (`7 tool calls · 6 messages`); the answer stays open. The transcript stays pinned, and a trim cuts it in place.
+- A turn is ordered steps. Earlier steps collapse (`7 tool calls · 6 messages`); the answer stays open. The transcript stays pinned, and a trim cuts it in place. The newest 20 turns load first; `Load earlier turns` pages older ones back in, tool calls included.
 - An `https://` markdown image renders in the bubble and in tool steps. Publish the picture to an image host first.
 - Denser chrome, message hover actions, and tall images scroll.
 
 ### Sessions, pairing, delegates
 
-- `session_search` finds this agent's messages. `sessions_history` can read around a hit (`around_message_id`).
+- `session_search` finds this agent's messages, tool calls and tool output, and matches Chinese/Japanese/Korean by substring. `sessions_history` can read around a hit (`around_message_id`).
 - `gateway.master_pair_code` mints a device token without using up the one-time pairing code. It is a secret, and it does nothing while pairing is off. Details live in the `gateway.master_pair_code` config key.
 - Nested background delegates stay visible to their caller.
+- An empty or filler-only final reply gets one continuation nudge instead of ending the turn; a second one in a row fails the turn with an explicit error.
 
 ## Install
 

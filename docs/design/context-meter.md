@@ -72,7 +72,7 @@
 |---|---|---|---|
 | 1 | The wire carries a single budget number; consumers reuse it as both trigger and denominator | Two distinct published numbers: the effective window (denominator) and the trim budget, which is both the trigger and the fit target (see `context-management.md` R9) | R1, R2 |
 | 2 | No published effective window | `effective_context_window` is published on usage events, WS done frames, and the RPC context-usage surface | R2 |
-| 3 | No estimation fallback specified | Provider omits usage → local estimate (script-aware, see `context-management.md` § token estimation) | R3 |
+| 3 | No estimation fallback specified | Provider omits usage → local estimate (script-aware, see `context-management.md` § What the guard measures) | R3 |
 | 4 | The turn-start meter re-estimates the population from bytes, so it jumps down at every turn start | The turn-start meter is the anchor (provider measurement + conservative tail) or the conservative estimate. The raw estimator stays as the pre-anchor face; the in-turn dispatch guard anchors the same way and is never ratio-scaled | R4, R5 |
 
 ## Merge notes
@@ -131,9 +131,7 @@
 - Fork commits `06a229f69`, `01a0a2fe3` (estimated usage on the meter,
   estimate when the provider omits counts), `22ec17f5e` (publish the
   effective window, rename the ceiling).
-- 2026-10 session diagnostics: a turn billed 25,787 input tokens; the
-  next turn's turn-start estimate published 20,826 (byte estimate of the
-  same rows, ratio 0.808) and the meter fell ~20% below the number just
-  charged; the anchor plus a conservative margin was the fix. The factor
-  has since been tightened from 5/4 to 11/10 — the bias is real but the
-  families in use came in far closer to the estimate than that session did.
+- 2026-10 session diagnostics: the measurements quoted in R4. The margin
+  factor has since been tightened from 5/4 to 11/10 — the bias is real, but
+  the families in use came in far closer to the estimate than that session
+  did.

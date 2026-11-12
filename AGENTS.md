@@ -12,10 +12,14 @@
 8. Act directly; explain only when analysis affects the result.
 9. Discuss in Chinese; repository artifacts in English.
 
-## Upstream merges
+## Where things are
 
-Rare, and long: see `docs/merge_update_rules.md`. Read it before touching
-upstream code; do not deviate from it during a merge.
+- Fork features and their decisions: `zerolite_feature_list.md` → one design
+  doc per feature in `docs/design/`.
+- Upstream merge (rare, long): `docs/merge_update_rules.md`. Read it before
+  touching upstream code; do not deviate from it during a merge.
+- Release: `docs/maintainers/build-cli-binaries.md` § Release checklist.
+- Local build and deploy: `docs/maintainers/build-cli-local.md`.
 
 ## Hard constraints (do not work around these)
 
@@ -41,9 +45,8 @@ upstream code; do not deviate from it during a merge.
   `zeroclaw-channels` — `orchestrator::tests::compiled_channel_*`.
 - NEVER spawn parallel subagents on this repo (provider rate limiting).
   One agent at a time, or do the work inline.
-- Builds and deployment: see `docs/maintainers/build-cli-binaries.md`
-  and `docs/maintainers/build-cli-local.md`. Local CLI build = Docker
-  cross-compile Linux arm64 → `dist/bin/aarch64-unknown-linux-gnu/zeroclaw`
+- Local CLI build = Docker cross-compile Linux arm64 →
+  `dist/bin/aarch64-unknown-linux-gnu/zeroclaw`
   (`scripts/dev/build-cli-local.sh`), always
   `--features embedded-web,plugins-wasm-cranelift`.
 - Disk reclaim after any cargo/Docker compile or test (mandatory,

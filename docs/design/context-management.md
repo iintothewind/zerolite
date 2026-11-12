@@ -175,14 +175,17 @@ it is accepted.
 
 ## What the guard measures
 
-Size is a local **script-aware** estimate (Latin ≈4 chars/token, CJK/kana/Hangul
-≈1 char/token, ~4 framing tokens per message), corrected by the provider: after
-an accepted response, `ContextCalibration` records `usage.input_tokens` plus the
-fingerprint of the rows it covers, and the next turn prices
+Size is a local **script-aware** estimate, not bytes: Latin ≈4 chars/token,
+CJK/kana/Hangul ≈1 char/token (they tokenize near 1:1 with common BPE
+families), ~4 framing tokens per message and a per-image charge. It
+over-counts CJK-heavy text against real BPE merges, so the number is a
+trigger and a progress indicator, never a bill. The provider corrects it:
+after an accepted response, `ContextCalibration` records `usage.input_tokens`
+plus the fingerprint of the rows it covers, and the next turn prices
 `reported + margin(tail)`. The anchor is cleared by a trim, a history
-replacement inside it, a model/provider switch, a config-generation change and a
-tool-catalog change; it is not persisted, so a restored session starts on the
-local estimate. Details and labels: `context-meter.md`.
+replacement inside it, a model/provider switch, a config-generation change and
+a tool-catalog change; it is not persisted, so a restored session starts on
+the local estimate. Details and labels: `context-meter.md`.
 
 The **in-turn guard** re-measures before every dispatch and prices the same way:
 `reported + margin(tail)` when the route's report applies and the population is
@@ -251,13 +254,6 @@ hard-limit path), which is a figure, not a knob. Non-negotiable:
   `tokens_after`; a later accepted `usage` (a request sent *after* the trim) is
   newer information about the same population and wins. "`done` wins" therefore
   has this one exception.
-
-## Token estimation
-
-Script-aware, not bytes: Latin ≈4 chars/token, CJK/kana/Hangul one token each
-(they tokenize near 1:1 with common BPE families), plus per-image and framing
-charges. The estimator over-counts CJK-heavy text against real BPE merges, so the
-number is a trigger and a progress indicator, never a bill.
 
 ## Cache-economics feedback
 
