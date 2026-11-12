@@ -2191,6 +2191,57 @@ mod tests {
         );
     }
 
+    /// ZeroLite (context-meter #2): the effective context window rides the
+    /// per-call usage event and the turn's usage totals, and survives a round
+    /// trip; absent, it stays off the wire for older clients.
+    #[test]
+    fn context_usage_types_round_trip_the_effective_context_window() {
+        let evt = SessionUpdateEvent::ContextUsage {
+            session_id: "s".into(),
+            input_tokens: Some(25_787),
+            input_tokens_source: None,
+            max_context_tokens: Some(80_000),
+            model_context_window: Some(131_072),
+            effective_context_window: Some(100_000),
+        };
+        let v = serde_json::to_value(&evt).unwrap();
+        assert_eq!(v["effective_context_window"], json!(100_000));
+        assert_eq!(v["max_context_tokens"], json!(80_000));
+        let round: SessionUpdateEvent = serde_json::from_value(v).unwrap();
+        assert!(matches!(
+            round,
+            SessionUpdateEvent::ContextUsage {
+                effective_context_window: Some(100_000),
+                ..
+            }
+        ));
+
+        let totals = TurnUsageTotals {
+            input_tokens: None,
+            output_tokens: None,
+            tokens_used: None,
+            cost_usd: None,
+            provider_ref: None,
+            model: None,
+            last_input_tokens: Some(25_787),
+            max_context_tokens: Some(80_000),
+            model_context_window: Some(131_072),
+            effective_context_window: Some(100_000),
+            usage_by_provider: Vec::new(),
+        };
+        let v = serde_json::to_value(&totals).unwrap();
+        assert_eq!(v["effective_context_window"], json!(100_000));
+        let round: TurnUsageTotals = serde_json::from_value(v).unwrap();
+        assert_eq!(round.effective_context_window, Some(100_000));
+
+        let older = TurnUsageTotals {
+            effective_context_window: None,
+            ..round
+        };
+        let v = serde_json::to_value(&older).unwrap();
+        assert!(v.get("effective_context_window").is_none(), "{v}");
+    }
+
     #[test]
     fn turn_complete_carries_safeguard_and_usage_totals_additively() {
         let evt = SessionUpdateEvent::TurnComplete {
