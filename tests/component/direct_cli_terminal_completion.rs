@@ -282,8 +282,10 @@ runtime_profile = "default"
             .await
             .expect("request recording enabled")
             .len(),
-        1,
-        "the CLI must reach the local provider fixture exactly once"
+        // ZeroLite (delegation-turn R5): the empty reply gets one
+        // continuation nudge before the semantic-empty failure.
+        2,
+        "the CLI must reach the local provider fixture twice: the reply and one nudge"
     );
 }
 
@@ -378,7 +380,9 @@ runtime_profile = "default"
             .await
             .expect("request recording enabled")
             .len(),
-        1,
-        "the interactive CLI must reach the local provider fixture exactly once"
+        // ZeroLite (delegation-turn R5): the empty reply gets one
+        // continuation nudge before the semantic-empty failure.
+        2,
+        "the interactive CLI must reach the local provider fixture twice: the reply and one nudge"
     );
 }

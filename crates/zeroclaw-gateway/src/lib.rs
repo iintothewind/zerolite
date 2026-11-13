@@ -2359,7 +2359,7 @@ pub async fn run_gateway_with_plugin_webhooks(
     }
     if pairing.has_master_code() {
         // Never print the value — only that recovery is configured.
-        println!("  🔑 Master recovery code: configured (value not printed)");
+        println!("  🔑 Master recovery code: configured (value not printed)"); // i18n-exempt: startup banner line, like the pairing lines beside it
     }
     println!("  POST {pfx}/pair      — pair a new client (X-Pairing-Code header)");
     println!("  POST {pfx}/webhook   — {{\"message\": \"your prompt\"}}");
@@ -5811,7 +5811,8 @@ mod tests {
 
         // The daemon builds its authority from the same configuration.
         let daemon_authority = PairingGuard::from_gateway_config(&gateway);
-        let guard = super::resolve_pairing_guard(Some(daemon_authority), &gateway, PairingLimits::default);
+        let guard =
+            super::resolve_pairing_guard(Some(daemon_authority), &gateway, PairingLimits::default);
 
         assert!(
             guard.try_master("a-long-random-recovery-string").is_some(),

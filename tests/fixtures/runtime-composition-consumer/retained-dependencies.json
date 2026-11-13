@@ -5,6 +5,10 @@
       "owner": "crates/zeroclaw-runtime/src/composition.rs",
       "reason": "Composition ports, model/tool/channel/memory traits, principal identity and observer events; this is the capability contract owner."
     },
+    "zeroclaw-context": {
+      "owner": "crates/zeroclaw-runtime/Cargo.toml",
+      "reason": "ZeroLite fork crate (AppendOnlyLog, docs/design/prompt-cache-prefix.md conflicts #3), declared by the runtime manifest; no runtime module imports it as of the v0.9.0 merge. Pure data structure; it supplies no adapter selection authority."
+    },
     "zeroclaw-config": {
       "owner": "crates/zeroclaw-runtime/src/live_config_authority.rs",
       "reason": "Authoritative schema3 config generation, policy resolution and admitted agent identity; the runtime keeps enforcement and resolves live state at use time."

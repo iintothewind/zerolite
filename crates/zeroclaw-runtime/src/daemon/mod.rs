@@ -3256,7 +3256,8 @@ mod tests {
     fn the_published_pairing_authority_carries_the_configured_master_code() {
         let mut config = zeroclaw_config::schema::Config::default();
         assert!(
-            !daemon_pairing_guard(&config, zeroclaw_config::pairing::PairingLimits::default).has_master_code(),
+            !daemon_pairing_guard(&config, zeroclaw_config::pairing::PairingLimits::default)
+                .has_master_code(),
             "no configured master code means no master code"
         );
 

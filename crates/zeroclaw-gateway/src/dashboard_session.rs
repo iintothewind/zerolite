@@ -2735,7 +2735,11 @@ mod tests {
             )
             .await;
             assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
-            assert_eq!(json(response).await["reason"], "operator_required", "{path}");
+            assert_eq!(
+                json(response).await["reason"],
+                "operator_required",
+                "{path}"
+            );
 
             let paired = send(
                 &fixture.router,
