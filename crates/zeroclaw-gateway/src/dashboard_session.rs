@@ -2196,6 +2196,15 @@ mod tests {
             .route("/ws/canvas/{id}", get(crate::canvas::handle_ws_canvas))
             .route("/api/events", get(crate::sse::handle_sse_events))
             .route("/ws/sop/runs", get(crate::ws_sop_runs::handle_ws_sop_runs))
+            // ZeroLite transcript reads, routed as `run_gateway` routes them.
+            .route(
+                "/api/sessions/{id}/messages",
+                get(crate::dashboard_core::session_messages),
+            )
+            .route(
+                "/api/sessions/{id}/messages/{message_id}",
+                get(crate::api::handle_api_session_message),
+            )
             .with_state(state.clone())
             .layer(axum::middleware::from_fn_with_state(
                 DashboardLayer {
@@ -2697,6 +2706,56 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// ZeroLite (gateway-session row 10): the fork's transcript reads are
+    /// operator routes under dashboard sign-in. A signed-in account that is
+    /// not an administrator is refused with `operator_required`; a paired
+    /// token reads them as before.
+    #[tokio::test]
+    async fn fork_session_routes_refuse_a_non_admin_dashboard_session() {
+        let server = idp(&["ops"], "gw").await;
+        let fixture = fixture(sign_in_config(&server.uri()));
+        let signed_in = sign_in(&fixture, &server).await;
+        assert_eq!(signed_in.session["admin"], false);
+        let cookie = signed_in.cookie_header();
+        for path in [
+            "/api/sessions/gw_s/messages",
+            "/api/sessions/gw_s/messages?before_turn=3&turns=2",
+            "/api/sessions/gw_s/messages/1",
+        ] {
+            let response = send(
+                &fixture.router,
+                request(
+                    "GET",
+                    path,
+                    loopback(),
+                    &[("cookie", &cookie), ("sec-fetch-site", "same-origin")],
+                ),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
+            assert_eq!(json(response).await["reason"], "operator_required", "{path}");
+
+            let paired = send(
+                &fixture.router,
+                request(
+                    "GET",
+                    path,
+                    loopback(),
+                    &[("authorization", "Bearer zc_paired")],
+                ),
+            )
+            .await;
+            assert!(
+                !matches!(
+                    paired.status(),
+                    StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED
+                ),
+                "{path}: a paired token reads the transcript as before, got {}",
+                paired.status()
+            );
+        }
     }
 
     #[tokio::test]
