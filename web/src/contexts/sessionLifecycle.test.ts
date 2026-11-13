@@ -3150,8 +3150,10 @@ for (const { keepCollapsed, label, whileThinking, afterChunk } of thinkingBoxCas
     await openSocket(runtime, 0);
     await settle();
 
+    // ZeroLite (webui #9): the toggle is an icon button in the chat header's
+    // icon group, named by its aria-label.
     const toggle = () => mounted.renderer.root.findAllByType('button')
-      .find((button) => nodeText(button).includes('Keep thinking collapsed'));
+      .find((button) => button.props['aria-label'] === 'Keep thinking collapsed');
     assert.equal(toggle()?.props['aria-pressed'], false);
     if (keepCollapsed) {
       await act(async () => { toggle()!.props.onClick(); });
