@@ -3,6 +3,8 @@
 #
 # Mandatory wipe list (compile/test residue only — do not touch unrelated Temp):
 #   - $REPO_ROOT/target/                 (cargo intermediates; can be 100s of GB)
+#   - $REPO_ROOT/target-docker/          (zeroclaw-test CARGO_TARGET_DIR; grows
+#                                        by one set of test binaries per run)
 #   - $TEMP/zc-cargo-home                (agent/sandbox CARGO_HOME; ~1 GB)
 #   - $TEMP/zeroclaw/                    (agent temp workspace)
 #   - $TEMP/zc-*                         (zc-check.ps1, zc-baseline-check.log,
@@ -107,6 +109,10 @@ _add_temp "/tmp"
 
 # 1) Repo cargo target/ — primary multi-hundred-GB offender.
 wipe_path "$REPO_ROOT/target" "repo cargo target/"
+
+# 1b) zeroclaw-test container target dir (AGENTS.md test command). Its
+# CARGO_TARGET_DIR is set inside the container, never in this shell.
+wipe_path "$REPO_ROOT/target-docker" "zeroclaw-test target-docker/"
 
 # 2–4) Agent/build temps under %TEMP%.
 for tmp in "${_temp_roots[@]+"${_temp_roots[@]}"}"; do

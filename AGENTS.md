@@ -52,7 +52,8 @@
 - Disk reclaim after any cargo/Docker compile or test (mandatory,
   residue only): run `scripts/dev/reclaim-cargo-disk.sh` (Windows:
   `scripts\dev\reclaim-cargo-disk.cmd`) before ending the turn. Clear
-  repo `target/`, `%TEMP%\zc-cargo-home`, `%TEMP%\zeroclaw\`, and
+  repo `target/`, repo `target-docker/`, `%TEMP%\zc-cargo-home`,
+  `%TEMP%\zeroclaw\`, and
   `%TEMP%\zc-*`. Deploy only from `dist/bin/<triple>/zeroclaw`. Do not
   blind-`docker system prune -a`; if Docker disk is still tight, prune
   unused `rust:1-bookworm` cross-compile dangling layers only.
