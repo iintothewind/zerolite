@@ -48,7 +48,8 @@ function windowHeightColumn(rendered: Host | Host[] | null): Host {
   assert.ok(rendered && !Array.isArray(rendered), "the column renders one top-level element");
   assert.equal(rendered.type, "div");
   const classes = String(rendered.props.className ?? "").split(/\s+/);
-  assert.ok(classes.includes("h-screen"), `column classes: ${rendered.props.className}`);
+  // ZeroLite (webui #9): the dynamic viewport height.
+  assert.ok(classes.includes("h-dvh"), `column classes: ${rendered.props.className}`);
   return rendered;
 }
 

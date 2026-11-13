@@ -87,7 +87,7 @@ export default function Layout() {
           not `vh`: on phones `100vh` is the toolbar-retracted height, which
           made the shell taller than the visible area and the whole page
           scrollable. */}
-      <MainColumn viaRelay={viaRelay}>
+      <MainColumn viaRelay={viaRelay} shellRef={shellRef}>
         <Header
           onMenuToggle={() => setSidebarOpen((v) => !v)}
           onOpenPalette={openPalette}

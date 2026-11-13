@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react';
+import type { ReactNode, Ref } from 'react';
 import { RelayNotice } from '@/components/auth/RelayNotice';
 
 /**
@@ -8,9 +8,20 @@ import { RelayNotice } from '@/components/auth/RelayNotice';
  * Above the column it would make the page taller than the window, and any
  * scroll, such as chat jumping to its latest message, would carry it away.
  */
-export function MainColumn({ viaRelay, children }: { viaRelay: boolean; children: ReactNode }) {
+export function MainColumn({
+  viaRelay,
+  shellRef,
+  children,
+}: {
+  viaRelay: boolean;
+  /** ZeroLite (webui #9): the shell `fitToVisualViewport` keeps above the keyboard. */
+  shellRef?: Ref<HTMLDivElement>;
+  children: ReactNode;
+}) {
+  // `dvh`: the visible viewport height, so the column never outgrows what a
+  // phone shows with its toolbars out (webui #9; see Layout.tsx).
   return (
-    <div className="flex flex-col flex-1 min-w-0 h-screen md:ml-14 ml-0">
+    <div ref={shellRef} className="flex flex-col flex-1 min-w-0 h-dvh md:ml-14 ml-0">
       {viaRelay && <RelayNotice bar />}
       {children}
     </div>
