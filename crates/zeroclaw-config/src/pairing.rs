@@ -1511,6 +1511,35 @@ mod tests {
         assert!(!PairingGuard::from_gateway_config(&gateway).has_master_code());
     }
 
+    /// ZeroLite (master-pair-code R3): the gateway's and the daemon's guards
+    /// are built from the configuration and then given live limits. The
+    /// master code must survive that, and the limits must be the ones in
+    /// force: here a zero code lifetime expires the one-time code at once
+    /// while the master code keeps pairing.
+    #[test]
+    async fn a_guard_with_live_limits_still_carries_the_master_code() {
+        let mut gateway = crate::schema::GatewayConfig::default();
+        gateway.require_pairing = true;
+        gateway.master_pair_code = Some("recovery-secret".to_string());
+        let limits = PairingLimits {
+            code_ttl: Duration::ZERO,
+            ..PairingLimits::default()
+        };
+        let guard = PairingGuard::from_gateway_config(&gateway).with_live_limits(move || limits);
+
+        assert!(guard.has_master_code());
+        assert!(guard.try_master("recovery-secret").is_some());
+        assert!(
+            guard.try_master("recovery-secret").is_some(),
+            "the master code stays reusable under live limits"
+        );
+        assert!(guard.try_master("not-the-master-code").is_none());
+        assert!(
+            guard.pairing_code().is_none(),
+            "the live zero lifetime applies to the one-time code"
+        );
+    }
+
     #[test]
     async fn try_master_issues_token_on_match_and_is_reusable() {
         let guard = new_guard(true, &[]).with_master_code(Some("recovery-secret".to_string()));

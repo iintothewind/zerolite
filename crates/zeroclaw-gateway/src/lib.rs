@@ -1026,11 +1026,17 @@ fn config_admin_router(route_auth: principal_gate::ConfigRouteAuth) -> Router<Ap
 /// daemon that built its guard without the configured master code would leave
 /// the web pairing page rejecting a code the operator had configured, with no
 /// hint why.
+///
+/// A standalone guard reads its code lifetime and brute-force limits from
+/// `limits` on every use; the daemon's guard already carries its own.
 fn resolve_pairing_guard(
     shared_pairing: Option<PairingGuard>,
     gateway_config: &zeroclaw_config::schema::GatewayConfig,
+    limits: impl Fn() -> PairingLimits + Send + Sync + 'static,
 ) -> Arc<PairingGuard> {
-    Arc::new(shared_pairing.unwrap_or_else(|| PairingGuard::from_gateway_config(gateway_config)))
+    Arc::new(shared_pairing.unwrap_or_else(|| {
+        PairingGuard::from_gateway_config(gateway_config).with_live_limits(limits)
+    }))
 }
 
 /// How long a stopping gateway lets its connections finish the requests in
@@ -2129,7 +2135,14 @@ pub async fn run_gateway_with_plugin_webhooks(
     // is resolved from config in exactly one guard: startup pairing,
     // `gateway get-paircode --new`, the dashboard pairing flow, and
     // rotate-device all issue through it.
-    let pairing = resolve_pairing_guard(shared_pairing, &config.gateway);
+    // Its code lifetime and brute-force limits are read from
+    // `[gateway.pairing_dashboard]` in live config on every use, in the
+    // daemon's guard as in this one.
+    let pairing = resolve_pairing_guard(
+        shared_pairing,
+        &config.gateway,
+        PairingLimits::live(config_state.clone()),
+    );
     let rate_limit_max_keys = normalize_max_keys(
         config.gateway.rate_limit_max_keys,
         RATE_LIMIT_MAX_KEYS_DEFAULT,
@@ -5774,7 +5787,7 @@ mod tests {
         gateway.require_pairing = true;
         gateway.master_pair_code = Some("a-long-random-recovery-string".to_string());
 
-        let guard = super::resolve_pairing_guard(None, &gateway);
+        let guard = super::resolve_pairing_guard(None, &gateway, PairingLimits::default);
 
         assert!(
             guard.try_master("a-long-random-recovery-string").is_some(),
@@ -5798,7 +5811,7 @@ mod tests {
 
         // The daemon builds its authority from the same configuration.
         let daemon_authority = PairingGuard::from_gateway_config(&gateway);
-        let guard = super::resolve_pairing_guard(Some(daemon_authority), &gateway);
+        let guard = super::resolve_pairing_guard(Some(daemon_authority), &gateway, PairingLimits::default);
 
         assert!(
             guard.try_master("a-long-random-recovery-string").is_some(),

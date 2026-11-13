@@ -786,7 +786,14 @@ pub async fn run_with_authority(
     // gateway serves /pair, rotation, and revocation from THIS instance
     // and the RPC native auth provider verifies against it, so a pairing
     // change reaches both surfaces immediately (no boot-time snapshot).
-    let pairing_guard = daemon_pairing_guard(&config);
+    // Code lifetime and brute-force limits are read from this generation's
+    // live `[gateway.pairing_dashboard]` on every use, for /pair and
+    // certificate enrollment alike; the master code rides the same guard
+    // (master-pair-code R3).
+    let pairing_guard = daemon_pairing_guard(
+        &config,
+        zeroclaw_config::pairing::PairingLimits::live(live_config_authority.live_handle()),
+    );
 
     // One inbound-auth state for this daemon generation. The RPC context
     // and the supervised gateway authenticate against the same accepted
@@ -3224,10 +3231,12 @@ fn has_supervised_channels(config: &Config) -> bool {
 /// then rejects the master code with no hint that it was configured.
 fn daemon_pairing_guard(
     config: &zeroclaw_config::schema::Config,
+    limits: impl Fn() -> zeroclaw_config::pairing::PairingLimits + Send + Sync + 'static,
 ) -> std::sync::Arc<zeroclaw_config::pairing::PairingGuard> {
-    std::sync::Arc::new(zeroclaw_config::pairing::PairingGuard::from_gateway_config(
-        &config.gateway,
-    ))
+    std::sync::Arc::new(
+        zeroclaw_config::pairing::PairingGuard::from_gateway_config(&config.gateway)
+            .with_live_limits(limits),
+    )
 }
 
 #[cfg(test)]
@@ -3247,13 +3256,13 @@ mod tests {
     fn the_published_pairing_authority_carries_the_configured_master_code() {
         let mut config = zeroclaw_config::schema::Config::default();
         assert!(
-            !daemon_pairing_guard(&config).has_master_code(),
+            !daemon_pairing_guard(&config, zeroclaw_config::pairing::PairingLimits::default).has_master_code(),
             "no configured master code means no master code"
         );
 
         config.gateway.require_pairing = true;
         config.gateway.master_pair_code = Some("a-long-random-recovery-string".to_string());
-        let guard = daemon_pairing_guard(&config);
+        let guard = daemon_pairing_guard(&config, zeroclaw_config::pairing::PairingLimits::default);
         assert!(
             guard.has_master_code(),
             "the configured master code must reach the published pairing authority"
@@ -3274,7 +3283,7 @@ mod tests {
         let mut config = zeroclaw_config::schema::Config::default();
         config.gateway.require_pairing = true;
         config.gateway.master_pair_code = Some("a-long-random-recovery-string".to_string());
-        let guard = daemon_pairing_guard(&config);
+        let guard = daemon_pairing_guard(&config, zeroclaw_config::pairing::PairingLimits::default);
 
         let token = guard
             .try_master("a-long-random-recovery-string")
