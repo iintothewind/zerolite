@@ -57,3 +57,7 @@
   session-frozen name-sorted catalogs, compact skills).
 - Upstream #12177 (MCP tool names sorted on listing) — consistent with R2
   (name-sorted catalogs); taken 2026-11-09.
+- Upstream #9579 (built-in `zeroclaw-docs` skill) — not taken (owner decision
+  2026-11-12, reverted before the v0.9.0 merge): it adds a prompt entry that
+  points at version-pinned upstream docs and changes the skills section when
+  `read_skill` availability changes.

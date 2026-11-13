@@ -43,6 +43,21 @@
   Any upstream change to pairing endpoints, daemon gateway hosting, or
   config schema that touches this path needs a new end-to-end check, not
   just a unit-test re-run.
+- **Guard construction (since v0.9.0):** the gateway's and the daemon's
+  guards are built `PairingGuard::from_gateway_config(..).with_live_limits(..)`
+  (`resolve_pairing_guard`, `daemon_pairing_guard`), so the master code rides
+  the same guard as upstream's live `[gateway.pairing_dashboard]` limits
+  (#12213), which govern the one-time code only. The enrollment-code slot
+  (#11940) never takes the master code, and `try_master`'s collision guard
+  reads the gateway pairing-code slot. Test:
+  `a_guard_with_live_limits_still_carries_the_master_code`.
+- **End-to-end procedure** (binary built with
+  `--features embedded-web,plugins-wasm-cranelift`, `require_pairing = true`,
+  `master_pair_code` set): standalone `zeroclaw gateway start` — `POST /pair`
+  with `X-Pairing-Code: <master>` twice → 200 both times; `POST /api/pair`
+  with `{"code": "<master>"}` → 200; a wrong code → not 200; the code from
+  `zeroclaw gateway get-paircode` → 200 once, then refused. Then
+  `zeroclaw daemon` — the two master-code requests → 200.
 - **Code anchors:** `crates/zeroclaw-config/src/pairing.rs`,
   `crates/zeroclaw-config/src/schema.rs` (`GatewayConfig`),
   `crates/zeroclaw-gateway/src/api_pairing.rs`,

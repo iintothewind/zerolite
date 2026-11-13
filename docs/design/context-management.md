@@ -61,6 +61,7 @@ Divergences, decision by decision (`#N` is the merge-report citation):
 | 7 | Ratio-scaled `trim_to_reported_budget`; the proactive trigger sizes from the estimate alone | `ContextCalibration` anchors on the report; only the tail is estimated, and the anchored size feeds trigger and trim | R5 |
 | 8 | An un-fittable floor is a silent no-op | A floor the **model window** cannot take is a hard failure: an error, and no `HistoryTrimmed` | R4 |
 | 9 | `context_compression.*` rewrites history into a summary | Removed entirely | R6, R7, R1 |
+| 10 | Older turns' tool context is collapsed when a request is built (`keep_tool_context_turns`, #11297), so the sent prefix is rewritten every turn | Not taken (reverted before the v0.9.0 merge): tool context is retained with its turn and dropped only with whole turns; `keep_tool_context_turns` stays the channel-cache switch | R1, R6, R8 |
 
 **`[runtime_profiles.<alias>.context]` is the only place context policy is
 configured.** A knob that exists upstream and not here was rejected, not
@@ -100,6 +101,18 @@ while no runtime code read it. Verify the resolution path is consumed, and that:
 target; `keep_recent_turns` is the only retention rule, cascading to a floor of
 one and hard-failing there; trimming cannot be disabled; size is anchored by
 `ContextCalibration`; no summarization exists in the retention path.
+
+**Diagnostics are not semantics.** The overflow error carries a breakdown
+(#11578: raw estimate, system and tool-schema shares). `estimated_tokens` on
+`ContextWindowExceeded` is the fork's decided number — the anchored size plus
+the margined tail, or the margined estimate (R5) — and the raw shares are
+reported beside it, never in its place
+(`breakdown_reports_raw_shares_and_never_changes_the_decided_total`).
+
+**Schema version 4.** The v4 migration (#11218) retires upstream's
+agent-inline knobs and leaves `[runtime_profiles.<alias>.context]`,
+`lean_bootstrap` and `gateway.master_pair_code` untouched
+(`v3_to_v4_migration_keeps_the_context_table_and_the_master_pair_code`).
 
 **An action must not survive a merge as a trigger.** The v0.8.6 merge
 (`1f379c6de`) swapped the post-loop re-sync for an upstream `Agent::trim_history`

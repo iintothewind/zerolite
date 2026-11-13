@@ -63,6 +63,11 @@
   `a_stopped_gateway_releases_its_port_before_its_drain_ends`. Scenario:
   `POST /admin/reload` with a chat socket open closes it `1001`, and the
   next chat turn completes on the new instance.
+- **Dashboard sign-in (#11965, undecided upstream semantics):** a signed-in
+  socket is closed when its session ends or loses access; the running turn
+  keeps going unattended and persists its rows, consistent with R1. The fork
+  transcript reads (row 10) are operator routes: a non-admin session gets 403
+  `operator_required` (`fork_session_routes_refuse_a_non_admin_dashboard_session`).
 - **Code anchors:** `crates/zeroclaw-gateway/src/`,
   `crates/zeroclaw-runtime/src/daemon/mod.rs`.
 

@@ -28,9 +28,10 @@
 | 4 | Outbound Grok ACP frame limits enforced | `feat(providers): enforce outbound Grok ACP frame limits` |
 | 5 | Non-object pricing tolerated in OpenAI-compatible model lists | `fix(providers): tolerate non-object pricing in OpenAI-compatible model lists` |
 | 6 | Signed reasoning kept intact on the seam sanitizers | `fix(providers): keep signed reasoning intact on the seam sanitizers` |
-| 7 | Tool-result images stay live for the current user turn (not inlined base64 into screenshots) | `fix(multimodal)`, `fix(tools): stop inlining base64 into screenshot results` |
+| 7 | Tool-result images stay live for the current user turn (not inlined base64 into screenshots). Since v0.9.0 (#10502, undecided) OpenAI-compatible endpoints relocate tool-result images into a user message at the wire by default | `fix(multimodal)`, `fix(tools): stop inlining base64 into screenshot results` |
 | 8 | Shell output encoding detection; PowerShell output initialized as UTF-8 | `fix(runtime): detect encoding for shell output`, `feat(shell): initialize PowerShell output as UTF-8` |
 | 9 | A chat-completions reply cut at the output limit (`finish_reason: "length"`) is reported, not passed off as finished: WARN `provider_output_truncated`, `StreamEvent::OutputTruncated`, WARN `turn_output_truncated`, and a display-only `output_truncated` WS frame for a text reply | `fix(providers): report replies cut at the output limit` |
+| 10 | Vision routing counts only the markers this turn introduces (`count_current_turn_image_markers`); images carried over from earlier turns are stripped for a non-vision primary and never move the turn onto `vision_model_provider`. Holds for the skill-review fork too: its review prompt makes the reviewed image carried over (owner ruling 2026-11-12, v0.9.0 merge; upstream's `skill_review_routes_vision_through_the_turns_binding` became `skill_review_keeps_carried_over_images_off_the_vision_route`) | `dadf41301` `fix(runtime): carried-over images keep the selected model`; test `carried_over_images_keep_the_selected_model` |
 
 ## Merge notes
 

@@ -79,6 +79,13 @@ from a single published `LiveStats` snapshot
   denominator equals the published effective window (see
   `context-meter.md`); confirm the logo and release names are still
   zerolite's.
+- **v0.9.0 notes:** #11933's narrow-layout header classes are skipped (#9);
+  #11920's keep-thinking toggle is an icon button in the fork's header icon
+  group and in the mobile More menu; #11571's in-flight prompt survives turn
+  paging (#8, `chatHydration.logic`); `MainColumn` (the shell column, #12270)
+  is `h-dvh` and carries the `shellRef`, and `SignInScreen` is `min-h-dvh`.
+  The scoped-chat composer state (`canSend`, operator-only attach, ready
+  status) lives in `InputBar.tsx` (#3).
 - **Upstream web refactors that touch the transcript store, the context
   bar, or branding assets are semantic changes here.** The web test
   files (`*.test.ts` beside each logic file) are fork tests; they must
