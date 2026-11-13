@@ -19492,13 +19492,16 @@ Let me check the result."#;
         ]
     }
 
-    /// The skill-review fork reuses the reviewed turn's provider and history.
-    /// When that history holds an image and the provider lacks vision, the
-    /// fork's vision route goes through the turn's binding, for its principal,
-    /// and the configured route behind the counting endpoint is never
-    /// contacted, whether the source refuses the route or serves it.
+    /// The skill-review fork reuses the reviewed turn's provider and history,
+    /// then appends its own review prompt. ZeroLite (`dadf41301`, carried-over
+    /// images keep the selected model; owner ruling 2026-11-12): the reviewed
+    /// turn's image is carried over by the time the fork dispatches, so it
+    /// never moves the fork onto a vision route — neither the turn binding's
+    /// source nor the configured route behind the counting endpoint is asked,
+    /// whether the source would refuse the route or serve it. (Upstream's
+    /// version of this test expects the binding's source to be asked.)
     #[tokio::test]
-    async fn skill_review_routes_vision_through_the_turns_binding() {
+    async fn skill_review_keeps_carried_over_images_off_the_vision_route() {
         use crate::composition::test_support::{
             IMAGE_TURN, VisionRouteProviders, capabilities_with_providers, counting_endpoint,
         };
@@ -19577,13 +19580,9 @@ Let me check the result."#;
 
             let vision = providers.vision.lock();
             assert!(
-                !vision.is_empty(),
-                "the review fork asks the turn's source for the vision route (refuse = {refuse})"
+                vision.is_empty(),
+                "a carried-over image asks no source for a vision route (refuse = {refuse})"
             );
-            for request in vision.iter() {
-                assert_eq!(request.provider_ref.as_deref(), Some("custom.vision"));
-                assert_eq!(request.principal.as_ref(), Some(&principal));
-            }
             assert_eq!(
                 endpoint.connections(),
                 0,
