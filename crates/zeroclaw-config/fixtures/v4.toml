@@ -761,10 +761,9 @@ max_delegation_depth = 4
 max_tool_iterations = 25
 
 [runtime_profiles.default]
-compact_context = false
 keep_tool_context_turns = 2
+lean_bootstrap = false
 max_actions_per_hour = 100
-max_context_tokens = 32000
 max_cost_per_day_cents = 1000
 max_history_messages = 50
 max_system_prompt_chars = 0
@@ -774,6 +773,9 @@ parallel_tools = true
 shell_timeout_secs = 60
 tool_call_dedup_exempt = []
 tool_dispatcher = "auto"
+
+[runtime_profiles.default.context]
+request_token_ceiling = 32000
 
 [scheduler]
 catch_up_on_startup = true

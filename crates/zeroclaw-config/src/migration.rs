@@ -1003,7 +1003,9 @@ const V3_ONLY_DESTINATIONS: &[&[&str]] = &[
 /// The keys of a current `[agents.<alias>]`. V2's agents had none of them,
 /// and the chain writes several (`model_provider`, `identity`), so an agent
 /// holding one is evidence of the V3 layout. Kept in step with the schema by
-/// `v3_agent_fields_are_the_current_agent_fields`.
+/// `v3_agent_fields_are_the_current_agent_fields`. ZeroLite: no
+/// `summary_provider` — the agent has no context-compression knob
+/// (context-management §1 #9).
 const V3_AGENT_FIELDS: &[&str] = &[
     "a2a",
     "acp_enable_mcp",
@@ -1022,7 +1024,6 @@ const V3_AGENT_FIELDS: &[&str] = &[
     "risk_profile",
     "runtime_profile",
     "skill_bundles",
-    "summary_provider",
     "transcription_provider",
     "tts_provider",
     "workspace",
