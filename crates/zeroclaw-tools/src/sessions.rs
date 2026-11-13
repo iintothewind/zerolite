@@ -284,6 +284,11 @@ impl SessionsListTool {
 
 #[async_trait]
 impl Tool for SessionsListTool {
+    fn requires_unrestricted_principal(&self) -> bool {
+        // Lists sessions other than the caller's own with no ownership check.
+        true
+    }
+
     fn name(&self) -> &str {
         "sessions_list"
     }
@@ -412,6 +417,12 @@ impl SessionSearchTool {
 
 #[async_trait]
 impl Tool for SessionSearchTool {
+    fn requires_unrestricted_principal(&self) -> bool {
+        // ZeroLite (session-search R2): ownership scoping is by agent/channel,
+        // not by principal, so a non-admin principal must not reach it.
+        true
+    }
+
     fn name(&self) -> &str {
         "session_search"
     }
@@ -600,6 +611,11 @@ impl SessionsHistoryTool {
 
 #[async_trait]
 impl Tool for SessionsHistoryTool {
+    fn requires_unrestricted_principal(&self) -> bool {
+        // Reads sessions other than the caller's own with no ownership check.
+        true
+    }
+
     fn name(&self) -> &str {
         "sessions_history"
     }
@@ -994,6 +1010,11 @@ impl SessionsSendTool {
 
 #[async_trait]
 impl Tool for SessionsSendTool {
+    fn requires_unrestricted_principal(&self) -> bool {
+        // Appends to sessions other than the caller's own with no ownership check.
+        true
+    }
+
     fn name(&self) -> &str {
         "sessions_send"
     }
@@ -1253,6 +1274,11 @@ impl SessionResetTool {
 
 #[async_trait]
 impl Tool for SessionResetTool {
+    fn requires_unrestricted_principal(&self) -> bool {
+        // Resets a session by id with no ownership check.
+        true
+    }
+
     fn name(&self) -> &str {
         "sessions_reset"
     }
@@ -1374,6 +1400,11 @@ impl SessionDeleteTool {
 
 #[async_trait]
 impl Tool for SessionDeleteTool {
+    fn requires_unrestricted_principal(&self) -> bool {
+        // Deletes a session by id with no ownership check.
+        true
+    }
+
     fn name(&self) -> &str {
         "sessions_delete"
     }

@@ -1,21 +1,23 @@
 import { memo, useState, useEffect, useLayoutEffect, useMemo, useRef, useCallback } from 'react';
 import { Link, Navigate, useParams } from 'react-router-dom';
-import { Bot, User, AlertCircle, Copy, Check, X, Trash2, Minimize2, Maximize2, ChevronDown, Wrench, FolderOpen, MoreVertical } from 'lucide-react';
+import { Bot, User, AlertCircle, Copy, Check, X, Trash2, Minimize2, Maximize2, ChevronDown, Wrench, Brain, FolderOpen, MoreVertical } from 'lucide-react';
 import ReactMarkdown, { type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { useAgent, type ChatMessage } from '@/contexts/AgentContext';
 import { ApiError, uploadChatImage } from '@/lib/api';
 import { useDraft } from '@/hooks/useDraft';
+import { useAvailableAgents, useNavAccess } from '@/hooks/useNavAccess';
 import { t } from '@/lib/i18n';
 import {
-  COMMANDS,
+  commandsFor,
   helpText,
   isSlashCommand,
   matchCommands,
   parseCommand,
   type CommandSpec,
 } from '@/lib/slashCommands';
-import { Button } from '@/components/ui';
+import { Button, Card } from '@/components/ui';
+import { NotAvailable } from '@/components/auth/NotAvailable';
 import { stripServerTimestamp } from '@/lib/stripServerTimestamp';
 import {
   createFollowState,
@@ -66,10 +68,68 @@ const markdownComponents: Components = {
  */
 export default function AgentChat() {
   const { alias } = useParams<{ alias: string }>();
+  const access = useNavAccess();
   if (!alias) {
     return <Navigate to="/agents" replace />;
   }
+  if (!access.operatorPages) {
+    return <ScopedChatWorkspace alias={alias} />;
+  }
   return <ChatWorkspace initialAlias={alias} />;
+}
+
+/**
+ * A signed-in account without the operator dashboard chats only with the
+ * agents `/api/agents/available` lists. The gateway refuses any other agent
+ * before the socket opens, which the browser would otherwise retry forever,
+ * so an unlisted alias shows "not available" and stale tabs for other agents
+ * are dropped. A list that failed to load says nothing about the account's
+ * access, so it offers another try instead.
+ */
+function ScopedChatWorkspace({ alias }: { alias: string }) {
+  const { loading, agents, error, retry } = useAvailableAgents(true);
+  const allowed = useMemo(
+    () => new Set(agents.filter((a) => a.enabled).map((a) => a.alias)),
+    [agents],
+  );
+  if (loading) {
+    return (
+      <div className="min-h-[60vh] flex items-center justify-center">
+        <div className="h-8 w-8 border-2 rounded-full animate-spin border-pc-border border-t-pc-accent" />
+      </div>
+    );
+  }
+  if (error !== null) {
+    return <AvailabilityLoadError error={error} onRetry={retry} />;
+  }
+  if (!allowed.has(alias)) {
+    return <NotAvailable access="not-available" />;
+  }
+  return <ChatWorkspace initialAlias={alias} allowedAliases={allowed} />;
+}
+
+/** The agents list failed to load: the error and a Retry, not a refusal. */
+function AvailabilityLoadError({ error, onRetry }: { error: string; onRetry: () => void }) {
+  return (
+    <div className="p-6">
+      <Card padded={false} className="p-6 w-full max-w-lg" data-agents-load-error="">
+        <div className="flex items-center gap-2 mb-2">
+          <AlertCircle className="h-5 w-5 shrink-0 text-status-error" />
+          <h2 className="text-lg font-semibold" style={{ color: 'var(--pc-text-primary)' }}>
+            {t('agent.availability_load_failed')}
+          </h2>
+        </div>
+        {error && (
+          <p className="text-sm mb-4 break-words" style={{ color: 'var(--pc-text-muted)' }}>
+            {error}
+          </p>
+        )}
+        <Button size="sm" onClick={onRetry} data-agents-retry="">
+          {t('common.retry')}
+        </Button>
+      </Card>
+    </div>
+  );
 }
 
 /** Status snapshot a chat pane pushes up to the workspace tab bar. */
@@ -99,6 +159,12 @@ export function AgentChatInner({
     messages,
     sendMessage,
     connected,
+    conversationLimited,
+    retryConnection,
+    conversationPerSocket,
+    startsConversationOnSend,
+    unsentMessage,
+    takeUnsentMessage,
     error,
     typing,
     currentModel,
@@ -125,6 +191,14 @@ export function AgentChatInner({
     loadEarlierTurns,
     loadToolOutputs,
   } = useAgent();
+  // A signed-in account without the operator dashboard can't switch the
+  // agent's model (that rewrites its config for everyone), upload, or open the
+  // agent's workspace.
+  const operator = useNavAccess().operatorPages;
+  const commands = useMemo(() => commandsFor(operator), [operator]);
+  // With one conversation per socket, no socket is open between
+  // conversations, and a message is what opens the next one.
+  const canSend = connected || startsConversationOnSend;
 
   // Keyed by conversation, not just alias: with the same agent open in two
   // panes an alias-only key would make both share one draft, so typing in one
@@ -184,6 +258,11 @@ export function AgentChatInner({
   // tool activity.
   const [showToolActivity, setShowToolActivity] = useState(() => {
     try { return localStorage.getItem('zeroclaw_show_tool_activity') === '1'; } catch { return false; }
+  });
+  // When set, the live Thinking box starts collapsed and is left to the user
+  // to open; by default it is open until the answer starts.
+  const [keepThinkingCollapsed, setKeepThinkingCollapsed] = useState(() => {
+    try { return localStorage.getItem('zeroclaw_keep_thinking_collapsed') === '1'; } catch { return false; }
   });
 
   /**
@@ -291,6 +370,14 @@ export function AgentChatInner({
   useEffect(() => {
     writeInput(draft);
   }, [draftKey, draft, writeInput]);
+
+  // A message that never reached a conversation comes back to the composer,
+  // ahead of anything typed since.
+  useEffect(() => {
+    if (unsentMessage === null) return;
+    applyInput((typed) => (typed ? `${unsentMessage}\n${typed}` : unsentMessage));
+    takeUnsentMessage();
+  }, [unsentMessage, applyInput, takeUnsentMessage]);
 
   // Report live status (typing + message count) up to the host workspace so it
   // can render streaming / unread indicators in the tab bar. Fires on every
@@ -437,7 +524,7 @@ export function AgentChatInner({
     const { command, args } = parseCommand(trimmed);
     switch (command) {
       case 'help':
-        addLocalMessage(helpText());
+        addLocalMessage(helpText(commands));
         return true;
 
       case 'clear':
@@ -455,6 +542,10 @@ export function AgentChatInner({
         return true;
 
       case 'upload':
+        if (!operator) {
+          addLocalMessage(t('auth.not_available'));
+          return true;
+        }
         // Same picker as the attach button — the input click is allowed here
         // because runCommand fires from the user's Enter keypress, keeping
         // the browser's user-activation requirement satisfied.
@@ -462,6 +553,10 @@ export function AgentChatInner({
         return true;
 
       case 'model': {
+        if (!operator) {
+          addLocalMessage(t('auth.not_available'));
+          return true;
+        }
         const name = args.trim();
         if (!name) {
           const current = currentModel
@@ -505,7 +600,7 @@ export function AgentChatInner({
         addLocalMessage(t('agent.cmd_unknown').replace('{cmd}', `/${command}`));
         return true;
     }
-  }, [addLocalMessage, clearAllMessages, startNewSession, currentModel, availableModels, switchModel, modelLoading]);
+  }, [addLocalMessage, clearAllMessages, startNewSession, currentModel, availableModels, switchModel, modelLoading, operator, commands]);
 
   const handleSend = () => {
     const trimmed = input.trim();
@@ -525,7 +620,7 @@ export function AgentChatInner({
     if (isSlashCommand(trimmed)) {
       runCommand(trimmed);
     } else {
-      if (!connected) return;
+      if (!canSend) return;
       // `//` is the documented escape for a literal leading slash (#7223);
       // strip one `/` so `//foo` is sent to the agent as `/foo`.
       sendMessage(trimmed.startsWith('//') ? trimmed.slice(1) : trimmed);
@@ -597,6 +692,7 @@ export function AgentChatInner({
   const handleDragEnter = (e: React.DragEvent) => {
     if (!dragHasFiles(e)) return;
     e.preventDefault();
+    if (!operator) return;
     dragDepthRef.current += 1;
     setDragActive(true);
   };
@@ -604,15 +700,18 @@ export function AgentChatInner({
     if (dragHasFiles(e)) e.preventDefault();
   };
   const handleDragLeave = (e: React.DragEvent) => {
-    if (!dragHasFiles(e)) return;
+    if (!dragHasFiles(e) || !operator) return;
     dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
     if (dragDepthRef.current === 0) setDragActive(false);
   };
   const handleDrop = (e: React.DragEvent) => {
     if (!dragHasFiles(e)) return;
+    // Without upload the drop is still swallowed, so the browser doesn't
+    // navigate away to the file.
     e.preventDefault();
     dragDepthRef.current = 0;
     setDragActive(false);
+    if (!operator) return;
     void uploadImages(e.dataTransfer.files);
   };
 
@@ -622,7 +721,7 @@ export function AgentChatInner({
     // Show the command popover while typing the command token (a single
     // leading '/' with no space yet). Hide once the user moves to arguments or
     // the token no longer matches any command.
-    const showHint = /^\/[^/\s]*$/.test(value) && matchCommands(value.slice(1)).length > 0;
+    const showHint = /^\/[^/\s]*$/.test(value) && matchCommands(value.slice(1), commands).length > 0;
     setShowCommandHint(showHint);
     e.target.style.height = 'auto';
     e.target.style.height = `${Math.min(e.target.scrollHeight, 200)}px`;
@@ -640,8 +739,8 @@ export function AgentChatInner({
   }, [applyInput]);
 
   const matchedCommands: CommandSpec[] = /^\/[^/\s]*$/.test(input)
-    ? matchCommands(input.slice(1))
-    : COMMANDS.slice();
+    ? matchCommands(input.slice(1), commands)
+    : commands.slice();
 
   const handleCopy = useCallback((msgId: string, content: string) => {
     const onSuccess = () => {
@@ -691,6 +790,14 @@ export function AgentChatInner({
     setShowToolActivity((prev) => {
       const next = !prev;
       try { localStorage.setItem('zeroclaw_show_tool_activity', next ? '1' : '0'); } catch { /* noop */ }
+      return next;
+    });
+  }, []);
+
+  const toggleKeepThinkingCollapsed = useCallback(() => {
+    setKeepThinkingCollapsed((prev) => {
+      const next = !prev;
+      try { localStorage.setItem('zeroclaw_keep_thinking_collapsed', next ? '1' : '0'); } catch { /* noop */ }
       return next;
     });
   }, []);
@@ -771,15 +878,17 @@ export function AgentChatInner({
           <span className="min-w-0 max-w-[5.5rem] sm:max-w-[12rem] truncate text-sm font-medium text-pc-text" title={agentAlias}>
             {agentAlias}
           </span>
-          <Link
-            to={`/agent/${encodeURIComponent(agentAlias)}/workspace`}
-            className="inline-flex shrink-0 items-center gap-1 px-1.5 sm:px-2 h-6 rounded-[var(--radius-md)] text-xs font-medium text-pc-text-secondary transition-colors hover:text-pc-text hover:bg-[var(--pc-hover)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]"
-            title={t('agentchat.open_workspace')}
-            aria-label={t('agentchat.open_workspace')}
-          >
-            <FolderOpen className="h-3.5 w-3.5" />
-            <span className="hidden sm:inline">{t('agentchat.files')}</span>
-          </Link>
+          {operator && (
+            <Link
+              to={`/agent/${encodeURIComponent(agentAlias)}/workspace`}
+              className="inline-flex shrink-0 items-center gap-1 px-1.5 sm:px-2 h-6 rounded-[var(--radius-md)] text-xs font-medium text-pc-text-secondary transition-colors hover:text-pc-text hover:bg-[var(--pc-hover)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]"
+              title={t('agentchat.open_workspace')}
+              aria-label={t('agentchat.open_workspace')}
+            >
+              <FolderOpen className="h-3.5 w-3.5" />
+              <span className="hidden sm:inline">{t('agentchat.files')}</span>
+            </Link>
+          )}
 
           {/* Desktop: bordered icon group so Compact/Hide/Clear are obvious */}
           <div className="hidden sm:flex items-center gap-0.5 ml-0.5 rounded-[var(--radius-md)] border border-pc-border bg-pc-elevated p-0.5">
@@ -805,6 +914,17 @@ export function AgentChatInner({
               title={showToolActivity ? t('agent.tool_activity_hide') : t('agent.tool_activity_show')}
             >
               <Wrench className="h-5 w-5" strokeWidth={2} />
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={toggleKeepThinkingCollapsed}
+              className="h-6 w-6 !p-0 aria-pressed:border-pc-accent/40 aria-pressed:bg-pc-accent/15 aria-pressed:text-pc-accent"
+              aria-label={t('agent.thinking_keep_collapsed')}
+              aria-pressed={keepThinkingCollapsed}
+              title={t('agent.thinking_keep_collapsed')}
+            >
+              <Brain className="h-5 w-5" strokeWidth={2} />
             </Button>
             <Button
               variant="ghost"
@@ -853,6 +973,16 @@ export function AgentChatInner({
                 </button>
                 <button
                   type="button"
+                  onClick={() => { toggleKeepThinkingCollapsed(); setShowMoreMenu(false); }}
+                  className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs text-pc-text transition-colors hover:bg-[var(--pc-hover)]"
+                  aria-pressed={keepThinkingCollapsed}
+                >
+                  <Brain className={`h-3.5 w-3.5 ${keepThinkingCollapsed ? 'text-pc-accent' : ''}`} />
+                  {t('agent.thinking_keep_collapsed')}
+                  {keepThinkingCollapsed && <Check className="ml-auto h-3.5 w-3.5 text-pc-accent" aria-hidden="true" />}
+                </button>
+                <button
+                  type="button"
                   onClick={() => { handleClearAll(); setShowMoreMenu(false); }}
                   className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs text-status-error transition-colors hover:bg-[var(--pc-hover)]"
                 >
@@ -865,48 +995,61 @@ export function AgentChatInner({
         </div>
 
         <div className="flex min-w-0 shrink items-center gap-1.5 sm:gap-2">
-          <SessionPicker
-            agentAlias={agentAlias}
-            labelClassName="max-w-[90px] sm:max-w-[160px]"
-          />
+          {/* Nothing to list or reopen when each socket is its own conversation. */}
+          {!conversationPerSocket && (
+            <SessionPicker
+              agentAlias={agentAlias}
+              labelClassName="max-w-[90px] sm:max-w-[160px]"
+            />
+          )}
 
-          <div className="relative min-w-0" ref={modelDropdownRef}>
-            <button
-              type="button"
-              onClick={() => setShowModelDropdown((v) => !v)}
-              disabled={modelLoading || typing || (availableModels.length === 0 && currentModel === null)}
-              className="flex max-w-full min-w-0 items-center gap-1.5 sm:gap-2 px-2 sm:px-3 h-7 rounded-[var(--radius-md)] text-xs font-medium border border-pc-border bg-pc-elevated text-pc-text-secondary transition-colors hover:text-pc-text hover:border-pc-border-strong disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]"
+          {operator ? (
+            <div className="relative min-w-0" ref={modelDropdownRef}>
+              <button
+                type="button"
+                onClick={() => setShowModelDropdown((v) => !v)}
+                disabled={modelLoading || typing || (availableModels.length === 0 && currentModel === null)}
+                className="flex max-w-full min-w-0 items-center gap-1.5 sm:gap-2 px-2 sm:px-3 h-7 rounded-[var(--radius-md)] text-xs font-medium border border-pc-border bg-pc-elevated text-pc-text-secondary transition-colors hover:text-pc-text hover:border-pc-border-strong disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]"
+              >
+                <span className="max-w-[90px] sm:max-w-[180px] truncate">
+                  {modelLoading
+                    ? t('agent.model_switching')
+                    : (currentModel ?? (availableModels.length === 0 ? t('agent.model_loading') : t('agent.select_model')))}
+                </span>
+                <ChevronDown className="h-3 w-3 shrink-0" />
+              </button>
+
+              {showModelDropdown && availableModels.length > 0 && (
+                <div className="absolute right-0 mt-1.5 rounded-[var(--radius-md)] border border-pc-border bg-pc-elevated shadow-[var(--pc-shadow-md)] z-50 py-1 min-w-[200px] max-h-60 overflow-y-auto">
+                  {availableModels.map((model) => {
+                    const isActive = model === currentModel;
+                    return (
+                      <button
+                        key={model}
+                        type="button"
+                        onClick={() => handleModelSwitch(model)}
+                        className={`w-full text-left px-3 py-2 text-xs transition-colors ${
+                          isActive
+                            ? 'text-pc-accent bg-pc-accent/10'
+                            : 'text-pc-text hover:bg-[var(--pc-hover)]'
+                        }`}
+                      >
+                        {model}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          ) : (
+            // Read-only: switching rewrites the agent's config for everyone.
+            <span
+              data-model-readonly=""
+              className="flex max-w-full min-w-0 items-center px-2 sm:px-3 h-7 rounded-[var(--radius-md)] text-xs font-medium border border-pc-border bg-pc-elevated text-pc-text-secondary"
             >
-              <span className="max-w-[90px] sm:max-w-[180px] truncate">
-                {modelLoading
-                  ? t('agent.model_switching')
-                  : (currentModel ?? (availableModels.length === 0 ? t('agent.model_loading') : t('agent.select_model')))}
-              </span>
-              <ChevronDown className="h-3 w-3 shrink-0" />
-            </button>
-
-            {showModelDropdown && availableModels.length > 0 && (
-              <div className="absolute right-0 mt-1.5 rounded-[var(--radius-md)] border border-pc-border bg-pc-elevated shadow-[var(--pc-shadow-md)] z-50 py-1 min-w-[200px] max-h-60 overflow-y-auto">
-                {availableModels.map((model) => {
-                  const isActive = model === currentModel;
-                  return (
-                    <button
-                      key={model}
-                      type="button"
-                      onClick={() => handleModelSwitch(model)}
-                      className={`w-full text-left px-3 py-2 text-xs transition-colors ${
-                        isActive
-                          ? 'text-pc-accent bg-pc-accent/10'
-                          : 'text-pc-text hover:bg-[var(--pc-hover)]'
-                      }`}
-                    >
-                      {model}
-                    </button>
-                  );
-                })}
-              </div>
-            )}
-          </div>
+              <span className="max-w-[90px] sm:max-w-[180px] truncate">{currentModel ?? t('agent.model_loading')}</span>
+            </span>
+          )}
         </div>
       </div>
 
@@ -915,6 +1058,18 @@ export function AgentChatInner({
         <div className="px-4 py-2 border-b border-status-error/20 bg-status-error/10 text-status-error flex items-start gap-2 text-sm animate-fade-in">
           <AlertCircle className="h-4 w-4 shrink-0 mt-0.5" />
           <p className="min-w-0 flex-1 break-words">{error}</p>
+        </div>
+      )}
+      {conversationLimited && (
+        <div
+          data-conversation-limit=""
+          className="px-4 py-2 border-b border-pc-border bg-pc-surface text-pc-text-secondary flex items-center gap-2 text-sm animate-fade-in"
+        >
+          <AlertCircle className="h-4 w-4 shrink-0" />
+          <span className="flex-1">{t('agent.conversation_limit')}</span>
+          <Button size="sm" variant="ghost" onClick={retryConnection}>
+            {t('common.retry')}
+          </Button>
         </div>
       )}
 
@@ -948,6 +1103,11 @@ export function AgentChatInner({
               <>
                 <p className="text-base font-semibold mb-1 text-pc-text">{t('agentchat.empty_title')}</p>
                 <p className="text-sm text-pc-text-muted">{t('agent.start_conversation')}</p>
+                {conversationPerSocket && (
+                  <p data-conversation-scope-note="" className="text-xs mt-2 text-pc-text-faint">
+                    {t('agent.conversation_ends_with_page')}
+                  </p>
+                )}
               </>
             ) : (
               <p className="text-sm text-pc-text-muted">{t('agent.session_loading')}</p>
@@ -1023,7 +1183,7 @@ export function AgentChatInner({
               {live.answer ? (
                 <div className={`${compact ? 'rounded-[var(--radius-md)] px-2 py-1' : 'rounded-[var(--radius-md)] px-2.5 py-1.5'} border border-pc-border bg-pc-elevated text-pc-text`}>
                   {live.answer.thinking && (
-                    <details className="mb-1" open={!live.answer.text}>
+                    <details className="mb-1" open={keepThinkingCollapsed ? undefined : !live.answer.text}>
                       <summary className="text-xs cursor-pointer select-none text-pc-text-muted">{t('agentchat.thinking')}{!live.answer.text && '...'}</summary>
                       <pre className="text-xs mt-1 whitespace-pre-wrap break-words leading-snug overflow-auto max-h-60 p-1.5 rounded-[var(--radius-sm)] text-pc-text-muted bg-pc-code">{live.answer.thinking}</pre>
                     </details>
@@ -1083,6 +1243,9 @@ export function AgentChatInner({
         {/* Composer. See InputBar.tsx for the visual rationale. */}
         <InputBar
           connected={connected}
+          canSend={canSend}
+          canAttach={operator}
+          startsConversationOnSend={startsConversationOnSend}
           hydrated={hydrated}
           typing={typing}
           uploading={uploading}

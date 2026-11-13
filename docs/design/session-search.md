@@ -15,6 +15,10 @@
 - **R2 — Ownership is a safety property, not a filter option.** An agent
   must only ever see its own sessions. Scoping is enforced at the tool
   layer by the caller's agent/channel identity, not left to the query.
+  Because that scope is agent/channel and never principal, `session_search`
+  is withheld from a non-admin principal, like upstream's cross-session
+  tools under #12232 (`requires_unrestricted_principal`; owner decision
+  2026-11-12).
 - **R3 — The storage layer is forked for the gateway transcript.** The
   original rule (leave upstream's FTS index, `search()` and query builder
   untouched) could not hold: whole-transcript rewrites deleted history on
@@ -35,7 +39,7 @@
 |---|---|---|---|
 | 1 | No agent-facing search tool: `sessions_list` lists, `sessions_history` reads only the last N messages | `session_search` returns matching message IDs (`sessions.id` = FTS rowid) with session key, turn, kind, role, tool name, timestamp, and snippet; tool calls and tool results are searched too. `sessions_history` accepts `around_message_id` (+ before/after) to read around any hit, always starting with the anchor turn's `user` row, and `include_tools` (default false) to show tool rows. A tool row's body is shown one window of lines at a time (`line_offset` / `line_limit`, default the first 50 lines, each line cut at 2000 characters); a cut body ends with the `line_offset` that continues it. Chat rows are never cut | R1 |
 | 2 | No ownership scoping at the tool layer | `session_search` and history reads are scoped to the calling agent/channel; cross-session leakage is a defect, not a misconfiguration. Registration lives in `crates/zeroclaw-runtime/src/tools/mod.rs` (`SessionOwnershipScope::with_channels`); it was lost in the v0.8.6 merge (`1f379c6de`) and restored with the transcript rework | R2 |
-| 3 | External-content FTS5 index over `sessions(session_key, content)` with sync triggers; transcripts rewritten wholesale on trim | Schema version 2 (`PRAGMA user_version`): `sessions` gains `kind`/`turn`/`tool_name`/`tool_call_id`, `session_metadata` gains `context_start_id`; contentless `sessions_fts` fed by the writers (`session_fts.rs`: `index_text`, `match_query`, `snippet`); gateway turns use `append_turn` + `set_context_start`, restore uses `load_context`. A v1 store is migrated in place on open (kinds and turns backfilled, index rebuilt) | R3 — an upstream change to the `sessions` columns or the FTS schema is a conflict with this page: report it, do not take it |
+| 3 | External-content FTS5 index over `sessions(session_key, content)` with sync triggers; transcripts rewritten wholesale on trim | Schema version 2 (`PRAGMA user_version`): `sessions` gains `kind`/`turn`/`tool_name`/`tool_call_id`, `session_metadata` gains `context_start_id`; contentless `sessions_fts` fed by the writers (`session_fts.rs`: `index_text`, `match_query`, `snippet`); gateway turns use `append_turn` + `set_context_start`, restore uses `load_context`. A v1 store is migrated in place on open (kinds and turns backfilled, index rebuilt). Upstream's authorized session effects (#11234, #12239) write through the same writers: `append_authorized` inserts via `append_on`/`insert_row` inside its authorizing transaction, both deletes share one row-delete helper, `try_load` returns chat rows only | R3 — an upstream change to the `sessions` columns or the FTS schema is a conflict with this page: report it, do not take it |
 
 ## Merge notes
 
@@ -53,7 +57,10 @@
   (`append_turn_*`, `context_start_bounds_load_context`,
   `fts_matches_cjk_substrings_and_tool_output`,
   `search_messages_reads_hits_in_rowid_order_without_a_sort`,
-  `opening_a_v1_store_migrates_rows_and_rebuilds_the_index`) are fork
+  `opening_a_v1_store_migrates_rows_and_rebuilds_the_index`,
+  `authorized_append_is_classified_and_searchable_like_append_turn`,
+  `authorized_delete_leaves_no_search_hit`) and the principal test
+  `session_search_is_withheld_from_non_admin_principals` are fork
   tests; they must survive the merge. If upstream rewrote `sessions.rs` or
   `session_sqlite.rs`, re-add them — do not accept their absence as
   "upstream refactored it away".

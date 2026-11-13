@@ -1,4 +1,4 @@
-schema_version = 3
+schema_version = 4
 
 # Ollama runs on the host. This is an endpoint, not a bearer credential.
 [providers.models.ollama.default]
@@ -39,6 +39,10 @@ turn_cancel_after = 5
 # Finish an OpenAI-compatible SSE stream after this many seconds without a
 # meaningful data: event. SSE comments (: ping) do not refresh the timer (0 = use default 60).
 sse_app_idle_secs = 60
+
+# Built-in tool selection: ["*"] is full, the default; [] is minimal.
+[tools]
+optional = ["*"]
 
 # Cost tracking and budget enforcement configuration
 # Enable to track API usage costs and enforce spending limits

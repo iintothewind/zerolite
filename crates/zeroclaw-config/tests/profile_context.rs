@@ -253,3 +253,64 @@ fn the_removed_upstream_knobs_do_not_change_resolution() {
         );
     }
 }
+
+/// ZeroLite: the V3 -> V4 migration (#11218) retires upstream's agent-inline
+/// knobs, but the fork's surfaces are not among them. The context table,
+/// `lean_bootstrap` and the master pair code survive the migration with their
+/// values, and the migrated file resolves the same context limits.
+#[test]
+fn v3_to_v4_migration_keeps_the_context_table_and_the_master_pair_code() {
+    const V3: &str = r#"
+schema_version = 3
+
+[gateway]
+master_pair_code = "zl-master-0123456789abcdef"
+
+[runtime_profiles.coder]
+lean_bootstrap = false
+
+[runtime_profiles.coder.context]
+request_token_ceiling = 100_000
+trim_threshold_percent = 80
+reserve_tokens = 16_384
+keep_recent_turns = 5
+
+[agents.coder]
+enabled = true
+runtime_profile = "coder"
+model_provider = "anthropic.default"
+risk_profile = "default"
+"#;
+    let migrated = zeroclaw_config::migration::migrate_file(V3)
+        .expect("a V3 file migrates")
+        .expect("a V3 file changes on migration");
+    let value: toml::Value = toml::from_str(&migrated).expect("the migrated file parses");
+    assert_eq!(value["schema_version"].as_integer(), Some(4));
+    let profile = &value["runtime_profiles"]["coder"];
+    assert_eq!(profile["lean_bootstrap"].as_bool(), Some(false));
+    let context = &profile["context"];
+    assert_eq!(context["request_token_ceiling"].as_integer(), Some(100_000));
+    assert_eq!(context["trim_threshold_percent"].as_integer(), Some(80));
+    assert_eq!(context["reserve_tokens"].as_integer(), Some(16_384));
+    assert_eq!(context["keep_recent_turns"].as_integer(), Some(5));
+    assert_eq!(
+        value["gateway"]["master_pair_code"].as_str(),
+        Some("zl-master-0123456789abcdef")
+    );
+
+    let cfg: Config = toml::from_str(&migrated).expect("the migrated file loads");
+    let expected = profile_config();
+    let (got, want) = (
+        &cfg.runtime_profiles["coder"].context,
+        &expected.runtime_profiles["coder"].context,
+    );
+    assert_eq!(got.request_token_ceiling, want.request_token_ceiling);
+    assert_eq!(got.trim_threshold_percent, want.trim_threshold_percent);
+    assert_eq!(got.reserve_tokens, want.reserve_tokens);
+    assert_eq!(got.keep_recent_turns, want.keep_recent_turns);
+    assert!(!cfg.runtime_profiles["coder"].lean_bootstrap.unwrap_or(true));
+    assert_eq!(
+        cfg.gateway.master_pair_code.as_deref(),
+        Some("zl-master-0123456789abcdef")
+    );
+}

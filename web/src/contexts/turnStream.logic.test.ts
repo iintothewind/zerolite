@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import {
   classifyCompletion,
+  errorEndsTurn,
   initialTurnStreamState,
   reduceTurnFrame,
   streamedText,
@@ -438,4 +439,15 @@ test('error keeps the whole trajectory in the group and commits nothing', () => 
   assert.equal(completions.length, 0);
   assert.equal(last.steps.length, 2);
   assert.equal(last.steps[1]!.text, 'partial');
+});
+
+test('only CAPABILITY_MISSING and INVALID_JSON leave the running turn going', () => {
+  assert.equal(errorEndsTurn('CAPABILITY_MISSING'), false);
+  assert.equal(errorEndsTurn('INVALID_JSON'), false);
+  for (const code of [
+    'AGENT_ERROR', 'CORE_UNAVAILABLE', 'TURN_RESULT_LOST', 'NOT_PERMITTED',
+    'SESSION_NOT_FOUND', 'CORE_REFUSED', 'PROVIDER_ERROR', undefined,
+  ]) {
+    assert.equal(errorEndsTurn(code), true, String(code));
+  }
 });

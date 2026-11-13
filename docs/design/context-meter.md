@@ -116,6 +116,10 @@
   `turn/outcome.rs` (`ContextAnchorSink`),
   `crates/zeroclaw-api/src/agent.rs` (`TokenCountSource`), web
   `ContextRing.tsx` (source row).
+- **Code anchor (RPC surface):** since v0.9.0 (#12244) the RPC wire types
+  live in `crates/zeroclaw-rpc-proto/src/types.rs`; `effective_context_window`
+  rides `SessionUpdateEvent::ContextUsage` and `TurnUsageTotals` there. Test:
+  `context_usage_types_round_trip_the_effective_context_window`.
 - **Meter regression tests:** `cargo test -p zeroclaw-runtime --lib --
   --test-threads=1 meter` runs the anchor matrix; `cargo test -p
   zeroclaw-gateway --lib -- --test-threads=1 context_estimate` and

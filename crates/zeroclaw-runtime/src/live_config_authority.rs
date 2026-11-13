@@ -46,6 +46,34 @@ impl LiveConfigAuthority {
         }
     }
 
+    /// Test-only authority whose config write lock is private to it.
+    ///
+    /// A unit-test binary is one process, so authorities built with
+    /// [`Self::new`] share one lock across every test in it: a test holding
+    /// its context's guard stalls every other test's config writers, and
+    /// parallel runs queue timing-bounded tests behind unrelated ones.
+    /// Clones of this authority still share its lock, as they do in
+    /// production.
+    #[cfg(test)]
+    pub(crate) fn for_tests(config: Config) -> Self {
+        Self {
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            ..Self::new(config)
+        }
+    }
+
+    /// Test-only authority with its own published config and lifecycle that
+    /// serializes on `writer`'s config write lock: another connection to the
+    /// daemon `writer` belongs to, for a fixture that needs a different
+    /// config than the first connection's.
+    #[cfg(test)]
+    pub(crate) fn for_tests_sharing_writer(config: Config, writer: &Self) -> Self {
+        Self {
+            config_write_lock: Arc::clone(&writer.config_write_lock),
+            ..Self::new(config)
+        }
+    }
+
     /// Create an authority that exclusively owns this config across processes.
     pub fn new_owned(config: Config) -> Result<Self> {
         let ownership = ConfigOwnershipGuard::acquire(&config.data_dir)?;
@@ -147,6 +175,21 @@ impl LiveConfigAuthority {
             application_results: Arc::clone(&self.application_results),
             application_attempts: Vec::new(),
         })
+    }
+
+    /// Hold this authority's config writer mutex without admitting a commit.
+    /// Readers in the route-generation transaction (session construction,
+    /// `session/configure`, rehydration and its reconciliation) take it so
+    /// that no commit publishes while they build from config. It admits no
+    /// write lease, so a closing generation never drains against a reader.
+    pub async fn lock_config_writer(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        Arc::clone(&self.config_write_lock).lock_owned().await
+    }
+
+    /// [`Self::lock_config_writer`] without waiting: `None` while a commit or
+    /// another reader holds the mutex.
+    pub fn try_lock_config_writer(&self) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        Arc::clone(&self.config_write_lock).try_lock_owned().ok()
     }
 
     /// Whether the daemon-wide config writer mutex is currently held.
@@ -345,8 +388,9 @@ impl AgentExecutionSelection {
 
 impl AgentExecutionCapability {
     pub fn capture_selection(&self) -> AgentExecutionSelection {
-        // Never nest the lifecycle mutex and config lock. A mutation between
-        // these reads changes the generation and is rejected at admission.
+        // Release the lifecycle mutex before acquiring config here. SOP RPC
+        // effects may already hold a config read guard; lifecycle operations
+        // never acquire config while retaining this mutex.
         let (generations, closing) = {
             let state = self.agent_lifecycle.state.lock();
             let generations: HashMap<_, _> = state
@@ -367,7 +411,9 @@ impl AgentExecutionCapability {
         };
         let generations = self
             .config
-            .read()
+            // A queued writer must not block this nested read behind the
+            // outer SOP effect guard that the writer itself is waiting on.
+            .read_recursive()
             .agents
             .keys()
             .map(|alias| {
@@ -675,9 +721,33 @@ fn lock_dir_creation_error(
     ))
 }
 
+/// Render `path` for a pasted shell remedy.
+///
+/// Relative paths whose first component starts with `-` would be read as
+/// options by `rm`, and by GNU `chmod`/`chown`. BSD `chmod`/`chown` also reject
+/// a `--` separator, so prefix those paths with `./` instead. Absolute paths
+/// and every other relative form are left alone.
+#[cfg(unix)]
+fn remedy_shell_path(path: &Path) -> std::path::PathBuf {
+    use std::path::Component;
+
+    let mut components = path.components();
+    match components.next() {
+        Some(Component::Normal(first)) if first.to_string_lossy().starts_with('-') => {
+            let mut out = std::path::PathBuf::from(".");
+            out.push(path);
+            out
+        }
+        _ => path.to_path_buf(),
+    }
+}
+
 #[cfg(unix)]
 fn remedy_command(command: &str, path: &Path) -> String {
-    format!("{command} {}", crate::util::shell_escape(path.as_os_str()))
+    format!(
+        "{command} {}",
+        crate::util::shell_escape(remedy_shell_path(path).as_os_str())
+    )
 }
 
 /// The account name for `uid`, when the user database has one.
@@ -1685,6 +1755,52 @@ mod tests {
     }
 
     #[test]
+    fn test_authorities_get_a_private_write_lock_unless_told_to_share_one() {
+        let process = zeroclaw_config::write_lock::shared_config_write_lock();
+        let isolated = LiveConfigAuthority::for_tests(Config::default());
+        let other = LiveConfigAuthority::for_tests(Config::default());
+        assert!(!Arc::ptr_eq(&isolated.config_write_lock, &process));
+        assert!(!Arc::ptr_eq(
+            &isolated.config_write_lock,
+            &other.config_write_lock
+        ));
+        assert!(Arc::ptr_eq(
+            &isolated.config_write_lock,
+            &isolated.clone().config_write_lock
+        ));
+
+        let sharing = LiveConfigAuthority::for_tests_sharing_writer(Config::default(), &isolated);
+        assert!(Arc::ptr_eq(
+            &sharing.config_write_lock,
+            &isolated.config_write_lock
+        ));
+        assert!(!sharing.live_handle().same_storage(&isolated.live_handle()));
+    }
+
+    #[tokio::test]
+    async fn config_writer_gate_and_commits_serialize_on_one_mutex() {
+        let authority = LiveConfigAuthority::for_tests(Config::default());
+        let gate = authority.lock_config_writer().await;
+        assert!(authority.try_lock_config_writer().is_none());
+        let mut commit = std::pin::pin!(authority.begin_config_commit());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut commit)
+                .await
+                .is_err(),
+            "a commit must wait while a reader holds the writer gate"
+        );
+
+        drop(gate);
+        let commit = tokio::time::timeout(std::time::Duration::from_secs(5), commit)
+            .await
+            .expect("the commit proceeds once the reader releases the gate")
+            .expect("an open generation admits the commit");
+        assert!(authority.try_lock_config_writer().is_none());
+        drop(commit);
+        assert!(authority.try_lock_config_writer().is_some());
+    }
+
+    #[test]
     fn delete_refuses_reserved_and_live_aliases() {
         let lifecycle = AgentLifecycleCoordinator::default();
         let reservation = lifecycle.reserve_admission("alpha").unwrap();
@@ -1906,6 +2022,71 @@ mod tests {
             .expect_err("a dangling lifecycle link must be refused")
             .to_string();
         assert!(error.contains(&command), "missing `{command}`: {error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remedy_commands_keep_dash_prefixed_relative_paths_as_paths() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let _spawning = SPAWN_VS_LOCK_REACQUIRE.blocking_write();
+        let temp = tempfile::TempDir::new().unwrap();
+        let lock_dir = temp
+            .path()
+            .join("-install")
+            .join("data")
+            .join(LIFECYCLE_DIR);
+        std::fs::create_dir_all(&lock_dir).unwrap();
+        std::fs::set_permissions(&lock_dir, PermissionsExt::from_mode(0o775)).unwrap();
+
+        let relative = Path::new("-install").join("data").join(LIFECYCLE_DIR);
+        let chmod_cmd = remedy_command("chmod 700", &relative);
+        assert_eq!(chmod_cmd, "chmod 700 ./-install/data/.lifecycle");
+        assert!(
+            Command::new("sh")
+                .arg("-c")
+                .arg(&chmod_cmd)
+                .current_dir(temp.path())
+                .status()
+                .unwrap()
+                .success(),
+            "chmod remedy must succeed when pasted: {chmod_cmd}"
+        );
+        assert_eq!(mode_of(&lock_dir) & 0o777, 0o700);
+
+        // Replace the directory with a symlink so `rm` is the pasted fix.
+        std::fs::remove_dir(&lock_dir).unwrap();
+        let elsewhere = temp.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &lock_dir).unwrap();
+        let rm_cmd = remedy_command("rm", &relative);
+        assert_eq!(rm_cmd, "rm ./-install/data/.lifecycle");
+        assert!(
+            Command::new("sh")
+                .arg("-c")
+                .arg(&rm_cmd)
+                .current_dir(temp.path())
+                .status()
+                .unwrap()
+                .success(),
+            "rm remedy must succeed when pasted: {rm_cmd}"
+        );
+        assert!(!lock_dir.exists());
+        assert!(
+            elsewhere.exists(),
+            "rm must remove the link, not the target"
+        );
+
+        // Absolute paths, and relatives that do not start with `-`, stay as-is.
+        assert_eq!(
+            remedy_command("chmod 700", Path::new("/tmp/data/.lifecycle")),
+            "chmod 700 /tmp/data/.lifecycle"
+        );
+        assert_eq!(
+            remedy_command("rm", Path::new("data/.lifecycle")),
+            "rm data/.lifecycle"
+        );
     }
 
     /// Remedy commands are pasted into a shell, so the rendered text must not

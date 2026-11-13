@@ -8,9 +8,10 @@
 
 Run from a clean `zerolite` checkout level with `origin/zerolite`. `X.Y.Z` is the new version.
 
-1. **Bump the version.** In `Cargo.toml`, set `[workspace.package] version` and the 24 `[workspace.dependencies]` path pins (`crates/*`, `apps/*`) to `X.Y.Z`: 25 lines. Refresh the lock with `cargo update --workspace --offline`. `git diff --numstat Cargo.lock` must read `29 29` (the 29 workspace members, version lines only) and `cargo metadata --locked --offline --format-version 1 >/dev/null` must succeed.
+1. **Bump the version.** In `Cargo.toml`, set `[workspace.package] version` and the 26 `[workspace.dependencies]` path pins (`crates/*`, `apps/*`) to `X.Y.Z`: 27 lines. Refresh the lock with `cargo update --workspace --offline`. `git diff --numstat Cargo.lock` must read `32 32` (the 32 workspace members, version lines only) and `cargo metadata --locked --offline --format-version 1 >/dev/null` must succeed.
 2. **Verify** under the `AGENTS.md` test rules (`zeroclaw-test` image, one command at a time, `-- --test-threads=1`): the tests of the crates and modules changed since the last tag, `cargo fmt --all --check`, clippy on the touched crates, `cargo build --locked --features embedded-web,plugins-wasm-cranelift --bin zeroclaw`; for the dashboard, `npm --prefix web test` and `npm --prefix web run build`.
 3. **Write `docs/releases/vX.Y.Z.md`** and delete the previous release's file; the repository keeps only the notes of the release being cut. Order: summary (upstream base, config/store migration statement), `## Before you upgrade` when an operator must act, one section per change area, `## Install` (asset table), `## Build notes` (what was verified, with counts).
+   The first release after the v0.9.0 merge must carry, under `## Before you upgrade`: run `zeroclaw config migrate` once (config schema version 4).
 4. **Commit** the three items above as `chore(release): prepare X.Y.Z` and push `zerolite`.
 5. **Tag the pushed commit and push the tag:**
 

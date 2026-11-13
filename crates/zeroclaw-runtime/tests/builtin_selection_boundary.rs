@@ -254,6 +254,8 @@ fn full_chat_fixture_names() -> BTreeSet<String> {
         "schedule",
         "send_message_to_peer",
         "send_via",
+        // ZeroLite (session-search): the agent-facing transcript search.
+        "session_search",
         "sessions_current",
         "sessions_history",
         "sessions_list",

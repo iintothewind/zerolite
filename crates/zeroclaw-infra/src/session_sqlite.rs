@@ -446,6 +446,24 @@ impl SqliteSessionBackend {
         Ok(id)
     }
 
+    /// Chat rows of a session: the rows `load` returns (session-search R3).
+    fn chat_row_count_on(conn: &Connection, session_key: &str) -> rusqlite::Result<usize> {
+        conn.query_row(
+            &format!("SELECT COUNT(*) FROM sessions WHERE session_key = ?1 AND {CHAT_KINDS}"),
+            params![session_key],
+            |row| row.get(0),
+        )
+    }
+
+    /// Delete every transcript row of a session. The `sessions_ad` trigger
+    /// removes their full-text index entries with them.
+    fn delete_rows_on(conn: &Connection, session_key: &str) -> rusqlite::Result<usize> {
+        conn.execute(
+            "DELETE FROM sessions WHERE session_key = ?1",
+            params![session_key],
+        )
+    }
+
     fn session_row_exists(conn: &Connection, session_key: &str) -> rusqlite::Result<bool> {
         conn.query_row(
             "SELECT 1 FROM session_metadata WHERE session_key = ?1",
@@ -1121,10 +1139,89 @@ impl SessionBackend for SqliteSessionBackend {
         rows.filter_map(|r| r.ok()).collect()
     }
 
+    /// Like `load`, but a transcript that can't be read, or a row that can't be
+    /// decoded, is an error rather than a shorter history.
+    fn try_load(&self, session_key: &str) -> std::io::Result<Vec<ChatMessage>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT role, content FROM sessions WHERE session_key = ?1 AND {CHAT_KINDS}
+                 ORDER BY id ASC"
+            ))
+            .map_err(std::io::Error::other)?;
+        let rows = stmt
+            .query_map(params![session_key], |row| {
+                Ok(ChatMessage {
+                    role: row.get(0)?,
+                    content: row.get(1)?,
+                })
+            })
+            .map_err(std::io::Error::other)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(std::io::Error::other)
+    }
+
     fn append(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()> {
         let conn = self.conn.lock();
         let now = Utc::now().to_rfc3339();
         Self::append_on(&conn, session_key, message, &now).map_err(std::io::Error::other)
+    }
+
+    fn append_authorized(
+        &self,
+        session_key: &str,
+        message: &ChatMessage,
+        authorize: &crate::session_backend::SessionEffectAuthorization<'_>,
+        committed: &mut dyn FnMut(),
+    ) -> std::io::Result<usize> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(std::io::Error::other)?;
+        // Missing is not an ownerless row: never recreate a deleted session.
+        let owner: Option<String> = tx
+            .query_row(
+                "SELECT principal_id FROM session_metadata WHERE session_key = ?1",
+                params![session_key],
+                |row| row.get(0),
+            )
+            .map_err(std::io::Error::other)?;
+        let _authority = authorize(owner.as_deref())?;
+        // ZeroLite (session-search R3): the fork's row writer classifies the
+        // row, numbers its turn and indexes it, inside this transaction.
+        Self::append_on(&tx, session_key, message, &Utc::now().to_rfc3339())
+            .map_err(std::io::Error::other)?;
+        let count = Self::chat_row_count_on(&tx, session_key).map_err(std::io::Error::other)?;
+        tx.commit().map_err(std::io::Error::other)?;
+        committed();
+        Ok(count)
+    }
+
+    fn set_session_name_authorized(
+        &self,
+        session_key: &str,
+        name: &str,
+        authorize: &crate::session_backend::SessionEffectAuthorization<'_>,
+    ) -> std::io::Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(std::io::Error::other)?;
+        let owner: Option<String> = tx
+            .query_row(
+                "SELECT principal_id FROM session_metadata WHERE session_key = ?1",
+                params![session_key],
+                |row| row.get(0),
+            )
+            .map_err(std::io::Error::other)?;
+        let _authority = authorize(owner.as_deref())?;
+        let name_val = if name.is_empty() { None } else { Some(name) };
+        tx.execute(
+            "UPDATE session_metadata SET name = ?1 WHERE session_key = ?2",
+            params![name_val, session_key],
+        )
+        .map_err(std::io::Error::other)?;
+        tx.commit().map_err(std::io::Error::other)
     }
 
     fn replace_messages(
@@ -1377,12 +1474,8 @@ impl SessionBackend for SqliteSessionBackend {
             return Ok(false);
         }
 
-        // Delete messages (FTS5 trigger handles sessions_fts cleanup)
-        conn.execute(
-            "DELETE FROM sessions WHERE session_key = ?1",
-            params![session_key],
-        )
-        .map_err(std::io::Error::other)?;
+        // Delete messages (the `sessions_ad` trigger clears their index rows)
+        Self::delete_rows_on(&conn, session_key).map_err(std::io::Error::other)?;
 
         // Delete metadata
         conn.execute(
@@ -1392,6 +1485,88 @@ impl SessionBackend for SqliteSessionBackend {
         .map_err(std::io::Error::other)?;
 
         Ok(true)
+    }
+
+    fn with_session_owner(
+        &self,
+        session_key: &str,
+        effect: &mut dyn FnMut(Option<&str>) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        let conn = self.conn.lock();
+        let owner: Option<String> = conn
+            .query_row(
+                "SELECT principal_id FROM session_metadata WHERE session_key = ?1",
+                params![session_key],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(std::io::Error::other)?
+            .flatten();
+        effect(owner.as_deref())
+    }
+
+    fn delete_session_authorized(
+        &self,
+        session_key: &str,
+        expected_owner: Option<&str>,
+        authorize: &crate::session_backend::SessionEffectAuthorization<'_>,
+    ) -> std::io::Result<bool> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(std::io::Error::other)?;
+        let owner: Option<Option<String>> = tx
+            .query_row(
+                "SELECT principal_id FROM session_metadata WHERE session_key = ?1",
+                params![session_key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(std::io::Error::other)?;
+        let _authority = authorize(owner.as_ref().and_then(|owner| owner.as_deref()))?;
+        if owner
+            .as_ref()
+            .is_none_or(|owner| owner.as_deref() != expected_owner)
+        {
+            return Ok(false);
+        }
+        Self::delete_rows_on(&tx, session_key).map_err(std::io::Error::other)?;
+        tx.execute(
+            "DELETE FROM session_metadata WHERE session_key = ?1 AND principal_id IS ?2",
+            params![session_key, expected_owner],
+        )
+        .map_err(std::io::Error::other)?;
+        tx.commit().map_err(std::io::Error::other)?;
+        Ok(true)
+    }
+
+    fn set_session_state_authorized(
+        &self,
+        session_key: &str,
+        state: &str,
+        turn_id: Option<&str>,
+        _live_owner: Option<&str>,
+        authorize: &crate::session_backend::SessionEffectAuthorization<'_>,
+    ) -> std::io::Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(std::io::Error::other)?;
+        let owner: Option<String> = tx
+            .query_row(
+                "SELECT principal_id FROM session_metadata WHERE session_key = ?1",
+                params![session_key],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(std::io::Error::other)?
+            .flatten();
+        let _authority = authorize(owner.as_deref())?;
+        let now = Utc::now().to_rfc3339();
+        let started_at = (state == "running").then_some(now.as_str());
+        tx.execute("UPDATE session_metadata SET state = ?1, turn_id = ?2, turn_started_at = ?3 WHERE session_key = ?4", params![state, turn_id, started_at, session_key]).map_err(std::io::Error::other)?;
+        tx.commit().map_err(std::io::Error::other)?;
+        Ok(())
     }
 
     fn clear_agent_attribution(&self, agent_alias: &str) -> std::io::Result<usize> {
@@ -2195,6 +2370,76 @@ impl SessionBackend for SqliteSessionBackend {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn guarded_state_and_delete_recheck_owner_and_authority_after_connection_wait() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        for delete in [false, true] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let backend = Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
+            backend.set_session_agent_alias("s", "test").unwrap();
+            backend.set_session_principal("s", "user:bob").unwrap();
+            backend.append("s", &ChatMessage::user("private")).unwrap();
+            let before = backend.get_session_state("s").unwrap();
+            let allowed = Arc::new(AtomicBool::new(true));
+            let lock = backend.conn.lock();
+            let (started, waiting) = std::sync::mpsc::channel();
+            let worker_backend = Arc::clone(&backend);
+            let worker_allowed = Arc::clone(&allowed);
+            let worker = std::thread::spawn(move || {
+                started.send(()).unwrap();
+                let authorize = |owner: Option<&str>| -> std::io::Result<
+                    Box<dyn crate::session_backend::SessionEffectGuard>,
+                > {
+                    assert_eq!(owner, Some("user:bob"));
+                    if !worker_allowed.load(Ordering::SeqCst) {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            "revoked",
+                        ));
+                    }
+                    Ok(Box::new(()))
+                };
+                if delete {
+                    worker_backend
+                        .delete_session_authorized("s", Some("user:bob"), &authorize)
+                        .map(|_| ())
+                } else {
+                    worker_backend.set_session_state_authorized(
+                        "s",
+                        "running",
+                        Some("turn"),
+                        Some("user:alice"),
+                        &authorize,
+                    )
+                }
+            });
+            waiting.recv().unwrap();
+            allowed.store(false, Ordering::SeqCst);
+            drop(lock);
+            assert!(worker.join().unwrap().is_err());
+            assert_eq!(
+                backend.get_session_state("s").unwrap().map(|s| (
+                    s.state,
+                    s.turn_id,
+                    s.turn_started_at
+                )),
+                before.map(|s| (s.state, s.turn_id, s.turn_started_at))
+            );
+            assert_eq!(backend.load("s").len(), 1);
+            assert_eq!(
+                backend
+                    .get_session_metadata("s")
+                    .unwrap()
+                    .principal_id
+                    .as_deref(),
+                Some("user:bob")
+            );
+        }
+    }
+
     use super::*;
     use crate::session_store::SessionStore;
     use std::sync::{Arc, mpsc};
@@ -2476,6 +2721,36 @@ mod tests {
 
         assert!(backend.delete_session("ghost").unwrap());
         assert!(!backend.session_exists("ghost"));
+    }
+
+    /// `try_load` is the read that refuses to guess: a transcript that can't
+    /// be read, or has a row that can't be decoded, is an error, never a
+    /// shorter history.
+    #[test]
+    fn try_load_reports_an_unreadable_transcript() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        backend.append("s", &ChatMessage::user("hello")).unwrap();
+        backend.append("s", &ChatMessage::assistant("hi")).unwrap();
+        assert_eq!(backend.try_load("s").unwrap().len(), 2);
+
+        let db = Connection::open(tmp.path().join("sessions/sessions.db")).unwrap();
+        db.execute(
+            "UPDATE sessions SET content = CAST(x'ff' AS BLOB) WHERE content = 'hi'",
+            [],
+        )
+        .unwrap();
+        assert!(
+            backend.try_load("s").is_err(),
+            "an undecodable row must not read as a shorter transcript"
+        );
+
+        db.execute_batch("ALTER TABLE sessions RENAME TO sessions_unreadable;")
+            .unwrap();
+        assert!(
+            backend.try_load("s").is_err(),
+            "an unreadable transcript must not read as an empty one"
+        );
     }
 
     #[test]
@@ -3256,6 +3531,91 @@ mod tests {
             let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
             assert_eq!(backend.list_sessions().len(), OPENERS);
         }
+    }
+
+    #[test]
+    fn authorized_append_and_rename_hold_authority_through_commit() {
+        use std::cell::Cell;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        backend
+            .append("rpc_effect", &ChatMessage::user("before"))
+            .unwrap();
+        backend
+            .set_session_principal("rpc_effect", "owner")
+            .unwrap();
+        let held = Cell::new(false);
+        struct Lease<'a>(&'a Cell<bool>);
+        impl Drop for Lease<'_> {
+            fn drop(&mut self) {
+                self.0.set(false);
+            }
+        }
+        let authorize = |owner: Option<&str>| -> std::io::Result<
+            Box<dyn crate::session_backend::SessionEffectGuard + '_>,
+        > {
+            assert_eq!(owner, Some("owner"));
+            held.set(true);
+            Ok(Box::new(Lease(&held)))
+        };
+        let committed = Cell::new(false);
+        let count = backend
+            .append_authorized(
+                "rpc_effect",
+                &ChatMessage::assistant("after"),
+                &authorize,
+                &mut || {
+                    assert!(held.get());
+                    committed.set(true);
+                },
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+        assert!(committed.get());
+        assert!(!held.get());
+        backend
+            .set_session_name_authorized("rpc_effect", "accepted", &authorize)
+            .unwrap();
+        assert_eq!(
+            backend.get_session_name("rpc_effect").unwrap().as_deref(),
+            Some("accepted")
+        );
+        assert!(!held.get());
+        let deny = |_: Option<&str>| -> std::io::Result<Box<dyn crate::session_backend::SessionEffectGuard>> {
+            Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "revoked"))
+        };
+        assert!(
+            backend
+                .append_authorized(
+                    "rpc_effect",
+                    &ChatMessage::assistant("denied"),
+                    &deny,
+                    &mut || panic!("denied append must not publish live effects")
+                )
+                .is_err()
+        );
+        assert!(
+            backend
+                .set_session_name_authorized("rpc_effect", "denied", &deny)
+                .is_err()
+        );
+        assert_eq!(backend.load("rpc_effect").len(), 2);
+        assert_eq!(
+            backend.get_session_name("rpc_effect").unwrap().as_deref(),
+            Some("accepted")
+        );
+        backend.delete_session("rpc_effect").unwrap();
+        assert!(
+            backend
+                .append_authorized(
+                    "rpc_effect",
+                    &ChatMessage::assistant("recreated"),
+                    &authorize,
+                    &mut || panic!("deleted row must stay absent")
+                )
+                .is_err()
+        );
+        assert!(!backend.session_exists("rpc_effect"));
     }
 
     #[test]
@@ -4131,6 +4491,80 @@ mod tests {
         backend.delete_session("s").unwrap();
         assert!(!backend.set_context_start("s", 2, true).unwrap());
         assert!(!backend.session_exists("s"));
+    }
+
+    /// An authorizing guard that admits every owner.
+    fn admit_all(
+        _owner: Option<&str>,
+    ) -> std::io::Result<Box<dyn crate::session_backend::SessionEffectGuard + 'static>> {
+        Ok(Box::new(()))
+    }
+
+    /// ZeroLite (session-search R3): a row appended through upstream's
+    /// authorized effect is written by the fork's writer — classified, in a
+    /// turn, and searchable by a CJK substring — like an `append_turn` row.
+    #[test]
+    fn authorized_append_is_classified_and_searchable_like_append_turn() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        backend.set_session_agent_alias("s", "default").unwrap();
+        backend
+            .append_turn("s", &[row(RowKind::User, "user", "先问一句", None)])
+            .unwrap()
+            .unwrap();
+        let mut committed = false;
+        let count = backend
+            .append_authorized(
+                "s",
+                &ChatMessage::assistant("我们讨论数据库查询效率的问题"),
+                &admit_all,
+                &mut || committed = true,
+            )
+            .unwrap();
+        assert!(committed);
+        assert_eq!(count, 2, "chat rows, as `load` counts them");
+
+        let page = backend.load_turn_page("s", None, 1, true);
+        let appended = page.last().expect("the appended row");
+        assert_eq!(appended.kind, RowKind::Assistant);
+        assert_eq!(appended.turn, 1);
+        let hits = message_hits(&backend, "查询", None, None);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].kind, RowKind::Assistant);
+        assert_eq!(hits[0].message_id, appended.message_id);
+    }
+
+    /// ZeroLite (session-search R3): deleting through the authorized effect
+    /// removes the index entries with the rows, as `delete_session` does.
+    #[test]
+    fn authorized_delete_leaves_no_search_hit() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        backend.set_session_agent_alias("s", "default").unwrap();
+        backend
+            .append_turn(
+                "s",
+                &[
+                    row(RowKind::User, "user", "我们讨论数据库查询效率的问题", None),
+                    row(RowKind::ToolResult, "tool", "exit code 127", Some("shell")),
+                ],
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(message_hits(&backend, "查询", None, None).len(), 1);
+
+        assert!(
+            backend
+                .delete_session_authorized("s", None, &admit_all)
+                .unwrap()
+        );
+        assert!(message_hits(&backend, "查询", None, None).is_empty());
+        assert!(message_hits(&backend, "127", None, None).is_empty());
+        let conn = backend.conn.lock();
+        let indexed: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sessions_fts", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(indexed, 0, "no index row outlives its transcript row");
     }
 
     #[test]

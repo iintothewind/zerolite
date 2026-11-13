@@ -14,6 +14,7 @@ if exist "%GIT_BASH%" goto run_bash
 
 echo Git Bash not found; using cmd fallback.
 if exist "target\" rmdir /s /q "target"
+if exist "target-docker\" rmdir /s /q "target-docker"
 if exist ".cache\npm\" rmdir /s /q ".cache\npm"
 if exist "%TEMP%\zc-cargo-home\" rmdir /s /q "%TEMP%\zc-cargo-home"
 if exist "%TEMP%\zeroclaw\" rmdir /s /q "%TEMP%\zeroclaw"

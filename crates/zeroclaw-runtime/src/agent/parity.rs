@@ -150,6 +150,7 @@ async fn parity_l1_engine_honors_excluded_tools() {
         parent_agent_alias: None,
         served_route_sink: None,
         sop_reassembly: None,
+        capability_binding: None,
         exec: ResolvedAgentExecution::resolve(
             ResolvedModelAccess {
                 model_provider: &provider,
@@ -257,18 +258,7 @@ fn a4_policy() -> Arc<SecurityPolicy> {
 /// Minimal `AllToolsResult` around a bare tool list, matching the fixture
 /// `scoped::tests::built_with` uses to drive `assemble()` in isolation.
 fn built_with(tools: Vec<Box<dyn Tool>>) -> AllToolsResult {
-    AllToolsResult {
-        tools,
-        reserved_host_names: std::collections::HashSet::new(),
-        delegate_handle: None,
-        ask_user_handle: None,
-        reaction_handle: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
-        poll_handle: None,
-        escalate_handle: None,
-        channel_room_handle: None,
-        unfiltered_tool_arcs: Vec::new(),
-        delegate_tool: None,
-    }
+    AllToolsResult::from_prebuilt_tools(tools)
 }
 
 #[tokio::test]
@@ -393,6 +383,7 @@ async fn parity_l2_sop_live_step_agent_isolation() {
         None,
         "restricted",
         Arc::clone(&engine),
+        None,
         None,
         None,
     )

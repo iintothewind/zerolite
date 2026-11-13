@@ -31,6 +31,7 @@
 | 1 | Upstream release names, version, README | Zerolite release names, README, `1.x` version, `docs/releases/v<version>.md` as release body | R1 |
 | 2 | Upstream CI workflows incl. sync-upstream automation | Workflows stripped; sync-upstream on manual dispatch only; release-workflow parity checks skipped when the workflow is absent | R2 |
 | 3 | Docs site + translations submodule + `docs/book/` content | Deleted; upstream `docs/book/` edits dropped on modify/delete (`git rm`), never restored | R3 |
+| 4 | `zeroclaw update` self-updates from upstream releases, `--standard` switches a CLI-only build to the standard one (#12111) | Self-update, including `--standard`, stays disabled (`fork_self_update_disabled`) | R1, R2 |
 
 ## Merge notes
 
@@ -52,3 +53,6 @@
   dropped.
 - 2026-11-09 cherry-picks (`merge-2026-11-09`, release 1.3.1): `docs/book`
   sides dropped (#11855, #11523, #12114).
+- v0.9.0 full merge (`merge-v0.9.0`): `docs/book`, workflow, `CLAUDE.md`,
+  `CHANGELOG-next.md`, `nix/` and `flake.nix` sides dropped; README and
+  version kept; upstream tag never created locally or pushed.

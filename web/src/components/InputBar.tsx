@@ -14,6 +14,12 @@ import css from './InputBar.module.css';
 
 interface InputBarProps {
   connected: boolean;
+  /** The composer may send: the socket is open, or the first message will open it. */
+  canSend: boolean;
+  /** Image attachments are offered (operator accounts only). */
+  canAttach: boolean;
+  /** No socket yet; the first message starts the conversation. */
+  startsConversationOnSend: boolean;
   hydrated: boolean;
   typing: boolean;
   uploading: boolean;
@@ -44,6 +50,9 @@ interface InputBarProps {
 export function InputBar(props: InputBarProps) {
   const {
     connected,
+    canSend,
+    canAttach,
+    startsConversationOnSend,
     hydrated,
     typing,
     uploading,
@@ -64,7 +73,7 @@ export function InputBar(props: InputBarProps) {
     onUpload,
   } = props;
 
-  const placeholder = !connected
+  const placeholder = !canSend
     ? t('agent.connecting')
     : !hydrated
       ? t('agent.session_loading')
@@ -72,30 +81,34 @@ export function InputBar(props: InputBarProps) {
         ? t('agent.running')
         : t('agent.type_message');
 
-  const sendDisabled = !connected || !hydrated || !input.trim();
+  const sendDisabled = !canSend || !hydrated || !input.trim();
 
   const statusTitle = typing
     ? t('agent.running')
     : connected
       ? t('agent.connected_status')
-      : t('agent.disconnected_status');
+      : startsConversationOnSend
+        ? t('agent.ready_status')
+        : t('agent.disconnected_status');
 
   return (
     <div className={css.root}>
       <div className={css.card}>
-        <input
-          ref={fileInputRef}
-          type="file"
-          accept="image/*"
-          multiple
-          className="hidden"
-          onChange={(e) => {
-            if (e.target.files) {
-              void onUpload(e.target.files);
-            }
-            e.target.value = '';
-          }}
-        />
+        {canAttach && (
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/*"
+            multiple
+            className="hidden"
+            onChange={(e) => {
+              if (e.target.files) {
+                void onUpload(e.target.files);
+              }
+              e.target.value = '';
+            }}
+          />
+        )}
         <div className={css.scroll}>
           <textarea
             ref={inputRef}
@@ -106,25 +119,27 @@ export function InputBar(props: InputBarProps) {
             onCompositionStart={onCompositionStart}
             onCompositionEnd={onCompositionEnd}
             placeholder={placeholder}
-            disabled={!connected || typing || !hydrated}
+            disabled={!canSend || typing || !hydrated}
             className={css.input}
             style={{ minHeight: '40px', maxHeight: '200px' }}
           />
         </div>
         <div className={css.row}>
           <div className={css.tools}>
-            <button
-              type="button"
-              onClick={() => fileInputRef.current?.click()}
-              disabled={uploading}
-              className={css.attach}
-              aria-label={t('agent.attach_image')}
-              title={t('agent.attach_image')}
-            >
-              {uploading
-                ? <Loader2 className="animate-spin" strokeWidth={2} />
-                : <Plus strokeWidth={2} />}
-            </button>
+            {canAttach && (
+              <button
+                type="button"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={uploading}
+                className={css.attach}
+                aria-label={t('agent.attach_image')}
+                title={t('agent.attach_image')}
+              >
+                {uploading
+                  ? <Loader2 className="animate-spin" strokeWidth={2} />
+                  : <Plus strokeWidth={2} />}
+              </button>
+            )}
           </div>
           <div className={css.mid}>
             <span
@@ -134,7 +149,9 @@ export function InputBar(props: InputBarProps) {
                 ? { background: 'var(--pc-accent)', boxShadow: '0 0 6px var(--pc-accent)' }
                 : connected
                   ? { background: 'var(--color-status-success)', boxShadow: '0 0 6px var(--color-status-success)' }
-                  : { background: 'var(--color-status-error)', boxShadow: '0 0 6px var(--color-status-error)' }
+                  : startsConversationOnSend
+                    ? { background: 'var(--pc-text-faint)' }
+                    : { background: 'var(--color-status-error)', boxShadow: '0 0 6px var(--color-status-error)' }
               }
             />
             <SessionStatsRow stats={liveStats} compact />

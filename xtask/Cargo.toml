@@ -26,9 +26,11 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.8"
 cargo_metadata = "0.18"
+schemars = { version = "1.2" }
 tokio = { version = "1.50", default-features = false, features = ["rt-multi-thread", "macros", "net"] }
 zeroclaw-api = { workspace = true }
 zeroclaw-config = { workspace = true }
+zeroclaw-rpc-proto = { workspace = true, features = ["schema-export"] }
 zeroclaw-hardware = { workspace = true }
 zeroclaw-providers = { workspace = true }
 zeroclaw-runtime = { workspace = true, features = ["schema-export"] }
@@ -36,4 +38,6 @@ zeroclaw-gateway = { workspace = true, features = ["schema-export"] }
 zerocode = { workspace = true }
 
 [dev-dependencies]
+# Draft 7 validation of the generated OpenRPC schemas (same version zeroclaw-plugins pins).
+jsonschema = { version = "0.48", default-features = false }
 tempfile = "3"
