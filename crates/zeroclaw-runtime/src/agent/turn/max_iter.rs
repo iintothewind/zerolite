@@ -253,7 +253,7 @@ pub(crate) async fn finish_after_max_iterations(
                 );
                 messages.extend(transient_suffix);
             }
-            let (tokens_before, _) =
+            let (tokens_before, tokens_before_source) =
                 token_counter.measure(crate::agent::history::estimate_history_tokens(&messages));
             let mut dropped_messages = 0;
             let mut dropped_turns = 0;
@@ -303,6 +303,7 @@ pub(crate) async fn finish_after_max_iterations(
                     trim_budget,
                     tokens_before,
                     tokens,
+                    tokens_before_source,
                     tokens_source,
                 );
                 let floor = tokens > context_limits.model_context_window as u64;
@@ -312,7 +313,6 @@ pub(crate) async fn finish_after_max_iterations(
                     trim_budget
                 };
                 if dropped_messages > 0 || floor {
-                    let source = tokens_source;
                     let reason = crate::i18n::get_required_cli_string("history-trim-reason-budget");
                     if let Some(tx) = event_tx {
                         let _ = tx
@@ -324,8 +324,8 @@ pub(crate) async fn finish_after_max_iterations(
                                 token_budget: Some(event_budget as u64),
                                 tokens_before: Some(tokens_before),
                                 tokens_after: Some(tokens),
-                                tokens_before_source: Some(source),
-                                tokens_after_source: Some(source),
+                                tokens_before_source: Some(tokens_before_source),
+                                tokens_after_source: Some(tokens_source),
                                 unsatisfiable_floor: floor.then_some(true),
                                 retained_context: Some(super::retained_context_snapshot(
                                     injected_memory_preamble,
@@ -346,8 +346,8 @@ pub(crate) async fn finish_after_max_iterations(
                             token_budget: Some(event_budget as u64),
                             tokens_before: Some(tokens_before),
                             tokens_after: Some(tokens),
-                            tokens_before_source: Some(source),
-                            tokens_after_source: Some(source),
+                            tokens_before_source: Some(tokens_before_source),
+                            tokens_after_source: Some(tokens_source),
                             unsatisfiable_floor: floor.then_some(true),
                         },
                     );
@@ -1338,6 +1338,88 @@ mod graceful_summary_metering_tests {
             assert!(!retained.breadcrumb);
             assert_eq!(retained.retained_messages.len(), 2);
         }
+    }
+
+    #[tokio::test]
+    async fn graceful_summary_trim_labels_each_count_with_its_own_source() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = CapturingProvider {
+            seen: Arc::clone(&seen),
+            vision: false,
+            ..Default::default()
+        };
+        let padding = "x".repeat(4000);
+        let mut history = vec![
+            ChatMessage::user(format!("old {padding}")),
+            ChatMessage::assistant(format!("old {padding}")),
+            ChatMessage::user("current question"),
+            ChatMessage::assistant("work completed"),
+        ];
+        let estimated = crate::agent::history::estimate_history_tokens(&history);
+        let mut crumb_present = false;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        finish_after_max_iterations(
+            &mut None,
+            &provider,
+            &mut history,
+            "custom",
+            "test-model",
+            "test-model",
+            None,
+            &PacingConfig::default(),
+            None,
+            CompletionLimit::LocalIterations(1),
+            String::new(),
+            "summary-trim-sources",
+            &LoopKnobs::default(),
+            Some(&tx),
+            None,
+            None,
+            None,
+            &MultimodalConfig::default(),
+            None,
+            None,
+            None,
+            None,
+            |_, _| ResolvedContextLimits {
+                model_context_window: 1_000_000,
+                keep_recent_turns: zeroclaw_config::scattered_types::DEFAULT_KEEP_RECENT_TURNS,
+                request_token_ceiling: None,
+                ..ResolvedContextLimits::legacy_fallback(estimated)
+            },
+            &mut crumb_present,
+            Some(super::super::ReportedRequestUsage {
+                provider_name: "custom".into(),
+                model: "test-model".into(),
+                reported_tokens: estimated,
+                estimated_tokens: estimated,
+            }),
+            &crate::observability::NoopObserver,
+            None,
+        )
+        .await
+        .expect("the summary fits once the old turn is dropped");
+        let (dropped_turns, tokens_before_source, tokens_after_source) =
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .find_map(|event| match event {
+                    TurnEvent::HistoryTrimmed {
+                        dropped_turns,
+                        tokens_before_source,
+                        tokens_after_source,
+                        ..
+                    } => Some((dropped_turns, tokens_before_source, tokens_after_source)),
+                    _ => None,
+                })
+                .expect("expected a summary trim event");
+        assert_eq!(dropped_turns, 1);
+        assert_eq!(
+            tokens_before_source,
+            Some(zeroclaw_api::agent::TokenCountSource::Calibrated)
+        );
+        assert_eq!(
+            tokens_after_source,
+            Some(zeroclaw_api::agent::TokenCountSource::Estimated)
+        );
     }
 
     // The summary request must drop declared audio attachments before dispatch,

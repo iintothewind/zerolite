@@ -291,13 +291,12 @@ mod tests {
                 ("dropped", "2"),
                 ("kept", "1"),
                 ("dropped-kind", "other"),
-                ("kept-kind", "one"),
             ];
             let turns = bundles
                 .format("zc-chat-history-trimmed-turns", &args)
                 .unwrap();
-            assert!(turns.contains("older turns dropped"), "{locale}: {turns}");
-            assert!(turns.contains("turn kept"), "{locale}: {turns}");
+            assert!(turns.contains("dropped 2 older turns"), "{locale}: {turns}");
+            assert!(turns.contains("kept 1"), "{locale}: {turns}");
             let old_key = "zc-chat-history-trimmed";
             assert_eq!(
                 bundles.format(old_key, &args),

@@ -877,18 +877,6 @@ struct PromptCompletion {
     cancelled: bool,
 }
 
-/// Map a wire `token_source` value ("provider"/"estimate"/"calibrated") to the
-/// Fluent key whose localized label describes that provenance. Unknown values
-/// (older or future daemons) fall back to a label-less render.
-fn token_source_fluent_key(source: &str) -> String {
-    match source {
-        "provider" => "zc-chat-history-trimmed-token-source-provider".to_string(),
-        "estimate" => "zc-chat-history-trimmed-token-source-estimate".to_string(),
-        "calibrated" => "zc-chat-history-trimmed-token-source-calibrated".to_string(),
-        other => format!("zc-chat-history-trimmed-token-source-{other}"),
-    }
-}
-
 fn should_retry_on_entry(phase: &ChatPhase) -> bool {
     matches!(phase, ChatPhase::Error(_) | ChatPhase::PickAgent { .. })
 }
@@ -11982,89 +11970,78 @@ impl ChatState {
                 ..
             } => {
                 self.freeze_prompt_settled_stream();
-                let dropped = dropped_turns.unwrap_or(dropped_messages).to_string();
-                let kept = kept_turns.to_string();
-                let dropped_kind = if dropped_turns == Some(1) {
-                    "one"
-                } else {
-                    "other"
+                // `~` marks a local estimate, as the context bar does
+                // (`CtxBar::approx_marker`); measured and anchored counts are bare.
+                let tokens = |count: u64, source: Option<&str>| {
+                    let approx = if source == Some("estimate") { "~" } else { "" };
+                    format!("{approx}{}", crate::widgets::fmt_tokens_compact(count))
                 };
-                let kept_kind = if kept_turns == 1 { "one" } else { "other" };
                 // The unsatisfiable newest-turn/schema floor is flagged
                 // explicitly by the runtime: the retained request cannot fit
                 // the configured budget even though history MAY have been
                 // trimmed on the way to that floor, so the notice must not
                 // claim a successful trim.
-                let at_floor = unsatisfiable_floor == Some(true);
-                let notice = if at_floor {
+                let notice = if unsatisfiable_floor == Some(true) {
                     crate::i18n::t_args(
                         "zc-chat-history-trimmed-floor",
                         &[
-                            ("reason", &reason),
-                            ("after", &tokens_after.unwrap_or_default().to_string()),
-                            ("budget", &token_budget.unwrap_or_default().to_string()),
+                            (
+                                "after",
+                                &tokens(
+                                    tokens_after.unwrap_or_default(),
+                                    tokens_after_source.as_deref(),
+                                ),
+                            ),
+                            (
+                                "budget",
+                                &crate::widgets::fmt_tokens_compact(
+                                    token_budget.unwrap_or_default(),
+                                ),
+                            ),
                         ],
                     )
                 } else {
-                    match (tokens_before, tokens_after) {
-                        (Some(before), Some(after)) => {
-                            let mut notice = crate::i18n::t_args(
-                                if dropped_turns.is_some() {
-                                    "zc-chat-history-trimmed-tokens-turns"
-                                } else {
-                                    "zc-chat-history-trimmed-tokens"
-                                },
-                                &[
-                                    ("reason", &reason),
-                                    ("before", &before.to_string()),
-                                    ("after", &after.to_string()),
-                                    ("dropped", &dropped),
-                                    ("kept", &kept),
-                                    ("dropped-kind", dropped_kind),
-                                    ("kept-kind", kept_kind),
-                                ],
-                            );
-                            // The configured budget is context, never the trim
-                            // target: recovery trims toward a provider-overflow
-                            // target, so the notice must not present the
-                            // configured limit as governing the trim.
-                            if let Some(budget) = token_budget {
-                                notice.push_str(&crate::i18n::t_args(
-                                    "zc-chat-history-trimmed-token-budget-clause",
-                                    &[("budget", &budget.to_string())],
-                                ));
-                            }
-                            let before_label = tokens_before_source.as_deref().and_then(|source| {
-                                crate::i18n::try_t(&token_source_fluent_key(source))
-                            });
-                            let after_label = tokens_after_source.as_deref().and_then(|source| {
-                                crate::i18n::try_t(&token_source_fluent_key(source))
-                            });
-                            if let (Some(before_label), Some(after_label)) =
-                                (before_label, after_label)
-                            {
-                                notice.push(' ');
-                                notice.push_str(&crate::i18n::t_args(
-                                    "zc-chat-history-trimmed-token-sources",
-                                    &[("before", &before_label), ("after", &after_label)],
-                                ));
-                            }
-                            notice
-                        }
-                        _ => crate::i18n::t_args(
-                            if dropped_turns.is_some() {
-                                "zc-chat-history-trimmed-turns"
-                            } else {
-                                "zc-chat-history-trimmed"
-                            },
+                    let kept = kept_turns.to_string();
+                    let counts = match dropped_turns {
+                        Some(turns) => crate::i18n::t_args(
+                            "zc-chat-history-trimmed-turns",
                             &[
-                                ("reason", &reason),
-                                ("dropped", &dropped),
+                                ("dropped", &turns.to_string()),
                                 ("kept", &kept),
-                                ("dropped-kind", dropped_kind),
-                                ("kept-kind", kept_kind),
+                                ("dropped-kind", if turns == 1 { "one" } else { "other" }),
                             ],
                         ),
+                        // The non-English legacy strings still interpolate `reason`.
+                        None => crate::i18n::t_args(
+                            "zc-chat-history-trimmed",
+                            &[
+                                ("reason", &reason),
+                                ("dropped", &dropped_messages.to_string()),
+                                ("kept", &kept),
+                            ],
+                        ),
+                    };
+                    match (tokens_before, tokens_after) {
+                        (Some(before), Some(after)) => {
+                            let before = tokens(before, tokens_before_source.as_deref());
+                            let after = tokens(after, tokens_after_source.as_deref());
+                            match token_budget {
+                                Some(budget) => crate::i18n::t_args(
+                                    "zc-chat-history-trimmed-size-budget",
+                                    &[
+                                        ("notice", &counts),
+                                        ("before", &before),
+                                        ("after", &after),
+                                        ("budget", &crate::widgets::fmt_tokens_compact(budget)),
+                                    ],
+                                ),
+                                None => crate::i18n::t_args(
+                                    "zc-chat-history-trimmed-size",
+                                    &[("notice", &counts), ("before", &before), ("after", &after)],
+                                ),
+                            }
+                        }
+                        _ => counts,
                     }
                 };
                 self.entries
@@ -26802,13 +26779,10 @@ mod tests {
             unsatisfiable_floor: None,
         });
 
-        assert!(matches!(
-            s.entries().last(),
-            Some(ChatEntry::SystemMessage(text))
-                if text.contains("history message limit exceeded")
-                    && text.contains("4 older turns dropped")
-                    && text.contains("3")
-        ));
+        assert_eq!(
+            system_messages(&s).pop().as_deref(),
+            Some("History trimmed: dropped 4 older turns, kept 3")
+        );
     }
 
     #[test]
@@ -26828,11 +26802,10 @@ mod tests {
             unsatisfiable_floor: None,
         });
 
-        assert!(matches!(
-            s.entries().last(),
-            Some(ChatEntry::SystemMessage(text))
-                if text.contains("12 messages dropped") && text.contains("3 turns kept")
-        ));
+        assert_eq!(
+            system_messages(&s).pop().as_deref(),
+            Some("History trimmed: dropped 12 messages, kept 3 turns")
+        );
     }
 
     #[test]
@@ -26852,11 +26825,10 @@ mod tests {
             unsatisfiable_floor: None,
         });
 
-        assert!(matches!(
-            s.entries().last(),
-            Some(ChatEntry::SystemMessage(text))
-                if text.contains("1 older turn dropped; 1 turn kept")
-        ));
+        assert_eq!(
+            system_messages(&s).pop().as_deref(),
+            Some("History trimmed: dropped 1 older turn, kept 1")
+        );
     }
 
     #[test]
@@ -26876,21 +26848,12 @@ mod tests {
             unsatisfiable_floor: None,
         });
 
-        assert!(matches!(
-            s.entries().last(),
-            Some(ChatEntry::SystemMessage(text))
-                if text.contains("612000")
-                    && text.contains("117000")
-                    && text.contains("configured token budget: 500000")
-                    && text.contains("context token budget exceeded")
-                    && text.contains("12")
-                    && text.contains("33")
-                    && text.contains("provider")
-                    && text.contains("estimate")
-                    && text.contains("before")
-                    && text.contains("after")
-                    && !text.contains("against a")
-        ));
+        assert_eq!(
+            system_messages(&s).pop().as_deref(),
+            Some(
+                "History trimmed: dropped 12 messages, kept 33 turns · 612K → 117K tokens (budget 500K)"
+            )
+        );
     }
 
     #[test]
@@ -26910,57 +26873,24 @@ mod tests {
                 tokens_after_source: Some("calibrated".to_string()),
                 unsatisfiable_floor: floor.then_some(true),
             });
-            let Some(ChatEntry::SystemMessage(text)) = s.entries().last() else {
-                panic!("expected trim notice");
+            let text = system_messages(&s).pop().expect("expected trim notice");
+            let expected = match (dropped_turns, floor) {
+                (_, true) => {
+                    "History cannot be trimmed further: the newest turn needs 12K tokens, over the 10K-token context window"
+                }
+                (1, false) => {
+                    "History trimmed: dropped 1 older turn, kept 2 · 20K → 6K tokens (budget 10K)"
+                }
+                _ => {
+                    "History trimmed: dropped 0 older turns, kept 2 · 20K → 6K tokens (budget 10K)"
+                }
             };
-            if floor {
-                assert!(text.contains("could not be trimmed below the configured token budget"));
-                assert!(!text.contains("history was trimmed"));
-            } else {
-                let expected = if dropped_turns == 1 {
-                    "1 older turn dropped"
-                } else {
-                    "0 older turns dropped"
-                };
-                assert!(text.contains(expected), "{text}");
-                assert!(text.contains("2 turns kept"), "{text}");
-                assert!(text.contains("20000") && text.contains("6000"));
-                assert!(text.contains("provider") && text.contains("estimate"));
-                assert!(!text.contains("12 older"));
-            }
+            assert_eq!(text, expected);
         }
     }
 
     #[test]
-    fn history_trimmed_recovery_below_configured_budget_does_not_claim_budget_governed() {
-        let mut s = state();
-        s.apply_update(SessionUpdate::HistoryTrimmed {
-            session_id: "sess-1".to_string(),
-            dropped_messages: 4,
-            dropped_turns: None,
-            kept_turns: 2,
-            reason: "context window overflow recovery".to_string(),
-            token_budget: Some(500_000),
-            tokens_before: Some(612_000),
-            tokens_after: Some(117_000),
-            tokens_before_source: Some("provider".to_string()),
-            tokens_after_source: Some("calibrated".to_string()),
-            unsatisfiable_floor: None,
-        });
-
-        assert!(matches!(
-            s.entries().last(),
-            Some(ChatEntry::SystemMessage(text))
-                if text.contains("612000")
-                    && text.contains("117000")
-                    && text.contains("context window overflow recovery")
-                    && text.contains("configured token budget: 500000")
-                    && !text.contains("against a")
-        ));
-    }
-
-    #[test]
-    fn history_trimmed_recovery_with_enforcement_disabled_renders_valid_counts() {
+    fn history_trimmed_without_a_budget_omits_the_budget_clause() {
         let mut s = state();
         s.apply_update(SessionUpdate::HistoryTrimmed {
             session_id: "sess-1".to_string(),
@@ -26976,14 +26906,10 @@ mod tests {
             unsatisfiable_floor: None,
         });
 
-        assert!(matches!(
-            s.entries().last(),
-            Some(ChatEntry::SystemMessage(text))
-                if text.contains("612000")
-                    && text.contains("117000")
-                    && text.contains("context window overflow recovery")
-                    && !text.contains("budget")
-        ));
+        assert_eq!(
+            system_messages(&s).pop().as_deref(),
+            Some("History trimmed: dropped 4 messages, kept 2 turns · 612K → 117K tokens")
+        );
     }
 
     #[test]
@@ -27007,15 +26933,12 @@ mod tests {
             unsatisfiable_floor: Some(true),
         });
 
-        assert!(matches!(
-            s.entries().last(),
-            Some(ChatEntry::SystemMessage(text))
-                if text.contains("could not be trimmed below the configured token budget")
-                    && text.contains("117000")
-                    && text.contains("configured budget: 100000")
-                    && !text.contains("was trimmed:")
-                    && !text.contains("messages dropped")
-        ));
+        assert_eq!(
+            system_messages(&s).pop().as_deref(),
+            Some(
+                "History cannot be trimmed further: the newest turn needs 117K tokens, over the 100K-token context window"
+            )
+        );
     }
 
     #[test]
@@ -27038,13 +26961,11 @@ mod tests {
             unsatisfiable_floor: Some(true),
         });
 
-        assert!(matches!(
-            s.entries().last(),
-            Some(ChatEntry::SystemMessage(text))
-                if text.contains("could not be trimmed below the configured token budget")
-                    && text.contains("configured budget: 100000")
-                    && !text.contains("Earlier conversation history was trimmed")
-        ));
+        let text = system_messages(&s).pop().expect("expected trim notice");
+        assert!(
+            text.starts_with("History cannot be trimmed further"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -27067,12 +26988,9 @@ mod tests {
             unsatisfiable_floor: None,
         });
 
-        assert!(matches!(
-            s.entries().last(),
-            Some(ChatEntry::SystemMessage(text))
-                if text.contains("Earlier conversation history was trimmed")
-                    && !text.contains("could not be trimmed")
-        ));
+        let text = system_messages(&s).pop().expect("expected trim notice");
+        assert!(text.starts_with("History trimmed: "), "{text}");
+        assert!(!text.contains("cannot be trimmed"), "{text}");
     }
 
     #[test]
@@ -27092,13 +27010,12 @@ mod tests {
             unsatisfiable_floor: None,
         });
 
-        assert!(matches!(
-            s.entries().last(),
-            Some(ChatEntry::SystemMessage(text))
-                if text.contains("estimated")
-                    && text.contains("estimated before")
-                    && text.contains("estimated after")
-        ));
+        assert_eq!(
+            system_messages(&s).pop().as_deref(),
+            Some(
+                "History trimmed: dropped 2 messages, kept 1 turns · ~12K → ~6K tokens (budget 10K)"
+            )
+        );
     }
 
     #[test]

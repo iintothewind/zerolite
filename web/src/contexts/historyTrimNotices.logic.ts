@@ -2,13 +2,15 @@
  * History-trim notice rendering, extracted from AgentContext so the web
  * rendering boundary is unit-testable without a React/browser harness.
  *
- * The token-rich notice depends only on `tokens_before`/`tokens_after` being
- * available. The configured budget is optional context — recovery trims toward
- * a provider-overflow target, never the configured limit, so the wording must
- * never present the configured budget as the trim target.
+ * The notice is the counts sentence (`formatHistoryTrimmedNotice`), wrapped
+ * by a size message when `tokens_before`/`tokens_after` are present, with the
+ * budget appended when one was in effect. Counts use the compact
+ * `formatTokens` form; a `~` marks a count whose source is a local estimate.
+ * The trim reason is not rendered.
  */
 
 import { formatHistoryTrimmedNotice } from '../lib/historyTrimNotice.ts';
+import { formatTokens } from '../lib/sessionStats.logic.ts';
 
 export interface HistoryTrimmedNoticeMessage {
   dropped_turns?: number;
@@ -27,56 +29,25 @@ export function buildHistoryTrimmedNotice(
   msg: HistoryTrimmedNoticeMessage,
   t: (key: string) => string,
 ): string {
-  const reason = msg.reason || t('agent.history_trimmed_unknown_reason');
-  const dropped = String(msg.dropped_turns ?? msg.dropped_messages ?? 0);
-  const kept = String(msg.kept_turns ?? 0);
-  const hasTokens = msg.tokens_before != null && msg.tokens_after != null;
+  const tokens = (count: number, source?: string) =>
+    `${source === 'estimate' ? '~' : ''}${formatTokens(count)}`;
+
+  const { tokens_before: before, tokens_after: after, token_budget: budget } = msg;
+  const counts = formatHistoryTrimmedNotice({ type: 'history_trimmed', ...msg }, t);
+  if (before == null || after == null) return counts;
   // The unsatisfiable newest-turn/schema floor is flagged explicitly by the
   // runtime: the retained request cannot fit the configured budget even though
   // history MAY have been trimmed on the way to that floor. The flag — not
   // `dropped_messages === 0` — is the authoritative signal, so a floor reached
   // after real drops still renders truthfully.
-  const atFloor =
-    msg.unsatisfiable_floor === true && hasTokens && msg.token_budget != null;
-  if (atFloor) {
+  if (msg.unsatisfiable_floor === true && budget != null) {
     return t('agent.history_trimmed_floor')
-      .replace('{reason}', reason)
-      .replace('{after}', String(msg.tokens_after))
-      .replace('{budget}', String(msg.token_budget));
+      .replace('{after}', tokens(after, msg.tokens_after_source))
+      .replace('{budget}', formatTokens(budget));
   }
-  if (!hasTokens) {
-    return formatHistoryTrimmedNotice({ type: 'history_trimmed', ...msg }, t);
-  }
-  let content = t(msg.dropped_turns !== undefined ? 'agent.history_trimmed_tokens_turns' : 'agent.history_trimmed_tokens')
-    .replace('{reason}', reason)
-    .replace('{before}', String(msg.tokens_before))
-    .replace('{after}', String(msg.tokens_after))
-    .replace('{dropped}', dropped)
-    .replace('{kept}', kept)
-    .replace('{dropped_unit}', t(msg.dropped_turns === 1 ? 'agent.history_trimmed_turn_singular' : 'agent.history_trimmed_turn_plural'))
-    .replace('{kept_unit}', t(msg.kept_turns === 1 ? 'agent.history_trimmed_turn_singular' : 'agent.history_trimmed_turn_plural'));
-  if (msg.token_budget != null) {
-    content += t('agent.history_trimmed_tokens_budget_clause').replace(
-      '{budget}',
-      String(msg.token_budget),
-    );
-  }
-  const sourceLabel = (source?: string) =>
-    source === 'provider'
-      ? t('agent.history_trimmed_tokens_source_provider')
-      : source === 'estimate'
-        ? t('agent.history_trimmed_tokens_source_estimate')
-        : source === 'calibrated'
-          ? t('agent.history_trimmed_tokens_source_calibrated')
-          : undefined;
-  const beforeLabel = sourceLabel(msg.tokens_before_source);
-  const afterLabel = sourceLabel(msg.tokens_after_source);
-  if (beforeLabel && afterLabel) {
-    content +=
-      ' ' +
-      t('agent.history_trimmed_tokens_sources')
-        .replace('{before}', beforeLabel)
-        .replace('{after}', afterLabel);
-  }
-  return content;
+  const sized = t(budget != null ? 'agent.history_trimmed_size_budget' : 'agent.history_trimmed_size')
+    .replace('{notice}', () => counts)
+    .replace('{before}', tokens(before, msg.tokens_before_source))
+    .replace('{after}', tokens(after, msg.tokens_after_source));
+  return budget != null ? sized.replace('{budget}', formatTokens(budget)) : sized;
 }

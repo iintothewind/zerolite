@@ -1122,7 +1122,8 @@ fn record_dispatch_trim(
     budget: usize,
     tokens_before: u64,
     tokens_after: u64,
-    token_source: zeroclaw_api::agent::TokenCountSource,
+    tokens_before_source: zeroclaw_api::agent::TokenCountSource,
+    tokens_after_source: zeroclaw_api::agent::TokenCountSource,
 ) {
     if trim.dropped_messages == 0 {
         return;
@@ -1146,8 +1147,8 @@ fn record_dispatch_trim(
                 "budget_tokens": budget,
                 "tokens_before": tokens_before,
                 "tokens_after": tokens_after,
-                "tokens_before_source": token_source,
-                "tokens_after_source": token_source,
+                "tokens_before_source": tokens_before_source,
+                "tokens_after_source": tokens_after_source,
                 "tokens_reclaimed": tokens_before.saturating_sub(tokens_after),
                 "budget_headroom": (budget as u64).saturating_sub(tokens_after),
             })),
@@ -2622,6 +2623,7 @@ async fn run_tool_call_loop_impl<'a>(
                 tokens_before_dispatch,
                 tokens_after_dispatch,
                 dispatch_token_source,
+                dispatch_after_source,
             );
             if let Some(tx) = event_tx.as_ref() {
                 let _ = tx
@@ -3024,6 +3026,7 @@ async fn run_tool_call_loop_impl<'a>(
                     ctx.context_limits.model_context_window,
                     ctx.context_limits.keep_recent_turns,
                     &context_calibration,
+                    tool_schema_tokens,
                     &mut turn_state.crumb_present,
                 )
                 .await;

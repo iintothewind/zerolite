@@ -292,6 +292,12 @@ impl ContextCalibration {
         Self::default()
     }
 
+    /// Whether a provider report anchors this calibration.
+    #[must_use]
+    pub fn is_anchored(&self) -> bool {
+        self.reported_input_tokens.is_some()
+    }
+
     /// Record a provider-authoritative prompt size for the current history.
     /// Called each time a response carries `usage.input_tokens`; the reported
     /// value is the full prompt the provider just saw, so the messages present
@@ -810,57 +816,6 @@ pub(crate) fn insert_conversation_breadcrumb_deduped(history: &mut Vec<Conversat
         return;
     }
     history.insert(system_count, ConversationMessage::Chat(crumb));
-}
-
-/// Build a [`zeroclaw_api::agent::TurnEvent::HistoryTrimmed`] from trim accounting.
-#[must_use]
-pub fn history_trimmed_turn_event(
-    dropped_messages: usize,
-    kept_turns: usize,
-    reason: String,
-    tokens_after: Option<usize>,
-    tokens_before: Option<usize>,
-    dropped_turns: Option<usize>,
-) -> zeroclaw_api::agent::TurnEvent {
-    zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
-        dropped_messages,
-        dropped_turns: dropped_turns.unwrap_or(0),
-        kept_turns,
-        reason,
-        token_budget: None,
-        tokens_before: tokens_before.map(|v| v as u64),
-        tokens_after: tokens_after.map(|v| v as u64),
-        tokens_before_source: None,
-        tokens_after_source: None,
-        unsatisfiable_floor: None,
-        retained_context: None,
-    }
-}
-
-/// Build an observer HistoryTrimmed event from trim accounting.
-#[must_use]
-pub fn history_trimmed_observer_event(
-    dropped_messages: usize,
-    kept_turns: usize,
-    reason: String,
-    tokens_after: Option<usize>,
-    tokens_before: Option<usize>,
-    _dropped_turns: Option<usize>,
-) -> zeroclaw_api::observability_traits::ObserverEvent {
-    zeroclaw_api::observability_traits::ObserverEvent::HistoryTrimmed {
-        dropped_messages,
-        kept_turns,
-        reason,
-        channel: None,
-        agent_alias: None,
-        turn_id: None,
-        token_budget: None,
-        tokens_before: tokens_before.map(|v| v as u64),
-        tokens_after: tokens_after.map(|v| v as u64),
-        tokens_before_source: None,
-        tokens_after_source: None,
-        unsatisfiable_floor: None,
-    }
 }
 
 #[cfg(test)]

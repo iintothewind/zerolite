@@ -1703,8 +1703,8 @@ impl Agent {
         meter: Option<(usize, zeroclaw_api::agent::TokenCountSource)>,
     ) -> Result<Option<HistoryTrimNotice>, anyhow::Error> {
         // A zero budget means "no fit constraint", not "do nothing": the keep-N
-        // preference still applies, and `trim_conversation_to_fit_with` treats a
-        // zero budget exactly that way.
+        // preference still applies, and `trim_conversation_to_fit_with_crumb`
+        // treats a zero budget exactly that way.
         let budget = self.config.resolved.context_trim_budget();
         // The cascade prices messages, while the budget bounds the whole
         // request — messages plus the tool definitions it carries. Handing the
@@ -1722,12 +1722,13 @@ impl Agent {
             crate::agent::history::estimate_history_tokens(&dispatcher.to_provider_messages(h))
         };
         let taken = std::mem::take(&mut self.history);
-        let mut result = crate::agent::history_trim::trim_conversation_to_fit_with(
+        let mut result = crate::agent::history_trim::trim_conversation_to_fit_with_crumb(
             taken,
             keep,
             history_budget,
             self.config.resolved.effective_context_window(),
             estimate,
+            self.history_has_trim_breadcrumb,
         );
         // A trim rewrites the durable rows, so the population the provider
         // measured no longer exists as a prefix of this history. Drop the
@@ -1746,26 +1747,12 @@ impl Agent {
                 history_budget,
                 &result,
             );
-            let reason = crate::i18n::get_required_cli_string("history-trim-reason-budget");
-            self.observer.record_event(
-                &crate::agent::history_trim::history_trimmed_observer_event(
-                    result.dropped_messages,
-                    result.kept_turns,
-                    reason.clone(),
-                    // Reported as provider-facing sizes: the request the next
-                    // dispatch sends is messages plus tool definitions, and a
-                    // count that omits them is not comparable to `usage`.
-                    Some(result.tokens_after + schema_tokens),
-                    Some(result.tokens_before + schema_tokens),
-                    Some(result.dropped_turns),
-                ),
-            );
             self.history = result.history;
-            return Ok(Some(HistoryTrimNotice {
+            let notice = HistoryTrimNotice {
                 dropped_messages: result.dropped_messages,
                 dropped_turns: result.dropped_turns,
                 kept_turns: result.kept_turns,
-                reason,
+                reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
                 retained_context: self.retained_context_snapshot(),
                 // `tokens_after` was re-priced above, after the breadcrumb
                 // was inserted: the breadcrumb is part of what the next
@@ -1791,7 +1778,25 @@ impl Agent {
                     result.tokens_after + schema_tokens,
                 ) as u64,
                 token_budget: (budget > 0).then_some(budget as u64),
-            }));
+            };
+            // The observer sees the same numbers the WS/RPC notice carries.
+            self.observer.record_event(
+                &zeroclaw_api::observability_traits::ObserverEvent::HistoryTrimmed {
+                    dropped_messages: notice.dropped_messages,
+                    kept_turns: notice.kept_turns,
+                    reason: notice.reason.clone(),
+                    channel: None,
+                    agent_alias: None,
+                    turn_id: None,
+                    token_budget: notice.token_budget,
+                    tokens_before: Some(notice.tokens_before),
+                    tokens_after: Some(notice.tokens_after),
+                    tokens_before_source: Some(notice.tokens_before_source),
+                    tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
+                    unsatisfiable_floor: None,
+                },
+            );
+            return Ok(Some(notice));
         }
         self.history = result.history;
         if result.exceeds_budget {
@@ -15759,6 +15764,182 @@ mod tests {
         assert_eq!(
             trim_events[0].2,
             crate::i18n::get_required_cli_string("history-trim-reason-budget")
+        );
+    }
+
+    #[test]
+    fn durable_trim_does_not_count_the_breadcrumb_as_a_turn() {
+        let capturing = Arc::new(CapturingObserver::default());
+        let observer: Arc<dyn Observer> = capturing.clone();
+        let mut agent = trim_test_agent_with_resolved(keep_one_turn_resolved(), observer);
+        agent.history = vec![
+            ConversationMessage::Chat(ChatMessage::system("system")),
+            ConversationMessage::Chat(crate::agent::history_trim::breadcrumb()),
+            ConversationMessage::Chat(ChatMessage::user("kept user")),
+            ConversationMessage::Chat(ChatMessage::assistant("kept assistant")),
+        ];
+        agent.history_has_trim_breadcrumb = true;
+        let generation = agent.history_trim_generation;
+
+        assert!(
+            trim_durable_history_for_test(&mut agent).is_none(),
+            "a breadcrumb plus one real turn holds nothing to drop at keep-1"
+        );
+        assert_eq!(agent.history.len(), 4);
+        assert_eq!(agent.history_trim_generation, generation);
+        assert!(
+            !capturing
+                .events
+                .lock()
+                .iter()
+                .any(|event| matches!(event, ObserverEvent::HistoryTrimmed { .. })),
+            "no trim event may be emitted when only the breadcrumb sits before the kept turn"
+        );
+    }
+
+    #[test]
+    fn durable_trim_after_an_earlier_trim_counts_only_real_turns() {
+        let capturing = Arc::new(CapturingObserver::default());
+        let observer: Arc<dyn Observer> = capturing.clone();
+        let mut agent = trim_test_agent_with_resolved(keep_one_turn_resolved(), observer);
+        agent.history = vec![
+            ConversationMessage::Chat(ChatMessage::system("system")),
+            ConversationMessage::Chat(crate::agent::history_trim::breadcrumb()),
+            ConversationMessage::Chat(ChatMessage::user("old user")),
+            ConversationMessage::Chat(ChatMessage::assistant("old assistant")),
+            ConversationMessage::Chat(ChatMessage::user("new user")),
+            ConversationMessage::Chat(ChatMessage::assistant("new assistant")),
+        ];
+        agent.history_has_trim_breadcrumb = true;
+
+        let notice = trim_durable_history_for_test(&mut agent).expect("the old turn is dropped");
+        assert_eq!(notice.dropped_turns, 1);
+        assert_eq!(notice.dropped_messages, 2);
+        assert_eq!(notice.kept_turns, 1);
+        let notice_counts = (
+            Some(notice.tokens_before),
+            Some(notice.tokens_after),
+            notice.token_budget,
+        );
+
+        let crumb = crate::agent::history_trim::breadcrumb().content;
+        let rows: Vec<(String, String)> = agent
+            .history
+            .iter()
+            .map(|message| match message {
+                ConversationMessage::Chat(chat) => (chat.role.clone(), chat.content.clone()),
+                other => panic!("unexpected row {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("system".to_string(), "system".to_string()),
+                ("user".to_string(), crumb),
+                ("user".to_string(), "new user".to_string()),
+                ("assistant".to_string(), "new assistant".to_string()),
+            ]
+        );
+
+        let observed: Vec<_> = capturing
+            .events
+            .lock()
+            .iter()
+            .filter_map(|event| match event {
+                ObserverEvent::HistoryTrimmed {
+                    tokens_before,
+                    tokens_after,
+                    token_budget,
+                    ..
+                } => Some((*tokens_before, *tokens_after, *token_budget)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            observed,
+            vec![notice_counts],
+            "the observer reports the notice's numbers"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_loop_trim_is_announced_once() {
+        const WINDOW: usize = 40_000;
+        let mut resolved = zeroclaw_config::schema::ResolvedRuntime::default();
+        resolved.model_context_window = WINDOW;
+        resolved.context.trim_threshold_percent = 100;
+        resolved.context.keep_recent_turns = Some(3);
+
+        let capturing = Arc::new(CapturingObserver::default());
+        let observer: Arc<dyn Observer> = capturing.clone();
+        let mut agent = trim_test_agent_with_resolved(resolved, observer);
+
+        let padding = "x".repeat(20_000);
+        agent.history = vec![ConversationMessage::Chat(ChatMessage::system("system"))];
+        for index in 0..3 {
+            agent
+                .history
+                .push(ConversationMessage::Chat(ChatMessage::user(format!(
+                    "old user {index} {padding}"
+                ))));
+            agent
+                .history
+                .push(ConversationMessage::Chat(ChatMessage::assistant(format!(
+                    "old assistant {index} {padding}"
+                ))));
+        }
+        let before = crate::agent::history::estimate_history_tokens(
+            &agent.tool_dispatcher.to_provider_messages(&agent.history),
+        );
+        assert!(
+            before < WINDOW,
+            "the fixture must start under the window ({before} >= {WINDOW})"
+        );
+
+        let reply = "y".repeat(4 * (WINDOW + 3_000 - before));
+        agent.model_provider = Box::new(MockModelProvider {
+            responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
+                text: Some(reply),
+                tool_calls: vec![zeroclaw_providers::ToolCall {
+                    id: "trim-loop-call".into(),
+                    name: "echo".into(),
+                    arguments: "{}".into(),
+                    extra_content: None,
+                }],
+                usage: None,
+                reasoning_content: None,
+            }]),
+        });
+
+        agent.turn("new user").await.expect("turn should succeed");
+
+        assert!(
+            !agent.history.iter().any(|message| matches!(
+                message,
+                ConversationMessage::Chat(chat) if chat.content.starts_with("old user 0")
+            )),
+            "the turn the loop dropped must not be resurrected in durable history"
+        );
+        let trims: Vec<(Option<u64>, Option<u64>)> = capturing
+            .events
+            .lock()
+            .iter()
+            .filter_map(|event| match event {
+                ObserverEvent::HistoryTrimmed {
+                    tokens_before,
+                    tokens_after,
+                    ..
+                } => Some((*tokens_before, *tokens_after)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(trims.len(), 1, "one trim must be announced once: {trims:?}");
+        let (Some(before), Some(after)) = trims[0] else {
+            panic!("the trim event must carry both counts: {trims:?}");
+        };
+        assert!(
+            after < before,
+            "a real trim shrinks the request ({before} -> {after})"
         );
     }
 

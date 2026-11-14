@@ -214,6 +214,22 @@ fn fmt_tokens(n: u64) -> String {
     out.chars().rev().collect()
 }
 
+/// Compact token count, the same rule as the web `formatTokens`: one decimal,
+/// a trailing `.0` dropped (`1K`, `1.5K`, `135K`, `27.5M`).
+pub(crate) fn fmt_tokens_compact(n: u64) -> String {
+    for (unit, suffix) in [(1_000_000_000_u64, "B"), (1_000_000, "M"), (1_000, "K")] {
+        if n >= unit {
+            let tenths = (n as f64 / unit as f64 * 10.0).round() as u64;
+            return if tenths % 10 == 0 {
+                format!("{}{suffix}", tenths / 10)
+            } else {
+                format!("{}.{}{suffix}", tenths / 10, tenths % 10)
+            };
+        }
+    }
+    n.to_string()
+}
+
 #[cfg(test)]
 mod context_bar_tests {
     use super::*;
@@ -249,6 +265,23 @@ mod context_bar_tests {
         assert!(rendered.contains("16,000 /  32,000"));
         assert!(!rendered.contains('│'));
         assert!(rendered.contains("50%"));
+    }
+
+    #[test]
+    fn fmt_tokens_compact_matches_the_web_reference_row() {
+        for (n, expected) in [
+            (0, "0"),
+            (999, "999"),
+            (1000, "1K"),
+            (1500, "1.5K"),
+            (135_000, "135K"),
+            (27_500_000, "27.5M"),
+            (2_000_000_000, "2B"),
+            (112_146, "112.1K"),
+            (24_155, "24.2K"),
+        ] {
+            assert_eq!(fmt_tokens_compact(n), expected, "{n}");
+        }
     }
 
     #[test]

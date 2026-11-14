@@ -497,30 +497,16 @@ zc-chat-pane-acp = ACP
 
 zc-chat-no-agents = No enabled agents yet. Open Quickstart to create one, or use Config to add and enable an agent.
 zc-chat-error-fetch-agents = Failed to fetch agents: { $error }
-zc-chat-history-trimmed-turns = Earlier conversation history was trimmed: { $reason } ({ $dropped } older { $dropped-kind ->
+zc-chat-history-trimmed-turns = History trimmed: dropped { $dropped } older { $dropped-kind ->
     [one] turn
    *[other] turns
-} dropped; { $kept } { $kept-kind ->
-    [one] turn
-   *[other] turns
-} kept).
-zc-chat-history-trimmed = Earlier conversation history was trimmed: { $reason } ({ $dropped } messages dropped; { $kept } turns kept).
-zc-chat-history-trimmed-tokens = Earlier conversation history was trimmed from approximately { $before } to { $after } tokens: { $reason }; { $dropped } messages dropped and { $kept } turns kept.
-zc-chat-history-trimmed-tokens-turns = Earlier conversation history was trimmed from approximately { $before } to { $after } tokens: { $reason }; { $dropped } older { $dropped-kind ->
-    [one] turn
-   *[other] turns
-} dropped and { $kept } { $kept-kind ->
-    [one] turn
-   *[other] turns
-} kept.
-zc-chat-history-trimmed-floor = The conversation history could not be trimmed below the configured token budget: { $reason }; the most recent turn still needs approximately { $after } tokens (configured budget: { $budget }).
+}, kept { $kept }
+zc-chat-history-trimmed = History trimmed: dropped { $dropped } messages, kept { $kept } turns
+zc-chat-history-trimmed-size = { $notice } · { $before } → { $after } tokens
+zc-chat-history-trimmed-size-budget = { $notice } · { $before } → { $after } tokens (budget { $budget })
+zc-chat-history-trimmed-floor = History cannot be trimmed further: the newest turn needs { $after } tokens, over the { $budget }-token context window
 zc-chat-budget-warning-day = Cost warning: ${ $spent } of the ${ $limit } daily limit spent ({ $percent }%). Turns stop at the limit.
 zc-chat-budget-warning-month = Cost warning: ${ $spent } of the ${ $limit } monthly limit spent ({ $percent }%). Turns stop at the limit.
-zc-chat-history-trimmed-token-budget-clause = (configured token budget: { $budget })
-zc-chat-history-trimmed-token-source-provider = provider-reported
-zc-chat-history-trimmed-token-source-estimate = estimated
-zc-chat-history-trimmed-token-source-calibrated = provider + estimate
-zc-chat-history-trimmed-token-sources = ({ $before } before; { $after } after)
 zc-chat-error-create-session = Failed to create session: { $error }
 zc-chat-error-resume-history = The session reattached, but its durable transcript could not be loaded: { $error }
 zc-chat-session-switch-error = Failed to switch session: { $error }

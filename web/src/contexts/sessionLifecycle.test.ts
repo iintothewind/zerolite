@@ -1622,7 +1622,7 @@ test('a trim cuts the transcript locally, so committed turns stay folded', async
   assert.equal(text.includes('first turn'), false, 'the dropped turn is off the screen');
   assert.match(text, /2 tool calls · 1 messages/, 'and the kept turn kept its own header');
   assert.equal(text.includes('out 0'), false, 'still collapsed, so its body is not rendered');
-  assert.match(text, /Earlier conversation history was trimmed/);
+  assert.match(text, /History trimmed/);
 
   // Expanding proves the group holds the live trajectory, not a rebuilt shadow.
   const expand = expandGroupButton(mounted);

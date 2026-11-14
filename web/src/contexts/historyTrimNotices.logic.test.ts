@@ -9,22 +9,14 @@ import {
 // English strings mirrored from `@/lib/i18n` so the branch logic is tested
 // without a browser/React harness.
 const en: Record<string, string> = {
-  'agent.history_trimmed':
-    'Earlier conversation history was trimmed: {reason} ({dropped} messages dropped; {kept} turns kept).',
-  'agent.history_trimmed_turns': 'Earlier conversation history was trimmed: {reason} ({dropped} older {dropped_unit} dropped; {kept} {kept_unit} kept).',
+  'agent.history_trimmed': 'History trimmed: dropped {dropped} messages, kept {kept} turns',
+  'agent.history_trimmed_turns': 'History trimmed: dropped {dropped} older {dropped_unit}, kept {kept}',
   'agent.history_trimmed_turn_singular': 'turn',
   'agent.history_trimmed_turn_plural': 'turns',
-  'agent.history_trimmed_tokens_turns': 'Earlier conversation history was trimmed from approximately {before} to {after} tokens: {reason}; {dropped} older {dropped_unit} dropped and {kept} {kept_unit} kept.',
-  'agent.history_trimmed_tokens':
-    'Earlier conversation history was trimmed from approximately {before} to {after} tokens: {reason}; {dropped} messages dropped and {kept} turns kept.',
+  'agent.history_trimmed_size': '{notice} · {before} → {after} tokens',
+  'agent.history_trimmed_size_budget': '{notice} · {before} → {after} tokens (budget {budget})',
   'agent.history_trimmed_floor':
-    'The conversation history could not be trimmed below the configured token budget: {reason}; the most recent turn still needs approximately {after} tokens (configured budget: {budget}).',
-  'agent.history_trimmed_tokens_budget_clause': ' (configured token budget: {budget})',
-  'agent.history_trimmed_tokens_source_provider': 'provider-reported',
-  'agent.history_trimmed_tokens_source_estimate': 'estimated',
-  'agent.history_trimmed_tokens_source_calibrated': 'provider + estimate',
-  'agent.history_trimmed_tokens_sources': '({before} before; {after} after)',
-  'agent.history_trimmed_unknown_reason': 'history limit exceeded',
+    'History cannot be trimmed further: the newest turn needs {after} tokens, over the {budget}-token context window',
 };
 const t = (key: string) => en[key] ?? key;
 
@@ -36,37 +28,17 @@ test('combined turn and token accounting preserves units, sources and floor prec
     tokens_before_source: 'provider', tokens_after_source: 'calibrated',
   };
   const text = buildHistoryTrimmedNotice(event, t);
-  assert.match(text, /20000 to 6000 tokens/);
-  assert.match(text, /1 older turn dropped and 2 turns kept/);
-  assert.ok(text.includes("provider-reported before; provider + estimate after"));
-  assert.ok(!text.includes('12 messages'));
+  assert.equal(text, 'History trimmed: dropped 1 older turn, kept 2 · 20K → 6K tokens (budget 10K)');
   const zero = buildHistoryTrimmedNotice({ ...event, dropped_turns: 0 }, t);
-  assert.match(zero, /0 older turns dropped/);
+  assert.match(zero, /dropped 0 older turns/);
   const floor = buildHistoryTrimmedNotice({ ...event, tokens_after: 12000, unsatisfiable_floor: true }, t);
-  assert.match(floor, /could not be trimmed below/);
-  assert.ok(!floor.includes('Earlier conversation history was trimmed'));
-});
-
-test('recovery below a large configured budget renders counts with the recovery phrase, not the budget as target', () => {
-  const text = buildHistoryTrimmedNotice(
-    {
-      reason: 'context window overflow recovery',
-      dropped_messages: 4,
-      kept_turns: 2,
-      token_budget: 500000,
-      tokens_before: 612000,
-      tokens_after: 117000,
-    } satisfies HistoryTrimmedNoticeMessage,
-    t,
+  assert.equal(
+    floor,
+    'History cannot be trimmed further: the newest turn needs 12K tokens, over the 10K-token context window',
   );
-  assert.match(text, /612000/);
-  assert.match(text, /117000/);
-  assert.match(text, /context window overflow recovery/);
-  assert.match(text, /configured token budget: 500000/);
-  assert.ok(!/against a \d+/.test(text), 'must not present the configured limit as the trim target');
 });
 
-test('recovery with enforcement disabled still renders valid counts without a budget clause', () => {
+test('a trim without a budget omits the budget clause', () => {
   const text = buildHistoryTrimmedNotice(
     {
       reason: 'context window overflow recovery',
@@ -78,27 +50,7 @@ test('recovery with enforcement disabled still renders valid counts without a bu
     } satisfies HistoryTrimmedNoticeMessage,
     t,
   );
-  assert.match(text, /612000/);
-  assert.match(text, /117000/);
-  assert.match(text, /context window overflow recovery/);
-  assert.ok(!text.includes('budget'), 'no configured budget means no budget clause');
-});
-
-test('configured-budget trim keeps the neutral budget clause and shows the reason', () => {
-  const text = buildHistoryTrimmedNotice(
-    {
-      reason: 'context token budget exceeded',
-      dropped_messages: 12,
-      kept_turns: 33,
-      token_budget: 100000,
-      tokens_before: 612000,
-      tokens_after: 117000,
-    } satisfies HistoryTrimmedNoticeMessage,
-    t,
-  );
-  assert.match(text, /context token budget exceeded/);
-  assert.match(text, /configured token budget: 100000/);
-  assert.ok(!/against a \d+/.test(text));
+  assert.equal(text, 'History trimmed: dropped 4 messages, kept 2 turns · 612K → 117K tokens');
 });
 
 test('message-limit trim without token accounting keeps the count-only fallback', () => {
@@ -110,9 +62,7 @@ test('message-limit trim without token accounting keeps the count-only fallback'
     } satisfies HistoryTrimmedNoticeMessage,
     t,
   );
-  assert.match(text, /history message limit exceeded/);
-  assert.match(text, /12 messages dropped/);
-  assert.match(text, /3 turns kept/);
+  assert.equal(text, 'History trimmed: dropped 12 messages, kept 3 turns');
 });
 
 test('untrimmable newest-turn floor renders a distinct notice that does not claim history was trimmed', () => {
@@ -128,11 +78,10 @@ test('untrimmable newest-turn floor renders a distinct notice that does not clai
     } satisfies HistoryTrimmedNoticeMessage,
     t,
   );
-  assert.match(text, /could not be trimmed below the configured token budget/);
-  assert.match(text, /117000/);
-  assert.match(text, /configured budget: 100000/);
-  assert.ok(!text.includes('was trimmed:'), 'the floor must not claim history changed');
-  assert.ok(!text.includes('messages dropped'), 'the floor must not claim a trim happened');
+  assert.equal(
+    text,
+    'History cannot be trimmed further: the newest turn needs 117K tokens, over the 100K-token context window',
+  );
 });
 
 test('floor reached after real drops reports the unsatisfiable outcome, not a successful trim', () => {
@@ -148,8 +97,10 @@ test('floor reached after real drops reports the unsatisfiable outcome, not a su
     } satisfies HistoryTrimmedNoticeMessage,
     t,
   );
-  assert.match(text, /could not be trimmed below the configured token budget/);
-  assert.ok(!text.includes('Earlier conversation history was trimmed'));
+  assert.equal(
+    text,
+    'History cannot be trimmed further: the newest turn needs 117K tokens, over the 100K-token context window',
+  );
 });
 
 test('ordinary trim with dropped messages keeps the trimmed wording even when slightly over budget', () => {
@@ -164,6 +115,23 @@ test('ordinary trim with dropped messages keeps the trimmed wording even when sl
     } satisfies HistoryTrimmedNoticeMessage,
     t,
   );
-  assert.match(text, /Earlier conversation history was trimmed/);
-  assert.ok(!text.includes('could not be trimmed'));
+  assert.match(text, /^History trimmed: /);
+  assert.ok(!text.includes('cannot be trimmed'));
+});
+
+test('an estimated count is marked, a measured one is not', () => {
+  const text = buildHistoryTrimmedNotice(
+    {
+      dropped_messages: 2,
+      dropped_turns: 1,
+      kept_turns: 1,
+      token_budget: 108000,
+      tokens_before: 112146,
+      tokens_after: 24155,
+      tokens_before_source: 'calibrated',
+      tokens_after_source: 'estimate',
+    } satisfies HistoryTrimmedNoticeMessage,
+    t,
+  );
+  assert.equal(text, 'History trimmed: dropped 1 older turn, kept 1 · 112.1K → ~24.2K tokens (budget 108K)');
 });

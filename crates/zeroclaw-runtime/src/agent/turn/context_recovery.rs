@@ -3,7 +3,8 @@
 use super::context::TurnCtx;
 use super::events::{ProgressEvent, send_progress};
 use super::outcome::is_tool_loop_cancelled;
-use crate::agent::history_trim::ContextCalibration;
+use crate::agent::history::estimate_history_tokens;
+use crate::agent::history_trim::{ContextCalibration, conservative_estimate_tokens};
 use crate::observability::{Observer, ObserverEvent};
 use std::time::Instant;
 use zeroclaw_providers::ChatMessage;
@@ -71,6 +72,9 @@ pub(crate) async fn try_recover_context_overflow(
     model_context_window: usize,
     keep_recent_turns: usize,
     calibration: &ContextCalibration,
+    // Tool definitions the retried request carries; both notice counts
+    // include them so they price the request, not just its messages.
+    tool_schema_tokens: usize,
     crumb_present: &mut bool,
 ) -> bool {
     if zeroclaw_providers::reliable::is_context_window_exceeded(e) {
@@ -87,9 +91,20 @@ pub(crate) async fn try_recover_context_overflow(
         // turns, then one fewer at a time while the retained set still exceeds
         // the trim budget. There is no deeper variant — the keep-N cut is
         // already deep, and the cascade is what covers a rejection the budget
-        // did not predict. The current size is the provider-authoritative
-        // calibration, kept for telemetry and the system-floor guard below.
-        let tokens_now = calibration.current(history);
+        // did not predict. The size before is the provider-authoritative
+        // calibration when a provider report anchors it, the conservative
+        // local estimate of the whole request otherwise.
+        let (tokens_before, tokens_before_source) = if calibration.is_anchored() {
+            (
+                calibration.current(history),
+                zeroclaw_api::agent::TokenCountSource::Calibrated,
+            )
+        } else {
+            (
+                conservative_estimate_tokens(estimate_history_tokens(history) + tool_schema_tokens),
+                zeroclaw_api::agent::TokenCountSource::Estimated,
+            )
+        };
         let owned = std::mem::take(history);
         // The synthetic crumb is not a turn: it must not consume a keep-N
         // slot nor be dropped by the cascade.
@@ -123,7 +138,6 @@ pub(crate) async fn try_recover_context_overflow(
         let dropped_turns = result.dropped_turns;
         let dropped_messages = result.dropped_messages;
         let kept_turns = result.kept_turns;
-        let tokens_after = result.tokens_after;
         if trimmed && !exceeds_budget {
             crate::agent::history_trim::warn_if_below_preferred_keep(
                 keep_recent_turns,
@@ -144,6 +158,10 @@ pub(crate) async fn try_recover_context_overflow(
         }
         *history = recovered_history;
         if trimmed && !exceeds_budget {
+            // Priced after the breadcrumb lands: the retry carries it, and the
+            // tool definitions, through the same conservative margin.
+            let tokens_after =
+                conservative_estimate_tokens(estimate_history_tokens(history) + tool_schema_tokens);
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Retry)
@@ -151,7 +169,7 @@ pub(crate) async fn try_recover_context_overflow(
                     .with_attrs(::serde_json::json!({
                         "dropped_turns": dropped_turns,
                         "dropped_messages": dropped_messages,
-                        "tokens_before": tokens_now,
+                        "tokens_before": tokens_before,
                         "tokens_after": tokens_after,
                         "kept_turns": kept_turns,
                     })),
@@ -166,14 +184,10 @@ pub(crate) async fn try_recover_context_overflow(
                         kept_turns,
                         reason: reason.clone(),
                         token_budget: Some(trim_budget as u64),
-                        tokens_before: Some(tokens_now as u64),
+                        tokens_before: Some(tokens_before as u64),
                         tokens_after: Some(tokens_after as u64),
-                        tokens_before_source: Some(
-                            zeroclaw_api::agent::TokenCountSource::Calibrated,
-                        ),
-                        tokens_after_source: Some(
-                            zeroclaw_api::agent::TokenCountSource::Calibrated,
-                        ),
+                        tokens_before_source: Some(tokens_before_source),
+                        tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
                         unsatisfiable_floor: None,
                         // The durable snapshot travels with the notice: the
                         // session store records the retained population so a
@@ -194,10 +208,10 @@ pub(crate) async fn try_recover_context_overflow(
                 agent_alias: None,
                 turn_id: None,
                 token_budget: Some(trim_budget as u64),
-                tokens_before: Some(tokens_now as u64),
+                tokens_before: Some(tokens_before as u64),
                 tokens_after: Some(tokens_after as u64),
-                tokens_before_source: Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
-                tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
+                tokens_before_source: Some(tokens_before_source),
+                tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
                 unsatisfiable_floor: None,
             });
             return true;
@@ -272,6 +286,7 @@ mod tests {
             budget,
             keep,
             &ContextCalibration::new(),
+            0,
             &mut crumb_present,
         )
         .await;
@@ -287,6 +302,75 @@ mod tests {
             kept_user_turns, keep,
             "retention must follow keep_recent_turns ({keep}), not context_token_budget ({budget})"
         );
+    }
+
+    #[tokio::test]
+    async fn recovery_notice_prices_the_request_the_retry_carries() {
+        use zeroclaw_api::agent::{TokenCountSource, TurnEvent};
+
+        const SCHEMA: usize = 5_000;
+        let recover = |calibration: ContextCalibration| async move {
+            let mut history = overflowing_history();
+            let before = history.clone();
+            let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+            let mut crumb_present = false;
+            let recovered = try_recover_context_overflow(
+                &mut None,
+                &mut history,
+                &anyhow::Error::msg("maximum context length exceeded"),
+                1,
+                Some(&tx),
+                None,
+                &NoopObserver,
+                32_000,
+                32_000,
+                5,
+                &calibration,
+                SCHEMA,
+                &mut crumb_present,
+            )
+            .await;
+            assert!(recovered);
+            let Ok(TurnEvent::HistoryTrimmed {
+                tokens_before,
+                tokens_after,
+                tokens_before_source,
+                tokens_after_source,
+                ..
+            }) = rx.try_recv()
+            else {
+                panic!("recovery must announce the trim");
+            };
+            (
+                before,
+                history,
+                tokens_before.unwrap(),
+                tokens_after.unwrap(),
+                tokens_before_source,
+                tokens_after_source,
+            )
+        };
+
+        let (before, after, tokens_before, tokens_after, before_source, after_source) =
+            recover(ContextCalibration::new()).await;
+        assert_eq!(
+            tokens_before,
+            conservative_estimate_tokens(estimate_history_tokens(&before) + SCHEMA) as u64
+        );
+        assert_eq!(
+            tokens_after,
+            conservative_estimate_tokens(estimate_history_tokens(&after) + SCHEMA) as u64
+        );
+        assert_eq!(before_source, Some(TokenCountSource::Estimated));
+        assert_eq!(after_source, Some(TokenCountSource::Estimated));
+        assert!(tokens_after < tokens_before);
+
+        let mut anchored = ContextCalibration::new();
+        anchored.observe_reported(40_000, &overflowing_history(), "p", "m", SCHEMA);
+        let (_, _, tokens_before, _, before_source, after_source) = recover(anchored).await;
+        assert_eq!(tokens_before, 40_000);
+        assert_eq!(before_source, Some(TokenCountSource::Calibrated));
+        assert_eq!(after_source, Some(TokenCountSource::Estimated));
     }
 
     /// The `CompactingContext` lifecycle state is only reachable through this
@@ -313,6 +397,7 @@ mod tests {
             32_000,
             5,
             &ContextCalibration::new(),
+            0,
             &mut crumb_present,
         )
         .await;
@@ -351,6 +436,7 @@ mod tests {
             32_000,
             5,
             &ContextCalibration::new(),
+            0,
             &mut crumb_present,
         )
         .await;
@@ -392,6 +478,7 @@ mod tests {
             32_000,
             5,
             &ContextCalibration::new(),
+            0,
             &mut crumb_present,
         )
         .await;
@@ -431,6 +518,7 @@ mod tests {
             32_000,
             5,
             &ContextCalibration::new(),
+            0,
             &mut crumb_present,
         )
         .await;
@@ -491,6 +579,7 @@ mod tests {
             100,
             5,
             &ContextCalibration::new(),
+            0,
             &mut crumb_present,
         )
         .await;
@@ -532,6 +621,7 @@ mod tests {
             32_000,
             5,
             &ContextCalibration::new(),
+            0,
             &mut crumb_present,
         )
         .await;
@@ -578,6 +668,7 @@ mod tests {
             budget,
             5,
             &ContextCalibration::new(),
+            0,
             &mut crumb_present,
         )
         .await;
