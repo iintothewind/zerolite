@@ -162,23 +162,30 @@ Notes:
 
 ## Architecture
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│            channels       gateway        ACP                 │
-│          (30+ adapters)   (REST/WS)    (JSON-RPC)            │
-│                        ↓                                     │
-│                   ZeroClaw runtime                           │
-│         ┌──────────┬──────────┬──────────┐                   │
-│         │  agent   │ security │   SOP    │                   │
-│         │   loop   │  policy  │  engine  │                   │
-│         └──────────┴──────────┴──────────┘                   │
-│              ↓          ↓           ↓                        │
-│          providers    tools      memory                      │
-│         (Anthropic,  (shell,    (SQLite,                     │
-│          OpenAI,     browser,    embeddings)                 │
-│          Ollama,     HTTP,                                   │
-│          ~20 more)   hardware)                               │
-└──────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart LR
+    subgraph inbound["Inbound"]
+        direction TB
+        ch["Channels<br/>Discord · Telegram · Matrix<br/>email · CLI · +25"]
+        gw["Gateway<br/>REST / WebSocket"]
+        acp["ACP<br/>JSON-RPC 2.0 over stdio"]
+    end
+
+    subgraph core["ZeroClaw runtime"]
+        direction TB
+        loop["Agent loop"]
+        sec["Security policy<br/>profiles · sandbox · receipts"]
+        sop["SOP engine<br/>event-triggered, resumable"]
+    end
+
+    subgraph backend["Backends"]
+        direction TB
+        prov["Providers<br/>Anthropic · OpenAI<br/>Ollama · ~20 more"]
+        tools["Tools<br/>shell · browser · HTTP<br/>hardware · MCP"]
+        mem["Memory<br/>SQLite · embeddings"]
+    end
+
+    inbound --> core --> backend
 ```
 
 ## License
