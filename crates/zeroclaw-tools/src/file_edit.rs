@@ -1,8 +1,16 @@
+use crate::helpers::filesystem_boundary::{
+    FilesystemBoundaryError, open_absolute_dir_nofollow, open_file_nofollow, write_file_atomic,
+};
 use async_trait::async_trait;
 use serde_json::json;
+use std::io::Read;
+use std::path::Path;
 use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult, with_ephemeral_workspace_warning};
 use zeroclaw_config::policy::SecurityPolicy;
+
+/// Largest file `file_edit` reads into memory for a replacement.
+const MAX_EDIT_FILE_BYTES: u64 = 10 * 1024 * 1024;
 
 pub struct FileEditTool {
     security: Arc<SecurityPolicy>,
@@ -205,55 +213,116 @@ impl FileEditTool {
         }
 
         // ── 9. Read → match → replace → write ─────────────────────
-        let content = match tokio::fs::read_to_string(&resolved_target).await {
-            Ok(c) => c,
-            Err(e) => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: ToolOutput::default(),
-                    error: Some(format!("Failed to read file: {e}")),
-                });
-            }
-        };
+        let file_name = Path::new(file_name).to_path_buf();
+        let old_string = old_string.to_owned();
+        let new_string = new_string.to_owned();
+        let display_path = path.to_owned();
+        Ok(tokio::task::spawn_blocking(move || {
+            replace_in_file(
+                &resolved_parent,
+                &file_name,
+                &old_string,
+                &new_string,
+                &display_path,
+            )
+        })
+        .await?)
+    }
+}
 
-        let match_count = content.matches(old_string).count();
+/// Read → match → replace → write through the canonical parent's directory
+/// handle: the read is no-follow and size-bounded, the write is an atomic
+/// replace, and neither resolves the ambient pathname again.
+fn replace_in_file(
+    parent: &Path,
+    name: &Path,
+    old_string: &str,
+    new_string: &str,
+    display_path: &str,
+) -> ToolResult {
+    let failure = |error: String| ToolResult {
+        success: false,
+        output: ToolOutput::default(),
+        error: Some(error),
+    };
+    let read_failure = |error: FilesystemBoundaryError| match error {
+        error @ FilesystemBoundaryError::Denied { .. } => localize_filesystem_boundary(&error),
+        FilesystemBoundaryError::Io(error) => format!("Failed to read file: {error}"),
+    };
 
-        if match_count == 0 {
-            return Ok(ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some(no_match_diagnostic(&content, old_string)),
-            });
+    let dir = match open_absolute_dir_nofollow(parent) {
+        Ok(dir) => dir,
+        Err(error) => return failure(read_failure(error)),
+    };
+    let mut file = match open_file_nofollow(&dir, name) {
+        Ok(file) => file,
+        Err(error) => return failure(read_failure(error)),
+    };
+    let len = match file.metadata() {
+        Ok(meta) => meta.len(),
+        Err(e) => return failure(format!("Failed to read file: {e}")),
+    };
+    if len > MAX_EDIT_FILE_BYTES {
+        return failure(format!(
+            "File too large to edit: {len} bytes (limit: {MAX_EDIT_FILE_BYTES} bytes)"
+        ));
+    }
+    let mut bytes = Vec::new();
+    if let Err(e) = (&mut file)
+        .take(MAX_EDIT_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+    {
+        return failure(format!("Failed to read file: {e}"));
+    }
+    if bytes.len() as u64 > MAX_EDIT_FILE_BYTES {
+        return failure(format!(
+            "File too large to edit: {}+ bytes (limit: {MAX_EDIT_FILE_BYTES} bytes)",
+            bytes.len()
+        ));
+    }
+    let Ok(content) = String::from_utf8(bytes) else {
+        return failure("Failed to read file: stream did not contain valid UTF-8".into());
+    };
+
+    let match_count = content.matches(old_string).count();
+
+    if match_count == 0 {
+        return failure(no_match_diagnostic(&content, old_string));
+    }
+
+    if match_count > 1 {
+        return failure(format!(
+            "old_string matches {match_count} times; must match exactly once"
+        ));
+    }
+
+    let new_content = content.replacen(old_string, new_string, 1);
+
+    match write_file_atomic(&dir, name, new_content.as_bytes()) {
+        Ok(()) => ToolResult {
+            success: true,
+            output: format!(
+                "Edited {display_path}: replaced 1 occurrence ({} bytes)",
+                new_content.len()
+            )
+            .into(),
+            error: None,
+        },
+        Err(error @ FilesystemBoundaryError::Denied { .. }) => {
+            failure(localize_filesystem_boundary(&error))
         }
-
-        if match_count > 1 {
-            return Ok(ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some(format!(
-                    "old_string matches {match_count} times; must match exactly once"
-                )),
-            });
+        Err(FilesystemBoundaryError::Io(error)) => {
+            failure(format!("Failed to write file: {error}"))
         }
+    }
+}
 
-        let new_content = content.replacen(old_string, new_string, 1);
-
-        match tokio::fs::write(&resolved_target, &new_content).await {
-            Ok(()) => Ok(ToolResult {
-                success: true,
-                output: format!(
-                    "Edited {path}: replaced 1 occurrence ({} bytes)",
-                    new_content.len()
-                )
-                .into(),
-                error: None,
-            }),
-            Err(e) => Ok(ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some(format!("Failed to write file: {e}")),
-            }),
+fn localize_filesystem_boundary(error: &FilesystemBoundaryError) -> String {
+    match error.localization() {
+        Some((key, path)) => {
+            crate::i18n::get_required_tool_string_with_args(key, &[("path", &path)])
         }
+        None => error.to_string(),
     }
 }
 
@@ -978,5 +1047,77 @@ mod tests {
         );
 
         let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
+    async fn file_edit_rejects_file_over_size_limit() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_edit_size_limit");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let oversized = vec![b'x'; MAX_EDIT_FILE_BYTES as usize + 1];
+        tokio::fs::write(dir.join("big.txt"), &oversized)
+            .await
+            .unwrap();
+
+        let tool = test_tool(dir.clone());
+        let result = tool
+            .execute(json!({"path": "big.txt", "old_string": "x", "new_string": "y"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("File too large to edit"),
+            "{:?}",
+            result.error
+        );
+        let len = tokio::fs::metadata(dir.join("big.txt"))
+            .await
+            .unwrap()
+            .len();
+        assert_eq!(len, MAX_EDIT_FILE_BYTES + 1);
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_edit_replaces_file_atomically() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_edit_atomic");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let target = dir.join("doc.txt");
+        std::fs::write(&target, "hello world").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let mut old_handle = std::fs::File::open(&target).unwrap();
+
+        let tool = test_tool(dir.clone());
+        let result = tool
+            .execute(json!({"path": "doc.txt", "old_string": "hello", "new_string": "goodbye"}))
+            .await
+            .unwrap();
+        assert!(result.success, "{:?}", result.error);
+
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "goodbye world");
+        let mut old_contents = String::new();
+        old_handle.read_to_string(&mut old_contents).unwrap();
+        assert_eq!(
+            old_contents, "hello world",
+            "the edit must replace, not truncate"
+        );
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o640);
+        let entries: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("doc.txt")]);
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }

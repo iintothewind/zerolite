@@ -2401,7 +2401,10 @@ fn all_tools_with_runtime_on_thread(
         "file_read",
         Arc::new(RateLimitedTool::new(
             PathGuardedTool::new(
-                FileReadTool::new_with_persistence(security.clone(), persistent_writes),
+                FileReadTool::new_with_persistence(security.clone(), persistent_writes)
+                    .with_runtime_result_budget(
+                        root_config.effective_max_tool_result_chars(agent_alias),
+                    ),
                 security.clone(),
             ),
             security.clone(),

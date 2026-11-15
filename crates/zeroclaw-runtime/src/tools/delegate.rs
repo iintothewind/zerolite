@@ -632,6 +632,8 @@ impl DelegateTool {
     const MAX_AWAIT_SESSION_TASK_IDS: usize = 128;
     const TERMINAL_TRANSITION_ATTEMPTS: usize = 3;
     const TERMINAL_TRANSITION_RETRY_DELAY: Duration = Duration::from_millis(25);
+    /// Largest delegate result artifact read back into memory.
+    const MAX_RESULT_ARTIFACT_BYTES: u64 = 10 * 1024 * 1024;
     const TERMINAL_SETTLEMENT_MAX_RETRY_DELAY: Duration = Duration::from_secs(5);
     const OUTPUT_ARTIFACT_PREFIX: &'static str = "artifact:";
     const AGENTIC_ALWAYS_ASK_DOC_REF: &'static str =
@@ -2327,6 +2329,29 @@ impl DelegateTool {
     /// Directory where background delegate results are stored.
     fn results_dir(&self) -> PathBuf {
         self.workspace_dir.join("delegate_results")
+    }
+
+    /// `read_to_string` bounded by [`Self::MAX_RESULT_ARTIFACT_BYTES`]. Result
+    /// artifacts live in the agent-writable workspace, so one byte past the cap is
+    /// requested and an oversized or still-growing file is refused, not slurped.
+    async fn read_result_artifact(result_path: &Path) -> std::io::Result<String> {
+        use tokio::io::AsyncReadExt;
+        let file = tokio::fs::File::open(result_path).await?;
+        let mut bytes = Vec::new();
+        file.take(Self::MAX_RESULT_ARTIFACT_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .await?;
+        if bytes.len() as u64 > Self::MAX_RESULT_ARTIFACT_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::FileTooLarge,
+                format!(
+                    "delegate result artifact exceeds {} bytes",
+                    Self::MAX_RESULT_ARTIFACT_BYTES
+                ),
+            ));
+        }
+        String::from_utf8(bytes)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     }
 
     async fn background_control_plane(
@@ -4403,7 +4428,7 @@ impl DelegateTool {
         task_id: &str,
     ) -> anyhow::Result<Option<StoredBackgroundOutput>> {
         let result_path = self.results_dir().join(format!("{task_id}.json"));
-        let content = match tokio::fs::read_to_string(&result_path).await {
+        let content = match Self::read_result_artifact(&result_path).await {
             Ok(content) => content,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
@@ -4907,7 +4932,7 @@ impl DelegateTool {
 
         // Compatibility path for legacy result files without a task row.
         let result_path = self.results_dir().join(format!("{task_id}.json"));
-        let content = match tokio::fs::read_to_string(&result_path).await {
+        let content = match Self::read_result_artifact(&result_path).await {
             Ok(content) => content,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(ToolResult {
@@ -6287,7 +6312,8 @@ mod tests {
         let missing = "77777777-7777-7777-7777-777777777777";
         let corrupt = "88888888-8888-8888-8888-888888888888";
         let mismatched = "99999999-9999-9999-9999-999999999999";
-        for task_id in [missing, corrupt, mismatched] {
+        let oversized = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        for task_id in [missing, corrupt, mismatched, oversized] {
             store
                 .create(task_record(task_id, TaskStatus::Running))
                 .await
@@ -6329,6 +6355,18 @@ mod tests {
             )
             .await
             .unwrap();
+        store
+            .transition_terminal(
+                oversized,
+                TaskStatus::Completed,
+                Some(format!(
+                    "{}{oversized}.json",
+                    DelegateTool::OUTPUT_ARTIFACT_PREFIX
+                )),
+                None,
+            )
+            .await
+            .unwrap();
         tokio::fs::create_dir_all(temp.path().join("delegate_results"))
             .await
             .unwrap();
@@ -6337,6 +6375,14 @@ mod tests {
                 .join("delegate_results")
                 .join(format!("{corrupt}.json")),
             b"{not-json",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            temp.path()
+                .join("delegate_results")
+                .join(format!("{oversized}.json")),
+            vec![b' '; DelegateTool::MAX_RESULT_ARTIFACT_BYTES as usize + 1],
         )
         .await
         .unwrap();
@@ -6349,6 +6395,7 @@ mod tests {
             (missing, "is missing"),
             (corrupt, "is unreadable"),
             (mismatched, "does not match task"),
+            (oversized, "exceeds"),
         ] {
             let (state, view, error) = tool
                 .read_background_view(task_id, true)

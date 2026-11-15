@@ -91,7 +91,7 @@ tool-file-download-error-flush = Failed to flush downloaded file: { $err }
 tool-file-download-error-move = Failed to move downloaded file into place: { $err }
 tool-file-download-success = Downloaded { $written } bytes to { $dest_path } ({ $status })
 
-tool-file-read = Read file contents with line numbers. Supports partial reading via offset and limit. Binary and image files are rejected (use the image_info tool for images). Set encoding="base64" to return raw bytes base64-encoded (for binary files such as .pdf/.xlsx/.docx); offset/limit are ignored in that mode.
+tool-file-read = Read a text file as numbered lines ("N: text"). offset (1-based) and limit select a window of lines, so a file of any size can be read piece by piece. One call returns at most about 48 KB, less under a smaller tool-result budget; when that limit cuts the output, the trailing note gives the offset to continue from. A single line longer than the limit is cut and marked "…[truncated]". For large files, search first (content_search) and read only the lines you need. Binary and image files are rejected (use the image_info tool for images). Set encoding="base64" to return raw bytes base64-encoded (for binary files such as .pdf/.xlsx/.docx, up to 10 MB); offset/limit are ignored in that mode.
 
 tool-file-write = Write contents to a file in the workspace
 tool-file-write-error-path-blocked = Path blocked by security policy: '{ $path }'
