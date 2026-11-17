@@ -1,5 +1,6 @@
 //! WebSocket-backed [`Channel`] implementation that surfaces tool approval
-//! prompts to the gateway client and waits for the operator's decision.
+//! prompts and agent questions (`ask_user`, `poll`) to the gateway client and
+//! waits for the operator's answer.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -14,6 +15,8 @@ use zeroclaw_api::channel::{
     ApprovalSource, AttributedApprovalResponse, Channel, ChannelApprovalRequest,
     ChannelApprovalResponse, ChannelMessage, SendMessage,
 };
+
+use crate::ws_question::{PendingQuestions, new_pending_questions};
 
 /// Shared map keyed by `request_id`. Consumed by the receive loop to resolve
 /// the oneshot when an `approval_response` frame arrives.
@@ -31,6 +34,7 @@ pub struct WsApprovalChannel {
     event_tx: mpsc::Sender<TurnEvent>,
     pending: PendingApprovals,
     timeout: Duration,
+    questions: PendingQuestions,
 }
 
 impl WsApprovalChannel {
@@ -43,6 +47,48 @@ impl WsApprovalChannel {
             event_tx,
             pending,
             timeout,
+            questions: new_pending_questions(),
+        }
+    }
+
+    /// The registry the socket loop resolves `question_response` frames into.
+    pub fn pending_questions(&self) -> PendingQuestions {
+        Arc::clone(&self.questions)
+    }
+
+    /// Show a question card to the viewer and wait for the answer. Never
+    /// yields "no answer" as `Ok`: every unanswered outcome is a named error.
+    async fn ask(
+        &self,
+        question: &str,
+        choices: &[String],
+        multi_select: bool,
+        timeout: Duration,
+    ) -> anyhow::Result<Vec<String>> {
+        let request_id = Uuid::new_v4().to_string();
+        let (tx, rx) = oneshot::channel();
+        self.questions.lock().insert(request_id.clone(), tx);
+
+        let event = TurnEvent::QuestionRequest {
+            request_id: request_id.clone(),
+            question: question.to_string(),
+            choices: choices.to_vec(),
+            multi_select,
+            timeout_secs: timeout.as_secs(),
+        };
+        if self.event_tx.send(event).await.is_err() {
+            self.questions.lock().remove(&request_id);
+            anyhow::bail!("the web chat connection is closed");
+        }
+
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(Some(answers))) => Ok(answers),
+            Ok(Ok(None)) => anyhow::bail!("the user dismissed the question without answering"),
+            Ok(Err(_)) => anyhow::bail!("no web chat viewer is attached to answer the question"),
+            Err(_) => {
+                self.questions.lock().remove(&request_id);
+                anyhow::bail!("no answer within {} seconds", timeout.as_secs())
+            }
         }
     }
 }
@@ -89,6 +135,62 @@ impl Channel for WsApprovalChannel {
 
     fn supports_free_form_ask(&self) -> bool {
         false
+    }
+
+    // The question methods never return `Ok(None)`: on this channel `ask_user`
+    // would report that as "no free-form fallback". The viewer's answer may be
+    // free text outside `choices`; `min_items`/`max_items` are not enforced
+    // because the answer card returns at least one entry and may add its
+    // "other" text.
+    async fn request_choice(
+        &self,
+        question: &str,
+        choices: &[String],
+        timeout: Duration,
+    ) -> anyhow::Result<Option<String>> {
+        let answers = self.ask(question, choices, false, timeout).await?;
+        Ok(answers.into_iter().next())
+    }
+
+    async fn request_multi_choice(
+        &self,
+        question: &str,
+        choices: &[String],
+        _min_items: usize,
+        _max_items: usize,
+        timeout: Duration,
+    ) -> anyhow::Result<Option<Vec<String>>> {
+        Ok(Some(self.ask(question, choices, true, timeout).await?))
+    }
+
+    async fn request_text(
+        &self,
+        question: &str,
+        timeout: Duration,
+    ) -> anyhow::Result<Option<String>> {
+        let answers = self.ask(question, &[], false, timeout).await?;
+        Ok(answers.into_iter().next())
+    }
+
+    // The trait default for reactions is a silent no-op that reports success.
+    // The web chat has no agent-visible message ids and renders no reactions,
+    // so refuse instead of claiming a reaction that never happened.
+    async fn add_reaction(
+        &self,
+        _channel_id: &str,
+        _message_id: &str,
+        _emoji: &str,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("the web chat has no message reactions; nothing was changed")
+    }
+
+    async fn remove_reaction(
+        &self,
+        _channel_id: &str,
+        _message_id: &str,
+        _emoji: &str,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("the web chat has no message reactions; nothing was changed")
     }
 
     /// Delegates to [`Self::request_approval_attributed`] and drops the
@@ -263,5 +365,145 @@ mod tests {
             .await
             .expect("timeout is not an error");
         assert_eq!(response, Some(ChannelApprovalResponse::Deny));
+    }
+
+    /// Read the `QuestionRequest` that `ask` emitted.
+    async fn next_question(rx: &mut mpsc::Receiver<TurnEvent>) -> (String, Vec<String>, bool, u64) {
+        match rx.recv().await.expect("a question event") {
+            TurnEvent::QuestionRequest {
+                request_id,
+                choices,
+                multi_select,
+                timeout_secs,
+                ..
+            } => (request_id, choices, multi_select, timeout_secs),
+            other => panic!("expected a QuestionRequest, got {other:?}"),
+        }
+    }
+
+    /// Answer through the frame parser, exactly as the socket loop does.
+    fn answer(channel: &WsApprovalChannel, request_id: &str, answers: serde_json::Value) {
+        assert!(crate::ws_question::resolve_question(
+            &channel.pending_questions(),
+            &serde_json::json!({"type": "question_response", "request_id": request_id, "answers": answers}),
+        ));
+    }
+
+    fn choices(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[tokio::test]
+    async fn an_answered_question_returns_the_answer() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let channel = WsApprovalChannel::new(tx, new_pending_approvals(), Duration::from_secs(30));
+        let offered = choices(&["A", "B"]);
+        let call = channel.request_choice("Which?", &offered, Duration::from_secs(30));
+        let answerer = async {
+            let (id, sent, multi, timeout_secs) = next_question(&mut rx).await;
+            assert_eq!(sent, offered);
+            assert!(!multi);
+            assert_eq!(timeout_secs, 30);
+            answer(&channel, &id, serde_json::json!([" B "]));
+        };
+        let (result, ()) = tokio::join!(call, answerer);
+        assert_eq!(result.unwrap(), Some("B".to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_free_form_question_carries_no_choices() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let channel = WsApprovalChannel::new(tx, new_pending_approvals(), Duration::from_secs(30));
+        let call = channel.request_text("Name?", Duration::from_secs(30));
+        let answerer = async {
+            let (id, sent, multi, _) = next_question(&mut rx).await;
+            assert!(sent.is_empty());
+            assert!(!multi);
+            answer(&channel, &id, serde_json::json!(["zerolite"]));
+        };
+        let (result, ()) = tokio::join!(call, answerer);
+        assert_eq!(result.unwrap(), Some("zerolite".to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_multi_select_question_returns_every_pick() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let channel = WsApprovalChannel::new(tx, new_pending_approvals(), Duration::from_secs(30));
+        let offered = choices(&["A", "B", "C"]);
+        let call = channel.request_multi_choice("Which?", &offered, 1, 3, Duration::from_secs(30));
+        let answerer = async {
+            let (id, _, multi, _) = next_question(&mut rx).await;
+            assert!(multi);
+            answer(
+                &channel,
+                &id,
+                serde_json::json!(["A", "C", "something else"]),
+            );
+        };
+        let (result, ()) = tokio::join!(call, answerer);
+        assert_eq!(
+            result.unwrap(),
+            Some(choices(&["A", "C", "something else"]))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dismissed_question_is_an_error() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let channel = WsApprovalChannel::new(tx, new_pending_approvals(), Duration::from_secs(30));
+        let offered = choices(&["A"]);
+        let call = channel.request_choice("Which?", &offered, Duration::from_secs(30));
+        let answerer = async {
+            let (id, ..) = next_question(&mut rx).await;
+            answer(&channel, &id, serde_json::Value::Null);
+        };
+        let (result, ()) = tokio::join!(call, answerer);
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("dismissed the question"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_question_whose_responder_is_dropped_fails_at_once() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let channel = WsApprovalChannel::new(tx, new_pending_approvals(), Duration::from_secs(300));
+        let offered = choices(&["A"]);
+        let call = channel.request_choice("Which?", &offered, Duration::from_secs(300));
+        let dropper = async {
+            let _ = next_question(&mut rx).await;
+            channel.pending_questions().lock().clear();
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(call, dropper)
+        })
+        .await
+        .expect("a dropped responder must not wait for the timeout");
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("no web chat viewer is attached"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_question_times_out() {
+        let (tx, _rx) = mpsc::channel(8);
+        let channel = WsApprovalChannel::new(tx, new_pending_approvals(), Duration::from_secs(30));
+        let err = channel
+            .request_choice("Which?", &choices(&["A"]), Duration::from_millis(50))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no answer within 0 seconds"), "{err}");
+        assert!(channel.pending_questions().lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reactions_are_refused_not_dropped() {
+        let (tx, _rx) = mpsc::channel(8);
+        let channel = WsApprovalChannel::new(tx, new_pending_approvals(), Duration::from_secs(30));
+        let add = channel.add_reaction("chat", "1", "🔥").await.unwrap_err();
+        let remove = channel
+            .remove_reaction("chat", "1", "🔥")
+            .await
+            .unwrap_err();
+        assert!(add.to_string().contains("no message reactions"));
+        assert!(remove.to_string().contains("no message reactions"));
     }
 }

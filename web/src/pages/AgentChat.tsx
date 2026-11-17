@@ -34,6 +34,7 @@ import ToolCallGroup from '@/components/ToolCallGroup';
 import ChatImage from '@/components/ChatImage';
 import { hasChatImage, stepsHaveChatImage } from '@/components/chatImage.logic';
 import ApprovalBanner from '@/components/ApprovalBanner';
+import QuestionBanner from '@/components/QuestionBanner';
 import SessionPicker from '@/components/SessionPicker';
 import InputBar from '@/components/InputBar';
 import {
@@ -180,6 +181,8 @@ export function AgentChatInner({
     abortSession,
     pendingApproval,
     respondToApproval,
+    pendingQuestions,
+    respondToQuestion,
     contextEffectiveWindow,
     contextTrimBudgetTokens,
     contextInputTokens,
@@ -1206,6 +1209,16 @@ export function AgentChatInner({
       {/* Tool approval banner — supervised-mode consent prompt (#6522). */}
       {pendingApproval && (
         <ApprovalBanner pending={pendingApproval} onRespond={respondToApproval} />
+      )}
+
+      {/* Agent question card (`ask_user`, `poll`): one at a time, oldest first. */}
+      {pendingQuestions[0] && (
+        <QuestionBanner
+          key={pendingQuestions[0].requestId}
+          pending={pendingQuestions[0]}
+          total={pendingQuestions.length}
+          onRespond={respondToQuestion}
+        />
       )}
 
       {/* Input area */}

@@ -94,6 +94,27 @@ impl Channel for RpcApprovalChannel {
         false
     }
 
+    // The trait default for reactions is a silent no-op that reports success.
+    // This channel backs the scoped web chat and the zerocode Code tab;
+    // neither has agent-visible message ids or renders reactions.
+    async fn add_reaction(
+        &self,
+        _channel_id: &str,
+        _message_id: &str,
+        _emoji: &str,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("this chat has no message reactions; nothing was changed")
+    }
+
+    async fn remove_reaction(
+        &self,
+        _channel_id: &str,
+        _message_id: &str,
+        _emoji: &str,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("this chat has no message reactions; nothing was changed")
+    }
+
     async fn request_approval(
         &self,
         recipient: &str,
@@ -623,5 +644,16 @@ mod tests {
         // matching `AcpChannel`. Even with the form capability advertised
         // the channel cannot yet answer a no-choices `ask_user`.
         assert!(!ch.supports_free_form_ask());
+    }
+
+    #[tokio::test]
+    async fn reactions_are_refused_not_dropped() {
+        let (rpc, mut write_rx) = make_rpc();
+        let ch = make_channel_no_caps(Arc::clone(&rpc), make_pending());
+        let add = ch.add_reaction("chat", "1", "🔥").await.unwrap_err();
+        let remove = ch.remove_reaction("chat", "1", "🔥").await.unwrap_err();
+        assert!(add.to_string().contains("no message reactions"));
+        assert!(remove.to_string().contains("no message reactions"));
+        assert!(write_rx.try_recv().is_err(), "nothing reaches the client");
     }
 }

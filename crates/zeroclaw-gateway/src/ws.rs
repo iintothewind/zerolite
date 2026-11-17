@@ -9,6 +9,7 @@ use super::{
     remove_cancel_token_if_current,
 };
 use crate::ws_approval::{PendingApprovals, WsApprovalChannel, new_pending_approvals};
+use crate::ws_question::{PendingQuestions, question_request_frame, resolve_question};
 use axum::{
     Extension,
     extract::{
@@ -904,6 +905,7 @@ async fn handle_socket(
     agent
         .channel_handles()
         .register_channel(WS_CHANNEL_KEY, approval_channel.clone());
+    let pending_questions = approval_channel.pending_questions();
 
     let ch = agent.channel_handles();
     let channel_names = zeroclaw_channels::orchestrator::register_channels_for_tools(
@@ -980,6 +982,7 @@ async fn handle_socket(
                             &mut receiver,
                             &mut approval_event_rx,
                             &pending_approvals,
+                            &pending_questions,
                             &mut ping_interval,
                             &ws_memory,
                             &mut persisted_watermark,
@@ -1135,6 +1138,19 @@ async fn handle_socket(
                     continue;
                 }
 
+                // ── question_response (operator answered an agent question) ──
+                if msg_type == "question_response" {
+                    if !resolve_question(&pending_questions, &parsed) {
+                        let err = serde_json::json!({
+                            "type": "error",
+                            "message": "question_response requires request_id",
+                            "code": "INVALID_QUESTION_RESPONSE"
+                        });
+                        let _ = sender.send(Message::Text(err.to_string().into())).await;
+                    }
+                    continue;
+                }
+
                 if msg_type != "message" {
                     let err = serde_json::json!({
                         "type": "error",
@@ -1200,6 +1216,7 @@ async fn handle_socket(
                     &mut receiver,
                     &mut approval_event_rx,
                     &pending_approvals,
+                    &pending_questions,
                     &mut ping_interval,
                     &ws_memory,
                     &mut persisted_watermark,
@@ -1268,8 +1285,22 @@ async fn handle_socket(
                         "arguments_summary": arguments_summary,
                         "timeout_secs": timeout_secs,
                     }),
+                    zeroclaw_api::agent::TurnEvent::QuestionRequest {
+                        request_id,
+                        question,
+                        choices,
+                        multi_select,
+                        timeout_secs,
+                    } => question_request_frame(
+                        &request_id,
+                        &question,
+                        &choices,
+                        multi_select,
+                        true,
+                        Some(timeout_secs),
+                    ),
                     other => {
-                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"kind": format!("{:?}", other)})), "non-ApprovalRequest event leaked into approval channel");
+                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"kind": format!("{:?}", other)})), "non-prompt event leaked into approval channel");
                         continue;
                     }
                 };
@@ -1705,12 +1736,19 @@ fn classify_client_frame(frame: Option<Result<Message, axum::Error>>) -> ClientF
     }
 }
 
-/// The viewer went away mid-turn. Log it and drop every parked approval
-/// oneshot: with nobody attached to answer, the approval channel resolves each
-/// as an unreachable-operator deny immediately instead of after the prompt
+/// The viewer went away mid-turn. Log it and drop every parked approval and
+/// question oneshot: with nobody attached to answer, the approval channel
+/// resolves each approval as an unreachable-operator deny and each question as
+/// a "no viewer attached" error immediately instead of after the prompt
 /// timeout. The turn itself keeps running.
-fn detach_mid_turn(session_key: &str, turn_id: &str, pending_approvals: &PendingApprovals) {
+fn detach_mid_turn(
+    session_key: &str,
+    turn_id: &str,
+    pending_approvals: &PendingApprovals,
+    pending_questions: &PendingQuestions,
+) {
     let parked: Vec<_> = pending_approvals.lock().drain().collect();
+    let parked_questions: Vec<_> = pending_questions.lock().drain().collect();
     ::zeroclaw_log::record!(
         INFO,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
@@ -1718,11 +1756,13 @@ fn detach_mid_turn(session_key: &str, turn_id: &str, pending_approvals: &Pending
                 "session_key": session_key,
                 "trace_id": turn_id,
                 "parked_approvals": parked.len(),
+                "parked_questions": parked_questions.len(),
             })
         ),
         "WebSocket client detached mid-turn; turn continues unattended"
     );
     drop(parked);
+    drop(parked_questions);
 }
 
 fn has_assistant_chat_message(messages: &[zeroclaw_providers::ConversationMessage]) -> bool {
@@ -2273,6 +2313,7 @@ async fn process_chat_message(
     receiver: &mut futures_util::stream::SplitStream<WebSocket>,
     approval_event_rx: &mut tokio::sync::mpsc::Receiver<zeroclaw_api::agent::TurnEvent>,
     pending_approvals: &PendingApprovals,
+    pending_questions: &PendingQuestions,
     ping_interval: &mut Option<tokio::time::Interval>,
     ws_memory: &Option<Arc<dyn zeroclaw_memory::Memory>>,
     // Transcript generation and length this connection's history reflects;
@@ -2433,12 +2474,22 @@ async fn process_chat_message(
                 match send_unless_lost(&mut *sender, $message, &mut *session, state).await {
                     Sent::Delivered => {}
                     Sent::PeerGone => {
-                        detach_mid_turn(session_key, &turn_id, pending_approvals);
+                        detach_mid_turn(
+                            session_key,
+                            &turn_id,
+                            pending_approvals,
+                            pending_questions,
+                        );
                         *session = None;
                         client_gone = true;
                     }
                     Sent::SessionLost(code) => {
-                        detach_mid_turn(session_key, &turn_id, pending_approvals);
+                        detach_mid_turn(
+                            session_key,
+                            &turn_id,
+                            pending_approvals,
+                            pending_questions,
+                        );
                         *session = None;
                         close_with(
                             &mut *sender,
@@ -2458,6 +2509,7 @@ async fn process_chat_message(
                 _ = cancel_token.cancelled(), if !cancel_drained => {
                     let drained: Vec<_> = pending_approvals.lock().drain().collect();
                     drop(drained);
+                    drop(pending_questions.lock().drain().collect::<Vec<_>>());
                     cancel_drained = true;
                     // Fall through; the agent loop will now wake from the
                     // approval await, see the cancel token, and propagate
@@ -2469,7 +2521,7 @@ async fn process_chat_message(
                 // finishes, and is treated as a viewer that left. Ahead of
                 // the client arm so buffered input cannot win the race.
                 code = crate::dashboard_session::session_lost(&mut *session, state), if !client_gone => {
-                    detach_mid_turn(session_key, &turn_id, pending_approvals);
+                    detach_mid_turn(session_key, &turn_id, pending_approvals, pending_questions);
                     *session = None;
                     close_with(&mut *sender, &mut *receiver, code, "dashboard session ended").await;
                     client_gone = true;
@@ -2483,7 +2535,7 @@ async fn process_chat_message(
                         }
                         ClientFrame::Ignore => continue,
                         ClientFrame::Gone => {
-                            detach_mid_turn(session_key, &turn_id, pending_approvals);
+                            detach_mid_turn(session_key, &turn_id, pending_approvals, pending_questions);
                             *session = None;
                             client_gone = true;
                             continue;
@@ -2492,7 +2544,7 @@ async fn process_chat_message(
                     if let Err(code) =
                         crate::dashboard_session::session_admits_now(&mut *session, state).await
                     {
-                        detach_mid_turn(session_key, &turn_id, pending_approvals);
+                        detach_mid_turn(session_key, &turn_id, pending_approvals, pending_questions);
                         *session = None;
                         close_with(&mut *sender, &mut *receiver, code, "dashboard session ended").await;
                         client_gone = true;
@@ -2540,6 +2592,9 @@ async fn process_chat_message(
                                 ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"request_id": request_id})), "approval_response with no matching pending request (mid-turn)");
                             }
                         }
+                        Some("question_response") => {
+                            let _ = resolve_question(pending_questions, &parsed);
+                        }
                         Some("message") => {
                             let content = parsed["content"].as_str().unwrap_or("").to_string();
                             if content.is_empty() {
@@ -2576,27 +2631,53 @@ async fn process_chat_message(
                 }
                 approval = approval_event_rx.recv() => {
                     let Some(event) = approval else { continue };
-                    if let TurnEvent::ApprovalRequest {
-                        request_id,
-                        tool_name,
-                        arguments_summary,
-                        timeout_secs,
-                    } = event {
-                        if client_gone {
-                            // Nobody is attached to answer: drop the parked
-                            // oneshot so the approval channel resolves it as an
-                            // unreachable-operator deny now, not at the timeout.
-                            drop(pending_approvals.lock().remove(&request_id));
-                            continue;
+                    match event {
+                        TurnEvent::ApprovalRequest {
+                            request_id,
+                            tool_name,
+                            arguments_summary,
+                            timeout_secs,
+                        } => {
+                            if client_gone {
+                                // Nobody is attached to answer: drop the parked
+                                // oneshot so the approval channel resolves it as an
+                                // unreachable-operator deny now, not at the timeout.
+                                drop(pending_approvals.lock().remove(&request_id));
+                                continue;
+                            }
+                            let frame = serde_json::json!({
+                                "type": "approval_request",
+                                "request_id": request_id,
+                                "tool": tool_name,
+                                "arguments_summary": arguments_summary,
+                                "timeout_secs": timeout_secs,
+                            });
+                            send_to_viewer!(Message::Text(frame.to_string().into()));
                         }
-                        let frame = serde_json::json!({
-                            "type": "approval_request",
-                            "request_id": request_id,
-                            "tool": tool_name,
-                            "arguments_summary": arguments_summary,
-                            "timeout_secs": timeout_secs,
-                        });
-                        send_to_viewer!(Message::Text(frame.to_string().into()));
+                        TurnEvent::QuestionRequest {
+                            request_id,
+                            question,
+                            choices,
+                            multi_select,
+                            timeout_secs,
+                        } => {
+                            if client_gone {
+                                // Same rule as approvals: the question fails now
+                                // with "no viewer attached".
+                                drop(pending_questions.lock().remove(&request_id));
+                                continue;
+                            }
+                            let frame = question_request_frame(
+                                &request_id,
+                                &question,
+                                &choices,
+                                multi_select,
+                                true,
+                                Some(timeout_secs),
+                            );
+                            send_to_viewer!(Message::Text(frame.to_string().into()));
+                        }
+                        _ => {}
                     }
                 }
                 _ = tick_websocket_ping(ping_interval), if !client_gone => {
@@ -4468,6 +4549,167 @@ data: {\"type\":\"message_stop\"}\n\n",
             !follow_up.contains("steer after sign-out"),
             "steering sent after sign-out reached the model"
         );
+        fixture.shutdown();
+    }
+
+    /// A fixture whose web agent may call `ask_user` (and `extra` tools)
+    /// without a tool-approval prompt.
+    async fn asking_fixture(extra: &[&str]) -> ParkedTurnFixture {
+        let extra: Vec<String> = extra.iter().map(|tool| (*tool).to_string()).collect();
+        ParkedTurnFixture::spawn_with(None, move |config| {
+            let tools: Vec<String> = std::iter::once("ask_user".to_string())
+                .chain(extra)
+                .collect();
+            config.tools.optional.extend(tools.iter().cloned());
+            config
+                .risk_profiles
+                .get_mut("fixture")
+                .expect("the fixture's risk profile")
+                .auto_approve
+                .extend(tools);
+        })
+        .await
+    }
+
+    async fn answer_question(client: &mut WsClient, request: &serde_json::Value, answer: &str) {
+        send_raw(
+            client,
+            serde_json::json!({
+                "type": "question_response",
+                "request_id": request["request_id"].as_str().expect("the question names its request"),
+                "answers": [answer],
+            }),
+        )
+        .await;
+    }
+
+    #[test]
+    fn a_question_is_answered_over_the_socket() {
+        run_ws_regression(
+            "ws-question-answered",
+            a_question_is_answered_over_the_socket_inner,
+        );
+    }
+
+    async fn a_question_is_answered_over_the_socket_inner() {
+        let mut fixture = asking_fixture(&[]).await;
+        fixture.script_tool_call(
+            1,
+            "ask_user",
+            serde_json::json!({"question": "Which color?", "choices": ["Red", "Green"]}),
+        );
+        fixture.script_tool_call(
+            2,
+            "ask_user",
+            serde_json::json!({"question": "Which name?"}),
+        );
+        let session_id = "question-answered";
+        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+        let (mut client, _) = fixture.connect(session_id).await;
+        fixture.start_parked_turn(&mut client, "ask me").await;
+        fixture.release_next();
+
+        let asked = next_frame_of(&mut client, "question_request").await;
+        assert_eq!(asked["question"], "Which color?");
+        assert_eq!(asked["choices"], serde_json::json!(["Red", "Green"]));
+        assert_eq!(asked["multi_select"], false);
+        assert_eq!(asked["free_text"], true);
+        assert_eq!(asked["timeout_secs"], 300);
+        answer_question(&mut client, &asked, "Teal, actually").await;
+        let follow_up = fixture.next_provider_request().await.to_string();
+        assert!(
+            follow_up.contains("Teal, actually"),
+            "free text outside the choices reaches the model"
+        );
+
+        fixture.release_next();
+        let asked = next_frame_of(&mut client, "question_request").await;
+        assert_eq!(asked["question"], "Which name?");
+        assert_eq!(asked["choices"], serde_json::json!([]));
+        answer_question(&mut client, &asked, "zerolite").await;
+        let follow_up = fixture.next_provider_request().await.to_string();
+        assert!(
+            follow_up.contains("zerolite"),
+            "the typed answer reaches the model"
+        );
+
+        fixture.release_next();
+        fixture.wait_for_turn_to_settle(&session_key).await;
+        fixture.shutdown();
+    }
+
+    #[test]
+    fn a_question_fails_at_once_when_its_viewer_leaves() {
+        run_ws_regression(
+            "ws-question-viewer-leaves",
+            a_question_fails_at_once_when_its_viewer_leaves_inner,
+        );
+    }
+
+    async fn a_question_fails_at_once_when_its_viewer_leaves_inner() {
+        let mut fixture = asking_fixture(&[]).await;
+        fixture.script_tool_call(
+            1,
+            "ask_user",
+            serde_json::json!({"question": "Which color?", "choices": ["Red", "Green"]}),
+        );
+        let session_id = "question-viewer-leaves";
+        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+        let (mut client, _) = fixture.connect(session_id).await;
+        fixture.start_parked_turn(&mut client, "ask me").await;
+        fixture.release_next();
+        next_frame_of(&mut client, "question_request").await;
+        disconnect_viewer(client).await;
+
+        // Within the provider deadline (10 s), far short of the 300 s question.
+        let follow_up = fixture.next_provider_request().await.to_string();
+        assert!(
+            follow_up.contains("no web chat viewer is attached"),
+            "the question fails with a named cause once its viewer leaves"
+        );
+        fixture.release_next();
+        fixture.wait_for_turn_to_settle(&session_key).await;
+        fixture.shutdown();
+    }
+
+    #[test]
+    fn a_poll_question_is_answered_over_the_socket() {
+        run_ws_regression(
+            "ws-question-poll",
+            a_poll_question_is_answered_over_the_socket_inner,
+        );
+    }
+
+    async fn a_poll_question_is_answered_over_the_socket_inner() {
+        let mut fixture = asking_fixture(&["poll"]).await;
+        fixture.script_tool_call(
+            1,
+            "poll",
+            serde_json::json!({"question": "Lunch?", "options": ["Noodles", "Rice"], "duration_minutes": 10}),
+        );
+        let session_id = "question-poll";
+        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+        let (mut client, _) = fixture.connect(session_id).await;
+        fixture.start_parked_turn(&mut client, "run a poll").await;
+        fixture.release_next();
+
+        let asked = next_frame_of(&mut client, "question_request").await;
+        assert_eq!(asked["question"], "Lunch?");
+        assert_eq!(asked["choices"], serde_json::json!(["Noodles", "Rice"]));
+        assert_eq!(asked["multi_select"], false);
+        assert_eq!(asked["timeout_secs"], 600);
+        answer_question(&mut client, &asked, "Neither, soup").await;
+        let follow_up = fixture.next_provider_request().await.to_string();
+        assert!(
+            follow_up.contains("Neither, soup"),
+            "the poll answer reaches the model"
+        );
+        assert!(
+            !follow_up.contains("did not complete the"),
+            "the poll no longer falls into the structured-only failure"
+        );
+        fixture.release_next();
+        fixture.wait_for_turn_to_settle(&session_key).await;
         fixture.shutdown();
     }
 
@@ -6385,7 +6627,12 @@ data: {\"type\":\"message_stop\"}\n\n",
         let (tx, rx) = tokio::sync::oneshot::channel::<ChannelApprovalResponse>();
         pending.lock().insert("req-1".to_string(), tx);
 
-        detach_mid_turn("gw_detached", "turn-1", &pending);
+        detach_mid_turn(
+            "gw_detached",
+            "turn-1",
+            &pending,
+            &crate::ws_question::new_pending_questions(),
+        );
 
         assert!(
             pending.lock().is_empty(),

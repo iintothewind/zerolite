@@ -176,6 +176,17 @@ export class WebSocketClient {
     );
   }
 
+  /**
+   * Answer an agent `question_request`. `answers: null` dismisses it. If the
+   * socket is closed the gateway fails the question itself, so this no-ops.
+   */
+  sendQuestionResponse(requestId: string, answers: string[] | null): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    this.ws.send(
+      JSON.stringify({ type: 'question_response', request_id: requestId, answers }),
+    );
+  }
+
   /** Close the connection without auto-reconnecting. */
   disconnect(): void {
     this.intentionallyClosed = true;

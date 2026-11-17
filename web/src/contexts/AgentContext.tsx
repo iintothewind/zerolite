@@ -2,6 +2,7 @@ import { createContext, useContext, useEffect, useRef, useState, useCallback, us
 import type {
   ApprovalDecision,
   PendingApproval,
+  PendingQuestion,
   SessionMessageResponse,
   SessionMessagesResponse,
   WsMessage,
@@ -38,6 +39,14 @@ import { contextMeterStep, type ContextInputSource } from './contextMeter.logic'
 import { buildHistoryTrimmedNotice } from './historyTrimNotices.logic';
 import { formatOutputTruncatedNotice } from '@/lib/outputTruncatedNotice';
 import { isPendingCall, type ToolCall } from '@/lib/toolCall';
+import {
+  dropExpiredQuestions,
+  dropQuestion,
+  dropSocketQuestions,
+  enqueueQuestion,
+  nextQuestionExpiry,
+  questionFromFrame,
+} from '@/lib/pendingQuestions.logic';
 import { emptyLiveTurn, type LiveTurn, type TurnSegments } from '@/lib/turnSegments';
 import { resolveToolResultIndex } from '@/lib/toolCardMatch';
 import {
@@ -199,6 +208,13 @@ export interface AgentContextValue {
    */
   pendingApproval: PendingApproval | null;
   respondToApproval: (decision: ApprovalDecision) => void;
+  /**
+   * Agent questions (`ask_user`, `poll`) waiting for an answer, oldest first;
+   * the chat shows the first. Populated from `question_request` frames.
+   */
+  pendingQuestions: PendingQuestion[];
+  /** Answer (`answers`) or dismiss (`null`) a pending question. */
+  respondToQuestion: (requestId: string, answers: string[] | null) => void;
   // Context window tracking (from "done" WS frames). See #7311 and
   // docs/design/context-management.md.
   /** The effective context window: the meter denominator. */
@@ -310,6 +326,7 @@ export interface SessionSocket {
   readonly connected: boolean;
   sendMessage(content: string): void;
   sendApprovalResponse(requestId: string, decision: ApprovalDecision): void;
+  sendQuestionResponse(requestId: string, answers: string[] | null): void;
 }
 
 export interface AgentSessionRuntime {
@@ -413,6 +430,7 @@ export function AgentProvider({
   // loads it again.
   const hydrationFailedRef = useRef<string | null>(null);
   const [pendingApproval, setPendingApproval] = useState<PendingApproval | null>(null);
+  const [pendingQuestions, setPendingQuestions] = useState<PendingQuestion[]>([]);
   // Context window tracking (from "done" WS frames). See #7311.
   const [contextEffectiveWindow, setContextEffectiveWindow] = useState<number | null>(null);
   const [contextTrimBudgetTokens, setContextTrimBudgetTokens] = useState<number | null>(null);
@@ -599,6 +617,17 @@ export function AgentProvider({
     }, remainingMs);
     return () => clearTimeout(id);
   }, [pendingApproval]);
+
+  // Drop a question card once its server-side deadline passes: the gateway
+  // has already failed the question, so an answer would resolve nothing.
+  useEffect(() => {
+    const delay = nextQuestionExpiry(pendingQuestions, Date.now());
+    if (delay === null) return;
+    const id = setTimeout(() => {
+      setPendingQuestions((queue) => dropExpiredQuestions(queue, Date.now()));
+    }, delay);
+    return () => clearTimeout(id);
+  }, [pendingQuestions]);
 
   const foldTurnStream = useCallback((frame: TurnStreamFrame) => {
     const result = reduceTurnFrame(turnStreamStateRef.current, frame);
@@ -829,6 +858,8 @@ export function AgentProvider({
         const _rateNow = tokenRateRef.current.rate(Date.now());
         setTokenRateState((s) => ({ rate: _rateNow, rateMuted: true, rateBilled: s.rateBilled }));
         setTyping(false);
+        // A finished turn has no tool left waiting for an answer.
+        setPendingQuestions([]);
         break;
       }
 
@@ -1045,6 +1076,14 @@ export function AgentProvider({
         break;
       }
 
+      case 'question_request': {
+        // Stale-socket frames never reach here, so the current socket
+        // generation is the one that delivered this question.
+        const question = questionFromFrame(msg, Date.now(), wsVersionRef.current);
+        if (question) setPendingQuestions((queue) => enqueueQuestion(queue, question));
+        break;
+      }
+
       case 'aborted': {
         // Gateway sends this after a cancelled turn; the parked approval (if
         // any) is no longer valid because its request_id belongs to the old
@@ -1070,6 +1109,7 @@ export function AgentProvider({
         );
         setTyping(false);
         setPendingApproval(null);
+        setPendingQuestions([]);
         break;
       }
 
@@ -1102,6 +1142,7 @@ export function AgentProvider({
         if (!errorEndsTurn(msg.code)) break;
         setTyping(false);
         setPendingApproval(null);
+        setPendingQuestions([]);
         break;
       }
     }
@@ -1156,6 +1197,9 @@ export function AgentProvider({
         approvalSocketVersionRef.current = null;
         setPendingApproval(null);
       }
+      // Questions die with the socket that delivered them, stale or not: the
+      // gateway fails them when that socket closes.
+      setPendingQuestions((queue) => dropSocketQuestions(queue, version));
       if (version !== wsVersionRef.current) return;
       setConnected(false);
 
@@ -1516,6 +1560,7 @@ export function AgentProvider({
       // after we tear it down. Clear here explicitly because we null out the
       // old socket's callbacks below, so its onClose will not fire to do it.
       setPendingApproval(null);
+      setPendingQuestions([]);
 
       // Re-arm the watchdog with a fresh budget for the reconnect phase — the
       // one step no awaited promise covers. Bail first if the write phase
@@ -1584,6 +1629,7 @@ export function AgentProvider({
     foldTurnStream({ type: 'reset' });
     setTyping(false);
     setPendingApproval(null);
+    setPendingQuestions([]);
     // Context-window figures describe the transcript we just dropped; leaving
     // them would show the outgoing conversation's token usage against an empty
     // one until the next `done` frame refreshes them.
@@ -1809,6 +1855,15 @@ export function AgentProvider({
     });
   }, []);
 
+  const respondToQuestion = useCallback((requestId: string, answers: string[] | null) => {
+    try {
+      wsRef.current?.sendQuestionResponse(requestId, answers);
+    } catch {
+      // Socket closed mid-question; the gateway fails the question itself.
+    }
+    setPendingQuestions((queue) => dropQuestion(queue, requestId));
+  }, []);
+
   // Turns are dense from 1, so a loaded transcript whose oldest turn is past 1
   // has earlier turns on the server; no server flag is needed.
   const oldestLoadedTurn = useMemo(() => {
@@ -1921,6 +1976,7 @@ export function AgentProvider({
       // backend on a late click anyway. Don't wait for the `aborted` frame
       // to round-trip; the user clicked Stop and expects the UI to follow.
       setPendingApproval(null);
+      setPendingQuestions([]);
       const target = perSocket ? conversationIdRef.current : sessionId;
       if (!target) return;
       try {
@@ -1931,6 +1987,8 @@ export function AgentProvider({
     },
     pendingApproval,
     respondToApproval,
+    pendingQuestions,
+    respondToQuestion,
     // Context window tracking (from "done" WS frames). See #7311.
     contextEffectiveWindow,
     contextTrimBudgetTokens,

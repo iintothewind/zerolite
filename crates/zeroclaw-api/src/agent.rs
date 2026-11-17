@@ -136,6 +136,19 @@ pub enum TurnEvent {
         /// How long the channel will wait before auto-denying.
         timeout_secs: u64,
     },
+    /// A question for the human at the gateway chat socket (`ask_user`, `poll`).
+    /// Emitted only on the gateway's own prompt channel, like `ApprovalRequest`.
+    QuestionRequest {
+        /// Correlation ID. The matching response frame must echo it.
+        request_id: String,
+        question: String,
+        /// Offered answers; empty for a free-form question.
+        choices: Vec<String>,
+        /// Whether several choices may be picked.
+        multi_select: bool,
+        /// How long the channel waits before the question fails.
+        timeout_secs: u64,
+    },
     /// Older whole turns were dropped to fit either the context token budget or
     /// the configured turn limit. Surfaces a user-visible "context was cut
     /// here" marker so trimming is never silent. Emitted whenever a trim occurs.

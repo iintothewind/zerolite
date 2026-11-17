@@ -41,7 +41,9 @@ use tokio_util::sync::CancellationToken;
 use zeroclaw_api::jsonrpc::error_codes::{
     AUTH_REQUIRED, FORBIDDEN, SESSION_NOT_FOUND, SESSION_NOT_OWNED,
 };
-use zeroclaw_rpc_client::{ClientError, ConnectOptions, ConnectionState, Method, RpcClient};
+use zeroclaw_rpc_client::{
+    ClientError, ConnectOptions, ConnectionState, InboundRequest, Method, RpcClient,
+};
 use zeroclaw_rpc_proto::types::{AgentsListResult, SessionCancelResult, SessionNewResult};
 use zeroclaw_runtime::rpc::inproc::Served;
 
@@ -535,6 +537,11 @@ async fn handshake(
         auth_provider: Some(format!("oidc.{provider}")),
         tui_id: identity.map(|identity| identity.id.clone()),
         tui_sig: identity.map(|identity| identity.sig.clone()),
+        // The core sends `elicitation/create` (an agent's question) only on a
+        // connection a conversation is bound to; only chats bind
+        // conversations, and `Chat::relay_turn` answers them. The other
+        // connections made here (close, abort, agent list) bind none.
+        client_capabilities: Some(json!({ "elicitation": { "form": {} } })),
         ..ConnectOptions::default()
     };
     let outcome = RpcClient::connect_over(stream, options).await;
@@ -571,6 +578,8 @@ pub(crate) struct CoreChat {
     /// The connection the conversation was created or last rebound on: the
     /// one its turns' updates and approval requests reach.
     bound: Arc<RpcClient>,
+    /// Server-initiated requests on `bound`.
+    pub(crate) requests: Option<tokio::sync::mpsc::Receiver<InboundRequest>>,
     /// How many times [`Self::renew`] has replaced `client`, counted here
     /// and nowhere else. A renewal can wait on the identity provider, so a
     /// caller that checked the session before a call compares this to tell
@@ -839,6 +848,7 @@ impl CoreChat {
         let _: SessionNewResult = self.call(Method::SessionNew, params).await?;
         let previous = std::mem::replace(&mut self.bound, Arc::clone(&self.client));
         previous.shutdown();
+        self.requests = self.bound.take_inbound_requests();
         Ok(())
     }
 
@@ -1421,6 +1431,7 @@ impl CoreCaller {
             },
         );
         self.end_before_expiry(closing.done.clone());
+        let requests = client.take_inbound_requests();
         Ok(CoreChat {
             caller: self.clone(),
             core_id: opened.session_id,
@@ -1428,6 +1439,7 @@ impl CoreCaller {
             cwd: cwd.map(str::to_string),
             client: Arc::clone(&client),
             bound: client,
+            requests,
             renewals: 0,
             identity,
             credential,
@@ -1937,6 +1949,41 @@ mod tests {
                             "function": {
                                 "name": "file_read",
                                 "arguments": "{\"path\":\"note.txt\"}",
+                            },
+                        }],
+                    },
+                    "finish_reason": "tool_calls",
+                }]
+            })))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        // "please ask me" calls `ask_user` with two choices; once the answer
+        // is in the conversation, the turn ends in text.
+        Mock::given(http_method("POST"))
+            .and(http_path("/chat/completions"))
+            .and(body_string_contains("please ask me"))
+            .and(body_string_contains("call_ask"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{"message": {"role": "assistant", "content": "asked it"}}]
+            })))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(http_method("POST"))
+            .and(http_path("/chat/completions"))
+            .and(body_string_contains("please ask me"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call_ask",
+                            "type": "function",
+                            "function": {
+                                "name": "ask_user",
+                                "arguments": "{\"question\":\"Which color?\",\"choices\":[\"Red\",\"Green\"]}",
                             },
                         }],
                     },
@@ -5413,6 +5460,70 @@ mod tests {
             .get_mut("test-profile")
             .expect("the fixture's risk profile")
             .always_ask = vec!["file_read".to_string()];
+    }
+
+    /// The fixture with `ask_user` granted to the chat profile and run
+    /// without a tool-approval prompt.
+    fn asking_user(config: &mut Config) {
+        let chatters = config
+            .permission_profiles
+            .get_mut("chat-user")
+            .expect("the fixture's chat profile");
+        chatters.allowed_tools = vec!["ask_user".to_string()];
+        chatters.grants.insert(Resource::Tools, vec![Verb::Execute]);
+        config.tools.optional.push("ask_user".to_string());
+        config
+            .risk_profiles
+            .get_mut("test-profile")
+            .expect("the fixture's risk profile")
+            .auto_approve
+            .push("ask_user".to_string());
+    }
+
+    #[tokio::test]
+    async fn a_scoped_chat_answers_a_question_with_one_of_its_choices() {
+        let fixture = Fixture::with_config(asking_user).await;
+        let addr = serve(fixture.router()).await;
+        let (alice, _) = fixture.sign_in("alice").await;
+        let mut socket = open_chat(addr, &alice, "support", "web-ask")
+            .await
+            .expect("alice may chat");
+        await_frame(&mut socket, "session_start").await;
+        let ask = json!({ "type": "message", "content": "please ask me" });
+        socket
+            .send(ClientMessage::Text(ask.to_string().into()))
+            .await
+            .unwrap();
+
+        let asked = await_frame(&mut socket, "question_request").await;
+        assert_eq!(asked["question"], "Which color?", "{asked}");
+        assert_eq!(asked["choices"], json!(["Red", "Green"]), "{asked}");
+        assert_eq!(asked["free_text"], false, "{asked}");
+        assert_eq!(asked["multi_select"], false, "{asked}");
+        assert!(asked["timeout_secs"].is_null(), "{asked}");
+        let answer = json!({
+            "type": "question_response",
+            "request_id": asked["request_id"],
+            "answers": ["Green"],
+        });
+        socket
+            .send(ClientMessage::Text(answer.to_string().into()))
+            .await
+            .unwrap();
+        await_frame(&mut socket, "done").await;
+
+        let requests = fixture._model.received_requests().await.unwrap_or_default();
+        let last: Value =
+            serde_json::from_slice(&requests.last().expect("a model request").body).unwrap();
+        let tool_answer = last["messages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|message| message["role"] == "tool")
+            .map(|message| message["content"].to_string())
+            .unwrap_or_else(|| panic!("the tool's answer reaches the model: {last}"));
+        assert!(tool_answer.contains("Green"), "{tool_answer}");
+        assert!(!tool_answer.contains("Red"), "{tool_answer}");
     }
 
     #[tokio::test]

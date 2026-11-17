@@ -30,7 +30,7 @@ impl AskUserTool {
 }
 
 /// Format a question with optional choices for display.
-fn format_question(question: &str, choices: Option<&[String]>) -> String {
+fn format_question(question: &str, choices: Option<&[String]>, multi_select: bool) -> String {
     let mut lines = Vec::new();
     lines.push(format!("**{question}**"));
 
@@ -40,7 +40,14 @@ fn format_question(question: &str, choices: Option<&[String]>) -> String {
             lines.push(format!("{}. {choice}", i + 1));
         }
         lines.push(String::new());
-        lines.push("_Reply with a number or type your answer._".to_string());
+        lines.push(
+            if multi_select {
+                "_Reply with one or more numbers, or type your answer._"
+            } else {
+                "_Reply with a number or type your answer._"
+            }
+            .to_string(),
+        );
     }
 
     lines.join("\n")
@@ -55,7 +62,8 @@ impl Tool for AskUserTool {
     fn description(&self) -> &str {
         "Ask the user a question and wait for their response. \
          Sends the question to a messaging channel and blocks until the user replies \
-         or the timeout expires. Optionally provide choices for structured responses."
+         or the timeout expires. Optionally provide choices for structured responses. \
+         Ask one question per call; to ask several, make one call per question."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -70,6 +78,10 @@ impl Tool for AskUserTool {
                     "type": "array",
                     "items": { "type": "string" },
                     "description": "Optional list of choices (renders as buttons on Telegram, numbered list on CLI)"
+                },
+                "multi_select": {
+                    "type": "boolean",
+                    "description": "Let the user pick several of `choices` (default: false). Ignored without `choices`."
                 },
                 "timeout_secs": {
                     "type": "integer",
@@ -128,6 +140,10 @@ impl Tool for AskUserTool {
             .get("timeout_secs")
             .and_then(|v| v.as_u64())
             .unwrap_or(DEFAULT_TIMEOUT_SECS);
+        let multi_select = args
+            .get("multi_select")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         let requested_channel = args
             .get("channel")
@@ -194,10 +210,17 @@ impl Tool for AskUserTool {
         if let Some(ref choices_vec) = choices
             && !choices_vec.is_empty()
         {
-            match channel
-                .request_choice(&question, choices_vec, timeout)
-                .await
-            {
+            let native = if multi_select {
+                channel
+                    .request_multi_choice(&question, choices_vec, 1, choices_vec.len(), timeout)
+                    .await
+                    .map(|picked| picked.map(|picked| picked.join("\n")))
+            } else {
+                channel
+                    .request_choice(&question, choices_vec, timeout)
+                    .await
+            };
+            match native {
                 Ok(Some(answer)) => {
                     return Ok(ToolResult {
                         success: true,
@@ -230,19 +253,41 @@ impl Tool for AskUserTool {
                     });
                 }
             }
-        } else if !channel.supports_free_form_ask() {
-            return Ok(ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some(format!(
-                    "Channel '{channel_name}' requires `choices` for ask_user \
-                     (free-form questions await ACP elicitation Phase 2)"
-                )),
-            });
+        } else {
+            // Prefer the channel's native free-text prompt (the gateway web chat).
+            match channel.request_text(&question, timeout).await {
+                Ok(Some(answer)) => {
+                    return Ok(ToolResult {
+                        success: true,
+                        output: answer.into(),
+                        error: None,
+                    });
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(format!(
+                            "Failed to ask question on channel '{channel_name}': {e}"
+                        )),
+                    });
+                }
+            }
+            if !channel.supports_free_form_ask() {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(format!(
+                        "Channel '{channel_name}' requires `choices` for ask_user \
+                         (free-form questions await ACP elicitation Phase 2)"
+                    )),
+                });
+            }
         }
 
         // Format and send the question
-        let text = format_question(&question, choices.as_deref());
+        let text = format_question(&question, choices.as_deref(), multi_select);
         let msg = SendMessage::new(&text, "");
         if let Err(e) = channel.send(&msg).await {
             return Ok(ToolResult {
@@ -462,7 +507,7 @@ mod tests {
 
     #[test]
     fn format_question_without_choices() {
-        let text = format_question("Are you sure?", None);
+        let text = format_question("Are you sure?", None, false);
         assert!(text.contains("Are you sure?"));
         assert!(!text.contains("1."));
     }
@@ -470,7 +515,7 @@ mod tests {
     #[test]
     fn format_question_with_choices() {
         let choices = vec!["Yes".to_string(), "No".to_string(), "Maybe".to_string()];
-        let text = format_question("Continue?", Some(&choices));
+        let text = format_question("Continue?", Some(&choices), false);
         assert!(text.contains("Continue?"));
         assert!(text.contains("1. Yes"));
         assert!(text.contains("2. No"));
@@ -717,5 +762,118 @@ mod tests {
             !*ch.listen_called.lock(),
             "must not fall through to listen on a structured-only channel"
         );
+    }
+
+    /// A structured-only channel with a native prompt UI (the gateway web
+    /// chat): answers `request_text` / `request_multi_choice` itself.
+    struct NativePromptChannel {
+        text: Option<String>,
+        multi: Option<Vec<String>>,
+        listen_called: parking_lot::Mutex<bool>,
+    }
+
+    impl NativePromptChannel {
+        fn new(text: Option<&str>, multi: Option<Vec<&str>>) -> Self {
+            Self {
+                text: text.map(str::to_string),
+                multi: multi.map(|picked| picked.into_iter().map(str::to_string).collect()),
+                listen_called: parking_lot::Mutex::new(false),
+            }
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for NativePromptChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Webhook,
+            )
+        }
+        fn alias(&self) -> &str {
+            "test"
+        }
+    }
+
+    #[async_trait]
+    impl Channel for NativePromptChannel {
+        fn name(&self) -> &str {
+            "wss"
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            *self.listen_called.lock() = true;
+            Ok(())
+        }
+
+        fn supports_free_form_ask(&self) -> bool {
+            false
+        }
+
+        async fn request_text(
+            &self,
+            _question: &str,
+            _timeout: std::time::Duration,
+        ) -> anyhow::Result<Option<String>> {
+            Ok(self.text.clone())
+        }
+
+        async fn request_multi_choice(
+            &self,
+            _question: &str,
+            _choices: &[String],
+            _min_items: usize,
+            _max_items: usize,
+            _timeout: std::time::Duration,
+        ) -> anyhow::Result<Option<Vec<String>>> {
+            Ok(self.multi.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn free_form_question_uses_the_native_text_prompt() {
+        let ch = Arc::new(NativePromptChannel::new(Some("typed answer"), None));
+        let tool = make_tool_with_channels(vec![("wss", Arc::clone(&ch) as Arc<dyn Channel>)]);
+        let result = tool.execute(json!({ "question": "Name?" })).await.unwrap();
+        assert!(result.success, "error: {:?}", result.error);
+        assert_eq!(result.output, "typed answer");
+        assert!(!*ch.listen_called.lock());
+    }
+
+    #[tokio::test]
+    async fn free_form_question_without_a_native_prompt_fails_fast() {
+        let ch = Arc::new(StructuredOnlyChannel::new("rpc", Ok(None)));
+        let tool = make_tool_with_channels(vec![("rpc", Arc::clone(&ch) as Arc<dyn Channel>)]);
+        let result = tool.execute(json!({ "question": "Name?" })).await.unwrap();
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("requires `choices`")
+        );
+        assert!(!*ch.listen_called.lock());
+    }
+
+    #[tokio::test]
+    async fn multi_select_joins_the_picked_choices() {
+        let ch = Arc::new(NativePromptChannel::new(None, Some(vec!["A", "C"])));
+        let tool = make_tool_with_channels(vec![("wss", Arc::clone(&ch) as Arc<dyn Channel>)]);
+        let result = tool
+            .execute(json!({
+                "question": "Which?",
+                "choices": ["A", "B", "C"],
+                "multi_select": true
+            }))
+            .await
+            .unwrap();
+        assert!(result.success, "error: {:?}", result.error);
+        assert_eq!(result.output, "A\nC");
     }
 }

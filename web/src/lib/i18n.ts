@@ -131,6 +131,13 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.approval_deny': '拒绝',
     'agent.approval_always': '始终批准',
     'agent.approval_always_hint': '本会话内自动批准此工具',
+    'agent.question_title': '需要你回答一个问题',
+    'agent.question_timeout_in': '超时自动跳过',
+    'agent.question_other_placeholder': '其他答案…',
+    'agent.question_answer_placeholder': '输入你的回答…',
+    'agent.question_send': '发送',
+    'agent.question_submit': '提交',
+    'agent.question_skip': '跳过',
 
     // Slash commands (#7137)
     'agent.cmd_unknown': '未知命令：{cmd}。输入 /help 查看可用命令。',
@@ -1685,6 +1692,13 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.approval_deny': 'Deny',
     'agent.approval_always': 'Always approve',
     'agent.approval_always_hint': 'Approve this tool automatically for the rest of this session',
+    'agent.question_title': 'The agent has a question',
+    'agent.question_timeout_in': 'Auto-skip in',
+    'agent.question_other_placeholder': 'Something else…',
+    'agent.question_answer_placeholder': 'Type your answer…',
+    'agent.question_send': 'Send',
+    'agent.question_submit': 'Submit',
+    'agent.question_skip': 'Skip',
     'agent.stop': 'Stop',
 
     // Agent drawer / card

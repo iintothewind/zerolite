@@ -12,7 +12,7 @@
 //! whose decision the core would record under the wrong approver. A failed
 //! turn is reported without its details, which stay in the core's log.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,10 +22,11 @@ use axum::response::{IntoResponse, Response};
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt as _, StreamExt as _};
 use serde_json::{Value, json};
-use tokio::sync::{broadcast, watch};
-use zeroclaw_api::jsonrpc::error_codes::AUTH_REQUIRED;
+use tokio::sync::{broadcast, mpsc, watch};
+use zeroclaw_api::jsonrpc::JsonRpcError;
+use zeroclaw_api::jsonrpc::error_codes::{AUTH_REQUIRED, METHOD_NOT_FOUND};
 use zeroclaw_config::schema::AliasedAgentConfig;
-use zeroclaw_rpc_client::{ClientError, Method, Notification, RpcClient};
+use zeroclaw_rpc_client::{ClientError, InboundRequest, Method, Notification, RpcClient};
 use zeroclaw_rpc_proto::MAX_FRAME_BYTES;
 use zeroclaw_rpc_proto::notification::SESSION_UPDATE;
 use zeroclaw_rpc_proto::types::{SessionUpdateEvent, TurnCompletionOutcome, TurnUsageTotals};
@@ -41,6 +42,9 @@ use crate::dashboard_session::{
 use crate::ws::{
     ConnectParams, WS_PROTOCOL, WsQuery, close_for_reconnect, close_with, gateway_stop_signal,
     history_trimmed_ws_frame, tick_websocket_ping, websocket_ping_interval,
+};
+use crate::ws_question::{
+    Elicited, elicitation_answer, parse_elicitation, question_request_frame, question_response,
 };
 
 /// The longest the gateway waits for a turn's answer. The core's own limits
@@ -463,6 +467,8 @@ impl Chat {
                     .err()
                     .map(Stop::Close)
             }
+            // A late answer to a question whose turn already ended.
+            "question_response" => None,
             "message" => {
                 let content = parsed["content"].as_str().unwrap_or("");
                 if content.is_empty() {
@@ -592,6 +598,15 @@ impl Chat {
             };
         }
         let client = self.core.bound();
+        // Questions the core asked between turns have no card to answer
+        // them; refuse them before this turn's start.
+        if let Some(queue) = self.core.requests.as_mut() {
+            while let Ok(stale) = queue.try_recv() {
+                client
+                    .respond(stale.id.clone(), Ok(json!({"action": "cancel"})))
+                    .await;
+            }
+        }
         let session_id = self.core.core_id.clone();
         // A fresh receiver sees only what follows this turn's prompt, and the
         // turn's identity tells its end apart from another viewer's turn on
@@ -617,6 +632,7 @@ impl Chat {
             stop: None,
             meter: ContextMeter::default(),
             approval_receipts: BTreeSet::new(),
+            questions: HashMap::new(),
         };
 
         loop {
@@ -655,6 +671,9 @@ impl Chat {
                         turn.fail(sender, "the connection to the agent runtime was lost; the turn ended", "CORE_UNAVAILABLE").await;
                         return turn.end();
                     }
+                },
+                request = next_request(&mut self.core.requests), if !turn.client_gone => {
+                    turn.elicit(sender, request).await;
                 },
                 answered = &mut prompt => {
                     // Every frame reached the connection before its answer.
@@ -780,6 +799,7 @@ impl Chat {
                                 }
                             }
                         }
+                        Some("question_response") => turn.answer(&parsed).await,
                         Some("message") => {
                             let error = json!({
                                 "type": "error",
@@ -868,6 +888,27 @@ struct TurnRelay {
     meter: ContextMeter,
     /// Approval requests shown on this socket and not yet answered.
     approval_receipts: BTreeSet<String>,
+    /// Questions (`elicitation/create`) shown on this socket and not yet
+    /// answered, by the `request_id` the socket was given.
+    questions: HashMap<String, Asked>,
+}
+
+/// A question the core asked: the JSON-RPC id to answer and what was asked.
+struct Asked {
+    id: Value,
+    elicited: Elicited,
+}
+
+/// The next server-initiated request on the conversation's connection.
+/// Never resolves without one: a lost connection is reported by the
+/// notifications arm.
+async fn next_request(requests: &mut Option<mpsc::Receiver<InboundRequest>>) -> InboundRequest {
+    if let Some(queue) = requests.as_mut()
+        && let Some(request) = queue.recv().await
+    {
+        return request;
+    }
+    std::future::pending().await
 }
 
 impl TurnRelay {
@@ -879,13 +920,75 @@ impl TurnRelay {
         }
     }
 
-    /// The client left: nobody can answer the approvals it was shown, so
-    /// they are refused rather than left to time out.
+    /// The client left: nobody can answer the approvals or questions it was
+    /// shown, so they are refused rather than left to time out.
     async fn disconnect(&mut self) {
         self.client_gone = true;
         for request_id in std::mem::take(&mut self.approval_receipts) {
             refuse_unanswered(&self.client, &self.session_id, &request_id).await;
         }
+        for asked in std::mem::take(&mut self.questions).into_values() {
+            self.client
+                .respond(asked.id, Ok(json!({"action": "cancel"})))
+                .await;
+        }
+    }
+
+    /// Show a question the core asked (`elicitation/create`) as a card.
+    /// Only choice questions are answerable here: the answer travels back as
+    /// a choice index, so the card offers no free text.
+    async fn elicit(&mut self, sender: &mut Sender, request: InboundRequest) {
+        if request.method != "elicitation/create" {
+            let refusal = JsonRpcError {
+                code: METHOD_NOT_FOUND,
+                message: format!("unsupported client method: {}", request.method),
+                data: None,
+            };
+            self.client.respond(request.id, Err(refusal)).await;
+            return;
+        }
+        let elicited = match parse_elicitation(&request.params, &self.session_id) {
+            Some(elicited) if !self.client_gone => elicited,
+            _ => {
+                self.client
+                    .respond(request.id, Ok(json!({"action": "cancel"})))
+                    .await;
+                return;
+            }
+        };
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let frame = question_request_frame(
+            &request_id,
+            &elicited.question,
+            &elicited.choices,
+            elicited.multi_select,
+            false,
+            None,
+        );
+        self.questions.insert(
+            request_id,
+            Asked {
+                id: request.id,
+                elicited,
+            },
+        );
+        if send(sender, &frame).await.is_err() {
+            self.disconnect().await;
+        }
+    }
+
+    /// The viewer answered or dismissed a question: answer the core.
+    /// Unknown ids and malformed frames are ignored.
+    async fn answer(&mut self, frame: &Value) {
+        let Some((request_id, reply)) = question_response(frame) else {
+            return;
+        };
+        let Some(asked) = self.questions.remove(request_id) else {
+            return;
+        };
+        self.client
+            .respond(asked.id, Ok(elicitation_answer(&asked.elicited, &reply)))
+            .await;
     }
 
     async fn relay(&mut self, sender: &mut Sender, note: Notification) -> Relayed {

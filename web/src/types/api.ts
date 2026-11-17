@@ -237,6 +237,7 @@ export interface WsMessage {
     | "connected"
     | "cron_result"
     | "approval_request"
+    | "question_request"
     | "history_trimmed"
     | "context_usage"
     | "agent_start"
@@ -274,7 +275,14 @@ export interface WsMessage {
   request_id?: string;
   tool?: string;
   arguments_summary?: string;
-  timeout_secs?: number;
+  // Agent question (server → client, `question_request`): `ask_user` / `poll`.
+  // `timeout_secs` is null on a question whose deadline the gateway does not
+  // know (scoped chat).
+  timeout_secs?: number | null;
+  question?: string;
+  choices?: string[];
+  multi_select?: boolean;
+  free_text?: boolean;
   dropped_messages?: number;
   dropped_turns?: number;
   kept_turns?: number;
@@ -340,6 +348,19 @@ export interface PendingApproval {
   timeoutSecs: number;
   /** Wall-clock millis when the request arrived; used to compute remaining time. */
   receivedAt: number;
+}
+
+export interface PendingQuestion {
+  requestId: string;
+  question: string;
+  choices: string[];
+  multiSelect: boolean;
+  freeText: boolean;
+  /** null: the gateway does not know the deadline (scoped chat). */
+  timeoutSecs: number | null;
+  receivedAt: number;
+  /** Socket generation that delivered it; the question dies with that socket. */
+  socketVersion: number;
 }
 
 export type SessionRowKind =

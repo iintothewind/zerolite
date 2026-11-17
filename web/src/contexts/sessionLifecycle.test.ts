@@ -179,6 +179,7 @@ class FakeSocket implements SessionSocket {
   disconnectCalls = 0;
   sent: string[] = [];
   approvalResponses: Array<{ requestId: string; decision: ApprovalDecision }> = [];
+  questionResponses: Array<{ requestId: string; answers: string[] | null }> = [];
   private open = false;
 
   constructor(
@@ -196,6 +197,9 @@ class FakeSocket implements SessionSocket {
   }
   sendApprovalResponse(requestId: string, decision: ApprovalDecision): void {
     this.approvalResponses.push({ requestId, decision });
+  }
+  sendQuestionResponse(requestId: string, answers: string[] | null): void {
+    this.questionResponses.push({ requestId, answers });
   }
   emitOpen(): void { this.open = true; this.onOpen?.(); }
   /** The close frame arrived, but its event hasn't been delivered yet. */
@@ -1130,6 +1134,35 @@ test('a late close from the previous session socket cannot clear the active appr
   // request when the socket that carried it goes away.
   await act(async () => { runtime.sockets[1]!.emitClose(1006); });
   assert.equal(mounted.context().pendingApproval, null);
+  await unmount(mounted.renderer);
+});
+
+test('questions queue, an answer goes out and the next one shows, the socket\'s close clears them', async () => {
+  const runtime = new FakeSessionRuntime();
+  runtime.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
+  const mounted = await mountChat(runtime);
+  await openSocket(runtime, 0);
+  await settle();
+  const socket = runtime.sockets[0]!;
+
+  await act(async () => {
+    socket.emitMessage({
+      type: 'question_request',
+      request_id: 'req-1',
+      question: 'Which color?',
+      choices: ['Red', 'Green'],
+      timeout_secs: 300,
+    });
+    socket.emitMessage({ type: 'question_request', request_id: 'req-2', question: 'Name?' });
+  });
+  assert.deepEqual(mounted.context().pendingQuestions.map((q) => q.requestId), ['req-1', 'req-2']);
+
+  await act(async () => { mounted.context().respondToQuestion('req-1', ['Green']); });
+  assert.deepEqual(socket.questionResponses, [{ requestId: 'req-1', answers: ['Green'] }]);
+  assert.deepEqual(mounted.context().pendingQuestions.map((q) => q.requestId), ['req-2']);
+
+  await act(async () => { socket.emitClose(1006); });
+  assert.deepEqual(mounted.context().pendingQuestions, []);
   await unmount(mounted.renderer);
 });
 

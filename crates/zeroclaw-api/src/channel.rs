@@ -1489,6 +1489,19 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         Ok(None)
     }
 
+    /// Ask a free-form (no-choices) question through the channel's native
+    /// prompt UI. `Ok(Some(answer))`: answered. `Ok(None)`: the channel has no
+    /// native free-text prompt and the caller applies its own fallback
+    /// (`supports_free_form_ask` + `send`/`listen`). `Err`: the prompt was
+    /// shown or attempted and produced no answer. Default impl returns `None`.
+    async fn request_text(
+        &self,
+        _question: &str,
+        _timeout: std::time::Duration,
+    ) -> anyhow::Result<Option<String>> {
+        Ok(None)
+    }
+
     /// Whether this channel can answer free-form (no-choices) `ask_user`
     /// questions via the standard `send` + `listen` flow. Channels that only
     /// handle structured choices return `false` so callers fail fast with a
