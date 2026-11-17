@@ -59,12 +59,19 @@ from a single published `LiveStats` snapshot
   speed. The first `usage` frame marks the reading billed: it adds the
   provider's `output_tokens` against the silent span and clears the `est`
   flag.
+- **One span per request.** `agent_start` opens the first request's span
+  and every `tool_result` reopens it (the batch's last result wins), so a
+  tool-only request that streams no text is still billed by its `usage`
+  frame against its own duration. After a request's `usage` the meter ignores
+  text until the next span opens: that text is post-hoc (a non-streamed
+  answer such as the max-iteration summary, or a notice), already billed,
+  and carries no arrival timing.
 - **Publisher.** `chunk`/`thinking` frames feed the meter and never publish.
   A 1 Hz ticker publishes the reading while a turn is active, which is what
   lets a stall fall visibly; terminal frames (`message`/`done`/`aborted`)
   publish once and mute it, so the last reading stays on screen, dimmed.
 - **No placeholder.** While the meter has no evidence (gate: ≥200 estimated
-  tokens over ≥4 s of stream), the segment is absent — never `0 tok/s`.
+  tokens over ≥2 s of stream), the segment is absent — never `0 tok/s`.
   Formatting: `formatRate`, integers at ≥10, one decimal below.
 - **Reset with the transcript.** Session switch, `clearAllMessages`,
   `history_trimmed`, and unmount zero the meter. The outgoing conversation's

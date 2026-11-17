@@ -796,6 +796,8 @@ export function AgentProvider({
       case 'thinking':
         setTyping(true);
         foldTurnStream({ type: 'thinking', content: msg.content });
+        // After a request's `usage` frame the meter ignores text until the next
+        // request opens (`TokenRateMeter`): that text is post-hoc and billed.
         tokenRateRef.current.push(msg.content ?? '', Date.now());
         break;
 
@@ -926,6 +928,11 @@ export function AgentProvider({
         // `tool_call_id` for the same reason the card does: parallel calls can
         // complete out of order.
         foldTurnStream({ type: 'tool_result', id: resultId, output: msg.output ?? '' });
+        // The loop sends the next request once the batch's results are in, so
+        // its span opens here; the batch's last result wins. Without this, a
+        // tool-only request streams no text, never opens a span, and its
+        // `usage` frame bills nothing.
+        tokenRateRef.current.begin(Date.now());
         localMessageMutationVersionRef.current += 1;
         setMessages((prev) => {
           // Correlate the result to its pending card by gateway tool_call_id so

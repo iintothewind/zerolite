@@ -109,6 +109,22 @@ test('never amplifies a visible burst by overhead learned from small tool calls'
   assert.ok(settled < 105, `expected < 105, got ${settled}`);
 });
 
+test('text after a request ends is post-hoc and moves nothing until the next begin', () => {
+  const meter = new TokenRateMeter(words);
+  const clock = settle(meter, 3);
+  const settled = meter.rate(clock) ?? 0;
+  closeTo(settled, 60, 0);
+  // A non-streamed answer delivered after its usage: one delta, no timing.
+  meter.push('w '.repeat(2000), clock);
+  meter.end(undefined, clock + 5);
+  closeTo(meter.rate(clock + 5), settled, 0);
+  // The next request opens a span again.
+  meter.begin(clock + 5);
+  stream(meter, clock + 5, clock + 10_005, 6);
+  meter.end(600, clock + 10_005);
+  closeTo(meter.rate(clock + 10_005), 60, 0);
+});
+
 test('blanks on reset', () => {
   const meter = new TokenRateMeter(words);
   const clock = settle(meter, 2);

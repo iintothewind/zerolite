@@ -6,7 +6,7 @@
 
 const METER_HALF_LIVES_MS = [5_000, 20_000, 80_000];
 const METER_MIN_TOKENS = 200;
-const METER_MIN_TIME_MS = 4_000;
+const METER_MIN_TIME_MS = 2_000;
 const METER_BUCKET_MS = 250;
 const METER_CARRY_MAX_CHARS = 32;
 const METER_HIDDEN_DECAY = 0.8;
@@ -53,6 +53,10 @@ export class TokenRateMeter {
   #pendingTokens = -1;
   #hiddenTokens = 0;
   #hiddenSpanMs = 0;
+  /** Set by `end`, cleared by `begin`/`reset`: text pushed between a request's
+   *  end and the next request's begin is post-hoc (already billed, no arrival
+   *  timing) and is ignored rather than opening a zero-length span. */
+  #closed = false;
 
   constructor(count: (text: string) => number) {
     this.#count = count;
@@ -60,13 +64,14 @@ export class TokenRateMeter {
 
   begin(nowMs: number = Date.now()): void {
     this.#clearInflight();
+    this.#closed = false;
     this.#startedAt = nowMs;
     this.#advancedTo = nowMs;
     this.#inflightHiddenRate = Math.max(0, this.#hiddenTokens / (this.#hiddenSpanMs + METER_HIDDEN_PRIOR_MS));
   }
 
   push(text: string, nowMs: number = Date.now()): void {
-    if (text.length === 0) return;
+    if (text.length === 0 || this.#closed) return;
     if (this.#startedAt === null) this.begin(nowMs);
     const index = Math.floor((nowMs - (this.#startedAt ?? nowMs)) / METER_BUCKET_MS);
     if (index !== this.#pendingIndex) {
@@ -97,10 +102,12 @@ export class TokenRateMeter {
       this.#history[k]!.time += live.time;
     }
     this.#clearInflight();
+    this.#closed = true;
   }
 
   reset(): void {
     this.#clearInflight();
+    this.#closed = false;
     for (const sums of this.#history) sums.reset();
   }
 

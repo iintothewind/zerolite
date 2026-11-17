@@ -1306,7 +1306,7 @@ test('the stats row recounts the message list and keeps token totals live', asyn
   assert.equal(mounted.context().liveStats.turns, 1);
   assert.equal(mounted.context().liveStats.steps, 0);
   // No cumulative token segment: the row's rate needs streamed evidence
-  // (≥200 tokens over ≥4s), and one `usage` frame supplies neither, so the
+  // (≥200 tokens over ≥2s), and one `usage` frame supplies neither, so the
   // row carries counts and cache hit only.
   assert.equal(mounted.context().liveStats.rate, null);
   assert.doesNotMatch(renderedText(mounted), /17\.2K tok/);
@@ -1960,7 +1960,7 @@ test('terminal frames stamp the turn onto the finished turn', async () => {
 // ── Live throughput meter ───────────────────────────────────────────────────
 //
 // The composer row's `X tok/s` segment comes only from WebSocket frames. The
-// meter's evidence gate (≥200 tokens over ≥4s of stream) and the 1Hz publisher
+// meter's evidence gate (≥200 tokens over ≥2s of stream) and the 1Hz publisher
 // both key on wall time, so the fake clock owns `Date` and the ticker's
 // `setInterval` together: one `tick()` advances the stream, the gate, and the
 // publish cycle. `setTimeout` stays real, so `settle()` keeps working.
@@ -2021,14 +2021,14 @@ test('the composer rate publishes from streamed chunks, bills on usage, and mute
     'a new turn starts the meter clean',
   );
 
-  // Eight ~30-token frames across 4s stay below the evidence gate: the row
-  // carries no rate segment, and no `0 tok/s` placeholder stands in for it.
-  await streamFrames(socket, 'chunk', 8, 500);
-  assert.equal(mounted.context().liveStats.rate, null, 'frames feed the meter; they do not publish it');
+  // Four ~30-token frames across 2s stay below the evidence gate (~120 of 200
+  // tokens): the row carries no rate segment, and no `0 tok/s` placeholder.
+  await streamFrames(socket, 'chunk', 4, 500);
+  assert.equal(mounted.context().liveStats.rate, null, 'below the gate there is no reading');
   assert.doesNotMatch(renderedText(mounted), /tok\/s/);
 
-  // The crossing belongs to the publisher, not the frame: one cycle of the
-  // 1Hz ticker publishes the decayed-window reading.
+  // Past the gate the 1Hz ticker publishes the decayed-window reading.
+  await streamFrames(socket, 'chunk', 4, 500);
   await publishOnce();
   const live = mounted.context().liveStats.rate;
   assert.ok(live !== null && live > 40 && live < 65, `the crossed gate reads ${live}`);
@@ -2088,6 +2088,54 @@ test('reasoning-only streams count toward the rate and stay flagged as estimated
   assert.equal(terminal.rateMuted, true);
   assert.equal(terminal.rateBilled, false, 'a reasoning-only turn never gets billed');
   assert.equal(rateSegment(mounted)?.title, 'est');
+
+  await unmount(mounted.renderer);
+});
+
+test('tool-only steps bill the rate and a post-hoc answer does not move it', async () => {
+  const { mounted, socket } = await mountLiveChat();
+  mock.timers.enable({ apis: ['Date', 'setInterval'] });
+
+  await act(async () => {
+    mounted.context().sendMessage('search around');
+  });
+  await act(async () => {
+    socket.emitMessage({ type: 'agent_start', session_id: socket.sessionId });
+  });
+  // Five requests that stream no text: 120 billed tokens over 3s each (40
+  // tok/s), then a 2s tool. Each tool result opens the next request's span.
+  for (let i = 0; i < 5; i += 1) {
+    await act(async () => {
+      mock.timers.tick(3000);
+      socket.emitMessage({ type: 'usage', input_tokens: 900, output_tokens: 120 });
+      socket.emitMessage({ type: 'tool_call', name: 'shell', args: { i }, id: `call-${i}` });
+    });
+    await act(async () => {
+      mock.timers.tick(2000);
+      socket.emitMessage({ type: 'tool_result', name: 'shell', id: `call-${i}`, output: 'ok' });
+    });
+  }
+  const tools = mounted.context().liveStats;
+  assert.ok(tools.rate !== null && tools.rate > 35 && tools.rate < 45,
+    `every tool-only request is billed against its own span (${tools.rate})`);
+  assert.equal(tools.rateBilled, true);
+
+  // A non-streamed final answer: its usage first, then the whole text as one
+  // post-hoc chunk. The usage bills it; the chunk carries no timing.
+  await act(async () => {
+    mock.timers.tick(3000);
+    socket.emitMessage({ type: 'usage', input_tokens: 900, output_tokens: 120 });
+  });
+  const billed = mounted.context().liveStats.rate;
+  await act(async () => {
+    socket.emitMessage({ type: 'chunk', content: '合'.repeat(2000) });
+    mock.timers.tick(5);
+    socket.emitMessage({ type: 'done', full_response: '合'.repeat(2000), steps: 6 });
+  });
+  const terminal = mounted.context().liveStats;
+  assert.equal(terminal.rateMuted, true);
+  assert.ok(terminal.rate !== null && Math.abs(terminal.rate - (billed ?? 0)) < 2,
+    `the post-hoc chunk leaves the reading alone (${billed} → ${terminal.rate})`);
 
   await unmount(mounted.renderer);
 });
