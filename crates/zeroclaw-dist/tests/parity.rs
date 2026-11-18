@@ -97,6 +97,9 @@ fn repo_file(rel: &str) -> String {
 /// survives — so the release-workflow parity checks have no matrix to compare
 /// the dist registry against. They report and return instead of failing: the
 /// missing workflow is a deliberate branch policy, not a drifting registry.
+///
+/// The upstream installers (`install.sh`, `setup.bat`) are stripped the same
+/// way (`docs/design/fork-identity.md` R4), so their parity checks skip too.
 fn repo_file_opt(rel: &str) -> Option<String> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
@@ -409,7 +412,14 @@ fn release_workflow_required_assets_match_required_targets() {
 
 #[test]
 fn install_sh_detectable_triples_match_registry_with_exact_exceptions() {
-    let install = repo_file("install.sh");
+    let Some(install) = repo_file_opt("install.sh") else {
+        eprintln!(
+            "skipping: install.sh is absent on this branch (the fork strips upstream \
+             installers, fork-identity R4), so there is no host detection to compare the \
+             dist registry against"
+        );
+        return;
+    };
 
     let libc_variants: BTreeSet<String> =
         echoed_literals(&shell_function_body(&install, "detect_libc"))
@@ -466,7 +476,13 @@ fn install_sh_detectable_triples_match_registry_with_exact_exceptions() {
 
 #[test]
 fn setup_bat_target_is_a_registered_canonical_windows_target() {
-    let setup = repo_file("setup.bat");
+    let Some(setup) = repo_file_opt("setup.bat") else {
+        eprintln!(
+            "skipping: setup.bat is absent on this branch (the fork strips upstream \
+             installers, fork-identity R4), so there is no Windows target assignment to check"
+        );
+        return;
+    };
     let assignments: Vec<&str> = setup
         .lines()
         .filter_map(|line| line.trim().strip_prefix("set \"TARGET="))

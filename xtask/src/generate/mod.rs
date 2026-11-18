@@ -2,11 +2,8 @@
 //! surfaces from canonical route semantics. Typed specs own policy, renderers
 //! own generated content, and text outside generated zones stays hand-authored.
 
-pub mod install_sh;
 pub mod openrpc;
-pub mod packaging;
 pub mod runtime_locales;
-pub mod setup_bat;
 pub mod spec;
 pub mod tools_ftl;
 pub mod zerocode_themes;
@@ -30,16 +27,6 @@ struct Surface {
 fn registry() -> Vec<Surface> {
     vec![
         Surface {
-            name: "install-sh",
-            file: "install.sh",
-            render: |root, cur| install_sh::render_file(root, cur),
-        },
-        Surface {
-            name: "setup-bat",
-            file: "setup.bat",
-            render: |root, cur| setup_bat::render_file(root, cur),
-        },
-        Surface {
             name: "runtime-locales",
             file: "crates/zeroclaw-runtime/src/generated_locales.rs",
             render: runtime_locales::render_file,
@@ -48,21 +35,6 @@ fn registry() -> Vec<Surface> {
             name: "tools-en-ftl",
             file: "crates/zeroclaw-tools/locales/en/tools.ftl",
             render: tools_ftl::render_file,
-        },
-        Surface {
-            name: "pkgbuild",
-            file: "dist/aur/PKGBUILD",
-            render: |root, cur| packaging::render_pkgbuild(root, cur),
-        },
-        Surface {
-            name: "aur-srcinfo",
-            file: "dist/aur/.SRCINFO",
-            render: |root, cur| packaging::render_srcinfo(root, cur),
-        },
-        Surface {
-            name: "scoop",
-            file: "dist/scoop/zeroclaw.json",
-            render: |root, cur| packaging::render_scoop(root, cur),
         },
         Surface {
             name: "zerocode-themes",

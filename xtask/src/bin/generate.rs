@@ -11,7 +11,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Render install surfaces (setup.bat, ...) from the canonical spec.
+    /// Render generated source surfaces (runtime locales, tool strings, zerocode themes).
     Installers {
         /// Surface(s) to render. Omit (with no --check) to render all.
         targets: Vec<String>,
