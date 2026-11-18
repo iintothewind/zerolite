@@ -166,3 +166,6 @@ target/openapi.json
 
 # Local scratch workspace
 /.work/
+
+# Stray build/test logs at the repo root
+/*.log
