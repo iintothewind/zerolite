@@ -92,6 +92,12 @@ Undocumented conflict → STOP, report (commit, what the new semantics is,
 what adopting or refusing it changes), and wait for a decision. Never
 silently adopt upstream semantics.
 
+Stripped paths (`fork-identity.md` R2/R3/R4) are handled whether or not
+they conflict: a modify/delete conflict is resolved with `git rm`, and a
+new upstream file of a stripped kind that merged cleanly is deleted before
+the merge commit. Run the stripped-asset check in `fork-identity.md`
+Merge notes before committing.
+
 ## 4. Post-merge verification — per feature, by behavior
 
 For each feature in the feature list, run its design doc's "Merge notes"

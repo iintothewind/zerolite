@@ -62,6 +62,18 @@
   community asset reappears (`.github/` holds only `workflows/`;
   `cargo generate installers --check` lists exactly `runtime-locales`,
   `tools-en-ftl`, `zerocode-themes`).
+- **Stripped-asset check** (run before the merge commit; every command
+  must print nothing, otherwise delete what it lists per R2/R3/R4):
+
+  ```bash
+  git ls-files | grep -E '^(Dockerfile|Containerfile|Makefile|docker-compose|install\.sh$|setup\.bat$|demo/|apps/tauri/|dist/|dev/ci/|dev/sandbox/|docs/book/|scripts/(release|github|docs|desktop)/)'
+  git ls-files .github | grep -v '^\.github/workflows/'
+  git ls-files .github/workflows scripts/ci | grep -vxE '\.github/workflows/(release-cli|cross-image|sync-upstream)\.yml|scripts/ci/(build_plugin_smoke_packages\.sh|plugin_artifact_smoke\.sh|plugin_artifact_smoke\.test\.sh|plugin_smoke_provider\.py|plugin_smoke_provider_test\.py)'
+  ```
+
+  A hit on a new upstream file that the fork should keep (a new compile-time
+  input, a new release smoke script) is an undecided case: stop and report
+  it, then extend this check and the R4 exception list.
 - **Release procedure is not in this doc:** see `docs/maintainers/build-cli-binaries.md` § Release checklist.
 - **Code anchors:** `Cargo.toml`, `README.md`, `.github/workflows/`,
   `docs/releases/`, `docs/maintainers/`, `dev/cross/`, `scripts/dev/`.
