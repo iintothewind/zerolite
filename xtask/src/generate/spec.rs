@@ -1441,10 +1441,6 @@ mod tests {
                     .is_empty()
             );
         }
-        let desktop =
-            std::fs::read_to_string(root().join("scripts/desktop/prepare-kernel.sh")).unwrap();
-        assert!(desktop.contains("--selection \"$DISTRIBUTION\" --target \"$triple\""));
-        assert!(desktop.contains("--no-default-features"));
     }
 
     #[test]

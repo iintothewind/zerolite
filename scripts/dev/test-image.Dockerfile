@@ -13,8 +13,8 @@
 #     cargo test -p zeroclaw-runtime --lib -- --test-threads=1
 #
 # Keep this file to toolchain components only. System libraries a crate needs
-# (gdk-3.0 for `zerocode` / `zeroclaw-desktop`) are not added here: those two
-# packages stay excluded from workspace-wide runs.
+# (gdk-3.0 for `zerocode`) are not added here: that package stays excluded
+# from workspace-wide runs.
 FROM rust:1-bookworm
 
 RUN rustup component add rustfmt clippy \
