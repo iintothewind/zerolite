@@ -2,9 +2,6 @@
 //! surfaces from canonical route semantics. Typed specs own policy, renderers
 //! own generated content, and text outside generated zones stays hand-authored.
 
-pub mod container;
-pub mod container_base;
-pub mod docker_tags;
 pub mod install_sh;
 pub mod openrpc;
 pub mod packaging;
@@ -14,7 +11,6 @@ pub mod spec;
 pub mod tools_ftl;
 pub mod zerocode_themes;
 
-use container::ContainerSurface;
 use spec::Selection as Sel;
 use std::path::{Path, PathBuf};
 
@@ -54,34 +50,6 @@ fn registry() -> Vec<Surface> {
             render: tools_ftl::render_file,
         },
         Surface {
-            name: "containerfile",
-            file: "Containerfile",
-            render: |root, cur| containerfile_surface().render(root, cur),
-        },
-        Surface {
-            name: "dockerfile",
-            file: "Dockerfile",
-            render: |root, cur| render_docker_arg(root, cur),
-        },
-        Surface {
-            name: "dockerfile-debian",
-            file: "Dockerfile.debian",
-            render: |root, cur| render_docker_arg(root, cur),
-        },
-        Surface {
-            name: "dockerfile-alpine",
-            file: "Dockerfile.alpine",
-            render: |root, cur| render_docker_arg(root, cur),
-        },
-        // Base-image pins only: the relay builds `-p zerorelay` with no feature
-        // selection, so it carries no `docker-features-arg` zone and must not go
-        // through `render_docker_arg`.
-        Surface {
-            name: "dockerfile-zerorelay",
-            file: "apps/zerorelay/Dockerfile",
-            render: |root, cur| container_base::splice_zones(root, cur),
-        },
-        Surface {
             name: "pkgbuild",
             file: "dist/aur/PKGBUILD",
             render: |root, cur| packaging::render_pkgbuild(root, cur),
@@ -97,36 +65,11 @@ fn registry() -> Vec<Surface> {
             render: |root, cur| packaging::render_scoop(root, cur),
         },
         Surface {
-            name: "docker-tags",
-            file: "dev/ci/docker-tags.toml",
-            render: |root, cur| docker_tags::render_file(root, cur),
-        },
-        Surface {
             name: "zerocode-themes",
             file: "apps/zerocode/src/generated_themes.rs",
             render: zerocode_themes::render_file,
         },
     ]
-}
-
-/// Dockerfile-family ARG default: ships the lean standard Dist selection,
-/// build-time overridable via --build-arg.
-fn render_docker_arg(root: &Path, current: &str) -> anyhow::Result<String> {
-    let body = container::render_features_arg(root, &Sel::Dist)?;
-    let spliced = container::splice(current, "docker-features-arg", &body)?;
-    container_base::splice_zones(root, &spliced)
-}
-
-/// Containerfile surface: standard image ships lean Dist; fat image ships All
-/// (kitchen sink). Selections, not literals.
-fn containerfile_surface() -> ContainerSurface {
-    ContainerSurface {
-        file: "Containerfile",
-        zones: vec![
-            ("container-standard", Sel::Dist, "    "),
-            ("container-fat", Sel::All, "    "),
-        ],
-    }
 }
 
 fn workspace_root() -> PathBuf {
@@ -182,10 +125,6 @@ pub fn run(targets: &[String], check: bool) -> anyhow::Result<()> {
 
     let root = workspace_root();
     let mut drift = false;
-
-    if !check {
-        container_base::refresh_source(&root)?;
-    }
 
     for s in selected {
         let path = root.join(s.file);
