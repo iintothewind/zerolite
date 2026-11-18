@@ -29,8 +29,6 @@ Run from a clean `zerolite` checkout level with `origin/zerolite`. `X.Y.Z` is th
 
    Expect `ZeroLite X.Y.Z` and the three assets under [What gets built](#what-gets-built).
 
-Do not use `scripts/release/bump-version.sh` or `scripts/release/cut_release_tag.sh`. They are upstream tooling: the first also regenerates upstream install surfaces (`cargo generate installers`), the second requires `HEAD == origin/master`.
-
 ## Trigger
 
 **Tag push.** Filter `v[0-9]+.[0-9]+.[0-9]+`: strict semver, so `-rc` / `-canary` suffixes do **not** match. The workflow does not compare the tag against `Cargo.toml`.
