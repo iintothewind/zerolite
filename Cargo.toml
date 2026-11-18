@@ -7,8 +7,8 @@ resolver = "2"
 version = "1.3.6"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/zeroclaw-labs/zeroclaw"
-homepage = "https://www.zeroclaw.com"
+repository = "https://github.com/iintothewind/zerolite"
+homepage = "https://github.com/iintothewind/zerolite"
 rust-version = "1.96.0"
 
 [workspace.dependencies]
