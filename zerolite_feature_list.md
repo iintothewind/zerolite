@@ -20,7 +20,7 @@ new semantics and report it.
 | Web UI fork behavior | `docs/design/webui.md` | `web/src/lib/contextBar.ts`, `historyTrimNotice.ts`, transcript handling, zerocode keymap, gateway CSP `img-src` | `*.test.ts` beside each web logic file; `security_headers` CSP test | Transcript-store, context-bar, branding, or dashboard CSP changes |
 | Web chat questions (`ask_user`/`poll` card) and honest reactions | `docs/design/web-ask-user.md` | `crates/zeroclaw-gateway/src/ws_question.rs`, `ws_approval.rs` (`ask`, reaction overrides), `chat_core.rs` `TurnRelay::elicit`, `dashboard_core.rs` `handshake` capabilities, `crates/zeroclaw-runtime/src/rpc/approval_channel.rs` reaction overrides, `Channel::request_text`, `web/src/components/QuestionBanner.tsx`, `web/src/lib/pendingQuestions.logic.ts` | `ws_question`, `ws_approval` question/reaction, `ws.rs` question regressions, `a_scoped_chat_answers_a_question_with_one_of_its_choices`, `ask_user` native-prompt tests, `rpc::approval_channel` reaction test, `pendingQuestions.logic.test.ts`, the question case in `sessionLifecycle.test.ts` | `Channel` trait / `TurnEvent` changes, `ws.rs` approval arms, upstream free-form elicitation ("Phase 2") |
 | Provider compatibility shims | `docs/design/provider-compat.md` | `crates/zeroclaw-providers/src/`, seam sanitizers, media handling | Per-provider shim tests | Provider refactors that delete/rename a shim or its tests |
-| Fork identity & release | `docs/design/fork-identity.md` | `Cargo.toml`, `README.md`, `.github/workflows/`, `docs/releases/` | Release-workflow assertions (where present) | Version/README/workflow changes; restored upstream automation |
+| Fork identity & release | `docs/design/fork-identity.md` | `Cargo.toml`, `README.md`, `.github/workflows/`, `docs/releases/`, `dev/cross/`, `scripts/dev/` | Release-workflow assertions (where present) | Version/README/workflow changes; restored upstream automation; a stripped distribution or community asset reappearing (R4) |
 | Bounded tool file I/O (windowed file_read under the output budget; file_edit size cap + atomic replace; delegate artifact read cap) | `docs/design/bounded-file-io.md` | `crates/zeroclaw-runtime/src/tools/file_read.rs` (`LineWindow`, `with_runtime_result_budget`) and its registration in `crates/zeroclaw-runtime/src/tools/mod.rs`; `crates/zeroclaw-tools/src/file_edit.rs` (`replace_in_file`); `DelegateTool::read_result_artifact` | file_read window/paging/budget tests, file_edit size-limit + atomic-replace tests, the oversized case in `background_lifecycle_reports_artifact_errors_without_changing_terminal_status` | Upstream changes to file_read's read path or `FileReadTool` construction (#11592 lands in the same function), to file_edit's read/write tail, or to delegate result artifact reads |
 
 ## Explicitly undecided — not precedent
@@ -55,6 +55,8 @@ decided feature.
 - Config schema version 4 with retired-key migration (#11218) and the
   `[gateway.pairing_dashboard]` pairing limits (#12213).
 - The CLI-only build and its install/update path (#11269, #11975, #12111).
+  The installer scripts themselves (`install.sh`, `setup.bat`) are stripped
+  (`fork-identity.md` R4); the build shape stays undecided.
 - The conversation-binding port and channel conversation owner (#11438).
 - Cost `warn_at_percent` warnings surfaced as `TurnEvent::BudgetWarning`
   (#11692).
@@ -90,6 +92,11 @@ parallel execution are concurrency limits, not flakes to retry away
     breadcrumb from message text, which contradicts the fork's design
     (provenance is a canonical column, never inferred from text; see
     `trim_breadcrumb_provenance_is_a_canonical_column_not_inferred_from_text`).
+  - Detectors and renderer tests of stripped assets (owner decision
+    2026-11-18, `fork-identity.md` R4):
+    `tests/architecture/{release_workflow,desktop_release,container_release,ci_runner_labels}.rs`
+    and the `xtask` generator modules `install_sh`, `setup_bat`, `container`,
+    `container_base`, `docker_tags`, `packaging`, `release` with their tests.
 
 ## Upstream pick log
 
@@ -126,3 +133,4 @@ pick is taken, dropped or left out; a row is precedent for the next merge.
 | v0.9.0 | `crates/zeroclaw-runtime/AGENTS.md` exception table (#11980, #11963, #12274, #12295, #12297, #12342 and the rows the fork table lagged) | taken, two rows left out | The manual-compaction row stays removed (`context-management.md` R7); the `zeroclaw-docs` row is left out with #9579 |
 | v0.9.0 | #11174 test `skill_review_routes_vision_through_the_turns_binding` | adapted | Collides with fork `dadf41301` (carried-over images keep the selected model); owner ruling 2026-11-12: fork behavior kept, test pins it (`provider-compat.md` #10) |
 | v0.9.0 | Upstream checks meeting fork behavior: `builtin_selection_boundary` fixture, `direct_cli_terminal_completion` semantic-empty request count, `runtime-composition-consumer` retained edges, the master-recovery banner line | adapted | Fork `session_search` in the built-in set; one R5 nudge before the semantic-empty failure (`delegation-turn.md` R5); `zeroclaw-context` recorded as a retained runtime edge; banner line `i18n-exempt` |
+| 2026-11-18 | Upstream distribution and community assets (containers, package-manager manifests, installers, desktop app, `.github` community config, CI/release/triage scripts, Pi deploy kit) | stripped | Owner decision 2026-11-18, `fork-identity.md` R4; `firmware/` kept as a compile-time input of `zeroclaw-hardware` |
