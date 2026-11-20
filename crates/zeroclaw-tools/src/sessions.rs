@@ -430,7 +430,7 @@ impl Tool for SessionSearchTool {
     }
 
     fn description(&self) -> &str {
-        "Search message content in this agent's own conversation sessions by keyword. Returns matching message IDs with their session key, turn, kind and a text snippet. Tool calls and tool results are searched too; read around a hit with sessions_history (include_tools: true shows the tool rows)."
+        "Search message content in this agent's own conversation sessions by keyword. Returns matching message IDs with their session key, turn, kind and a text snippet. Messages with the same text are returned once, with duplicates=N for the rest. Tool calls and tool results are searched too unless ignore_tool_calls is true; read around a hit with sessions_history (include_tools: true shows the tool rows)."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -448,6 +448,10 @@ impl Tool for SessionSearchTool {
                 "session_id": {
                     "type": "string",
                     "description": "Optional: restrict search to one session ID"
+                },
+                "ignore_tool_calls": {
+                    "type": "boolean",
+                    "description": "Search chat messages only: leave out tool calls, tool results and the assistant's notes between them (default: false)"
                 }
             },
             "required": ["query"]
@@ -496,6 +500,10 @@ impl Tool for SessionSearchTool {
             .get("limit")
             .and_then(serde_json::Value::as_u64)
             .map_or(20, |value| value as usize);
+        let ignore_tool_calls = args
+            .get("ignore_tool_calls")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
 
         let (owner_agent_alias, owner_channel_ids) = self
             .ownership_scope
@@ -514,6 +522,7 @@ impl Tool for SessionSearchTool {
                 // This tool's own calls and results repeat the query and its
                 // hits; they are never hits themselves.
                 exclude_tools: vec![self.name().to_string()],
+                chat_only: ignore_tool_calls,
             })
         };
         let mut hits = search(MessageMatch::Exact);
@@ -538,9 +547,9 @@ impl Tool for SessionSearchTool {
             )
         };
         for hit in &hits {
-            let _ = writeln!(
+            let _ = write!(
                 output,
-                "- message_id={} session_key={} turn={} kind={} role={} tool={} created_at={} snippet={}",
+                "- message_id={} session_key={} turn={} kind={} role={} tool={} created_at={}",
                 hit.message_id,
                 hit.session_key,
                 hit.turn,
@@ -548,8 +557,11 @@ impl Tool for SessionSearchTool {
                 hit.role,
                 hit.tool_name.as_deref().unwrap_or("-"),
                 hit.created_at,
-                one_line(&hit.snippet),
             );
+            if hit.duplicates > 0 {
+                let _ = write!(output, " duplicates={}", hit.duplicates);
+            }
+            let _ = writeln!(output, " snippet={}", one_line(&hit.snippet));
         }
 
         Ok(ToolResult {
@@ -2156,6 +2168,7 @@ mod tests {
                     tool_name: Some("shell".into()),
                     snippet: "hello <b>world</b>\nnext".into(),
                     created_at: "2026-01-01T00:00:00Z".into(),
+                    duplicates: 0,
                 }],
                 expect_owner: None,
             }),
@@ -2237,6 +2250,175 @@ mod tests {
 
         let result = tool.execute(json!({"query": "zzqqxx"})).await.unwrap();
         assert_eq!(result.output, "No matching messages found.");
+    }
+
+    #[tokio::test]
+    async fn session_search_ignore_tool_calls_searches_chat_rows_only() {
+        use zeroclaw_infra::session_backend::TranscriptRow;
+
+        const ANCHOR: &str = "我们上周六去斯坦利公园散步，顺便讨论了量子纠缠低温实验的预算。";
+        const QUESTION: &str = "我上次是不是说过要去斯坦利公园散步";
+
+        let tmp = TempDir::new().unwrap();
+        let backend = zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path())
+            .expect("sqlite backend");
+        let row = |kind, role: &str, content: &str, tool: Option<&str>| TranscriptRow {
+            kind,
+            role: role.into(),
+            content: content.into(),
+            tool_name: tool.map(str::to_string),
+            tool_call_id: tool.map(|_| "call_1".to_string()),
+        };
+        backend.append("s", &ChatMessage::user(ANCHOR)).unwrap();
+        let document = format!("文档：{QUESTION}，这是变更请求的正文。");
+        backend
+            .append_turn(
+                "s",
+                &[
+                    row(RowKind::User, "user", "读一下那份文档", None),
+                    row(RowKind::Step, "assistant", "先看看斯坦利公园那份文档", None),
+                    row(
+                        RowKind::ToolCall,
+                        "assistant",
+                        r#"{"url":"https://example.com/cr"}"#,
+                        Some("web_fetch"),
+                    ),
+                    row(RowKind::ToolResult, "tool", &document, Some("web_fetch")),
+                    row(RowKind::Assistant, "assistant", "读完了", None),
+                ],
+            )
+            .unwrap()
+            .unwrap();
+        let tool = SessionSearchTool::new(Arc::new(backend), test_security());
+
+        let output = tool
+            .execute(json!({"query": QUESTION}))
+            .await
+            .unwrap()
+            .output
+            .to_string();
+        assert!(output.starts_with("Found 1 message(s):"), "{output}");
+        assert!(output.contains("kind=tool_result"), "{output}");
+
+        let output = tool
+            .execute(json!({"query": QUESTION, "ignore_tool_calls": true}))
+            .await
+            .unwrap()
+            .output
+            .to_string();
+        assert!(
+            output.starts_with(
+                "No exact match. 1 closest message(s) by shared two-character terms, best first:"
+            ),
+            "{output}"
+        );
+        assert!(output.contains("kind=user"), "{output}");
+        assert!(!output.contains("kind=tool_"), "{output}");
+        assert!(!output.contains("kind=step"), "{output}");
+
+        let output = tool
+            .execute(json!({"query": "文档"}))
+            .await
+            .unwrap()
+            .output
+            .to_string();
+        assert!(output.starts_with("Found 3 message(s):"), "{output}");
+
+        let output = tool
+            .execute(json!({"query": "文档", "ignore_tool_calls": true}))
+            .await
+            .unwrap()
+            .output
+            .to_string();
+        assert!(output.starts_with("Found 1 message(s):"), "{output}");
+        assert!(output.contains("kind=user"), "{output}");
+
+        let output = tool
+            .execute(json!({"query": "example", "ignore_tool_calls": true}))
+            .await
+            .unwrap()
+            .output
+            .to_string();
+        assert_eq!(output, "No matching messages found.");
+    }
+
+    #[tokio::test]
+    async fn session_search_folds_identical_messages() {
+        use zeroclaw_infra::session_backend::TranscriptRow;
+
+        const MEM: &str = "Found 1 memories: - [daily] probe: 我们上周六去斯坦利公园散步。";
+        const Q: &str = "上周六我们是不是去了公园";
+
+        let tmp = TempDir::new().unwrap();
+        let backend = zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path())
+            .expect("sqlite backend");
+        let row = |kind, role: &str, content: &str, tool: Option<&str>| TranscriptRow {
+            kind,
+            role: role.into(),
+            content: content.into(),
+            tool_name: tool.map(str::to_string),
+            tool_call_id: tool.map(|_| "call_1".to_string()),
+        };
+        backend
+            .append("s", &ChatMessage::user("先存一条记忆"))
+            .unwrap();
+        backend
+            .append_turn(
+                "s",
+                &[
+                    row(RowKind::User, "user", "再查几次", None),
+                    row(RowKind::ToolResult, "tool", MEM, Some("memory_recall")),
+                    row(RowKind::ToolResult, "tool", MEM, Some("memory_recall")),
+                    row(RowKind::ToolResult, "tool", MEM, Some("memory_recall")),
+                    row(RowKind::Assistant, "assistant", "上周六的事我记下了", None),
+                ],
+            )
+            .unwrap()
+            .unwrap();
+        let tool = SessionSearchTool::new(Arc::new(backend), test_security());
+
+        let output = tool
+            .execute(json!({"query": Q}))
+            .await
+            .unwrap()
+            .output
+            .to_string();
+        assert!(
+            output.starts_with(
+                "No exact match. 2 closest message(s) by shared two-character terms, best first:"
+            ),
+            "{output}"
+        );
+        assert_eq!(output.matches("kind=tool_result").count(), 1, "{output}");
+        assert!(output.contains(" duplicates=2 snippet="), "{output}");
+        let answer = output
+            .lines()
+            .find(|line| line.contains("kind=assistant"))
+            .unwrap();
+        assert!(!answer.contains("duplicates="), "{output}");
+
+        let output = tool
+            .execute(json!({"query": "memories"}))
+            .await
+            .unwrap()
+            .output
+            .to_string();
+        assert!(output.starts_with("Found 1 message(s):"), "{output}");
+        assert!(output.contains(" duplicates=2 snippet="), "{output}");
+
+        let output = tool
+            .execute(json!({"query": Q, "ignore_tool_calls": true}))
+            .await
+            .unwrap()
+            .output
+            .to_string();
+        assert!(
+            output.starts_with(
+                "No exact match. 1 closest message(s) by shared two-character terms, best first:"
+            ),
+            "{output}"
+        );
+        assert!(output.contains("kind=assistant"), "{output}");
     }
 
     #[tokio::test]

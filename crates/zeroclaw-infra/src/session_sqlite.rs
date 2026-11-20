@@ -10,6 +10,7 @@ use chrono::{DateTime, Duration, Utc};
 use parking_lot::Mutex;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::io::{self, BufRead, Read};
 use std::path::{Path, PathBuf};
 use zeroclaw_api::model_provider::ChatMessage;
@@ -1010,6 +1011,22 @@ const STORED_ROW_COLUMNS: &str = "id, turn, kind, role, content, \
 /// Predicate selecting chat-kind rows (the ones `load`/`load_context` see).
 const CHAT_KINDS: &str = "kind IN ('user', 'assistant', 'runtime')";
 
+/// Message hits `search_messages` returns when the query sets no limit.
+const DEFAULT_MESSAGE_HITS: usize = 20;
+/// Rows read per requested hit, so that rows repeating an earlier hit can be
+/// folded into it without the result falling short of the limit.
+const DUPLICATE_SCAN_FACTOR: usize = 5;
+/// Most rows one message search reads, unless the limit itself is higher.
+const MAX_SCANNED_ROWS: usize = 200;
+
+/// Rows a message search reads to return `limit` distinct hits.
+fn scanned_rows(limit: usize) -> usize {
+    limit
+        .saturating_mul(DUPLICATE_SCAN_FACTOR)
+        .min(MAX_SCANNED_ROWS)
+        .max(limit)
+}
+
 fn read_stored_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredRow> {
     let role: String = row.get(3)?;
     let kind = row
@@ -1039,8 +1056,8 @@ fn read_stored_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredRow> {
 /// SQL and bindings for `search_messages`; `None` when the keyword has no
 /// terms for the query's mode. Exact hits are read in descending FTS rowid
 /// order (= `sessions.id`), so SQLite walks the index backwards and stops at
-/// the limit instead of sorting every match; approximate hits are read in
-/// FTS5 rank order.
+/// the scan limit (`scanned_rows`) instead of sorting every match;
+/// approximate hits are read in FTS5 rank order.
 fn search_messages_sql(query: &MessageQuery) -> Option<(String, Vec<rusqlite::types::Value>)> {
     use rusqlite::types::Value;
 
@@ -1051,7 +1068,8 @@ fn search_messages_sql(query: &MessageQuery) -> Option<(String, Vec<rusqlite::ty
     if fts_query.is_empty() {
         return None;
     }
-    let limit = i64::try_from(query.limit.unwrap_or(20)).unwrap_or(i64::MAX);
+    let scan = i64::try_from(scanned_rows(query.limit.unwrap_or(DEFAULT_MESSAGE_HITS)))
+        .unwrap_or(i64::MAX);
     let scoped = query.owner_agent_alias.is_some() || !query.owner_channel_ids.is_empty();
 
     let mut sql = String::from(
@@ -1105,6 +1123,9 @@ fn search_messages_sql(query: &MessageQuery) -> Option<(String, Vec<rusqlite::ty
             }
         }
     }
+    if query.chat_only {
+        sql.push_str(&format!(" AND s.{CHAT_KINDS}"));
+    }
     if !query.exclude_tools.is_empty() {
         sql.push_str(" AND (s.tool_name IS NULL OR s.tool_name NOT IN (");
         for (i, tool) in query.exclude_tools.iter().enumerate() {
@@ -1117,15 +1138,15 @@ fn search_messages_sql(query: &MessageQuery) -> Option<(String, Vec<rusqlite::ty
         }
         sql.push_str("))");
     }
-    // Exact hits are read newest first, so a common term stops at the limit
-    // instead of sorting every match. Approximate hits are ranked: FTS5
+    // Exact hits are read newest first, so a common term stops at the scan
+    // limit instead of sorting every match. Approximate hits are ranked: FTS5
     // returns them in BM25 order itself.
     let order = match query.mode {
         MessageMatch::Exact => "sessions_fts.rowid DESC",
         MessageMatch::Approximate => "sessions_fts.rank",
     };
     sql.push_str(&format!(" ORDER BY {order} LIMIT ?{next}"));
-    bind.push(Value::Integer(limit));
+    bind.push(Value::Integer(scan));
     Some((sql, bind))
 }
 
@@ -1931,12 +1952,14 @@ impl SessionBackend for SqliteSessionBackend {
             MessageMatch::Exact => query.keyword.clone(),
             MessageMatch::Approximate => session_fts::recall_terms(&query.keyword).join(" "),
         };
+        let limit = query.limit.unwrap_or(DEFAULT_MESSAGE_HITS);
         let conn = self.conn.lock();
         let mut stmt = match conn.prepare(&sql) {
             Ok(stmt) => stmt,
             Err(_) => return Vec::new(),
         };
 
+        // Every row read, without its snippet, and its content.
         let rows = match stmt.query_map(rusqlite::params_from_iter(bind), |row| {
             let role: String = row.get(2)?;
             let kind = row
@@ -1944,25 +1967,41 @@ impl SessionBackend for SqliteSessionBackend {
                 .as_deref()
                 .and_then(RowKind::parse)
                 .unwrap_or_else(|| RowKind::from_role(&role));
-            let tool_name: Option<String> = row.get(6)?;
-            let content: String = row.get(7)?;
-            let source = session_fts::index_source(kind, tool_name.as_deref(), &content);
-            Ok(MessageHit {
+            let hit = MessageHit {
                 message_id: row.get(0)?,
                 session_key: row.get(1)?,
                 role,
                 created_at: row.get(3)?,
                 kind,
                 turn: row.get::<_, Option<i64>>(5)?.unwrap_or(0),
-                snippet: session_fts::snippet(&source, &snippet_terms),
-                tool_name,
-            })
+                tool_name: row.get(6)?,
+                snippet: String::new(),
+                duplicates: 0,
+            };
+            Ok((hit, row.get::<_, String>(7)?))
         }) {
             Ok(rows) => rows,
             Err(_) => return Vec::new(),
         };
 
-        rows.filter_map(|row| row.ok()).collect()
+        // One hit per distinct message, in search order: a row repeating an
+        // earlier hit's kind, tool name and content is counted on that hit.
+        let mut hits: Vec<MessageHit> = Vec::new();
+        let mut seen: HashMap<(RowKind, Option<String>, String), usize> = HashMap::new();
+        for (mut hit, content) in rows.filter_map(|row| row.ok()) {
+            let key = (hit.kind, hit.tool_name.clone(), content);
+            if let Some(&at) = seen.get(&key) {
+                hits[at].duplicates += 1;
+            } else if hits.len() < limit {
+                hit.snippet = session_fts::snippet(
+                    &session_fts::index_source(hit.kind, hit.tool_name.as_deref(), &key.2),
+                    &snippet_terms,
+                );
+                seen.insert(key, hits.len());
+                hits.push(hit);
+            }
+        }
+        hits
     }
 
     fn load_around(
@@ -4162,6 +4201,7 @@ mod tests {
             owner_channel_ids: Vec::new(),
             mode: MessageMatch::Exact,
             exclude_tools: Vec::new(),
+            chat_only: false,
         })
     }
 
@@ -4182,6 +4222,7 @@ mod tests {
                 .collect(),
             mode: MessageMatch::Exact,
             exclude_tools: Vec::new(),
+            chat_only: false,
         })
     }
 
@@ -4676,27 +4717,30 @@ mod tests {
         let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
         for mode in [MessageMatch::Exact, MessageMatch::Approximate] {
             for scoped in [false, true] {
-                let (sql, bind) = search_messages_sql(&crate::session_backend::MessageQuery {
-                    keyword: "anything".into(),
-                    session_key: None,
-                    limit: Some(20),
-                    owner_agent_alias: scoped.then(|| "rowan".to_string()),
-                    owner_channel_ids: Vec::new(),
-                    mode,
-                    exclude_tools: vec!["session_search".to_string()],
-                })
-                .unwrap();
-                let conn = backend.conn.lock();
-                let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
-                let plan: Vec<String> = stmt
-                    .query_map(rusqlite::params_from_iter(bind), |row| row.get(3))
-                    .unwrap()
-                    .map(Result::unwrap)
-                    .collect();
-                assert!(
-                    plan.iter().all(|step| !step.contains("TEMP B-TREE")),
-                    "{mode:?} {plan:?}"
-                );
+                for chat_only in [false, true] {
+                    let (sql, bind) = search_messages_sql(&crate::session_backend::MessageQuery {
+                        keyword: "anything".into(),
+                        session_key: None,
+                        limit: Some(20),
+                        owner_agent_alias: scoped.then(|| "rowan".to_string()),
+                        owner_channel_ids: Vec::new(),
+                        mode,
+                        exclude_tools: vec!["session_search".to_string()],
+                        chat_only,
+                    })
+                    .unwrap();
+                    let conn = backend.conn.lock();
+                    let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+                    let plan: Vec<String> = stmt
+                        .query_map(rusqlite::params_from_iter(bind), |row| row.get(3))
+                        .unwrap()
+                        .map(Result::unwrap)
+                        .collect();
+                    assert!(
+                        plan.iter().all(|step| !step.contains("TEMP B-TREE")),
+                        "{mode:?} scoped={scoped} chat_only={chat_only} {plan:?}"
+                    );
+                }
             }
         }
     }
@@ -4752,7 +4796,166 @@ mod tests {
                 .iter()
                 .map(|tool| (*tool).to_string())
                 .collect(),
+            chat_only: false,
         })
+    }
+
+    fn chat_hits(
+        backend: &SqliteSessionBackend,
+        keyword: &str,
+        mode: MessageMatch,
+    ) -> Vec<MessageHit> {
+        backend.search_messages(&MessageQuery {
+            keyword: keyword.to_string(),
+            session_key: None,
+            limit: Some(20),
+            owner_agent_alias: None,
+            owner_channel_ids: Vec::new(),
+            mode,
+            exclude_tools: Vec::new(),
+            chat_only: true,
+        })
+    }
+
+    fn hit_kinds(hits: &[MessageHit]) -> Vec<RowKind> {
+        hits.iter().map(|hit| hit.kind).collect()
+    }
+
+    /// A user message, then a turn in which a tool read a document that
+    /// quotes `QUESTION`.
+    fn write_document_fixture(backend: &SqliteSessionBackend) {
+        backend.append("s", &ChatMessage::user(ANCHOR)).unwrap();
+        let document = format!("文档：{QUESTION}，这是变更请求的正文。");
+        backend
+            .append_turn(
+                "s",
+                &[
+                    row(RowKind::User, "user", "读一下那份文档", None),
+                    row(RowKind::Step, "assistant", "先看看斯坦利公园那份文档", None),
+                    row(
+                        RowKind::ToolCall,
+                        "assistant",
+                        r#"{"url":"https://example.com/cr"}"#,
+                        Some("web_fetch"),
+                    ),
+                    row(RowKind::ToolResult, "tool", &document, Some("web_fetch")),
+                    row(RowKind::Assistant, "assistant", "读完了", None),
+                ],
+            )
+            .unwrap()
+            .unwrap();
+    }
+
+    #[test]
+    fn chat_only_search_leaves_out_step_and_tool_rows() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        write_document_fixture(&backend);
+
+        assert_eq!(
+            hit_kinds(&hits_with(&backend, QUESTION, MessageMatch::Exact, &[])),
+            [RowKind::ToolResult]
+        );
+        assert!(chat_hits(&backend, QUESTION, MessageMatch::Exact).is_empty());
+        let hits = chat_hits(&backend, QUESTION, MessageMatch::Approximate);
+        assert_eq!(hit_kinds(&hits), [RowKind::User], "{hits:?}");
+        assert!(
+            hits[0].snippet.contains("<b>公园</b><b>散步</b>"),
+            "{hits:?}"
+        );
+
+        assert_eq!(
+            hit_kinds(&hits_with(&backend, "文档", MessageMatch::Exact, &[])),
+            [RowKind::ToolResult, RowKind::Step, RowKind::User]
+        );
+        assert_eq!(
+            hit_kinds(&chat_hits(&backend, "文档", MessageMatch::Exact)),
+            [RowKind::User]
+        );
+        assert!(chat_hits(&backend, "example", MessageMatch::Exact).is_empty());
+    }
+
+    #[test]
+    fn search_folds_rows_repeating_an_earlier_hit() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        let memory =
+            |content: &str| row(RowKind::ToolResult, "tool", content, Some("memory_recall"));
+        backend
+            .append("s", &ChatMessage::user("kiwifruit first note"))
+            .unwrap();
+        backend
+            .append_turn(
+                "s",
+                &[
+                    row(RowKind::User, "user", "look it up", None),
+                    memory("kiwifruit memory"),
+                    memory("kiwifruit memory"),
+                    memory("kiwifruit memory"),
+                    row(RowKind::Assistant, "assistant", "kiwifruit answer", None),
+                ],
+            )
+            .unwrap()
+            .unwrap();
+        backend
+            .append("t", &ChatMessage::user("other session"))
+            .unwrap();
+        backend
+            .append_turn(
+                "t",
+                &[
+                    row(RowKind::User, "user", "kiwifruit memory", None),
+                    memory("kiwifruit memory"),
+                    row(
+                        RowKind::ToolResult,
+                        "tool",
+                        "kiwifruit memory",
+                        Some("shell"),
+                    ),
+                ],
+            )
+            .unwrap()
+            .unwrap();
+
+        // Same content under another tool or kind is a hit of its own; the
+        // three rows in session `s` fold into the newest one, in session `t`.
+        let hits = message_hits(&backend, "kiwifruit", None, None);
+        let summary: Vec<_> = hits
+            .iter()
+            .map(|hit| {
+                (
+                    hit.kind,
+                    hit.tool_name.as_deref(),
+                    hit.session_key.as_str(),
+                    hit.duplicates,
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                (RowKind::ToolResult, Some("shell"), "t", 0),
+                (RowKind::ToolResult, Some("memory_recall"), "t", 3),
+                (RowKind::User, None, "t", 0),
+                (RowKind::Assistant, None, "s", 0),
+                (RowKind::User, None, "s", 0),
+            ]
+        );
+
+        // The limit counts distinct hits; rows read after it is reached still
+        // count on the hits already taken.
+        let hits = message_hits(&backend, "kiwifruit", None, Some(2));
+        assert_eq!(
+            hits.iter().map(|hit| hit.duplicates).collect::<Vec<_>>(),
+            [0, 3]
+        );
+
+        let hits = chat_hits(&backend, "kiwifruit", MessageMatch::Exact);
+        assert_eq!(
+            hit_kinds(&hits),
+            [RowKind::User, RowKind::Assistant, RowKind::User]
+        );
+        assert!(hits.iter().all(|hit| hit.duplicates == 0), "{hits:?}");
     }
 
     #[test]

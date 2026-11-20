@@ -190,6 +190,10 @@ pub struct MessageHit {
     pub snippet: String,
     /// Raw `created_at` text from the sessions row.
     pub created_at: String,
+    /// Rows after this one in the search order with the same kind, tool name
+    /// and content. They are not hits of their own. Counted among the rows
+    /// the search read, so a lower bound.
+    pub duplicates: usize,
 }
 
 /// How a message search reads its keyword and orders its hits.
@@ -210,7 +214,7 @@ pub struct MessageQuery {
     pub keyword: String,
     /// When set, only messages in this session are returned.
     pub session_key: Option<String>,
-    /// Maximum number of message hits. Backends choose a default when absent.
+    /// Maximum number of message hits, one per distinct message. Backends choose a default when absent.
     pub limit: Option<usize>,
     /// When set with [`Self::owner_channel_ids`], restrict hits to sessions
     /// owned by this agent alias and/or those channel ids. When both this
@@ -224,6 +228,9 @@ pub struct MessageQuery {
     /// Rows written by these tools (`tool_call` and `tool_result`) are never
     /// returned.
     pub exclude_tools: Vec<String>,
+    /// Only chat rows (`RowKind::is_chat`: `user`, `assistant`, `runtime`)
+    /// are returned; `step`, `tool_call` and `tool_result` rows are left out.
+    pub chat_only: bool,
 }
 
 /// A caller-owned, synchronous authority hold. Storage knows no runtime policy.
@@ -471,7 +478,8 @@ pub trait SessionBackend: Send + Sync {
 
     /// Search individual messages by keyword. Default returns empty
     /// (backends with FTS override). A blank keyword returns empty, never
-    /// every row.
+    /// every row. Rows repeating an earlier hit's kind, tool name and content
+    /// are counted in that hit's `duplicates` instead of being returned.
     fn search_messages(&self, _query: &MessageQuery) -> Vec<MessageHit> {
         Vec::new()
     }
