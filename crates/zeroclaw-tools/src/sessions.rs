@@ -11,7 +11,9 @@ use zeroclaw_config::policy::ToolOperation;
 use zeroclaw_infra::acp_session_store::{
     AcpSessionAccess, AcpSessionData, AcpSessionStore, AcpSessionSummary,
 };
-use zeroclaw_infra::session_backend::{MessageQuery, RowKind, SessionBackend, StoredRow};
+use zeroclaw_infra::session_backend::{
+    MessageMatch, MessageQuery, RowKind, SessionBackend, StoredRow,
+};
 
 static SESSIONS_SEND_DESCRIPTION: OnceLock<String> = OnceLock::new();
 
@@ -501,13 +503,24 @@ impl Tool for SessionSearchTool {
             .map(SessionOwnershipScope::message_owner_filter)
             .unwrap_or((None, Vec::new()));
 
-        let hits = self.backend.search_messages(&MessageQuery {
-            keyword: query.to_string(),
-            session_key,
-            limit: Some(limit),
-            owner_agent_alias,
-            owner_channel_ids,
-        });
+        let search = |mode: MessageMatch| {
+            self.backend.search_messages(&MessageQuery {
+                keyword: query.to_string(),
+                session_key: session_key.clone(),
+                limit: Some(limit),
+                owner_agent_alias: owner_agent_alias.clone(),
+                owner_channel_ids: owner_channel_ids.clone(),
+                mode,
+                // This tool's own calls and results repeat the query and its
+                // hits; they are never hits themselves.
+                exclude_tools: vec![self.name().to_string()],
+            })
+        };
+        let mut hits = search(MessageMatch::Exact);
+        let exact = !hits.is_empty();
+        if !exact && zeroclaw_infra::session_fts::has_window_terms(query) {
+            hits = search(MessageMatch::Approximate);
+        }
         if hits.is_empty() {
             return Ok(ToolResult {
                 success: true,
@@ -516,7 +529,14 @@ impl Tool for SessionSearchTool {
             });
         }
 
-        let mut output = format!("Found {} message(s):\n", hits.len());
+        let mut output = if exact {
+            format!("Found {} message(s):\n", hits.len())
+        } else {
+            format!(
+                "No exact match. {} closest message(s) by shared two-character terms, best first:\n",
+                hits.len()
+            )
+        };
         for hit in &hits {
             let _ = writeln!(
                 output,
@@ -2149,6 +2169,74 @@ mod tests {
         assert!(result.output.contains(
             "message_id=7 session_key=telegram__alice turn=3 kind=tool_result role=tool tool=shell created_at=2026-01-01T00:00:00Z snippet=hello <b>world</b> next"
         ));
+    }
+
+    #[tokio::test]
+    async fn session_search_falls_back_to_the_closest_messages() {
+        use zeroclaw_infra::session_backend::TranscriptRow;
+
+        const ANCHOR: &str = "我们上周六去斯坦利公园散步，顺便讨论了量子纠缠低温实验的预算。";
+        const QUESTION: &str = "我上次是不是说过要去斯坦利公园散步";
+
+        let tmp = TempDir::new().unwrap();
+        let backend = zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path())
+            .expect("sqlite backend");
+        for text in [ANCHOR, "上次的会议改期了", "是不是该出发了", "要去超市买菜"]
+        {
+            backend.append("s", &ChatMessage::user(text)).unwrap();
+        }
+        let row = |kind, role: &str, content: &str, tool: bool| TranscriptRow {
+            kind,
+            role: role.into(),
+            content: content.into(),
+            tool_name: tool.then(|| "session_search".to_string()),
+            tool_call_id: tool.then(|| "call_1".to_string()),
+        };
+        let call = format!("{{\"query\":\"{QUESTION}\"}}");
+        backend
+            .append_turn(
+                "s",
+                &[
+                    row(RowKind::User, "user", "再找一次", false),
+                    row(RowKind::ToolCall, "assistant", &call, true),
+                    row(
+                        RowKind::ToolResult,
+                        "tool",
+                        "No matching messages found.",
+                        true,
+                    ),
+                ],
+            )
+            .unwrap()
+            .unwrap();
+        let tool = SessionSearchTool::new(Arc::new(backend), test_security());
+
+        let result = tool.execute(json!({"query": QUESTION})).await.unwrap();
+        assert!(result.success);
+        assert!(
+            result.output.starts_with(
+                "No exact match. 4 closest message(s) by shared two-character terms, best first:"
+            ),
+            "{}",
+            result.output
+        );
+        let best = result.output.lines().nth(1).unwrap();
+        assert!(best.contains("<b>公园</b><b>散步</b>"), "{best}");
+        assert!(
+            !result.output.contains("tool=session_search"),
+            "{}",
+            result.output
+        );
+
+        let result = tool.execute(json!({"query": "斯坦利公园"})).await.unwrap();
+        assert!(
+            result.output.starts_with("Found 1 message(s):"),
+            "{}",
+            result.output
+        );
+
+        let result = tool.execute(json!({"query": "zzqqxx"})).await.unwrap();
+        assert_eq!(result.output, "No matching messages found.");
     }
 
     #[tokio::test]

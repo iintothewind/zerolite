@@ -1,7 +1,7 @@
 //! SQLite-backed session persistence with FTS5 search.
 
 use crate::session_backend::{
-    AppendedTurn, MessageHit, MessageQuery, RowKind, SessionBackend, SessionContext,
+    AppendedTurn, MessageHit, MessageMatch, MessageQuery, RowKind, SessionBackend, SessionContext,
     SessionMetadata, SessionQuery, SessionState, StoredRow, TranscriptRow, TranscriptTail,
 };
 use crate::session_fts;
@@ -1037,13 +1037,17 @@ fn read_stored_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredRow> {
 }
 
 /// SQL and bindings for `search_messages`; `None` when the keyword has no
-/// terms. Hits are read in descending FTS rowid order (= `sessions.id`), so
-/// SQLite walks the index backwards and stops at the limit instead of
-/// sorting every match.
+/// terms for the query's mode. Exact hits are read in descending FTS rowid
+/// order (= `sessions.id`), so SQLite walks the index backwards and stops at
+/// the limit instead of sorting every match; approximate hits are read in
+/// FTS5 rank order.
 fn search_messages_sql(query: &MessageQuery) -> Option<(String, Vec<rusqlite::types::Value>)> {
     use rusqlite::types::Value;
 
-    let fts_query = session_fts::match_query(&query.keyword);
+    let fts_query = match query.mode {
+        MessageMatch::Exact => session_fts::match_query(&query.keyword),
+        MessageMatch::Approximate => session_fts::approximate_match_query(&query.keyword),
+    };
     if fts_query.is_empty() {
         return None;
     }
@@ -1101,7 +1105,26 @@ fn search_messages_sql(query: &MessageQuery) -> Option<(String, Vec<rusqlite::ty
             }
         }
     }
-    sql.push_str(&format!(" ORDER BY sessions_fts.rowid DESC LIMIT ?{next}"));
+    if !query.exclude_tools.is_empty() {
+        sql.push_str(" AND (s.tool_name IS NULL OR s.tool_name NOT IN (");
+        for (i, tool) in query.exclude_tools.iter().enumerate() {
+            if i > 0 {
+                sql.push(',');
+            }
+            sql.push_str(&format!("?{next}"));
+            bind.push(Value::Text(tool.clone()));
+            next += 1;
+        }
+        sql.push_str("))");
+    }
+    // Exact hits are read newest first, so a common term stops at the limit
+    // instead of sorting every match. Approximate hits are ranked: FTS5
+    // returns them in BM25 order itself.
+    let order = match query.mode {
+        MessageMatch::Exact => "sessions_fts.rowid DESC",
+        MessageMatch::Approximate => "sessions_fts.rank",
+    };
+    sql.push_str(&format!(" ORDER BY {order} LIMIT ?{next}"));
     bind.push(Value::Integer(limit));
     Some((sql, bind))
 }
@@ -1903,6 +1926,11 @@ impl SessionBackend for SqliteSessionBackend {
         let Some((sql, bind)) = search_messages_sql(query) else {
             return Vec::new();
         };
+        // Terms the snippet highlights: the ones the query matched on.
+        let snippet_terms = match query.mode {
+            MessageMatch::Exact => query.keyword.clone(),
+            MessageMatch::Approximate => session_fts::recall_terms(&query.keyword).join(" "),
+        };
         let conn = self.conn.lock();
         let mut stmt = match conn.prepare(&sql) {
             Ok(stmt) => stmt,
@@ -1926,7 +1954,7 @@ impl SessionBackend for SqliteSessionBackend {
                 created_at: row.get(3)?,
                 kind,
                 turn: row.get::<_, Option<i64>>(5)?.unwrap_or(0),
-                snippet: session_fts::snippet(&source, &query.keyword),
+                snippet: session_fts::snippet(&source, &snippet_terms),
                 tool_name,
             })
         }) {
@@ -4132,6 +4160,8 @@ mod tests {
             limit,
             owner_agent_alias: None,
             owner_channel_ids: Vec::new(),
+            mode: MessageMatch::Exact,
+            exclude_tools: Vec::new(),
         })
     }
 
@@ -4150,6 +4180,8 @@ mod tests {
                 .iter()
                 .map(|channel| (*channel).to_string())
                 .collect(),
+            mode: MessageMatch::Exact,
+            exclude_tools: Vec::new(),
         })
     }
 
@@ -4642,27 +4674,131 @@ mod tests {
     fn search_messages_reads_hits_in_rowid_order_without_a_sort() {
         let tmp = TempDir::new().unwrap();
         let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
-        for scoped in [false, true] {
-            let (sql, bind) = search_messages_sql(&crate::session_backend::MessageQuery {
-                keyword: "anything".into(),
-                session_key: None,
-                limit: Some(20),
-                owner_agent_alias: scoped.then(|| "rowan".to_string()),
-                owner_channel_ids: Vec::new(),
-            })
-            .unwrap();
-            let conn = backend.conn.lock();
-            let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
-            let plan: Vec<String> = stmt
-                .query_map(rusqlite::params_from_iter(bind), |row| row.get(3))
-                .unwrap()
-                .map(Result::unwrap)
-                .collect();
-            assert!(
-                plan.iter().all(|step| !step.contains("TEMP B-TREE")),
-                "{plan:?}"
-            );
+        for mode in [MessageMatch::Exact, MessageMatch::Approximate] {
+            for scoped in [false, true] {
+                let (sql, bind) = search_messages_sql(&crate::session_backend::MessageQuery {
+                    keyword: "anything".into(),
+                    session_key: None,
+                    limit: Some(20),
+                    owner_agent_alias: scoped.then(|| "rowan".to_string()),
+                    owner_channel_ids: Vec::new(),
+                    mode,
+                    exclude_tools: vec!["session_search".to_string()],
+                })
+                .unwrap();
+                let conn = backend.conn.lock();
+                let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+                let plan: Vec<String> = stmt
+                    .query_map(rusqlite::params_from_iter(bind), |row| row.get(3))
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .collect();
+                assert!(
+                    plan.iter().all(|step| !step.contains("TEMP B-TREE")),
+                    "{mode:?} {plan:?}"
+                );
+            }
         }
+    }
+
+    const ANCHOR: &str = "我们上周六去斯坦利公园散步，顺便讨论了量子纠缠低温实验的预算。";
+    const QUESTION: &str = "我上次是不是说过要去斯坦利公园散步";
+
+    /// Four user messages, then a turn whose tool rows are an earlier
+    /// `session_search` for `QUESTION`.
+    fn write_search_fixture(backend: &SqliteSessionBackend) {
+        for text in [ANCHOR, "上次的会议改期了", "是不是该出发了", "要去超市买菜"]
+        {
+            backend.append("s", &ChatMessage::user(text)).unwrap();
+        }
+        let call = format!("{{\"query\":\"{QUESTION}\"}}");
+        backend
+            .append_turn(
+                "s",
+                &[
+                    row(RowKind::User, "user", "再找一次", None),
+                    row(
+                        RowKind::ToolCall,
+                        "assistant",
+                        &call,
+                        Some("session_search"),
+                    ),
+                    row(
+                        RowKind::ToolResult,
+                        "tool",
+                        "No matching messages found.",
+                        Some("session_search"),
+                    ),
+                ],
+            )
+            .unwrap()
+            .unwrap();
+    }
+
+    fn hits_with(
+        backend: &SqliteSessionBackend,
+        keyword: &str,
+        mode: MessageMatch,
+        exclude_tools: &[&str],
+    ) -> Vec<MessageHit> {
+        backend.search_messages(&MessageQuery {
+            keyword: keyword.to_string(),
+            session_key: None,
+            limit: Some(20),
+            owner_agent_alias: None,
+            owner_channel_ids: Vec::new(),
+            mode,
+            exclude_tools: exclude_tools
+                .iter()
+                .map(|tool| (*tool).to_string())
+                .collect(),
+        })
+    }
+
+    #[test]
+    fn exact_search_leaves_out_rows_of_excluded_tools() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        write_search_fixture(&backend);
+
+        let hits = hits_with(&backend, QUESTION, MessageMatch::Exact, &[]);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].kind, RowKind::ToolCall);
+        assert_eq!(hits[0].tool_name.as_deref(), Some("session_search"));
+
+        assert!(hits_with(&backend, QUESTION, MessageMatch::Exact, &["session_search"]).is_empty());
+
+        let hits = hits_with(
+            &backend,
+            "斯坦利公园",
+            MessageMatch::Exact,
+            &["session_search"],
+        );
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].kind, RowKind::User);
+    }
+
+    #[test]
+    fn approximate_search_ranks_the_closest_row_first() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        write_search_fixture(&backend);
+
+        let hits = hits_with(
+            &backend,
+            QUESTION,
+            MessageMatch::Approximate,
+            &["session_search"],
+        );
+        assert_eq!(hits.len(), 4, "{hits:?}");
+        assert!(hits.iter().all(|hit| hit.tool_name.is_none()), "{hits:?}");
+        assert_eq!(
+            hits[0].snippet,
+            "我们上周六<b>去斯</b><b>坦利</b><b>公园</b><b>散步</b>，顺便讨论了量子纠缠低温实验的预算。"
+        );
+
+        assert!(hits_with(&backend, "zzqqxx", MessageMatch::Approximate, &[]).is_empty());
+        assert!(hits_with(&backend, "的", MessageMatch::Approximate, &[]).is_empty());
     }
 
     #[test]

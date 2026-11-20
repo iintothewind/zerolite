@@ -192,6 +192,17 @@ pub struct MessageHit {
     pub created_at: String,
 }
 
+/// How a message search reads its keyword and orders its hits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageMatch {
+    /// Each whitespace-separated term as written, any term matching, newest
+    /// first.
+    Exact,
+    /// The keyword's two-character terms (`session_fts::recall_terms`), any
+    /// term matching, best BM25 rank first.
+    Approximate,
+}
+
 /// Keyword query for message-level session search.
 #[derive(Debug, Clone)]
 pub struct MessageQuery {
@@ -208,6 +219,11 @@ pub struct MessageQuery {
     /// Channel refs (`<type>.<alias>`) whose sessions are visible alongside
     /// [`Self::owner_agent_alias`].
     pub owner_channel_ids: Vec<String>,
+    /// How `keyword` is matched and how hits are ordered.
+    pub mode: MessageMatch,
+    /// Rows written by these tools (`tool_call` and `tool_result`) are never
+    /// returned.
+    pub exclude_tools: Vec<String>,
 }
 
 /// A caller-owned, synchronous authority hold. Storage knows no runtime policy.

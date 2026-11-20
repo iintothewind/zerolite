@@ -22,7 +22,7 @@
   two-character tokens (`CI`, `AI`, `db`) stop being searchable. The fork
   already solved this for session search (`session-search.md` R3): keep
   `unicode61` and surround every CJK character with spaces, so each is one
-  token. Memory reuses `zeroclaw_infra::session_fts::{index_text, is_cjk}`
+  token. Memory reuses `zeroclaw_infra::session_fts::{index_text, recall_terms}`
   rather than copying the range table again.
 - **R2 — Index text comes from one SQL function called by the sync
   triggers.** `zerolite_fts_text(text)` returns `index_text(text)` (non-text
@@ -47,7 +47,9 @@
   version number, inside an `IMMEDIATE` transaction. It is idempotent; two
   processes converting at once only repeat the work. Trigger names stay
   `memories_ai/ad/au` so upstream's `IF NOT EXISTS` DDL is a no-op afterwards.
-- **R4 — Query expansion.** `cjk_fts::recall_terms` emits only terms with
+- **R4 — Query expansion.** `zeroclaw_infra::session_fts::recall_terms`
+  (shared with session search's approximate tier, `session-search.md` R4:
+  changing the rule changes both) emits only terms with
   at least two letters, digits or CJK characters (`MIN_TERM_CHARS`); shorter
   ones are dropped. Whitespace words without CJK text, and prefix wildcards
   (`wild*`, `召回*`, `A股*`), are kept verbatim when long enough. A word with
@@ -122,18 +124,20 @@
   the upstream form); changes to `fts5_term_query`, `fts5_search_scoped` or
   the LIKE fallback in `recall_scoped`; `MemoryRecallTool::execute` and the
   head of `render_memory_context` (the R6 gates).
-- **Changing `is_cjk` ranges** changes both indexes' tokenization: rebuild the
-  session index and the memory index (`reindex`) after such a change.
+- **Changing `is_cjk` ranges** (private to `session_fts.rs`) changes both
+  indexes' tokenization: rebuild the session index and the memory index
+  (`reindex`) after such a change.
 - **Code anchors:** `crates/zeroclaw-memory/src/cjk_fts.rs`
   (`register_fts_text_fn`, `index_is_current`, `rebuild_index`,
-  `ensure_index`, `recall_terms`, `is_too_short_recall_query`);
+  `ensure_index`, `is_too_short_recall_query`);
   `crates/zeroclaw-memory/src/sqlite.rs` (`open_and_initialize`,
   `fts5_search_scoped`, `fts5_term_query`, the LIKE fallback and the
   too-short gate in `recall_scoped`, `reindex`);
   `crates/zeroclaw-tools/src/memory_recall.rs` (`execute`);
   `crates/zeroclaw-runtime/src/agent/memory_inject.rs`
-  (`render_memory_context`); `zeroclaw_infra::session_fts::{index_text, is_cjk}`.
-- **Tests that must survive:** `cjk_fts::tests::recall_terms_*`,
+  (`render_memory_context`); `zeroclaw_infra::session_fts::{index_text,
+  recall_terms}`.
+- **Tests that must survive:** `session_fts::tests::recall_terms_*`,
   `too_short_query_excludes_recent_recall_queries`;
   `recall_cjk_substring_matches`, `recall_cjk_natural_sentence_matches`,
   `recall_single_character_query_returns_nothing`,

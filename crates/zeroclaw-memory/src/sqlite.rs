@@ -20,7 +20,7 @@ use uuid::Uuid;
 use zeroclaw_api::memory_traits::PrincipalScope;
 use zeroclaw_api::session_keys::sanitize_session_key;
 use zeroclaw_config::schema::SearchMode;
-use zeroclaw_infra::session_fts::index_text;
+use zeroclaw_infra::session_fts::{index_text, recall_terms};
 
 /// Maximum allowed open timeout (seconds) to avoid unreasonable waits.
 const SQLITE_OPEN_TIMEOUT_CAP_SECS: u64 = 300;
@@ -743,7 +743,7 @@ impl SqliteMemory {
         allowed_agent_ids: Option<&[String]>,
     ) -> anyhow::Result<Vec<(String, f32)>> {
         // Escape FTS5 special chars and build query
-        let fts_query: String = crate::cjk_fts::recall_terms(query)
+        let fts_query: String = recall_terms(query)
             .iter()
             .map(|term| Self::fts5_term_query(term))
             .collect::<Vec<_>>()
@@ -1335,7 +1335,7 @@ impl SqliteMemory {
             // If hybrid returned nothing, fall back to LIKE search.
             if results.is_empty() {
                 const MAX_LIKE_KEYWORDS: usize = 8;
-                let raw_keywords: Vec<String> = crate::cjk_fts::recall_terms(&query)
+                let raw_keywords: Vec<String> = recall_terms(&query)
                     .into_iter()
                     .take(MAX_LIKE_KEYWORDS)
                     .collect();
