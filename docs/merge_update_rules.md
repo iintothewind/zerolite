@@ -1,7 +1,7 @@
 # Upstream merge update rules
 
 The standing workflow for every upstream merge. Details live in
-`zerolite_feature_list.md` and `docs/design/`; this document is the outline
+`docs/feature_list.md` and `docs/design/`; this document is the outline
 the agent must not deviate from.
 
 Kept out of `AGENTS.md` on purpose: it is read only when a merge is actually
@@ -67,7 +67,7 @@ criterion, so a merge with green tests and stale docs is still open.
 
 ## 1. Pre-check
 
-Read `zerolite_feature_list.md` (features, standing merge decisions, pick log) and every design doc in `docs/design/`
+Read `docs/feature_list.md` (features, standing merge decisions, pick log) and every design doc in `docs/design/`
 before touching upstream code. Classify each upstream change:
 
 - (a) no semantics touched → may merge;

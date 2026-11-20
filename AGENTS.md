@@ -14,7 +14,7 @@
 
 ## Where things are
 
-- Fork features and their decisions: `zerolite_feature_list.md` → one design
+- Fork features and their decisions: `docs/feature_list.md` → one design
   doc per feature in `docs/design/`.
 - Upstream merge (rare, long): `docs/merge_update_rules.md`. Read it before
   touching upstream code; do not deviate from it during a merge.
