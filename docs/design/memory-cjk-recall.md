@@ -36,7 +36,11 @@
   is `delete-all` followed by re-inserting `zerolite_fts_text(key/content)`
   (`cjk_fts::rebuild_index`, used by `reindex`). The function is registered
   `DETERMINISTIC | INNOCUOUS`, never `DIRECTONLY`, so triggers can call it
-  under `trusted_schema=OFF`.
+  under `trusted_schema=OFF`. The session index (`session-search.md` R3)
+  is built the other way: its writers call `index_text` in Rust and insert
+  the result, so any connection can write `sessions`. The trigger form is
+  chosen here only because `memories` has many upstream write sites; for a
+  new index whose writes go through fork code, follow the session side.
 - **R3 — Upstream creates, the fork converts.** `init_schema` and the
   upstream v3 migration (`zeroclaw-config` `schema/v2.rs`
   `migrate_sqlite_memory_to_v3`) keep the upstream external-content DDL; the
@@ -99,6 +103,22 @@
   Rollback: drop `memories_ai`, `memories_ad`, `memories_au` and
   `memories_fts`, open the store with the old binary (it recreates the
   upstream shape) and run reindex.
+
+### Not covered
+
+- **Private-plane recall.** `PrincipalPlaneMemory::recall` calls
+  `SqliteMemory::recall_for_principal`, which still matches the whole
+  query with one `LIKE` (no `recall_terms`, no FTS leg): a CJK question
+  or a multi-word English query recalls nothing there, a single word
+  still matches as a substring. Only owned sessions use this plane (an
+  RPC session of an authenticated principal; owned subagent, step and
+  SOP runs), and they read only that principal's private rows. The R6
+  gates in `MemoryRecallTool::execute` and `render_memory_context` apply
+  before the backend is called, on either plane. The production store
+  has no private rows (8 memories, 0 with `principal_id`, 2026-11-20).
+- **Postgres backend** (`memory-postgres` feature): `to_tsvector('simple',
+  …) @@ plainto_tsquery('simple', $1)` keeps a CJK run as one token, the
+  same failure this page fixes for SQLite. The fork deploys SQLite only.
 
 ## Where upstream conflicts
 
