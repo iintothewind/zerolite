@@ -459,7 +459,7 @@ Rule 3: Protect the user.
         assert_eq!(memory_rowid, fts_rowid);
         let found: String = conn
             .query_row(
-                "SELECT key FROM memories_fts WHERE memories_fts MATCH 'agent'",
+                "SELECT m.key FROM memories_fts f JOIN memories m ON m.rowid = f.rowid WHERE memories_fts MATCH 'agent'",
                 [],
                 |row| row.get(0),
             )

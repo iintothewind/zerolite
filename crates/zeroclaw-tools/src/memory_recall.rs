@@ -5,6 +5,9 @@ use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_memory::Memory;
 
+/// Output for a keyword query with no term of two or more characters.
+const TOO_SHORT_QUERY_OUTPUT: &str = "No memories found. A query needs at least one term of two or more letters, digits or CJK characters.";
+
 /// Let the agent search its own memory
 pub struct MemoryRecallTool {
     memory: Arc<dyn Memory>,
@@ -102,6 +105,14 @@ impl Tool for MemoryRecallTool {
             .get("limit")
             .and_then(serde_json::Value::as_u64)
             .map_or(5, |v| v as usize);
+
+        if zeroclaw_memory::is_too_short_recall_query(query) {
+            return Ok(ToolResult {
+                success: true,
+                output: TOO_SHORT_QUERY_OUTPUT.into(),
+                error: None,
+            });
+        }
 
         match self.memory.recall(query, limit, None, since, until).await {
             Ok(entries) if entries.is_empty() => Ok(ToolResult {
@@ -359,6 +370,26 @@ mod tests {
         assert!(result.success);
         assert!(result.output.contains("recent memory"));
         assert_eq!(*last_query.lock().unwrap(), Some("*".into()));
+    }
+
+    #[tokio::test]
+    async fn recall_refuses_a_query_without_a_two_character_term() {
+        let last_query = Arc::new(Mutex::new(None));
+        let mem = Arc::new(QueryEchoMemory {
+            last_query: last_query.clone(),
+        });
+        let tool = MemoryRecallTool::new(mem);
+
+        for query in ["的", "a", "好。"] {
+            let result = tool.execute(json!({"query": query})).await.unwrap();
+            assert!(result.success, "{query:?}");
+            assert!(result.output.contains("No memories found"), "{query:?}");
+            assert!(result.output.contains("two or more"), "{query:?}");
+            assert_eq!(*last_query.lock().unwrap(), None, "{query:?}");
+        }
+
+        tool.execute(json!({"query": "A股"})).await.unwrap();
+        assert_eq!(*last_query.lock().unwrap(), Some("A股".into()));
     }
 
     #[tokio::test]

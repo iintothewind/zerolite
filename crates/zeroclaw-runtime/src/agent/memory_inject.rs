@@ -275,6 +275,12 @@ pub async fn render_memory_context(
     exclude_conversation: bool,
     turn: TurnMeta<'_>,
 ) -> String {
+    // A message with no term of two or more characters ("好", "的", "a")
+    // recalls nothing: skip the backend, and report no recall.
+    if zeroclaw_memory::is_too_short_recall_query(user_msg) {
+        return String::new();
+    }
+
     let backend = mem.name().to_string();
     let query_summary = make_query_summary(user_msg);
 
@@ -911,6 +917,36 @@ mod tests {
 
         assert!(context.is_empty());
         assert_eq!(observer.recalls.lock().as_slice(), &[(0, true)]);
+    }
+
+    #[tokio::test]
+    async fn message_without_a_two_character_term_skips_recall() {
+        let mem = FixtureMemory::with(vec![entry(
+            "pref",
+            "likes tea",
+            MemoryCategory::Core,
+            Some(0.9),
+        )]);
+        let observer = RecordingObserver::default();
+        let turn = || TurnMeta {
+            parent_agent_alias: None,
+            agent_alias: None,
+            turn_id: "t",
+            channel_name: "test",
+        };
+        let cfg = MemoryInjectConfig::default();
+
+        for message in ["好", "的", "a", "好。"] {
+            let context =
+                render_memory_context(&mem, &observer, message, &[], &cfg, false, turn()).await;
+            assert!(context.is_empty(), "{message:?}: {context}");
+        }
+        assert_eq!(mem.recalls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(observer.recalls.lock().is_empty());
+
+        let context = render_memory_context(&mem, &observer, "A股", &[], &cfg, false, turn()).await;
+        assert!(context.contains("likes tea"), "{context}");
+        assert_eq!(mem.recalls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -1615,7 +1651,7 @@ mod tests {
         render_memory_context(
             &mem,
             &RecordingObserver::default(),
-            "q",
+            "query",
             &[],
             &cfg,
             false,
@@ -1640,7 +1676,7 @@ mod tests {
         render_memory_context(
             &mem,
             &RecordingObserver::default(),
-            "q",
+            "query",
             &[],
             &cfg,
             false,

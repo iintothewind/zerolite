@@ -128,7 +128,7 @@ fn fold(ch: char) -> char {
 
 /// The ranges of `zeroclaw-runtime` `history.rs::is_cjk_kana_or_hangul`,
 /// duplicated because infra cannot depend on runtime.
-fn is_cjk(ch: char) -> bool {
+pub fn is_cjk(ch: char) -> bool {
     matches!(
         ch,
         '\u{1100}'..='\u{11FF}' // Hangul Jamo

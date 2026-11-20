@@ -12,6 +12,7 @@ pub mod audit;
 pub mod backend;
 pub mod budget;
 pub mod chunker;
+mod cjk_fts;
 pub mod classify;
 pub mod conflict;
 pub mod consolidation;
@@ -54,6 +55,7 @@ pub use backend::{
     MemoryBackendKind, MemoryBackendProfile, classify_memory_backend, default_memory_backend_key,
     memory_backend_profile, selectable_memory_backends,
 };
+pub use cjk_fts::is_too_short_recall_query;
 #[allow(unused_imports)]
 pub use embeddings::EmbeddingIdentity;
 pub use lucid::LucidMemory;

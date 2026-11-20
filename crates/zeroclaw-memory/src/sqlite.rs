@@ -20,6 +20,7 @@ use uuid::Uuid;
 use zeroclaw_api::memory_traits::PrincipalScope;
 use zeroclaw_api::session_keys::sanitize_session_key;
 use zeroclaw_config::schema::SearchMode;
+use zeroclaw_infra::session_fts::index_text;
 
 /// Maximum allowed open timeout (seconds) to avoid unreasonable waits.
 const SQLITE_OPEN_TIMEOUT_CAP_SECS: u64 = 300;
@@ -107,6 +108,7 @@ impl SqliteMemory {
         }
 
         let conn = Self::open_connection(db_path, open_timeout_secs)?;
+        crate::cjk_fts::register_fts_text_fn(&conn)?;
         conn.execute_batch(
             // foreign_keys is OFF by default in SQLite and is a
             // per-connection PRAGMA, so the multi-agent migration's
@@ -122,6 +124,7 @@ impl SqliteMemory {
         Self::init_schema(&conn)?;
         zeroclaw_config::schema::v2::migrate_sqlite_memory_to_v3(db_path, &conn)?;
         Self::init_schema(&conn)?;
+        crate::cjk_fts::ensure_index(&conn)?;
         Ok(conn)
     }
 
@@ -740,9 +743,9 @@ impl SqliteMemory {
         allowed_agent_ids: Option<&[String]>,
     ) -> anyhow::Result<Vec<(String, f32)>> {
         // Escape FTS5 special chars and build query
-        let fts_query: String = query
-            .split_whitespace()
-            .map(Self::fts5_term_query)
+        let fts_query: String = crate::cjk_fts::recall_terms(query)
+            .iter()
+            .map(|term| Self::fts5_term_query(term))
             .collect::<Vec<_>>()
             .join(" OR ");
 
@@ -813,14 +816,16 @@ impl SqliteMemory {
         Ok(results)
     }
 
+    /// One FTS5 phrase for `term`; CJK characters become one token each, as
+    /// in the index, so ASCII terms produce the same phrase as before.
     fn fts5_term_query(term: &str) -> String {
         if let Some(prefix) = term.strip_suffix('*')
             && !prefix.is_empty()
         {
-            let escaped = prefix.replace('"', "\"\"");
+            let escaped = index_text(&prefix.replace('"', "\"\""));
             format!("\"{escaped}\"*")
         } else {
-            let escaped = term.replace('"', "\"\"");
+            let escaped = index_text(&term.replace('"', "\"\""));
             format!("\"{escaped}\"")
         }
     }
@@ -1084,6 +1089,12 @@ impl SqliteMemory {
                 .collect());
         }
 
+        // No term of two or more characters: no stage may answer, and the
+        // query is not embedded.
+        if crate::cjk_fts::is_too_short_recall_query(query) {
+            return Ok(Vec::new());
+        }
+
         // Compute query embedding only when needed (skip for BM25-only mode)
         let query_embedding = if self.search_mode == SearchMode::Bm25 {
             None
@@ -1324,10 +1335,9 @@ impl SqliteMemory {
             // If hybrid returned nothing, fall back to LIKE search.
             if results.is_empty() {
                 const MAX_LIKE_KEYWORDS: usize = 8;
-                let raw_keywords: Vec<String> = query
-                    .split_whitespace()
+                let raw_keywords: Vec<String> = crate::cjk_fts::recall_terms(&query)
+                    .into_iter()
                     .take(MAX_LIKE_KEYWORDS)
-                    .map(str::to_string)
                     .collect();
                 if !raw_keywords.is_empty() {
                     let needs_prefix_filter = raw_keywords
@@ -1438,6 +1448,28 @@ impl SqliteMemory {
                         results.push(entry);
                         if results.len() >= limit {
                             break;
+                        }
+                    }
+                    // Score each row by its share of matched keywords,
+                    // relative to the best row of this batch.
+                    let matched: Vec<usize> = results
+                        .iter()
+                        .map(|entry| {
+                            raw_keywords
+                                .iter()
+                                .filter(|keyword| {
+                                    Self::like_fallback_matches(&entry.key, keyword)
+                                        || Self::like_fallback_matches(&entry.content, keyword)
+                                })
+                                .count()
+                                .max(1)
+                        })
+                        .collect();
+                    if let Some(&best) = matched.iter().max() {
+                        for (entry, hits) in results.iter_mut().zip(matched) {
+                            #[allow(clippy::cast_precision_loss)]
+                            let score = hits as f64 / best as f64;
+                            entry.score = Some(score);
                         }
                     }
                 }
@@ -2415,7 +2447,12 @@ impl Memory for SqliteMemory {
             let conn = self.conn.clone();
             tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
                 let conn = conn.lock();
-                conn.execute_batch("INSERT INTO memories_fts(memories_fts) VALUES('rebuild');")?;
+                let tx = rusqlite::Transaction::new_unchecked(
+                    &conn,
+                    rusqlite::TransactionBehavior::Immediate,
+                )?;
+                crate::cjk_fts::rebuild_index(&tx)?;
+                tx.commit()?;
                 Ok(())
             })
             .await??;
@@ -4606,6 +4643,231 @@ mod tests {
         // FTS should still work after rebuild
         let results = mem.recall("reindex", 10, None, None, None).await.unwrap();
         assert_eq!(results.len(), 2);
+    }
+
+    // ── CJK recall ───────────────────────────────────────────────
+
+    const ZH_PLAN: &str = "我上周决定用 Rust 重写召回层";
+    const ZH_WEATHER: &str = "今天天气不错，去海边散步";
+    const ZH_BUDGET: &str = "那个方案的预算还没批";
+    const ZH_QUESTION: &str = "你上周说的那个方案怎么样了";
+
+    async fn store_zh(mem: &SqliteMemory, keys: &[&str]) {
+        for key in keys {
+            let content = match *key {
+                "zh_plan" => ZH_PLAN,
+                "zh_weather" => ZH_WEATHER,
+                "zh_budget" => ZH_BUDGET,
+                other => panic!("unknown corpus key {other}"),
+            };
+            mem.store(key, content, MemoryCategory::Core, None)
+                .await
+                .unwrap();
+        }
+    }
+
+    fn fts_hits(mem: &SqliteMemory, query: &str) -> usize {
+        let conn = mem.conn.lock();
+        SqliteMemory::fts5_search(&conn, query, 10).unwrap().len()
+    }
+
+    fn noop_embedding_store(tmp: &TempDir) -> SqliteMemory {
+        SqliteMemory::with_embedder(
+            "test",
+            tmp.path(),
+            Arc::new(super::super::embeddings::NoopEmbedding),
+            0.7,
+            0.3,
+            1000,
+            None,
+            SearchMode::Embedding,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn recall_cjk_substring_matches() {
+        let (_tmp, mem) = temp_sqlite();
+        store_zh(&mem, &["zh_plan", "zh_weather", "zh_budget"]).await;
+        for query in ["召回", "上周"] {
+            assert_eq!(fts_hits(&mem, query), 1, "FTS hits for {query}");
+            let results = mem.recall(query, 10, None, None, None).await.unwrap();
+            let keys: Vec<&str> = results.iter().map(|e| e.key.as_str()).collect();
+            assert_eq!(keys, ["zh_plan"], "recall for {query}");
+        }
+    }
+
+    #[tokio::test]
+    async fn recall_cjk_natural_sentence_matches() {
+        let (_tmp, mem) = temp_sqlite();
+        store_zh(&mem, &["zh_plan", "zh_weather"]).await;
+        let results = mem.recall(ZH_QUESTION, 10, None, None, None).await.unwrap();
+        assert!(results.iter().any(|e| e.key == "zh_plan"));
+        assert!(results.iter().all(|e| e.key != "zh_weather"));
+    }
+
+    #[tokio::test]
+    async fn recall_single_character_query_returns_nothing() {
+        let (_tmp, mem) = temp_sqlite();
+        store_zh(&mem, &["zh_plan", "zh_weather", "zh_budget"]).await;
+        mem.store("en_note", "a quick note", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        for query in ["我", "的", "a", "我 a"] {
+            assert_eq!(fts_hits(&mem, query), 0, "FTS hits for {query}");
+            let results = mem.recall(query, 10, None, None, None).await.unwrap();
+            assert!(results.is_empty(), "recall for {query}: {results:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn recall_single_character_query_is_not_embedded() {
+        let tmp = TempDir::new().unwrap();
+        let embedder = Arc::new(StubEmbedding::new(4, 0.5));
+        let calls = Arc::clone(&embedder.calls);
+        let mem = SqliteMemory::with_embedder(
+            "test",
+            tmp.path(),
+            embedder,
+            0.7,
+            0.3,
+            1000,
+            None,
+            SearchMode::default(),
+        )
+        .unwrap();
+        store_zh(&mem, &["zh_plan"]).await;
+        let before = calls.load(std::sync::atomic::Ordering::SeqCst);
+        let results = mem.recall("我", 10, None, None, None).await.unwrap();
+        assert!(results.is_empty(), "got {results:?}");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), before);
+    }
+
+    #[tokio::test]
+    async fn recall_pairs_a_letter_with_a_cjk_character() {
+        let (_tmp, mem) = temp_sqlite();
+        store_zh(&mem, &["zh_plan", "zh_budget"]).await;
+        mem.store("zh_stock", "用户持有A股和基金", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store(
+            "en_grade",
+            "the exam grade was A",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(fts_hits(&mem, "A股"), 1);
+        let results = mem.recall("A股", 10, None, None, None).await.unwrap();
+        let keys: Vec<&str> = results.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(keys, ["zh_stock"]);
+        let results = mem
+            .recall("A股行情怎么样", 10, None, None, None)
+            .await
+            .unwrap();
+        assert!(
+            results.iter().any(|e| e.key == "zh_stock"),
+            "got {results:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recall_cjk_scores_are_distinguishable() {
+        let (_tmp, mem) = temp_sqlite();
+        store_zh(&mem, &["zh_plan", "zh_weather", "zh_budget"]).await;
+        let results = mem.recall(ZH_QUESTION, 10, None, None, None).await.unwrap();
+        assert!(results.len() >= 2, "got {results:?}");
+        assert_eq!(results[0].key, "zh_budget");
+        assert_eq!(results[0].score, Some(1.0));
+        assert_eq!(results[1].key, "zh_plan");
+        assert!(results[1].score.unwrap() < 1.0);
+    }
+
+    #[tokio::test]
+    async fn like_fallback_scores_follow_matched_keyword_share() {
+        let tmp = TempDir::new().unwrap();
+        let mem = noop_embedding_store(&tmp);
+        mem.store("k1", "alpha beta", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("k2", "alpha only", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let results = mem
+            .recall("alpha beta", 10, None, None, None)
+            .await
+            .unwrap();
+        let score = |key: &str| {
+            results
+                .iter()
+                .find(|e| e.key == key)
+                .and_then(|e| e.score)
+                .unwrap()
+        };
+        assert_eq!(score("k1"), 1.0);
+        assert_eq!(score("k2"), 0.5);
+
+        store_zh(&mem, &["zh_plan"]).await;
+        let results = mem.recall(ZH_QUESTION, 10, None, None, None).await.unwrap();
+        assert!(results.iter().any(|e| e.key == "zh_plan"));
+    }
+
+    #[tokio::test]
+    async fn opening_an_upstream_shaped_store_converts_the_index() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
+        store_zh(&mem, &["zh_plan"]).await;
+        mem.conn
+            .lock()
+            .execute_batch(
+                "DROP TRIGGER memories_ai;
+                 DROP TRIGGER memories_ad;
+                 DROP TRIGGER memories_au;
+                 DROP TABLE memories_fts;
+                 CREATE VIRTUAL TABLE memories_fts USING fts5(
+                     key, content, content=memories, content_rowid=rowid
+                 );
+                 INSERT INTO memories_fts(memories_fts) VALUES('rebuild');
+                 CREATE TRIGGER memories_ai AFTER INSERT ON memories BEGIN
+                     INSERT INTO memories_fts(rowid, key, content)
+                     VALUES (new.rowid, new.key, new.content);
+                 END;
+                 CREATE TRIGGER memories_ad AFTER DELETE ON memories BEGIN
+                     INSERT INTO memories_fts(memories_fts, rowid, key, content)
+                     VALUES ('delete', old.rowid, old.key, old.content);
+                 END;
+                 CREATE TRIGGER memories_au AFTER UPDATE ON memories BEGIN
+                     INSERT INTO memories_fts(memories_fts, rowid, key, content)
+                     VALUES ('delete', old.rowid, old.key, old.content);
+                     INSERT INTO memories_fts(rowid, key, content)
+                     VALUES (new.rowid, new.key, new.content);
+                 END;",
+            )
+            .unwrap();
+        assert_eq!(fts_hits(&mem, "召回"), 0);
+        drop(mem);
+
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
+        assert_eq!(fts_hits(&mem, "召回"), 1);
+        assert!(crate::cjk_fts::index_is_current(&mem.conn.lock()).unwrap());
+        assert!(mem.forget("zh_plan").await.unwrap());
+        assert_eq!(fts_hits(&mem, "召回"), 0);
+    }
+
+    #[test]
+    fn a_new_store_is_recognized_as_current() {
+        let (_tmp, mem) = temp_sqlite();
+        assert!(crate::cjk_fts::index_is_current(&mem.conn.lock()).unwrap());
+    }
+
+    #[tokio::test]
+    async fn reindex_keeps_cjk_substrings_searchable() {
+        let (_tmp, mem) = temp_sqlite();
+        store_zh(&mem, &["zh_plan"]).await;
+        assert_eq!(mem.reindex().await.unwrap(), 0);
+        assert_eq!(fts_hits(&mem, "召回"), 1);
     }
 
     // ── Embedding identity primitives──────────────
