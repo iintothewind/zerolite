@@ -740,8 +740,12 @@ pub struct ModelProviderRuntimeOptions {
     /// `/v1/responses` API instead of chat_completions.  `None` uses the
     /// provider's built-in default (chat_completions for most providers).
     pub wire_api: Option<String>,
-    /// Enable or disable chain-of-thought thinking. Forwarded as
-    /// `enable_thinking` in the request body. `None` lets the model decide.
+    /// Enable or disable chain-of-thought thinking. `None` lets the model
+    /// decide. On `custom` aliases it is sent as
+    /// `chat_template_kwargs.enable_thinking`; on DeepSeek endpoints as
+    /// `thinking.type`, and when unset there `[runtime] reasoning_enabled`
+    /// decides; the Ollama provider sends it as `think`. Other compatible
+    /// families do not send it.
     pub think: Option<bool>,
     /// Override the provider's vision (image input) capability. `None` keeps
     /// the provider family's built-in default; `Some(false)` marks a text-only
@@ -6378,7 +6382,8 @@ fn context_catalog_request(
 }
 
 /// Read a per-model context window from a family's OpenAI-compatible
-/// `GET {base}/models` catalog.
+/// `GET {base}/models` catalog: `context_length`, else the sibling
+/// `context_window` spelling, else LiteLLM's `max_input_tokens`.
 ///
 /// Answers `None` immediately — before resolving a URL or touching the
 /// network — for any family that has not declared a catalog auth policy in
@@ -6421,6 +6426,7 @@ async fn fetch_openai_compatible_context_window(
     model_entry
         .get("context_length")
         .or_else(|| model_entry.get("context_window"))
+        .or_else(|| model_entry.get("max_input_tokens"))
         .and_then(|v| v.as_u64())
         .map(|v| v as usize)
 }
@@ -6447,6 +6453,7 @@ mod context_window_discovery_tests {
                 {"id": "other/model-a", "object": "model", "context_length": 8_192},
                 {"id": "target/model", "object": "model", "context_length": 131_072},
                 {"id": "spelled/context-window", "object": "model", "context_window": 65_536},
+                {"id": "litellm/alias", "object": "model", "mode": "chat", "max_input_tokens": 262_144},
                 {"id": "windowless/model", "object": "model"},
             ]
         })
@@ -6592,6 +6599,23 @@ mod context_window_discovery_tests {
             seen,
             vec![("/models".to_string(), "Bearer sk-live-key".to_string())]
         );
+        server.abort();
+    }
+
+    /// A `custom` alias pointed at a LiteLLM proxy reads `max_input_tokens`,
+    /// and with no key configured the probe carries no Authorization header.
+    #[tokio::test]
+    async fn custom_reads_litellm_max_input_tokens() {
+        let capture: Capture = Arc::new(Mutex::new(Vec::new()));
+        let (base_url, server) = serve_catalog(Arc::clone(&capture)).await;
+
+        assert_eq!(
+            fetch_context_window("custom", &alias_config(&base_url, "litellm/alias", None)).await,
+            Some(262_144),
+            "LiteLLM publishes the window as `max_input_tokens`"
+        );
+        let seen = capture.lock().expect("capture lock poisoned").clone();
+        assert_eq!(seen, vec![("/models".to_string(), "<none>".to_string())]);
         server.abort();
     }
 

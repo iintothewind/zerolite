@@ -38,6 +38,8 @@
 | 14 | Chat-completions `finish_reason` `insufficient_system_resource` / `aborted` is a provider error, not a finished reply; partial tool calls are dropped | `INTERRUPTED_FINISH_REASONS`; tests `interrupted_finish_reasons_end_the_stream_with_an_error`, `interrupted_finish_reason_fails_a_non_streaming_reply` |
 | 15 | DeepSeek context window is discovered from `GET /models` (`context_window`); no built-in table entry | `SERVES_MODEL_CONTEXT_CATALOG` on `DeepseekModelProviderConfig` |
 | 16 | `web_search` route `deepseek` (DeepSeek Search API, `[web_search] deepseek_api_key`) | `crates/zeroclaw-tools/src/web_search_tool.rs` `search_deepseek` |
+| 17 | `custom` aliases send their own `think` as `chat_template_kwargs.enable_thinking` (chat-template backends behind LiteLLM ignore a top-level `enable_thinking`); an operator `chat_template_kwargs.enable_thinking` wins; `[runtime] reasoning_enabled` is not mapped; skipped under `thinking_passthrough` | `OpenAiCompatibleBuilder::chat_template_thinking`; test `custom_think_reaches_chat_template_kwargs` |
+| 18 | `custom` aliases probe `GET {uri}/models` for a context window; LiteLLM's `max_input_tokens` is read after `context_length` and `context_window` | `MODEL_CONTEXT_CATALOG_AUTH` on `CustomModelProviderConfig`; tests `custom_reads_litellm_max_input_tokens`, `custom_probes_with_the_same_auth_its_request_path_uses` |
 
 ## Merge notes
 
@@ -63,6 +65,25 @@
   assistant message without `reasoning_content` is HTTP 400 in thinking
   mode unless DeepSeek produced the call in thinking mode, and
   `reasoning_content: ""` is accepted.
+- **Qwen open-weight (rows 17–18):** probed live on 2026-11-20 through
+  a LiteLLM proxy (aliases on Strata 0.1.62 with qwen3.8-flash, vLLM
+  0.29.0 with Qwen3.5-9B, hosted Qwen3.8-27B with the official template).
+  A top-level `enable_thinking: false` is ignored on every alias;
+  `chat_template_kwargs: {"enable_thinking": false}` turns thinking off,
+  and LiteLLM forwards `chat_template_kwargs` unchanged.
+  `chat_template_kwargs.preserve_thinking` and `.reasoning_effort` also
+  reach the template. The official Qwen3.8 template answers HTTP 400 for
+  any effort other than `low|medium|xhigh`, top-level or inside the
+  kwargs, so operators set `chat_template_kwargs.reasoning_effort` per
+  alias and do not enable `reasoning_effort_passthrough` with a global
+  `high`. Qwen3.6 defaults `preserve_thinking` off and Qwen3.8 defaults it
+  on; set it per alias in `chat_template_kwargs`. History reasoning
+  replayed as `reasoning_content` is accepted on all aliases (LiteLLM
+  renames vLLM's `reasoning` to `reasoning_content` in responses);
+  reasoning replay, streaming, usage and parallel tool calls need no
+  shim. LiteLLM `GET /v1/models` publishes the window only as
+  `max_input_tokens`. No Qwen detection by model name and no Qwen family
+  shim: the toggle keys off the `custom` family and the alias's `think`.
 - **Code anchors:** `crates/zeroclaw-providers/src/`,
   `crates/zeroclaw-runtime/src/agent/turn/` (seam sanitizers, media).
 

@@ -78,7 +78,8 @@ pub(crate) trait FamilyProviderFactory {
     ///
     /// The default is `None`: a family is probed only when it has been
     /// verified to serve `GET {base}/models` returning `data[].id` with a
-    /// per-model `context_length` (or the sibling `context_window` spelling).
+    /// per-model `context_length` (or the sibling `context_window` spelling,
+    /// or LiteLLM's `max_input_tokens`).
     /// Speaking the OpenAI-compatible *chat* wire is not that proof — a family
     /// can be chat-compatible and publish its catalog at another path, in
     /// another shape, or not at all. Opting in without that evidence buys a
@@ -131,8 +132,8 @@ pub(crate) trait CompatFamilySpec {
 
     /// Whether this family is verified to serve `GET {DEFAULT_URL}/models`
     /// returning `data[].id` with a per-model `context_length` (or the
-    /// sibling `context_window` spelling), so context-window discovery can
-    /// read it.
+    /// sibling `context_window` spelling, or LiteLLM's `max_input_tokens`),
+    /// so context-window discovery can read it.
     ///
     /// Default `false`. Being an OpenAI-compatible *chat* family is not
     /// evidence for this: `CompatFamilySpec` proves the chat wire, not the
@@ -1970,6 +1971,17 @@ impl FamilyProviderFactory for OvhModelProviderConfig {
 impl FamilyProviderFactory for CustomModelProviderConfig {
     const ENDPOINT: ProviderEndpoint = ProviderEndpoint::OperatorRequired;
 
+    /// The custom family builds its provider by hand, so it declares the
+    /// catalog policy directly. `create_provider` below authenticates with
+    /// [`AuthStyle::Bearer`], and the endpoint is
+    /// [`ProviderEndpoint::OperatorRequired`], so a probe always targets the
+    /// operator's own `uri`. Verified 2026-11-20: a LiteLLM proxy answers
+    /// `GET {uri}/models` with `data[].id` and `max_input_tokens`. A custom
+    /// endpoint without such a catalog answers `None`, never a fabricated
+    /// default. `custom_probes_with_the_same_auth_its_request_path_uses`
+    /// fails if the auth here and in `create_provider` diverge.
+    const MODEL_CONTEXT_CATALOG_AUTH: Option<AuthStyle> = Some(AuthStyle::Bearer);
+
     fn create_provider(
         &self,
         alias: &str,
@@ -2009,7 +2021,10 @@ impl FamilyProviderFactory for CustomModelProviderConfig {
             .base_url(base_url)
             .credential(key)
             .auth_style(AuthStyle::Bearer)
-            .vision(true);
+            .vision(true)
+            // The alias's own `think` only: `[runtime] reasoning_enabled` is global and
+            // would reach non-template backends behind the same proxy.
+            .chat_template_thinking(opts.think);
         if opts.native_tools != Some(true) {
             b = b.without_native_tools();
         }
@@ -2093,6 +2108,192 @@ mod tests {
             &ModelProviderRuntimeOptions::default(),
         );
         assert!(!default_provider.capabilities().prompt_caching);
+    }
+
+    /// A `custom` alias's own `think` reaches chat-template backends as
+    /// `chat_template_kwargs.enable_thinking` on both the chat and the stream
+    /// path; operator kwargs win, the global `reasoning_enabled` is not mapped,
+    /// passthrough skips it, and other families never send it.
+    #[tokio::test]
+    async fn custom_think_reaches_chat_template_kwargs() {
+        use crate::traits::{ChatMessage, ChatRequest, StreamOptions};
+        use axum::response::IntoResponse;
+        use axum::{Json, Router, routing::post};
+        use futures_util::StreamExt as _;
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+        use zeroclaw_config::schema::{CustomModelProviderConfig, VllmModelProviderConfig};
+
+        #[derive(Clone, Copy)]
+        enum Family {
+            Custom,
+            Vllm,
+        }
+
+        async fn request(
+            family: Family,
+            opts: &ModelProviderRuntimeOptions,
+            stream: bool,
+        ) -> serde_json::Value {
+            let captured: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+            let captured_for_route = Arc::clone(&captured);
+            let app = Router::new().route(
+                "/chat/completions",
+                post(move |Json(body): Json<serde_json::Value>| {
+                    let captured = Arc::clone(&captured_for_route);
+                    async move {
+                        let streamed = body["stream"] == serde_json::Value::Bool(true);
+                        captured.lock().unwrap().push(body);
+                        if streamed {
+                            (
+                                [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n\
+                                 data: [DONE]\n\n",
+                            )
+                                .into_response()
+                        } else {
+                            Json(serde_json::json!({
+                                "choices": [{"message": {"content": "ok"}}]
+                            }))
+                            .into_response()
+                        }
+                    }
+                }),
+            );
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = format!("http://{}", listener.local_addr().unwrap());
+            let server = ::zeroclaw_spawn::spawn!(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let base = ModelProviderConfig {
+                uri: Some(addr.clone()),
+                ..Default::default()
+            };
+            let provider = match family {
+                Family::Custom => CustomModelProviderConfig { base }.create_provider(
+                    "lite",
+                    None,
+                    Some(&addr),
+                    opts,
+                ),
+                Family::Vllm => VllmModelProviderConfig { base }.create_provider(
+                    "lite",
+                    None,
+                    Some(&addr),
+                    opts,
+                ),
+            }
+            .expect("provider builds");
+            let messages = [ChatMessage::user("hi")];
+            let chat_request = ChatRequest {
+                messages: &messages,
+                tools: None,
+                thinking: None,
+            };
+            if stream {
+                let mut events = provider.stream_chat(
+                    chat_request,
+                    "spark-strata",
+                    None,
+                    StreamOptions::new(true),
+                );
+                while events.next().await.is_some() {}
+            } else {
+                provider
+                    .chat(chat_request, "spark-strata", None)
+                    .await
+                    .unwrap_or_else(|error| panic!("chat request failed: {error}"));
+            }
+            server.abort();
+            let requests = captured.lock().unwrap();
+            requests[0].clone()
+        }
+
+        let off = ModelProviderRuntimeOptions {
+            think: Some(false),
+            ..ModelProviderRuntimeOptions::default()
+        };
+        assert_eq!(
+            request(Family::Custom, &off, false).await["chat_template_kwargs"],
+            serde_json::json!({"enable_thinking": false})
+        );
+        assert_eq!(
+            request(Family::Custom, &off, true).await["chat_template_kwargs"],
+            serde_json::json!({"enable_thinking": false}),
+            "the stream path builds its body separately and must carry the toggle too"
+        );
+
+        let merged = request(
+            Family::Custom,
+            &ModelProviderRuntimeOptions {
+                think: Some(true),
+                chat_template_kwargs: Some(
+                    serde_json::json!({"preserve_thinking": true, "reasoning_effort": "low"}),
+                ),
+                ..ModelProviderRuntimeOptions::default()
+            },
+            false,
+        )
+        .await;
+        assert_eq!(
+            merged["chat_template_kwargs"],
+            serde_json::json!({
+                "preserve_thinking": true,
+                "reasoning_effort": "low",
+                "enable_thinking": true
+            })
+        );
+
+        let operator_wins = request(
+            Family::Custom,
+            &ModelProviderRuntimeOptions {
+                think: Some(false),
+                chat_template_kwargs: Some(serde_json::json!({"enable_thinking": true})),
+                ..ModelProviderRuntimeOptions::default()
+            },
+            false,
+        )
+        .await;
+        assert_eq!(
+            operator_wins["chat_template_kwargs"]["enable_thinking"],
+            serde_json::Value::Bool(true),
+            "an operator chat_template_kwargs.enable_thinking wins"
+        );
+
+        let global_only = request(
+            Family::Custom,
+            &ModelProviderRuntimeOptions {
+                reasoning_enabled: Some(false),
+                ..ModelProviderRuntimeOptions::default()
+            },
+            false,
+        )
+        .await;
+        assert!(
+            global_only.get("chat_template_kwargs").is_none(),
+            "[runtime] reasoning_enabled is not mapped: {global_only}"
+        );
+
+        let passthrough = request(
+            Family::Custom,
+            &ModelProviderRuntimeOptions {
+                think: Some(false),
+                thinking_passthrough: true,
+                ..ModelProviderRuntimeOptions::default()
+            },
+            false,
+        )
+        .await;
+        assert!(
+            passthrough.get("chat_template_kwargs").is_none(),
+            "thinking passthrough skips the chat-template toggle: {passthrough}"
+        );
+
+        let vllm = request(Family::Vllm, &off, false).await;
+        assert!(
+            vllm.get("chat_template_kwargs").is_none(),
+            "the toggle is gated to the custom family: {vllm}"
+        );
     }
 
     /// D2a: `cache_ttl` must survive the factory boundary on both builders.
@@ -3536,7 +3737,7 @@ mod tests {
     /// the bar is evidence that `GET {base}/models` really returns
     /// `data[].id` with a per-model `context_length`, not that the family
     /// speaks the OpenAI-compatible chat wire.
-    const PROBEABLE_FAMILIES: [&str; 10] = [
+    const PROBEABLE_FAMILIES: [&str; 11] = [
         "together",
         "groq",
         "fireworks",
@@ -3547,6 +3748,7 @@ mod tests {
         "nebius",
         "crusoe",
         "deepseek",
+        "custom",
     ];
 
     /// The families the hand-written probe list in `fetch_context_window` used
@@ -3637,6 +3839,11 @@ mod tests {
             if family_model_context_catalog_auth(family).is_none() {
                 continue;
             }
+            // An operator-required family cannot be built without the operator's
+            // `uri`, so discovery always has a URL to probe.
+            if endpoint_for_family(family) == Some(ProviderEndpoint::OperatorRequired) {
+                continue;
+            }
             assert!(
                 endpoint_for_family(family)
                     .and_then(ProviderEndpoint::fixed_url)
@@ -3695,6 +3902,19 @@ mod tests {
                 Some(AuthStyle::Bearer)
             ),
             "groq's create_provider authenticates with Bearer; discovery must say the same"
+        );
+    }
+
+    /// Custom declares its catalog policy by hand because it builds its
+    /// provider by hand. Pin the two together like Groq.
+    #[test]
+    fn custom_probes_with_the_same_auth_its_request_path_uses() {
+        assert!(
+            matches!(
+                family_model_context_catalog_auth("custom"),
+                Some(AuthStyle::Bearer)
+            ),
+            "custom's create_provider authenticates with Bearer; discovery must say the same"
         );
     }
 

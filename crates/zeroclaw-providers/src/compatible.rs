@@ -563,6 +563,8 @@ pub struct OpenAiCompatibleBuilder {
     thinking_passthrough: bool,
     /// Set by [`OpenAiCompatibleBuilder::thinking_enabled`]. Default `None`.
     thinking_enabled: Option<bool>,
+    /// Set by [`OpenAiCompatibleBuilder::chat_template_thinking`]. Default `None`.
+    chat_template_thinking: Option<bool>,
     api_path: Option<String>,
     max_tokens: Option<u32>,
     models_dev_key: Option<String>,
@@ -762,6 +764,15 @@ impl OpenAiCompatibleBuilder {
         self
     }
 
+    /// Thinking on/off for chat-template backends (vLLM, SGLang, llama.cpp, Strata, and
+    /// LiteLLM in front of them), sent as `chat_template_kwargs.enable_thinking`. These
+    /// servers ignore a top-level `enable_thinking`. Set only by the `custom` family from
+    /// the alias's own `think`; an operator `chat_template_kwargs.enable_thinking` wins.
+    pub fn chat_template_thinking(mut self, enabled: Option<bool>) -> Self {
+        self.chat_template_thinking = enabled;
+        self
+    }
+
     /// Set a custom API path suffix for this model_provider.
     pub fn api_path(mut self, api_path: Option<String>) -> Self {
         self.api_path = api_path;
@@ -885,6 +896,12 @@ impl OpenAiCompatibleBuilder {
             }
             _ => self.extra_body,
         };
+        let extra_body = match self.chat_template_thinking {
+            Some(enabled) if !self.thinking_passthrough => {
+                chat_template_thinking_extra_body(enabled, extra_body)
+            }
+            _ => extra_body,
+        };
         OpenAiCompatibleModelProvider {
             alias: self.alias,
             name,
@@ -945,6 +962,30 @@ fn deepseek_thinking_extra_body(
     }
 }
 
+/// `chat_template_kwargs.enable_thinking` merged under the configured extras: an explicit
+/// operator `chat_template_kwargs.enable_thinking` wins, other kwargs are kept.
+fn chat_template_thinking_extra_body(
+    enabled: bool,
+    configured: Option<serde_json::Value>,
+) -> Option<serde_json::Value> {
+    let mut body = match configured {
+        Some(serde_json::Value::Object(body)) => body,
+        // A non-object `extra_body` cannot be key-merged; the explicit value wins.
+        Some(other) => return Some(other),
+        None => serde_json::Map::new(),
+    };
+    // A non-object `chat_template_kwargs` cannot be key-merged; it is left as is and wins.
+    if let serde_json::Value::Object(kwargs) = body
+        .entry("chat_template_kwargs")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+    {
+        kwargs
+            .entry("enable_thinking")
+            .or_insert(serde_json::Value::Bool(enabled));
+    }
+    Some(serde_json::Value::Object(body))
+}
+
 impl OpenAiCompatibleModelProvider {
     /// Entry point for constructing an OpenAI-compatible provider.
     ///
@@ -977,6 +1018,7 @@ impl OpenAiCompatibleModelProvider {
             cache_ttl: None,
             thinking_passthrough: false,
             thinking_enabled: None,
+            chat_template_thinking: None,
             api_path: None,
             max_tokens: None,
             models_dev_key: None,

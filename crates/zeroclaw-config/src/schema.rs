@@ -1157,10 +1157,12 @@ pub struct ModelProviderConfig {
     pub native_tools: Option<bool>,
     /// Enable or disable chain-of-thought thinking for models that support it
     /// (e.g. Qwen3, GLM-4). `true` turns thinking on, `false` turns it off.
-    /// `None` (default) lets the model decide. Forwarded as `enable_thinking`
-    /// in the request body; mirrors the Ollama provider's `think` field.
-    /// On DeepSeek endpoints it is sent as `thinking: {"type": "enabled" | "disabled"}`;
-    /// when unset there, `[runtime] reasoning_enabled` decides.
+    /// `None` (default) lets the model decide. On `custom` aliases it is sent
+    /// as `chat_template_kwargs.enable_thinking` (an explicit
+    /// `chat_template_kwargs.enable_thinking` wins). On DeepSeek endpoints it is
+    /// sent as `thinking: {"type": "enabled" | "disabled"}`; when unset there,
+    /// `[runtime] reasoning_enabled` decides. The Ollama provider sends it as
+    /// `think`. Other OpenAI-compatible families do not send it.
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub think: Option<bool>,
