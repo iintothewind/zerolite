@@ -70,7 +70,11 @@
   written, so the approximate tier never reached the conversation. The
   parameter is part of the tool schema: a session open across the upgrade
   re-prefills its prompt prefix once. A chat message that quotes the query
-  still matches as written; the parameter does not change that.
+  still matches as written; the parameter does not change that. A value
+  that is not a JSON boolean (`"True"`, `1`) is an `Invalid
+  'ignore_tool_calls'` error, not false: on the device a model sent the
+  string `"True"` on every call, and reading it as false returned tool rows
+  with no sign that the parameter was ignored.
 - **R7 — One hit per distinct message.** Rows with the same kind, tool
   name and content are one hit: the first in search order (newest in the
   exact tier, best ranked in the approximate tier) is returned with
@@ -126,7 +130,8 @@
   `authorized_append_is_classified_and_searchable_like_append_turn`,
   `authorized_delete_leaves_no_search_hit`), the tool tests
   `session_search_falls_back_to_the_closest_messages`,
-  `session_search_ignore_tool_calls_searches_chat_rows_only` and
+  `session_search_ignore_tool_calls_searches_chat_rows_only`,
+  `session_search_rejects_a_non_boolean_ignore_tool_calls` and
   `session_search_folds_identical_messages`, and the principal test
   `session_search_is_withheld_from_non_admin_principals` are fork
   tests; they must survive the merge. If upstream rewrote `sessions.rs` or

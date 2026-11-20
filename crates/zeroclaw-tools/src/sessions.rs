@@ -500,10 +500,17 @@ impl Tool for SessionSearchTool {
             .get("limit")
             .and_then(serde_json::Value::as_u64)
             .map_or(20, |value| value as usize);
-        let ignore_tool_calls = args
-            .get("ignore_tool_calls")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
+        // A non-boolean is refused, not read as false: a model that sends
+        // "True" would otherwise get tool rows back without being told.
+        let ignore_tool_calls = match args.get("ignore_tool_calls") {
+            None | Some(serde_json::Value::Null) => false,
+            Some(serde_json::Value::Bool(value)) => *value,
+            Some(_) => {
+                return Ok(parameter_error(
+                    "Invalid 'ignore_tool_calls': must be a boolean (true or false), not a string or number.",
+                ));
+            }
+        };
 
         let (owner_agent_alias, owner_channel_ids) = self
             .ownership_scope
@@ -2152,6 +2159,25 @@ mod tests {
         let result = tool.execute(json!({"query": "   "})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap().contains("query"));
+    }
+
+    #[tokio::test]
+    async fn session_search_rejects_a_non_boolean_ignore_tool_calls() {
+        let tool = SessionSearchTool::new(Arc::new(AnchorBackend::empty()), test_security());
+        for value in [json!("True"), json!("true"), json!(1)] {
+            let result = tool
+                .execute(json!({"query": "budget", "ignore_tool_calls": value}))
+                .await
+                .unwrap();
+            assert!(!result.success, "{value}");
+            assert!(
+                result
+                    .error
+                    .unwrap()
+                    .contains("'ignore_tool_calls': must be a boolean"),
+                "{value}"
+            );
+        }
     }
 
     #[tokio::test]
