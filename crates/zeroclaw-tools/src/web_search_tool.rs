@@ -128,6 +128,15 @@ const SERPLY_USER_AGENT: &str = "ZeroClaw/1.0 (https://zeroclaw.ai)";
 /// allocation in a long-lived runtime.
 const SERPLY_RESPONSE_LIMIT_BYTES: usize = 1024 * 1024;
 
+/// DeepSeek Search API endpoint (`POST`, bearer auth, JSON body).
+const DEEPSEEK_SEARCH_URL: &str = "https://api.deepseek.com/v1/tools/search";
+/// DeepSeek rejects queries longer than this many Unicode characters (HTTP 400).
+const DEEPSEEK_MAX_QUERY_CHARS: usize = 128;
+/// Hard cap on the bytes buffered from a DeepSeek Search success response.
+const DEEPSEEK_RESPONSE_LIMIT_BYTES: usize = 1024 * 1024;
+/// Stable code for a `config.toml` parse failure while resolving the key.
+const DEEPSEEK_CONFIG_PARSE_ERROR_CODE: &str = "web_search.deepseek.config_parse_error";
+
 /// Non-disclosing description of a `config.toml` parse failure.
 ///
 /// `toml::de::Error` renders an annotated snippet through `Display`, and that
@@ -1115,6 +1124,207 @@ impl WebSearchTool {
         }
 
         Ok(render_results(results_header(query, "Bocha"), blocks))
+    }
+
+    fn resolve_deepseek_api_key(&self) -> anyhow::Result<String> {
+        let contents = std::fs::read_to_string(&self.config_path).map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": self.config_path.display().to_string(),
+                        "search_provider": "deepseek",
+                        "error": format!("{}", e),
+                    })),
+                "web_search: failed to read config for DeepSeek Search API key"
+            );
+            anyhow::Error::msg(format!(
+                "Failed to read config file {} for DeepSeek Search API key: {e}",
+                self.config_path.display()
+            ))
+        })?;
+
+        // Deliberately not `format!("{e}")`: the parser's message quotes the
+        // offending source line, which for a malformed `deepseek_api_key` line
+        // is the credential itself.
+        let config: zeroclaw_config::schema::Config = toml::from_str(&contents).map_err(|e| {
+            let line = toml_error_line(&contents, &e);
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": self.config_path.display().to_string(),
+                        "search_provider": "deepseek",
+                        "error_code": DEEPSEEK_CONFIG_PARSE_ERROR_CODE,
+                        "line": line,
+                    })),
+                "web_search: failed to parse config for DeepSeek Search API key"
+            );
+            let location = line.map(|n| format!(", line={n}")).unwrap_or_default();
+            anyhow::Error::msg(format!(
+                "Failed to parse config file {} for DeepSeek Search API key \
+                 (error_code={DEEPSEEK_CONFIG_PARSE_ERROR_CODE}{location}). \
+                 Fix the TOML syntax; the parser message is withheld because \
+                 it can quote the offending line.",
+                self.config_path.display()
+            ))
+        })?;
+
+        let raw_key = config
+            .web_search
+            .deepseek_api_key
+            .filter(|k| !k.is_empty())
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"search_provider": "deepseek"})),
+                    "web_search: DeepSeek Search API key not configured"
+                );
+                anyhow::Error::msg(
+                    "DeepSeek Search API key not configured. Set [web_search] deepseek_api_key \
+                     in config.toml. Obtain one at https://platform.deepseek.com/api_keys",
+                )
+            })?;
+
+        if zeroclaw_config::secrets::SecretStore::is_encrypted(&raw_key) {
+            let zeroclaw_dir = self.config_path.parent().unwrap_or_else(|| Path::new("."));
+            let store =
+                zeroclaw_config::secrets::SecretStore::new(zeroclaw_dir, self.secrets_encrypt);
+            let plaintext = store.decrypt(&raw_key)?;
+            if plaintext.is_empty() {
+                anyhow::bail!("DeepSeek Search API key not configured (decrypted value is empty)");
+            }
+            Ok(plaintext)
+        } else {
+            Ok(raw_key)
+        }
+    }
+
+    async fn search_deepseek(&self, query: &str) -> anyhow::Result<String> {
+        let builder = reqwest::Client::builder().timeout(Duration::from_secs(self.timeout_secs));
+        let builder =
+            zeroclaw_config::schema::apply_runtime_proxy_to_builder(builder, "tool.web_search");
+        let client = builder.build()?;
+        self.search_deepseek_with_client(&client, DEEPSEEK_SEARCH_URL, query)
+            .await
+    }
+
+    async fn search_deepseek_with_client(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+        query: &str,
+    ) -> anyhow::Result<String> {
+        // Rejected up front rather than truncated: cutting the query could
+        // drop operators such as `site:` and silently change the search.
+        if query.chars().count() > DEEPSEEK_MAX_QUERY_CHARS {
+            anyhow::bail!(
+                "DeepSeek search queries are limited to {DEEPSEEK_MAX_QUERY_CHARS} characters; \
+                 shorten the query and search again"
+            );
+        }
+        let api_key = self.resolve_deepseek_api_key()?;
+
+        let response = client
+            .post(url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .bearer_auth(&api_key)
+            .json(&serde_json::json!({"query": query, "count": self.max_results}))
+            .send()
+            .await
+            .map_err(|err| transport_search_failure("deepseek", "request", &err))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            return Err(http_search_failure("deepseek", status));
+        }
+
+        // Bounded read before decoding, as for Serply: the render caps bound
+        // only the parsed projection, not what the client buffers.
+        let body = response_body::read_bounded(response, Some(DEEPSEEK_RESPONSE_LIMIT_BYTES))
+            .await
+            .map_err(|err| match err.downcast_ref::<reqwest::Error>() {
+                Some(err) => transport_search_failure("deepseek", "response", err),
+                None => bounded_body_search_failure("deepseek", "body"),
+            })?;
+        if body.overflowed {
+            return Err(bounded_body_search_failure("deepseek", "oversized"));
+        }
+        let json: serde_json::Value = serde_json::from_slice(&body.bytes)
+            .map_err(|_| bounded_body_search_failure("deepseek", "decode"))?;
+        self.parse_deepseek_results(&json, query)
+    }
+
+    fn parse_deepseek_results(
+        &self,
+        json: &serde_json::Value,
+        query: &str,
+    ) -> anyhow::Result<String> {
+        let results = json
+            .get("results")
+            .and_then(|r| r.as_array())
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"search_provider": "deepseek"})),
+                    "web_search: invalid DeepSeek Search response"
+                );
+                anyhow::Error::msg("Invalid DeepSeek Search API response")
+            })?;
+
+        if results.is_empty() {
+            return Ok(no_results_message(query));
+        }
+
+        let mut blocks: Vec<Vec<String>> = Vec::new();
+
+        for (i, result) in results.iter().take(self.max_results).enumerate() {
+            let title = result
+                .get("title")
+                .and_then(|t| t.as_str())
+                .unwrap_or("No title");
+            let url = result.get("url").and_then(|u| u.as_str()).unwrap_or("");
+            // Prefer DeepSeek's summary; fall back to the raw snippet.
+            let body = result
+                .get("summary")
+                .and_then(|s| s.as_str())
+                .filter(|s| !s.is_empty())
+                .or_else(|| result.get("snippet").and_then(|s| s.as_str()))
+                .unwrap_or("");
+            // `site_name` and `date` may be JSON null.
+            let site = result
+                .get("site_name")
+                .and_then(|s| s.as_str())
+                .unwrap_or("");
+            let date = result.get("date").and_then(|d| d.as_str()).unwrap_or("");
+
+            let mut block = vec![format!("{}. {}", i + 1, title), format!("   {}", url)];
+
+            let attribution = match (site.is_empty(), date.is_empty()) {
+                (false, false) => format!("   {site} · {date}"),
+                (false, true) => format!("   {site}"),
+                (true, false) => format!("   {date}"),
+                (true, true) => String::new(),
+            };
+            if !attribution.is_empty() {
+                block.push(attribution);
+            }
+
+            if !body.is_empty() {
+                block.push(format!("   {}", cap_result_content(body)));
+            }
+
+            blocks.push(block);
+        }
+
+        Ok(render_results(results_header(query, "DeepSeek"), blocks))
     }
 
     fn resolve_anysearch_api_key(&self) -> anyhow::Result<Option<String>> {
@@ -2411,6 +2621,7 @@ impl Tool for WebSearchTool {
             WebSearchProviderRoute::AnySearch => self.search_anysearch(query).await?,
             WebSearchProviderRoute::Serply => self.search_serply(query).await?,
             WebSearchProviderRoute::Keenable => self.search_keenable(query).await?,
+            WebSearchProviderRoute::DeepSeek => self.search_deepseek(query).await?,
         };
 
         Ok(ToolResult {
@@ -3667,6 +3878,211 @@ mod tests {
         assert_eq!(body["count"], 5);
         assert_eq!(body["summary"], true);
         assert_eq!(body["freshness"], "noLimit");
+    }
+
+    fn deepseek_tool(config_path: PathBuf, secrets_encrypt: bool) -> WebSearchTool {
+        WebSearchTool::new_with_config(
+            "deepseek".to_string(),
+            None,
+            None,
+            None,
+            None,
+            5,
+            15,
+            config_path,
+            secrets_encrypt,
+        )
+    }
+
+    fn plain_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .build()
+            .expect("client builder should succeed without a proxy")
+    }
+
+    #[tokio::test]
+    async fn test_execute_deepseek_without_api_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "[web_search]\n").unwrap();
+
+        let tool = deepseek_tool(config_path, false);
+        let err = tool
+            .execute(json!({"query": "test"}))
+            .await
+            .expect_err("a missing key fails before any request")
+            .to_string();
+        assert!(
+            err.contains("DeepSeek Search API key not configured"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_deepseek_api_key_decrypts_encrypted_key() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = zeroclaw_config::secrets::SecretStore::new(tmp.path(), true);
+        let encrypted = store.encrypt("deepseek-secret-key").unwrap();
+
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!("[web_search]\ndeepseek_api_key = \"{encrypted}\"\n"),
+        )
+        .unwrap();
+
+        let tool = deepseek_tool(config_path, true);
+        assert_eq!(
+            tool.resolve_deepseek_api_key().unwrap(),
+            "deepseek-secret-key"
+        );
+    }
+
+    #[test]
+    fn test_deepseek_config_parse_failure_withholds_the_offending_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[web_search]\ndeepseek_api_key = sk-unquoted-secret\n",
+        )
+        .unwrap();
+
+        let tool = deepseek_tool(config_path, false);
+        let msg = format!(
+            "{:#}",
+            tool.resolve_deepseek_api_key()
+                .expect_err("a broken config must fail")
+        );
+        assert!(msg.contains(DEEPSEEK_CONFIG_PARSE_ERROR_CODE), "{msg}");
+        assert!(
+            !msg.contains("sk-unquoted-secret"),
+            "resolver error leaks: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_parse_deepseek_results_with_data() {
+        let tool = WebSearchTool::new("deepseek".to_string(), None, None, 5, 15);
+        let json = serde_json::json!({
+            "results": [
+                {
+                    "title": "DeepSeek Example Title",
+                    "url": "https://example.com/a",
+                    "snippet": "raw snippet body",
+                    "summary": "summary of the page",
+                    "site_name": "Example Site",
+                    "date": "2025-01-15"
+                },
+                {
+                    "title": "Second Result",
+                    "url": "https://example.org/b",
+                    "snippet": "second snippet only",
+                    "summary": "",
+                    "site_name": null,
+                    "date": null
+                }
+            ]
+        });
+        let result = tool.parse_deepseek_results(&json, "test").unwrap();
+        assert!(result.contains("DeepSeek"), "{result}");
+        assert!(result.contains("DeepSeek Example Title"), "{result}");
+        assert!(result.contains("summary of the page"), "{result}");
+        assert!(!result.contains("raw snippet body"), "{result}");
+        assert!(result.contains("Example Site · 2025-01-15"), "{result}");
+        assert!(result.contains("second snippet only"), "{result}");
+    }
+
+    #[test]
+    fn test_parse_deepseek_results_empty() {
+        let tool = WebSearchTool::new("deepseek".to_string(), None, None, 5, 15);
+        let result = tool
+            .parse_deepseek_results(&serde_json::json!({"results": []}), "test")
+            .unwrap();
+        assert!(result.contains("No results found"), "{result}");
+    }
+
+    #[test]
+    fn test_parse_deepseek_results_invalid_response() {
+        let tool = WebSearchTool::new("deepseek".to_string(), None, None, 5, 15);
+        let err = tool
+            .parse_deepseek_results(&serde_json::json!({"data": []}), "test")
+            .expect_err("a body without `results` is invalid")
+            .to_string();
+        assert!(
+            err.contains("Invalid DeepSeek Search API response"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_deepseek_request_uses_bearer_auth_and_documented_body() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/tools/search"))
+            .and(header("authorization", "Bearer ds-test-key"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"results": []})),
+            )
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[web_search]\ndeepseek_api_key = \"ds-test-key\"\n",
+        )
+        .unwrap();
+        let tool = deepseek_tool(config_path, false);
+
+        let result = tool
+            .search_deepseek_with_client(
+                &plain_client(),
+                &format!("{}/v1/tools/search", server.uri()),
+                "什么是 Rust",
+            )
+            .await
+            .expect("request should succeed against the mock");
+        assert!(result.contains("No results found"), "{result}");
+
+        let recorded = server.received_requests().await.unwrap();
+        assert_eq!(recorded.len(), 1, "expected exactly one POST");
+        let body: serde_json::Value = serde_json::from_slice(&recorded[0].body).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"query": "什么是 Rust", "count": 5})
+        );
+    }
+
+    #[tokio::test]
+    async fn test_deepseek_rejects_overlong_query_before_any_request() {
+        let server = wiremock::MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[web_search]\ndeepseek_api_key = \"ds-test-key\"\n",
+        )
+        .unwrap();
+        let tool = deepseek_tool(config_path, false);
+
+        let query = "字".repeat(DEEPSEEK_MAX_QUERY_CHARS + 1);
+        let err = tool
+            .search_deepseek_with_client(
+                &plain_client(),
+                &format!("{}/v1/tools/search", server.uri()),
+                &query,
+            )
+            .await
+            .expect_err("an overlong query is rejected locally")
+            .to_string();
+        assert!(err.contains("128 characters"), "{err}");
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     fn anysearch_tool(config_path: PathBuf, secrets_encrypt: bool) -> WebSearchTool {

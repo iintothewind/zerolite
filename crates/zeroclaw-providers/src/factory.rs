@@ -326,6 +326,7 @@ pub fn apply_compat_options(
     if opts.thinking_passthrough {
         b = b.with_thinking_passthrough();
     }
+    b = b.thinking_enabled(opts.think.or(opts.reasoning_enabled));
     // The configured `[multimodal]` policy. Without this the provider boundary
     // would re-normalize already-prepared messages under defaults and could
     // trim images the runtime had accepted under the operator's settings.
@@ -701,6 +702,9 @@ impl CompatFamilySpec for DeepseekModelProviderConfig {
     const DEFAULT_URL: &'static str = "https://api.deepseek.com";
     const AUTH: AuthStyle = AuthStyle::Bearer;
     const MODELS_DEV_KEY: Option<&'static str> = Some("deepseek");
+    // Verified 2026-11-20: GET {base}/models (and /v1/models) returns data[].id
+    // with `context_window` (1048576 for deepseek-flash and deepseek-v4-pro).
+    const SERVES_MODEL_CONTEXT_CATALOG: bool = true;
 }
 impl CompatFamilySpec for TogetherModelProviderConfig {
     const DISPLAY: &'static str = "Together AI";
@@ -3532,7 +3536,7 @@ mod tests {
     /// the bar is evidence that `GET {base}/models` really returns
     /// `data[].id` with a per-model `context_length`, not that the family
     /// speaks the OpenAI-compatible chat wire.
-    const PROBEABLE_FAMILIES: [&str; 9] = [
+    const PROBEABLE_FAMILIES: [&str; 10] = [
         "together",
         "groq",
         "fireworks",
@@ -3542,6 +3546,7 @@ mod tests {
         "novita",
         "nebius",
         "crusoe",
+        "deepseek",
     ];
 
     /// The families the hand-written probe list in `fetch_context_window` used
@@ -3569,7 +3574,6 @@ mod tests {
         for family in [
             "nearai",
             "mistral",
-            "deepseek",
             "cerebras",
             "perplexity",
             "vllm",

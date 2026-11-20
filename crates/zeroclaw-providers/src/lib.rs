@@ -6573,6 +6573,28 @@ mod context_window_discovery_tests {
         server.abort();
     }
 
+    #[tokio::test]
+    async fn deepseek_reads_its_window_from_the_context_window_field() {
+        let capture: Capture = Arc::new(Mutex::new(Vec::new()));
+        let (base_url, server) = serve_catalog(Arc::clone(&capture)).await;
+
+        assert_eq!(
+            fetch_context_window(
+                "deepseek",
+                &alias_config(&base_url, "spelled/context-window", Some("sk-live-key"))
+            )
+            .await,
+            Some(65_536),
+            "DeepSeek publishes the window as `context_window`"
+        );
+        let seen = capture.lock().expect("capture lock poisoned").clone();
+        assert_eq!(
+            seen,
+            vec![("/models".to_string(), "Bearer sk-live-key".to_string())]
+        );
+        server.abort();
+    }
+
     /// Z.AI and GLM store their credential as `id.secret` and mint a
     /// short-lived HMAC JWT from it per request. A catalog probe that attached
     /// the stored value with plain bearer auth would put the long-lived secret

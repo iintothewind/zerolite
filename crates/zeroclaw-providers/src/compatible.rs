@@ -102,6 +102,10 @@ pub struct OpenAiCompatibleModelProvider {
     /// translates between OpenAI Chat Completions and the Anthropic API;
     /// a non-translating upstream rejects the injected object with HTTP 400.
     thinking_passthrough: bool,
+    /// Whether this endpoint speaks DeepSeek's chat-completions dialect (the
+    /// `deepseek` family, or any alias whose host is `api.deepseek.com`).
+    /// Resolved once at build time; gates the DeepSeek request shims.
+    deepseek_contract: bool,
     /// Custom API path suffix (e.g. "/v2/generate").
     /// When set, overrides the default `/chat/completions` path detection.
     api_path: Option<String>,
@@ -557,6 +561,8 @@ pub struct OpenAiCompatibleBuilder {
     /// Set to `true` by [`OpenAiCompatibleBuilder::with_thinking_passthrough`].
     /// Default `false` leaves requests and response handling unchanged.
     thinking_passthrough: bool,
+    /// Set by [`OpenAiCompatibleBuilder::thinking_enabled`]. Default `None`.
+    thinking_enabled: Option<bool>,
     api_path: Option<String>,
     max_tokens: Option<u32>,
     models_dev_key: Option<String>,
@@ -748,6 +754,14 @@ impl OpenAiCompatibleBuilder {
         self
     }
 
+    /// Thinking on/off preference (`think` on the provider alias, else
+    /// `[runtime] reasoning_enabled`). Consumed only by endpoints with a known
+    /// toggle: DeepSeek gets a top-level `thinking: {"type": "enabled" | "disabled"}`.
+    pub fn thinking_enabled(mut self, enabled: Option<bool>) -> Self {
+        self.thinking_enabled = enabled;
+        self
+    }
+
     /// Set a custom API path suffix for this model_provider.
     pub fn api_path(mut self, api_path: Option<String>) -> Self {
         self.api_path = api_path;
@@ -863,6 +877,14 @@ impl OpenAiCompatibleBuilder {
                         None
                     }
                 });
+        let deepseek_contract =
+            OpenAiCompatibleModelProvider::targets_deepseek_contract(&name, &base_url);
+        let extra_body = match self.thinking_enabled {
+            Some(enabled) if deepseek_contract && !self.thinking_passthrough => {
+                Some(deepseek_thinking_extra_body(enabled, self.extra_body))
+            }
+            _ => self.extra_body,
+        };
         OpenAiCompatibleModelProvider {
             alias: self.alias,
             name,
@@ -887,6 +909,7 @@ impl OpenAiCompatibleBuilder {
             cache_passthrough: self.cache_passthrough,
             cache_ttl: self.cache_ttl,
             thinking_passthrough: self.thinking_passthrough,
+            deepseek_contract,
             api_path: self.api_path,
             max_tokens: self.max_tokens,
             models_dev_key: self.models_dev_key,
@@ -894,9 +917,31 @@ impl OpenAiCompatibleBuilder {
             local_model_tool_sanitize: self.local_model_tool_sanitize,
             public_model_listing: self.public_model_listing,
             tls_ca_cert_pem,
-            extra_body: self.extra_body,
+            extra_body,
             schema_cache: std::sync::Arc::new(zeroclaw_api::schema::SchemaCleanCache::new()),
         }
+    }
+}
+
+/// DeepSeek's thinking toggle merged under the configured extras, whose
+/// explicit keys win (an operator `provider_extra.thinking` stays authoritative).
+fn deepseek_thinking_extra_body(
+    enabled: bool,
+    configured: Option<serde_json::Value>,
+) -> serde_json::Value {
+    let mut body = serde_json::Map::new();
+    body.insert(
+        "thinking".to_string(),
+        serde_json::json!({"type": if enabled { "enabled" } else { "disabled" }}),
+    );
+    match configured {
+        Some(serde_json::Value::Object(extra)) => {
+            body.extend(extra);
+            serde_json::Value::Object(body)
+        }
+        // A non-object `extra_body` cannot be key-merged; the explicit value wins.
+        Some(other) => other,
+        None => serde_json::Value::Object(body),
     }
 }
 
@@ -931,6 +976,7 @@ impl OpenAiCompatibleModelProvider {
             cache_passthrough: false,
             cache_ttl: None,
             thinking_passthrough: false,
+            thinking_enabled: None,
             api_path: None,
             max_tokens: None,
             models_dev_key: None,
@@ -1319,6 +1365,17 @@ impl OpenAiCompatibleModelProvider {
 
     fn reasoning_effort_for_model(&self, model: &str) -> Option<String> {
         let effort = self.reasoning_effort.as_ref()?;
+        // DeepSeek documents `reasoning_effort` for every model, so the OpenAI
+        // name filter does not apply. Its ladder tops out at `max` and the server
+        // folds `xhigh` into `high`; send `max` so the harness's top level reaches
+        // DeepSeek's.
+        if self.deepseek_contract {
+            return Some(if effort == "xhigh" {
+                "max".to_string()
+            } else {
+                effort.clone()
+            });
+        }
         // The name filter below exists because some OpenAI-compatible
         // backends reject unknown request params (HTTP 400 for
         // `reasoning_effort` on models they do not treat as reasoners).
@@ -2089,6 +2146,18 @@ struct Choice {
 /// output limit. Any other reason (`stop`, `tool_calls`, a provider's own
 /// token) is a finished reply.
 const OUTPUT_LIMIT_FINISH_REASON: &str = "length";
+
+/// Chat-completions `finish_reason` values that report a generation the
+/// provider itself cut short (DeepSeek: `insufficient_system_resource` when
+/// inference capacity ran out, `aborted` when generation was interrupted).
+/// The reply is incomplete: an error to retry, never a finished turn.
+const INTERRUPTED_FINISH_REASONS: [&str; 2] = ["insufficient_system_resource", "aborted"];
+
+fn interrupted_finish_message(model_provider: &str, reason: &str) -> String {
+    format!(
+        "{model_provider} stopped generating before the reply was complete (finish_reason: {reason})"
+    )
+}
 
 fn record_output_truncated(model_provider: Option<&str>, reason: &str, streaming: bool) {
     ::zeroclaw_log::record!(
@@ -3020,6 +3089,17 @@ fn sse_bytes_to_events_for_contract(
             }
         }
 
+        if let Some(reason) = finish_reason
+            .as_deref()
+            .filter(|reason| INTERRUPTED_FINISH_REASONS.contains(reason))
+        {
+            let _ = tx
+                .send(Err(StreamError::ModelProvider(interrupted_finish_message(
+                    "provider", reason,
+                ))))
+                .await;
+            return;
+        }
         if !emitted_tool_calls {
             for tool_call in tool_calls.drain(..).filter_map(|tool_call| {
                 tool_call.into_provider_tool_call(
@@ -3078,6 +3158,14 @@ fn parse_chat_response_body(name: &str, body: &str) -> anyhow::Result<ApiChatRes
                 "{name} API returned an unexpected chat-completions payload; body={sanitized}"
             ))
         })?;
+    if let Some(reason) = parsed
+        .choices
+        .iter()
+        .find_map(|choice| choice.finish_reason.as_deref())
+        .filter(|reason| INTERRUPTED_FINISH_REASONS.contains(reason))
+    {
+        anyhow::bail!(interrupted_finish_message(name, reason));
+    }
     if let Some(reason) = parsed
         .choices
         .iter()
@@ -3597,7 +3685,17 @@ impl OpenAiCompatibleModelProvider {
                                 .then(|| MessageContent::Text(String::new()))
                         });
 
-                    let replay = self.assistant_thinking_replay(&value);
+                    let mut replay = self.assistant_thinking_replay(&value);
+                    // DeepSeek thinking mode rejects (HTTP 400) an assistant tool-call message
+                    // without `reasoning_content` unless DeepSeek itself produced that call in
+                    // thinking mode: history from another model, from a thinking-off turn, or
+                    // with replay stripped all fail. An empty string is accepted in every mode.
+                    if self.deepseek_contract
+                        && replay.reasoning_content.is_none()
+                        && replay.thinking_blocks.is_none()
+                    {
+                        replay.reasoning_content = Some(String::new());
+                    }
 
                     return NativeMessage {
                         role: "assistant".to_string(),
@@ -4000,6 +4098,17 @@ impl OpenAiCompatibleModelProvider {
             .ok()
             .and_then(|url| url.host_str().map(|h| h.to_ascii_lowercase()))
             .is_some_and(|host| host == "mistral.ai" || host.ends_with(".mistral.ai"))
+    }
+
+    fn targets_deepseek_contract(name: &str, base_url: &str) -> bool {
+        name.eq_ignore_ascii_case("deepseek")
+            || reqwest::Url::parse(base_url)
+                .ok()
+                .and_then(|url| {
+                    url.host_str()
+                        .map(|host| host.eq_ignore_ascii_case("api.deepseek.com"))
+                })
+                .unwrap_or(false)
     }
 
     fn reserve_tool_call_id(
@@ -8707,6 +8816,92 @@ mod tests {
     }
 
     #[test]
+    fn deepseek_contract_forwards_reasoning_effort_and_sends_max_for_xhigh() {
+        let build = |name: &str, url: &str, effort: &str| {
+            OpenAiCompatibleModelProvider::builder("test")
+                .display_name(name)
+                .base_url(url)
+                .credential(None)
+                .auth_style(AuthStyle::Bearer)
+                .reasoning_effort(Some(effort.to_string()))
+                .build()
+        };
+
+        let family = build("DeepSeek", "https://api.deepseek.com", "xhigh");
+        assert_eq!(
+            family
+                .reasoning_effort_for_model("deepseek-flash")
+                .as_deref(),
+            Some("max")
+        );
+        let family = build("DeepSeek", "https://api.deepseek.com", "low");
+        assert_eq!(
+            family
+                .reasoning_effort_for_model("deepseek-flash")
+                .as_deref(),
+            Some("low")
+        );
+
+        let by_host = build("custom", "https://api.deepseek.com/v1", "high");
+        assert_eq!(
+            by_host
+                .reasoning_effort_for_model("deepseek-flash")
+                .as_deref(),
+            Some("high")
+        );
+
+        let other = build("test", "https://example.com", "high");
+        assert_eq!(other.reasoning_effort_for_model("deepseek-flash"), None);
+    }
+
+    #[test]
+    fn deepseek_thinking_toggle_is_merged_under_configured_extras() {
+        let request_body =
+            |name: &str, url: &str, thinking: Option<bool>, extra: Option<serde_json::Value>| {
+                let mut builder = OpenAiCompatibleModelProvider::builder("test")
+                    .display_name(name)
+                    .base_url(url)
+                    .credential(None)
+                    .auth_style(AuthStyle::Bearer)
+                    .thinking_enabled(thinking);
+                if let Some(extra) = extra {
+                    builder = builder.extra_body(extra);
+                }
+                let p = builder.build();
+                let req = p.build_native_tool_chat_request(
+                    &[ChatMessage::user("hello")],
+                    None,
+                    "deepseek-flash",
+                    None,
+                    false,
+                    false,
+                    None,
+                );
+                serde_json::to_value(&req).unwrap()
+            };
+        let ds = "https://api.deepseek.com";
+
+        let value = request_body("DeepSeek", ds, Some(false), None);
+        assert_eq!(value["thinking"], serde_json::json!({"type": "disabled"}));
+        let value = request_body("DeepSeek", ds, Some(true), None);
+        assert_eq!(value["thinking"], serde_json::json!({"type": "enabled"}));
+        let value = request_body("DeepSeek", ds, None, None);
+        assert!(value.get("thinking").is_none(), "got: {value}");
+
+        let value = request_body(
+            "DeepSeek",
+            ds,
+            Some(false),
+            Some(serde_json::json!({"thinking": {"type": "enabled"}, "user_id": "u1"})),
+        );
+        assert_eq!(value["thinking"]["type"], "enabled");
+        assert_eq!(value["user_id"], "u1");
+
+        let value = request_body("test", "https://example.com", Some(false), None);
+        assert!(value.get("thinking").is_none(), "got: {value}");
+    }
+
+    #[test]
     fn reasoning_effort_passthrough_without_configured_effort_sends_none() {
         let p = OpenAiCompatibleModelProvider::builder("test")
             .display_name("test")
@@ -10223,6 +10418,67 @@ mod tests {
             "the stream still finishes: {events:?}"
         );
         assert!(truncated[0] < events.len() - 1, "truncation precedes Final");
+    }
+
+    #[tokio::test]
+    async fn interrupted_finish_reasons_end_the_stream_with_an_error() {
+        for (reason, body) in [
+            (
+                "insufficient_system_resource",
+                concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"par\"}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"shell\",\"arguments\":\"{\\\"cmd\\\":\"}}]}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"insufficient_system_resource\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":4}}\n\n",
+                    "data: [DONE]\n\n",
+                ),
+            ),
+            (
+                "aborted",
+                concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"par\"}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"shell\",\"arguments\":\"{\\\"cmd\\\":\"}}]}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"aborted\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":4}}\n\n",
+                    "data: [DONE]\n\n",
+                ),
+            ),
+        ] {
+            let events = collect_stream_events(body).await;
+            assert!(
+                matches!(
+                    events.last(),
+                    Some(Err(StreamError::ModelProvider(m)))
+                        if m.contains(&format!("finish_reason: {reason}"))
+                ),
+                "{reason}: stream must end with a provider error: {events:?}"
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, Ok(StreamEvent::Final | StreamEvent::ToolCall(_)))),
+                "{reason}: no Final and no partial tool call: {events:?}"
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|e| matches!(e, Ok(StreamEvent::Usage(_))))
+                    .count(),
+                1,
+                "{reason}: usage still reported once: {events:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn interrupted_finish_reason_fails_a_non_streaming_reply() {
+        let body = r#"{"choices":[{"message":{"role":"assistant","content":"par"},"finish_reason":"insufficient_system_resource"}]}"#;
+        let err = parse_chat_response_body("DeepSeek", body)
+            .expect_err("an interrupted reply is an error")
+            .to_string();
+        assert!(err.contains("DeepSeek stopped generating"), "got: {err}");
+        assert!(err.contains("insufficient_system_resource"), "got: {err}");
+
+        let finished = body.replace("insufficient_system_resource", "stop");
+        assert!(parse_chat_response_body("DeepSeek", &finished).is_ok());
     }
 
     #[tokio::test]
@@ -13845,6 +14101,59 @@ mod tests {
         );
         assert_eq!(value["tools"][0]["function"]["name"], "shell");
         assert_eq!(value["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn deepseek_tool_call_history_always_carries_reasoning_content() {
+        let first_message_for = |p: &OpenAiCompatibleModelProvider, history: serde_json::Value| {
+            let messages = vec![
+                ChatMessage::assistant(history.to_string()),
+                ChatMessage::tool(r#"{"tool_call_id":"call_1","content":"ok"}"#),
+                ChatMessage::user("continue"),
+            ];
+            let req = p.build_native_tool_chat_request(
+                &messages,
+                None,
+                "deepseek-flash",
+                None,
+                false,
+                false,
+                None,
+            );
+            serde_json::to_value(&req).unwrap()["messages"][0].clone()
+        };
+        let bare = serde_json::json!({
+            "content": null,
+            "tool_calls": [{"id": "call_1", "name": "shell", "arguments": "{}"}]
+        });
+        let mut with_reasoning = bare.clone();
+        with_reasoning["reasoning_content"] = serde_json::json!("R");
+
+        let deepseek = make_model_provider("DeepSeek", "https://api.deepseek.com", None);
+        assert_eq!(
+            first_message_for(&deepseek, bare.clone())["reasoning_content"],
+            ""
+        );
+        assert_eq!(
+            first_message_for(&deepseek, with_reasoning.clone())["reasoning_content"],
+            "R"
+        );
+
+        let no_replay = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("DeepSeek")
+            .base_url("https://api.deepseek.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .without_assistant_reasoning_replay()
+            .build();
+        assert_eq!(
+            first_message_for(&no_replay, with_reasoning)["reasoning_content"],
+            ""
+        );
+
+        let other = make_model_provider("test", "https://example.com/v1", None);
+        let message = first_message_for(&other, bare);
+        assert!(message.get("reasoning_content").is_none(), "got: {message}");
     }
 
     #[test]

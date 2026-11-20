@@ -1159,6 +1159,8 @@ pub struct ModelProviderConfig {
     /// (e.g. Qwen3, GLM-4). `true` turns thinking on, `false` turns it off.
     /// `None` (default) lets the model decide. Forwarded as `enable_thinking`
     /// in the request body; mirrors the Ollama provider's `think` field.
+    /// On DeepSeek endpoints it is sent as `thinking: {"type": "enabled" | "disabled"}`;
+    /// when unset there, `[runtime] reasoning_enabled` decides.
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub think: Option<bool>,
@@ -9354,7 +9356,7 @@ pub struct WebSearchConfig {
     /// Enable `web_search_tool` for web searches
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Search provider: "duckduckgo" (free), "brave" (requires API key), "tavily" (requires API key), "searxng" (self-hosted), "jina" (requires API key), "bocha" (requires API key), "anysearch" (optional API key; anonymous requests use a lower quota), "serply" (Google web results, requires API key), or "keenable" (works without a key; a key only lifts rate limits, <https://keenable.ai>)
+    /// Search provider: "duckduckgo" (free), "brave" (requires API key), "tavily" (requires API key), "searxng" (self-hosted), "jina" (requires API key), "bocha" (requires API key), "anysearch" (optional API key; anonymous requests use a lower quota), "serply" (Google web results, requires API key), "keenable" (works without a key; a key only lifts rate limits, <https://keenable.ai>), or "deepseek" (DeepSeek Search API, requires API key)
     #[serde(default = "default_web_search_provider")]
     pub search_provider: String,
     /// Brave Search API key (required if search_provider is "brave")
@@ -9399,6 +9401,12 @@ pub struct WebSearchConfig {
     #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub keenable_api_key: Option<String>,
+    /// DeepSeek API key for the Search API (required if search_provider is `"deepseek"`). The same key the DeepSeek model provider uses; searches are billed per successful request. Obtain at <https://platform.deepseek.com/api_keys>.
+    #[serde(default)]
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub deepseek_api_key: Option<String>,
     /// SearXNG instance URL (required if search_provider is `"searxng"`), e.g. `"https://searx.example.com"`.
     #[serde(default)]
     pub searxng_instance_url: Option<String>,
@@ -9434,6 +9442,7 @@ impl Default for WebSearchConfig {
             anysearch_api_key: None,
             serply_api_key: None,
             keenable_api_key: None,
+            deepseek_api_key: None,
             searxng_instance_url: None,
             max_results: default_web_search_max_results(),
             timeout_secs: default_web_search_timeout_secs(),

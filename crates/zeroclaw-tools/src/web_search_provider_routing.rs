@@ -9,6 +9,7 @@ pub enum WebSearchProviderRoute {
     AnySearch,
     Serply,
     Keenable,
+    DeepSeek,
 }
 
 /// Provider HTTP-failure status surfaced to the agent via the error message's
@@ -50,6 +51,7 @@ const BOCHA_PROVIDER: &str = "bocha";
 const ANYSEARCH_PROVIDER: &str = "anysearch";
 const SERPLY_PROVIDER: &str = "serply";
 const KEENABLE_PROVIDER: &str = "keenable";
+const DEEPSEEK_PROVIDER: &str = "deepseek";
 
 pub fn resolve_web_search_provider(raw_model_provider: &str) -> WebSearchProviderResolution {
     let normalized = raw_model_provider.trim().to_ascii_lowercase();
@@ -103,6 +105,11 @@ pub fn resolve_web_search_provider(raw_model_provider: &str) -> WebSearchProvide
         "keenable" | "keenable-search" | "keenable_search" => WebSearchProviderResolution {
             route: WebSearchProviderRoute::Keenable,
             canonical_provider: KEENABLE_PROVIDER,
+            used_fallback: false,
+        },
+        "deepseek" | "deepseek-search" | "deepseek_search" => WebSearchProviderResolution {
+            route: WebSearchProviderRoute::DeepSeek,
+            canonical_provider: DEEPSEEK_PROVIDER,
             used_fallback: false,
         },
         // Warns for unknown model_providers, falls back to default.
@@ -226,6 +233,17 @@ mod tests {
             let resolved = resolve_web_search_provider(alias);
             assert_eq!(resolved.route, WebSearchProviderRoute::Keenable);
             assert_eq!(resolved.canonical_provider, KEENABLE_PROVIDER);
+            assert!(!resolved.used_fallback);
+        }
+    }
+
+    #[test]
+    fn resolve_aliases_to_deepseek() {
+        let deepseek_aliases = ["deepseek", "deepseek-search", "deepseek_search"];
+        for alias in deepseek_aliases {
+            let resolved = resolve_web_search_provider(alias);
+            assert_eq!(resolved.route, WebSearchProviderRoute::DeepSeek);
+            assert_eq!(resolved.canonical_provider, DEEPSEEK_PROVIDER);
             assert!(!resolved.used_fallback);
         }
     }

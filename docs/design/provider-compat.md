@@ -32,6 +32,12 @@
 | 8 | Shell output encoding detection; PowerShell output initialized as UTF-8 | `fix(runtime): detect encoding for shell output`, `feat(shell): initialize PowerShell output as UTF-8` |
 | 9 | A chat-completions reply cut at the output limit (`finish_reason: "length"`) is reported, not passed off as finished: WARN `provider_output_truncated`, `StreamEvent::OutputTruncated`, WARN `turn_output_truncated`, and a display-only `output_truncated` WS frame for a text reply | `fix(providers): report replies cut at the output limit` |
 | 10 | Vision routing counts only the markers this turn introduces (`count_current_turn_image_markers`); images carried over from earlier turns are stripped for a non-vision primary and never move the turn onto `vision_model_provider`. Holds for the skill-review fork too: its review prompt makes the reviewed image carried over (owner ruling 2026-11-12, v0.9.0 merge; upstream's `skill_review_routes_vision_through_the_turns_binding` became `skill_review_keeps_carried_over_images_off_the_vision_route`) | `dadf41301` `fix(runtime): carried-over images keep the selected model`; test `carried_over_images_keep_the_selected_model` |
+| 11 | DeepSeek endpoints (`deepseek` family, or host `api.deepseek.com`) always receive the configured `reasoning_effort`; `xhigh` is sent as `max` | `deepseek_contract`, `reasoning_effort_for_model`; test `deepseek_contract_forwards_reasoning_effort_and_sends_max_for_xhigh` |
+| 12 | DeepSeek thinking toggle: alias `think`, else `[runtime] reasoning_enabled`, is sent as `thinking: {"type": "enabled" \| "disabled"}`; an operator `provider_extra.thinking` wins | `OpenAiCompatibleBuilder::thinking_enabled`; test `deepseek_thinking_toggle_is_merged_under_configured_extras` |
+| 13 | DeepSeek assistant tool-call history always carries `reasoning_content` (empty string when none is stored) | `convert_messages_for_native`; test `deepseek_tool_call_history_always_carries_reasoning_content` |
+| 14 | Chat-completions `finish_reason` `insufficient_system_resource` / `aborted` is a provider error, not a finished reply; partial tool calls are dropped | `INTERRUPTED_FINISH_REASONS`; tests `interrupted_finish_reasons_end_the_stream_with_an_error`, `interrupted_finish_reason_fails_a_non_streaming_reply` |
+| 15 | DeepSeek context window is discovered from `GET /models` (`context_window`); no built-in table entry | `SERVES_MODEL_CONTEXT_CATALOG` on `DeepseekModelProviderConfig` |
+| 16 | `web_search` route `deepseek` (DeepSeek Search API, `[web_search] deepseek_api_key`) | `crates/zeroclaw-tools/src/web_search_tool.rs` `search_deepseek` |
 
 ## Merge notes
 
@@ -50,6 +56,13 @@
   (stream_consume.rs). Only the chat-completions wire maps it today;
   Anthropic `max_tokens`, Gemini `MAX_TOKENS`, OpenAI Responses
   `incomplete` and Ollama `done_reason: length` are not mapped yet.
+- **DeepSeek (rows 11–16):** behaviors were probed live on 2026-11-20
+  against `deepseek-flash`: `reasoning_effort` accepts
+  `none|minimal|low|medium|high|xhigh|ultra|max`; `thinking.type`
+  overrides `reasoning_effort`; `enable_thinking` is ignored; a tool-call
+  assistant message without `reasoning_content` is HTTP 400 in thinking
+  mode unless DeepSeek produced the call in thinking mode, and
+  `reasoning_content: ""` is accepted.
 - **Code anchors:** `crates/zeroclaw-providers/src/`,
   `crates/zeroclaw-runtime/src/agent/turn/` (seam sanitizers, media).
 
