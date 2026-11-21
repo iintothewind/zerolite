@@ -5784,9 +5784,11 @@ mod tests {
     /// so the configured recovery credential is live without a daemon.
     #[test]
     fn a_standalone_gateway_adopts_the_configured_master_code() {
-        let mut gateway = zeroclaw_config::schema::GatewayConfig::default();
-        gateway.require_pairing = true;
-        gateway.master_pair_code = Some("a-long-random-recovery-string".to_string());
+        let gateway = zeroclaw_config::schema::GatewayConfig {
+            require_pairing: true,
+            master_pair_code: Some("a-long-random-recovery-string".to_string()),
+            ..Default::default()
+        };
 
         let guard = super::resolve_pairing_guard(None, &gateway, PairingLimits::default);
 
@@ -5806,9 +5808,11 @@ mod tests {
     /// the daemon built is what the gateway serves.
     #[test]
     fn a_supervised_gateway_serves_the_daemons_authority_verbatim() {
-        let mut gateway = zeroclaw_config::schema::GatewayConfig::default();
-        gateway.require_pairing = true;
-        gateway.master_pair_code = Some("a-long-random-recovery-string".to_string());
+        let gateway = zeroclaw_config::schema::GatewayConfig {
+            require_pairing: true,
+            master_pair_code: Some("a-long-random-recovery-string".to_string()),
+            ..Default::default()
+        };
 
         // The daemon builds its authority from the same configuration.
         let daemon_authority = PairingGuard::from_gateway_config(&gateway);

@@ -615,7 +615,7 @@ mod tests {
         let preset = runtime_preset("local_small").expect("local_small preset");
         let values = (preset.values)();
 
-        assert_eq!(values.agentic, true);
+        assert!(values.agentic);
         assert_eq!(values.max_tool_iterations, 4);
         assert_eq!(values.max_actions_per_hour, 10);
         assert_eq!(values.max_cost_per_day_cents, 100);

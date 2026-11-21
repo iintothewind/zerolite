@@ -220,7 +220,7 @@ pub(crate) fn fmt_tokens_compact(n: u64) -> String {
     for (unit, suffix) in [(1_000_000_000_u64, "B"), (1_000_000, "M"), (1_000, "K")] {
         if n >= unit {
             let tenths = (n as f64 / unit as f64 * 10.0).round() as u64;
-            return if tenths % 10 == 0 {
+            return if tenths.is_multiple_of(10) {
                 format!("{}{suffix}", tenths / 10)
             } else {
                 format!("{}.{}{suffix}", tenths / 10, tenths % 10)

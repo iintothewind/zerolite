@@ -15873,8 +15873,10 @@ mod tests {
     #[tokio::test]
     async fn a_loop_trim_is_announced_once() {
         const WINDOW: usize = 40_000;
-        let mut resolved = zeroclaw_config::schema::ResolvedRuntime::default();
-        resolved.model_context_window = WINDOW;
+        let mut resolved = zeroclaw_config::schema::ResolvedRuntime {
+            model_context_window: WINDOW,
+            ..Default::default()
+        };
         resolved.context.trim_threshold_percent = 100;
         resolved.context.keep_recent_turns = Some(3);
 
@@ -15967,10 +15969,10 @@ mod tests {
         // artefact rather than on the accounting being wrong.
         let mut history = vec![ConversationMessage::Chat(ChatMessage::system("system"))];
         for index in 0..8 {
-            history.push(ConversationMessage::Chat(ChatMessage::user(&format!(
+            history.push(ConversationMessage::Chat(ChatMessage::user(format!(
                 "old user {index}, long enough that dropping it saves real tokens"
             ))));
-            history.push(ConversationMessage::Chat(ChatMessage::assistant(&format!(
+            history.push(ConversationMessage::Chat(ChatMessage::assistant(format!(
                 "old assistant {index}, answering at a comparable length"
             ))));
         }
@@ -16089,10 +16091,10 @@ mod tests {
 
         let mut history = vec![ConversationMessage::Chat(ChatMessage::system("system"))];
         for index in 0..8 {
-            history.push(ConversationMessage::Chat(ChatMessage::user(&format!(
+            history.push(ConversationMessage::Chat(ChatMessage::user(format!(
                 "old user {index}, long enough that eight of these cross the budget on their own"
             ))));
-            history.push(ConversationMessage::Chat(ChatMessage::assistant(&format!(
+            history.push(ConversationMessage::Chat(ChatMessage::assistant(format!(
                 "old assistant {index}, answering at a comparable length so the estimate is honest"
             ))));
         }
@@ -16411,10 +16413,12 @@ mod tests {
         const REPORTED: u64 = 25_787;
         // A window far above the fixture keeps the budget out of the
         // picture; this test is about the meter, not about trimming.
-        let mut resolved = zeroclaw_config::schema::ResolvedRuntime::default();
-        resolved.model_context_window = 1_000_000;
-        resolved.model_context_window_source =
-            zeroclaw_config::schema::ModelContextWindowSource::Configured;
+        let mut resolved = zeroclaw_config::schema::ResolvedRuntime {
+            model_context_window: 1_000_000,
+            model_context_window_source:
+                zeroclaw_config::schema::ModelContextWindowSource::Configured,
+            ..Default::default()
+        };
         resolved.context.request_token_ceiling = Some(1_000_000);
         resolved.context.trim_threshold_percent = 80; // budget 800_000
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
@@ -16517,10 +16521,12 @@ mod tests {
     #[tokio::test]
     async fn model_switch_falls_back_to_the_conservative_estimate() {
         const REPORTED: u64 = 25_787;
-        let mut resolved = zeroclaw_config::schema::ResolvedRuntime::default();
-        resolved.model_context_window = 131_072;
-        resolved.model_context_window_source =
-            zeroclaw_config::schema::ModelContextWindowSource::Configured;
+        let mut resolved = zeroclaw_config::schema::ResolvedRuntime {
+            model_context_window: 131_072,
+            model_context_window_source:
+                zeroclaw_config::schema::ModelContextWindowSource::Configured,
+            ..Default::default()
+        };
         resolved.context.request_token_ceiling = Some(131_072);
         resolved.context.trim_threshold_percent = 80; // budget far above the fixture
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
@@ -16597,10 +16603,12 @@ mod tests {
         // (~100,750) under the budget, so turn one dispatches
         // untrimmed; the provider reports 100,000 and the anchor carries
         // it into turn two.
-        let mut resolved = zeroclaw_config::schema::ResolvedRuntime::default();
-        resolved.model_context_window = 131_072;
-        resolved.model_context_window_source =
-            zeroclaw_config::schema::ModelContextWindowSource::Configured;
+        let mut resolved = zeroclaw_config::schema::ResolvedRuntime {
+            model_context_window: 131_072,
+            model_context_window_source:
+                zeroclaw_config::schema::ModelContextWindowSource::Configured,
+            ..Default::default()
+        };
         resolved.context.request_token_ceiling = Some(131_072);
         resolved.context.trim_threshold_percent = 80;
         let budget = resolved.context_trim_budget();
@@ -16748,10 +16756,12 @@ mod tests {
     /// name the capacity the dispatch will actually be held to.
     #[tokio::test]
     async fn the_turn_start_frame_advertises_the_route_limits_not_the_profile() {
-        let mut resolved = zeroclaw_config::schema::ResolvedRuntime::default();
-        resolved.model_context_window = 65_536;
-        resolved.model_context_window_source =
-            zeroclaw_config::schema::ModelContextWindowSource::Configured;
+        let mut resolved = zeroclaw_config::schema::ResolvedRuntime {
+            model_context_window: 65_536,
+            model_context_window_source:
+                zeroclaw_config::schema::ModelContextWindowSource::Configured,
+            ..Default::default()
+        };
         resolved.context.trim_threshold_percent = 80;
         assert_eq!(
             resolved.context_trim_budget(),
@@ -16892,10 +16902,12 @@ mod tests {
     async fn a_fresh_agent_starts_on_the_conservative_estimate() {
         const REPORTED: u64 = 25_787;
         let observer1: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
-        let mut resolved1 = zeroclaw_config::schema::ResolvedRuntime::default();
-        resolved1.model_context_window = 131_072;
-        resolved1.model_context_window_source =
-            zeroclaw_config::schema::ModelContextWindowSource::Configured;
+        let mut resolved1 = zeroclaw_config::schema::ResolvedRuntime {
+            model_context_window: 131_072,
+            model_context_window_source:
+                zeroclaw_config::schema::ModelContextWindowSource::Configured,
+            ..Default::default()
+        };
         resolved1.context.request_token_ceiling = Some(131_072);
         resolved1.context.trim_threshold_percent = 80;
         let mut agent = trim_test_agent_with_resolved(resolved1, observer1);
@@ -16914,10 +16926,12 @@ mod tests {
 
         // Restore: a brand-new Agent over the same transcript.
         let observer2: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
-        let mut resolved2 = zeroclaw_config::schema::ResolvedRuntime::default();
-        resolved2.model_context_window = 131_072;
-        resolved2.model_context_window_source =
-            zeroclaw_config::schema::ModelContextWindowSource::Configured;
+        let mut resolved2 = zeroclaw_config::schema::ResolvedRuntime {
+            model_context_window: 131_072,
+            model_context_window_source:
+                zeroclaw_config::schema::ModelContextWindowSource::Configured,
+            ..Default::default()
+        };
         resolved2.context.request_token_ceiling = Some(131_072);
         resolved2.context.trim_threshold_percent = 80;
         let mut restored = trim_test_agent_with_resolved(resolved2, observer2);
@@ -16958,10 +16972,12 @@ mod tests {
     #[tokio::test]
     async fn replacing_history_across_the_anchored_rows_clears_the_meter() {
         const REPORTED: u64 = 25_787;
-        let mut resolved = zeroclaw_config::schema::ResolvedRuntime::default();
-        resolved.model_context_window = 131_072;
-        resolved.model_context_window_source =
-            zeroclaw_config::schema::ModelContextWindowSource::Configured;
+        let mut resolved = zeroclaw_config::schema::ResolvedRuntime {
+            model_context_window: 131_072,
+            model_context_window_source:
+                zeroclaw_config::schema::ModelContextWindowSource::Configured,
+            ..Default::default()
+        };
         resolved.context.request_token_ceiling = Some(131_072);
         resolved.context.trim_threshold_percent = 80;
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
@@ -17020,10 +17036,12 @@ mod tests {
     #[tokio::test]
     async fn a_tool_catalog_change_clears_the_meter() {
         const REPORTED: u64 = 25_787;
-        let mut resolved = zeroclaw_config::schema::ResolvedRuntime::default();
-        resolved.model_context_window = 131_072;
-        resolved.model_context_window_source =
-            zeroclaw_config::schema::ModelContextWindowSource::Configured;
+        let mut resolved = zeroclaw_config::schema::ResolvedRuntime {
+            model_context_window: 131_072,
+            model_context_window_source:
+                zeroclaw_config::schema::ModelContextWindowSource::Configured,
+            ..Default::default()
+        };
         resolved.context.request_token_ceiling = Some(131_072);
         resolved.context.trim_threshold_percent = 80;
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
@@ -17446,8 +17464,10 @@ mod tests {
     #[tokio::test]
     async fn a_turn_above_the_budget_trims_before_sending() {
         const WINDOW: usize = 40_000;
-        let mut resolved = zeroclaw_config::schema::ResolvedRuntime::default();
-        resolved.model_context_window = WINDOW;
+        let mut resolved = zeroclaw_config::schema::ResolvedRuntime {
+            model_context_window: WINDOW,
+            ..Default::default()
+        };
         // 30%: the budget sits at 12k, comfortably under the window, so a
         // transcript that already fits the window can still be over the
         // budget. That is the distinction between the budget and the window.
@@ -17523,8 +17543,10 @@ mod tests {
     #[tokio::test]
     async fn a_loop_trim_re_syncs_the_durable_history_after_the_turn() {
         const WINDOW: usize = 40_000;
-        let mut resolved = zeroclaw_config::schema::ResolvedRuntime::default();
-        resolved.model_context_window = WINDOW;
+        let mut resolved = zeroclaw_config::schema::ResolvedRuntime {
+            model_context_window: WINDOW,
+            ..Default::default()
+        };
         // 100%: the budget sits at the window, so it cannot fire on a
         // transcript that still fits. Only the loop's own cascade can.
         resolved.context.trim_threshold_percent = 100;

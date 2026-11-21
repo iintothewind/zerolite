@@ -1518,9 +1518,11 @@ mod tests {
     /// while the master code keeps pairing.
     #[test]
     async fn a_guard_with_live_limits_still_carries_the_master_code() {
-        let mut gateway = crate::schema::GatewayConfig::default();
-        gateway.require_pairing = true;
-        gateway.master_pair_code = Some("recovery-secret".to_string());
+        let gateway = crate::schema::GatewayConfig {
+            require_pairing: true,
+            master_pair_code: Some("recovery-secret".to_string()),
+            ..Default::default()
+        };
         let limits = PairingLimits {
             code_ttl: Duration::ZERO,
             ..PairingLimits::default()

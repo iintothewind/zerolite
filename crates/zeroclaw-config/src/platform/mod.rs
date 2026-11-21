@@ -128,6 +128,69 @@ fn validate_shell_windows(shell: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Create a runtime, optionally resolving host launchers against an injected
+/// PATH before the runtime's child workspace is applied.
+pub fn create_runtime_with_path(
+    config: &RuntimeConfig,
+    path: Option<&OsStr>,
+) -> anyhow::Result<Box<dyn RuntimeAdapter>> {
+    #[cfg(not(unix))]
+    let _ = path;
+
+    match config.kind {
+        RuntimeKind::Native => {
+            let shell = config.shell.clone().unwrap_or_else(native::default_shell);
+            #[cfg(unix)]
+            validate_shell_with_path(&shell, path)?;
+            #[cfg(windows)]
+            validate_shell_windows(&shell)?;
+            #[cfg(unix)]
+            let shell_path = path
+                .map(|path| {
+                    let configured_shell = if zeroclaw_api::platform::is_android() {
+                        OsStr::new("/system/bin/sh")
+                    } else {
+                        OsStr::new(&shell)
+                    };
+                    resolve_executable_with_path(configured_shell, std::env::split_paths(path))
+                        .map_err(|error| {
+                            anyhow::Error::new(error).context(format!(
+                                "native runtime shell {configured_shell:?} could not be resolved in the injected PATH"
+                            ))
+                        })
+                })
+                .transpose()?;
+            #[cfg(not(unix))]
+            let shell_path = None;
+            Ok(Box::new(NativeRuntime::with_shell_and_resolved_path(
+                shell, shell_path,
+            )))
+        }
+        RuntimeKind::Docker => {
+            #[cfg(unix)]
+            let docker_path = path
+                .map(|path| {
+                    resolve_executable_with_path(OsStr::new("docker"), std::env::split_paths(path))
+                        .map_err(|error| {
+                            anyhow::Error::new(error).context(
+                            "Docker runtime launcher could not be resolved in the injected PATH",
+                        )
+                        })
+                })
+                .transpose()?;
+            #[cfg(not(unix))]
+            let docker_path = None;
+            Ok(Box::new(DockerRuntime::with_resolved_launcher(
+                config.docker.clone(),
+                docker_path,
+            )))
+        }
+        RuntimeKind::Cloudflare => anyhow::bail!(
+            "runtime.kind='cloudflare' is not implemented yet. Use runtime.kind='native' for now."
+        ),
+    }
+}
+
 /// Write an executable shell shim into `dir` that records, on stdout, that it
 /// ran (`SHIM_RAN`) and each argument it received (`arg:<value>`). Used by
 /// tests to prove a configured shell is the binary that actually executes a
@@ -328,68 +391,5 @@ mod tests {
             stdout.contains("arg:echo factory-shim"),
             "shim should receive the command, got: {stdout:?}"
         );
-    }
-}
-
-/// Create a runtime, optionally resolving host launchers against an injected
-/// PATH before the runtime's child workspace is applied.
-pub fn create_runtime_with_path(
-    config: &RuntimeConfig,
-    path: Option<&OsStr>,
-) -> anyhow::Result<Box<dyn RuntimeAdapter>> {
-    #[cfg(not(unix))]
-    let _ = path;
-
-    match config.kind {
-        RuntimeKind::Native => {
-            let shell = config.shell.clone().unwrap_or_else(native::default_shell);
-            #[cfg(unix)]
-            validate_shell_with_path(&shell, path)?;
-            #[cfg(windows)]
-            validate_shell_windows(&shell)?;
-            #[cfg(unix)]
-            let shell_path = path
-                .map(|path| {
-                    let configured_shell = if zeroclaw_api::platform::is_android() {
-                        OsStr::new("/system/bin/sh")
-                    } else {
-                        OsStr::new(&shell)
-                    };
-                    resolve_executable_with_path(configured_shell, std::env::split_paths(path))
-                        .map_err(|error| {
-                            anyhow::Error::new(error).context(format!(
-                                "native runtime shell {configured_shell:?} could not be resolved in the injected PATH"
-                            ))
-                        })
-                })
-                .transpose()?;
-            #[cfg(not(unix))]
-            let shell_path = None;
-            Ok(Box::new(NativeRuntime::with_shell_and_resolved_path(
-                shell, shell_path,
-            )))
-        }
-        RuntimeKind::Docker => {
-            #[cfg(unix)]
-            let docker_path = path
-                .map(|path| {
-                    resolve_executable_with_path(OsStr::new("docker"), std::env::split_paths(path))
-                        .map_err(|error| {
-                            anyhow::Error::new(error).context(
-                            "Docker runtime launcher could not be resolved in the injected PATH",
-                        )
-                        })
-                })
-                .transpose()?;
-            #[cfg(not(unix))]
-            let docker_path = None;
-            Ok(Box::new(DockerRuntime::with_resolved_launcher(
-                config.docker.clone(),
-                docker_path,
-            )))
-        }
-        RuntimeKind::Cloudflare => anyhow::bail!(
-            "runtime.kind='cloudflare' is not implemented yet. Use runtime.kind='native' for now."
-        ),
     }
 }

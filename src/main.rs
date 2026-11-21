@@ -7841,7 +7841,10 @@ mod wss_client_auth_tests {
                 "relay.example.test".to_string(),
             ]
         );
-        assert!(wss_server_sans(&zeroclaw_config::schema::WssConfig::default(), &[]).is_empty());
+        assert_eq!(
+            wss_server_sans(&zeroclaw_config::schema::WssConfig::default(), &[]),
+            [] as [String; 0]
+        );
     }
 
     #[test]
@@ -8192,7 +8195,7 @@ mod wss_client_auth_tests {
         .unwrap();
         assert_eq!(sans, vec!["localhost", "127.0.0.1", "zero.tail1234.ts.net"]);
         // Default config, nothing known: empty keeps the default leaf path.
-        assert!(
+        assert_eq!(
             effective_server_sans(
                 dir.path(),
                 &wss_with_sans(&[]),
@@ -8200,8 +8203,8 @@ mod wss_client_auth_tests {
                     hostname_override: None
                 },
             )
-            .unwrap()
-            .is_empty()
+            .unwrap(),
+            [] as [String; 0]
         );
     }
 
@@ -20013,8 +20016,8 @@ mod tests {
             } => {
                 assert!(estop_command.is_none());
                 assert!(level.is_none());
-                assert!(domains.is_empty());
-                assert!(tools.is_empty());
+                assert_eq!(domains, [] as [String; 0]);
+                assert_eq!(tools, [] as [String; 0]);
             }
             other => panic!("expected estop command, got {other:?}"),
         }
@@ -20874,7 +20877,7 @@ mod tests {
             assert_eq!(supervisor.drivers.lock().unwrap().len(), 1);
             let teardown = supervisor.shutdown().await;
             assert!(teardown.still_running.is_empty());
-            assert!(teardown.unsettled_runs.is_empty());
+            assert_eq!(teardown.unsettled_runs, [] as [String; 0]);
             assert_eq!(store.claim_counts(name).unwrap().0, 1);
 
             let reopened =
@@ -22221,7 +22224,7 @@ mod tests {
 
         // Clean posture: no gate, no nag.
         let clean = Config::default();
-        assert!(clean.degraded_security.is_empty());
+        assert_eq!(clean.degraded_security, [] as [String; 0]);
         let handle = gate_security_posture(&clean, false).expect("clean posture must pass");
         assert!(handle.is_none(), "clean posture must not spawn a nag");
 
