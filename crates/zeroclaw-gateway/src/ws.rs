@@ -486,6 +486,59 @@ fn ws_consolidation_model(
     Some((provider, resolved_model, entry.temperature))
 }
 
+/// The `reasoning` object of `session_start` / `done` frames: the effort
+/// levels the web picker offers for one model. `auto` (no per-turn effort) is
+/// always offered; `key` identifies the model so the client can drop a choice
+/// made for another one. `rejected` tells it the endpoint refused the effort
+/// of the turn that just ended, which then ran without it.
+fn reasoning_frame(
+    key: &str,
+    support: &zeroclaw_api::model_provider::ReasoningSupport,
+    rejected: bool,
+) -> serde_json::Value {
+    let levels: Vec<&str> = std::iter::once("auto")
+        .chain(support.levels.iter().map(|level| level.as_str()))
+        .collect();
+    serde_json::json!({ "key": key, "levels": levels, "rejected": rejected })
+}
+
+/// [`reasoning_frame`] for the model an agent is configured to serve, known
+/// before the socket's `Agent` exists. An agent whose provider does not
+/// resolve offers `auto` only.
+fn ws_reasoning_for_agent(
+    config: &zeroclaw_config::schema::Config,
+    agent_alias: &str,
+) -> serde_json::Value {
+    config
+        .agent(agent_alias)
+        .and_then(|agent| {
+            zeroclaw_runtime::agent::agent::build_session_model_provider(
+                config,
+                &agent.model_provider,
+                None,
+            )
+            .ok()
+        })
+        .map(|(provider, provider_ref, model, _)| {
+            reasoning_frame(
+                &format!("{provider_ref}:{model}"),
+                &provider.reasoning_support(&model),
+                false,
+            )
+        })
+        .unwrap_or_else(|| reasoning_frame("", &Default::default(), false))
+}
+
+/// The reasoning effort a `message` frame asks for. Absent, `auto` or unknown
+/// → `None`: the turn runs with the configured behavior.
+fn message_effort(
+    parsed: &serde_json::Value,
+) -> Option<zeroclaw_api::model_provider::ReasoningEffort> {
+    parsed["effort"]
+        .as_str()
+        .and_then(zeroclaw_api::model_provider::ReasoningEffort::parse)
+}
+
 async fn handle_ws_sop_frame<S>(
     parsed: &serde_json::Value,
     state: &AppState,
@@ -699,6 +752,7 @@ async fn handle_socket(
         "session_id": session_id,
         "resumed": resumed,
         "message_count": message_count,
+        "reasoning": ws_reasoning_for_agent(&config, &agent_alias),
     });
     if let Some(ref name) = effective_name {
         session_start["name"] = serde_json::Value::String(name.clone());
@@ -991,6 +1045,7 @@ async fn handle_socket(
                             &session_id,
                             auth_subject.as_deref(),
                             &mut session_watch,
+                            message_effort(&parsed),
                         )
                         .await;
                         if client_gone {
@@ -1225,6 +1280,7 @@ async fn handle_socket(
                     &session_id,
                     auth_subject.as_deref(),
                     &mut session_watch,
+                    message_effort(&parsed),
                 )
                 .await;
                 if client_gone {
@@ -2213,6 +2269,8 @@ struct DoneFrameMeta<'a> {
     steps: u64,
     /// Stored turn number, when the turn was persisted.
     turn: Option<i64>,
+    /// Effort levels of the model the agent serves after this turn.
+    reasoning: serde_json::Value,
 }
 
 /// Build the `done`-frame JSON.
@@ -2239,6 +2297,7 @@ fn build_done_frame_json(
         "last_serving_model": meta.last_serving_model,
         "cached_input_tokens": meta.cached_input_tokens,
         "steps": meta.steps,
+        "reasoning": &meta.reasoning,
         "usage_by_provider": usage_by_provider.iter().map(|e| serde_json::json!({
             "provider_ref": e.provider_ref,
             "model": e.model,
@@ -2327,6 +2386,8 @@ async fn process_chat_message(
     auth_subject: Option<&str>,
     // The dashboard session that opened the socket, if one did.
     session: &mut Option<crate::dashboard_session::SessionWatch>,
+    // Reasoning effort the client chose for this turn, if any.
+    effort: Option<zeroclaw_api::model_provider::ReasoningEffort>,
 ) -> bool {
     use futures_util::StreamExt as _;
     use zeroclaw_runtime::agent::TurnEvent;
@@ -2402,6 +2463,9 @@ async fn process_chat_message(
         tokio::sync::mpsc::channel::<zeroclaw_runtime::agent::SteeringInput>(32);
 
     let content_owned = content.to_string();
+    // A level the serving model does not offer is dropped, not clamped.
+    let effort = effort.filter(|effort| agent.reasoning_support().supports(*effort));
+    let effort_rejected = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let session_key_owned = session_key.to_string();
     // The shared Agent turn boundary owns safeguard attribution and returns it
     // alongside the undecorated transcript. This transport only renders the
@@ -2423,14 +2487,20 @@ async fn process_chat_message(
                 turn_usage.clone(),
                 zeroclaw_runtime::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                     cost_tracking_context.clone(),
-                    agent
-                        .turn_streamed_with_steering_state(
-                            &content_owned,
-                            event_tx,
-                            Some(cancel_token.as_ref().clone()),
-                            Some(&mut steering_rx),
-                        )
-                        .instrument(span),
+                    // Boxed: one more scope layer around the bare turn future
+                    // overflows the `Send` proof (E0275).
+                    futures_util::FutureExt::boxed(zeroclaw_api::scope_reasoning_effort(
+                        effort,
+                        effort_rejected.clone(),
+                        agent
+                            .turn_streamed_with_steering_state(
+                                &content_owned,
+                                event_tx,
+                                Some(cancel_token.as_ref().clone()),
+                                Some(&mut steering_rx),
+                            )
+                            .instrument(span),
+                    )),
                 ),
             ),
         )
@@ -3016,6 +3086,7 @@ async fn process_chat_message(
                 .last_provider_ref
                 .as_deref()
                 .unwrap_or(&active_provider);
+            let (_, reasoning_provider, reasoning_model) = agent.attribution_fields();
             let meta = DoneFrameMeta {
                 full_response: &outcome.response,
                 input_tokens: usage_fold.total_input_tokens,
@@ -3034,6 +3105,11 @@ async fn process_chat_message(
                 cached_input_tokens: usage_fold.cached_input_tokens,
                 steps: usage_fold.steps,
                 turn: appended.and_then(|a| a.turn),
+                reasoning: reasoning_frame(
+                    &format!("{reasoning_provider}:{reasoning_model}"),
+                    &agent.reasoning_support(),
+                    effort_rejected.load(std::sync::atomic::Ordering::Relaxed),
+                ),
             };
             // Surface an at-most-one safety-safeguard downgrade notice just
             // before the terminal `done` frame, so the web chat shows the
@@ -6544,6 +6620,46 @@ data: {\"type\":\"message_stop\"}\n\n",
     }
 
     #[test]
+    fn reasoning_levels_are_published_for_the_agents_configured_model() {
+        use zeroclaw_config::schema::AliasedAgentConfig;
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config
+            .providers
+            .models
+            .ensure("deepseek", "main")
+            .expect("ensure creates entry")
+            .model = Some("deepseek-chat".to_string());
+        config.agents.insert(
+            "worker".to_string(),
+            AliasedAgentConfig {
+                model_provider: "deepseek.main".into(),
+                ..Default::default()
+            },
+        );
+
+        let frame = ws_reasoning_for_agent(&config, "worker");
+        assert_eq!(frame["key"], "deepseek.main:deepseek-chat");
+        assert_eq!(
+            frame["levels"],
+            serde_json::json!(["auto", "off", "low", "medium", "high", "xhigh", "max"])
+        );
+
+        // An agent whose provider does not resolve offers `auto` only.
+        assert_eq!(
+            ws_reasoning_for_agent(&config, "missing"),
+            serde_json::json!({"key": "", "levels": ["auto"], "rejected": false})
+        );
+
+        // `auto` is not a per-turn effort: it leaves the configured behavior.
+        assert_eq!(message_effort(&serde_json::json!({"effort": "auto"})), None);
+        assert_eq!(
+            message_effort(&serde_json::json!({"effort": "high"})),
+            Some(zeroclaw_api::model_provider::ReasoningEffort::High)
+        );
+    }
+
+    #[test]
     fn needs_onboarding_ws_error_points_to_onboard() {
         let config = zeroclaw_config::schema::Config::default();
         let frame = needs_onboarding_ws_error(&config)
@@ -7138,6 +7254,7 @@ data: {\"type\":\"message_stop\"}\n\n",
                 cached_input_tokens: None,
                 steps: 0,
                 turn: None,
+                reasoning: serde_json::Value::Null,
             };
             let done = build_done_frame_json(&meta, &[]);
             let v: serde_json::Value = serde_json::from_str(&done.to_string()).unwrap();
@@ -7259,6 +7376,7 @@ data: {\"type\":\"message_stop\"}\n\n",
                 cached_input_tokens: None,
                 steps: 0,
                 turn: None,
+                reasoning: serde_json::Value::Null,
             };
             let done = build_done_frame_json(&meta, &[]);
             let v: serde_json::Value = serde_json::from_str(&done.to_string()).unwrap();
@@ -7380,8 +7498,20 @@ data: {\"type\":\"message_stop\"}\n\n",
             cached_input_tokens: None,
             steps: 0,
             turn: None,
+            reasoning: reasoning_frame(
+                "glm.main:glm-5.2",
+                &zeroclaw_api::model_provider::ReasoningSupport::from_levels([
+                    zeroclaw_api::model_provider::ReasoningEffort::Low,
+                ]),
+                true,
+            ),
         };
         let done = build_done_frame_json(&meta, &[]);
+        assert_eq!(
+            done["reasoning"],
+            serde_json::json!({"key": "glm.main:glm-5.2", "levels": ["auto", "low"], "rejected": true}),
+            "the done frame republishes the serving model's effort levels"
+        );
         let v: serde_json::Value = serde_json::from_str(&done.to_string()).unwrap();
         assert!(
             v.get("model_context_window").is_none(),
@@ -7642,6 +7772,7 @@ data: {\"type\":\"message_stop\"}\n\n",
             cached_input_tokens: None,
             steps: 0,
             turn: None,
+            reasoning: serde_json::Value::Null,
         };
         let done = build_done_frame_json(&meta, &entries);
         let v: serde_json::Value = serde_json::from_str(&done.to_string()).unwrap();
@@ -7750,6 +7881,7 @@ data: {\"type\":\"message_stop\"}\n\n",
             cached_input_tokens: None,
             steps: 0,
             turn: None,
+            reasoning: serde_json::Value::Null,
         };
         let done = build_done_frame_json(&meta, &entries);
         let v: serde_json::Value = serde_json::from_str(&done.to_string()).unwrap();
@@ -7794,6 +7926,7 @@ data: {\"type\":\"message_stop\"}\n\n",
             cached_input_tokens: None,
             steps: 0,
             turn: None,
+            reasoning: serde_json::Value::Null,
         };
         let done = build_done_frame_json(&meta, &entries);
         let v: serde_json::Value = serde_json::from_str(&done.to_string()).unwrap();

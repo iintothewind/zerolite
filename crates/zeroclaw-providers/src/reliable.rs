@@ -3138,6 +3138,18 @@ impl ModelProvider for ReliableModelProvider {
             })
     }
 
+    fn reasoning_support(&self, model: &str) -> zeroclaw_api::model_provider::ReasoningSupport {
+        self.model_providers
+            .iter()
+            .find(|entry| Self::provider_allowed_for_turn(entry))
+            .map(|entry| {
+                entry
+                    .provider()
+                    .reasoning_support(entry.served_model(model))
+            })
+            .unwrap_or_default()
+    }
+
     fn capabilities(&self) -> crate::traits::ProviderCapabilities {
         let mut capabilities = self
             .model_providers

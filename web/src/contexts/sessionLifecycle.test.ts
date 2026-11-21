@@ -178,6 +178,7 @@ class FakeSocket implements SessionSocket {
   connectCalls = 0;
   disconnectCalls = 0;
   sent: string[] = [];
+  sentEfforts: Array<string | undefined> = [];
   approvalResponses: Array<{ requestId: string; decision: ApprovalDecision }> = [];
   questionResponses: Array<{ requestId: string; answers: string[] | null }> = [];
   private open = false;
@@ -191,9 +192,10 @@ class FakeSocket implements SessionSocket {
   connect(): void { this.connectCalls += 1; }
   disconnect(): void { this.disconnectCalls += 1; this.open = false; }
   get connected(): boolean { return this.open; }
-  sendMessage(content: string): void {
+  sendMessage(content: string, effort?: string): void {
     if (!this.open) throw new Error('closed');
     this.sent.push(content);
+    this.sentEfforts.push(effort);
   }
   sendApprovalResponse(requestId: string, decision: ApprovalDecision): void {
     this.approvalResponses.push({ requestId, decision });
@@ -755,6 +757,44 @@ test('manual rename is the only name write when the first message is sent', asyn
     await pendingRename;
   });
   assert.equal(runtime.renameCalls.length, 1);
+  await unmount(mounted.renderer);
+});
+
+test('a message carries the chosen reasoning effort until the endpoint refuses it', async () => {
+  const runtime = new FakeSessionRuntime();
+  runtime.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
+  const mounted = await mountChat(runtime);
+  await openSocket(runtime, 0);
+  await settle();
+  const socket = runtime.sockets[0];
+  assert.ok(socket);
+
+  await act(async () => {
+    socket.emitMessage({
+      type: 'session_start',
+      session_id: 'A',
+      reasoning: { key: 'a.b:m', levels: ['auto', 'low', 'medium', 'high'] },
+    });
+  });
+  assert.equal(mounted.context().effort, 'auto');
+  await act(async () => { mounted.context().sendMessage('default'); });
+  await act(async () => { socket.emitMessage({ type: 'done', full_response: 'ok' }); });
+
+  await act(async () => { mounted.context().setEffort('high'); });
+  await act(async () => { mounted.context().sendMessage('chosen'); });
+  // The endpoint refused the effort mid-turn: the level stays on offer.
+  await act(async () => {
+    socket.emitMessage({
+      type: 'done',
+      full_response: 'ok',
+      reasoning: { key: 'a.b:m', levels: ['auto', 'low', 'medium', 'high'], rejected: true },
+    });
+  });
+  assert.equal(mounted.context().effort, 'auto');
+  await act(async () => { mounted.context().sendMessage('after'); });
+
+  // `auto` sends no effort at all.
+  assert.deepEqual(socket.sentEfforts, [undefined, 'high', undefined]);
   await unmount(mounted.renderer);
 });
 

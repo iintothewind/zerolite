@@ -614,6 +614,18 @@ fn bedrock_model_supports_native_thinking(model: &str) -> bool {
     !model.contains("claude-opus-4-7")
 }
 
+/// Per-turn reasoning levels: budget-style Claude models only, since the
+/// Converse request here carries the fixed-budget `thinking` shape.
+fn bedrock_effort_support(model: &str) -> zeroclaw_api::model_provider::ReasoningSupport {
+    let budget_style = crate::anthropic::anthropic_thinking_style(model)
+        == crate::anthropic::AnthropicThinkingStyle::Budget;
+    if budget_style && bedrock_model_supports_native_thinking(model) {
+        crate::anthropic::anthropic_effort_support(model)
+    } else {
+        zeroclaw_api::model_provider::ReasoningSupport::default()
+    }
+}
+
 fn bedrock_model_supports_prompt_caching(model: &str) -> bool {
     let model = model.to_ascii_lowercase();
     if model.contains("claude") {
@@ -1654,6 +1666,10 @@ impl BedrockModelProvider {
 
 #[async_trait]
 impl ModelProvider for BedrockModelProvider {
+    fn reasoning_support(&self, model: &str) -> zeroclaw_api::model_provider::ReasoningSupport {
+        bedrock_effort_support(model)
+    }
+
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             native_tool_calling: true,
@@ -1789,9 +1805,11 @@ impl ModelProvider for BedrockModelProvider {
         // Native thinking forces temperature=1.0 (Anthropic API requirement).
         // Otherwise the caller's Option<f64> flows through verbatim; None
         // omits the field via skip_serializing_if.
-        let (effective_temperature, additional_fields, effective_max_tokens) = match request
-            .thinking
-        {
+        let thinking = crate::anthropic::budget_effort_thinking(
+            &bedrock_effort_support(model),
+            request.thinking,
+        );
+        let (effective_temperature, additional_fields, effective_max_tokens) = match thinking {
             Some(params) if bedrock_model_supports_native_thinking(model) => {
                 ::zeroclaw_log::record!(
                     INFO,
@@ -2521,6 +2539,47 @@ mod tests {
         assert!(bedrock_model_supports_native_thinking(
             "us.anthropic.claude-haiku-4-5-v1"
         ));
+    }
+
+    #[test]
+    fn reasoning_levels_cover_budget_style_claude_models_only() {
+        use zeroclaw_api::model_provider::{NativeThinkingParams, ReasoningEffort};
+        let support = bedrock_effort_support("us.anthropic.claude-sonnet-4-6-v1");
+        assert_eq!(
+            support.levels,
+            vec![
+                ReasoningEffort::Off,
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::High,
+            ]
+        );
+        assert!(
+            bedrock_effort_support("anthropic.claude-opus-4-7-v1:0")
+                .levels
+                .is_empty()
+        );
+        assert!(
+            bedrock_effort_support("amazon.nova-pro-v1:0")
+                .levels
+                .is_empty()
+        );
+
+        let requested = Some(NativeThinkingParams {
+            budget_tokens: 4_096,
+            display: None,
+        });
+        let scoped = |effort: ReasoningEffort| {
+            zeroclaw_api::REASONING_EFFORT_OVERRIDE.sync_scope(Some(effort), || {
+                crate::anthropic::budget_effort_thinking(&support, requested)
+            })
+        };
+        assert_eq!(
+            scoped(ReasoningEffort::High).map(|p| p.budget_tokens),
+            Some(16_384)
+        );
+        assert_eq!(scoped(ReasoningEffort::Off), None);
+        assert_eq!(scoped(ReasoningEffort::Max), requested);
     }
 
     #[test]

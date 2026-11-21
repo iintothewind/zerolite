@@ -57,6 +57,10 @@ impl ModelProvider for VisionOverrideProvider {
         self.inner.supports_single_tool_rounds(model)
     }
 
+    fn reasoning_support(&self, model: &str) -> zeroclaw_api::model_provider::ReasoningSupport {
+        self.inner.reasoning_support(model)
+    }
+
     fn capabilities(&self) -> super::traits::ProviderCapabilities {
         // Patch the canonical `vision` capability; the default
         // `supports_vision()` reads this, and so does anything that inspects

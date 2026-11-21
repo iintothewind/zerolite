@@ -166,6 +166,10 @@ struct NativeChatRequest {
     /// only; `None` (the default) keeps the request byte-identical to today.
     #[serde(skip_serializing_if = "Option::is_none")]
     fallbacks: Option<Vec<NativeFallbackEntry>>,
+    /// Per-turn effort for adaptive thinking. `None` (the default) keeps the
+    /// request byte-identical to one without a user-chosen effort.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_config: Option<NativeOutputConfig>,
 }
 
 /// One entry in the native `fallbacks` array: a model Anthropic may serve
@@ -173,6 +177,12 @@ struct NativeChatRequest {
 #[derive(Debug, Serialize)]
 struct NativeFallbackEntry {
     model: String,
+}
+
+/// The native `output_config` object; carries the adaptive-thinking effort.
+#[derive(Debug, Serialize)]
+struct NativeOutputConfig {
+    effort: &'static str,
 }
 
 /// Beta value that opts a request into Anthropic's server-side fallback
@@ -293,6 +303,49 @@ pub(crate) fn anthropic_thinking_style(model: &str) -> AnthropicThinkingStyle {
     match claude_model_version(model) {
         Some(version) if version >= (4, 7) => AnthropicThinkingStyle::Adaptive,
         _ => AnthropicThinkingStyle::Budget,
+    }
+}
+
+/// Per-turn reasoning levels for a Claude model: the full ladder on adaptive
+/// models (`output_config.effort`), budget-backed levels on older ones, and
+/// none for IDs that carry no Claude version.
+pub(crate) fn anthropic_effort_support(
+    model: &str,
+) -> zeroclaw_api::model_provider::ReasoningSupport {
+    use zeroclaw_api::model_provider::{ReasoningEffort, ReasoningSupport};
+    if claude_model_version(model).is_none() {
+        return ReasoningSupport::default();
+    }
+    match anthropic_thinking_style(model) {
+        AnthropicThinkingStyle::Adaptive => ReasoningSupport::from_levels(ReasoningEffort::ALL),
+        AnthropicThinkingStyle::Budget => ReasoningSupport::from_levels(
+            ReasoningEffort::ALL
+                .into_iter()
+                .filter(|level| *level == ReasoningEffort::Off || level.budget_tokens().is_some()),
+        ),
+    }
+}
+
+/// Thinking params for a budget-style Claude model under the user's per-turn
+/// effort, when one is scoped and listed in `support`: `off` clears them, a
+/// graded level sets its budget (keeping the requested `display`). No
+/// applicable effort returns `requested` unchanged.
+pub(crate) fn budget_effort_thinking(
+    support: &zeroclaw_api::model_provider::ReasoningSupport,
+    requested: Option<zeroclaw_api::model_provider::NativeThinkingParams>,
+) -> Option<zeroclaw_api::model_provider::NativeThinkingParams> {
+    let Some(effort) = crate::reasoning::supported_effort_override(support) else {
+        return requested;
+    };
+    if effort == zeroclaw_api::model_provider::ReasoningEffort::Off {
+        return None;
+    }
+    match effort.budget_tokens() {
+        Some(budget_tokens) => Some(zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens,
+            display: requested.and_then(|params| params.display),
+        }),
+        None => requested,
     }
 }
 
@@ -2381,6 +2434,40 @@ impl AnthropicModelProvider {
         }
     }
 
+    /// Applies the user's per-turn effort to the thinking params of a request.
+    /// Adaptive models think for every level but `off`, the level riding in
+    /// `output_config.effort`; budget models map the level to a token budget.
+    fn effort_thinking(
+        &self,
+        model: &str,
+        requested: Option<zeroclaw_api::model_provider::NativeThinkingParams>,
+    ) -> (
+        Option<zeroclaw_api::model_provider::NativeThinkingParams>,
+        Option<NativeOutputConfig>,
+    ) {
+        use zeroclaw_api::model_provider::{
+            MIN_BUDGET_TOKENS, NativeThinkingParams, ReasoningEffort,
+        };
+        let support = anthropic_effort_support(model);
+        if anthropic_thinking_style(model) == AnthropicThinkingStyle::Budget {
+            return (budget_effort_thinking(&support, requested), None);
+        }
+        match crate::reasoning::supported_effort_override(&support) {
+            None => (requested, None),
+            Some(ReasoningEffort::Off) => (None, None),
+            Some(effort) => (
+                // The adaptive request shape ignores the budget.
+                Some(requested.unwrap_or(NativeThinkingParams {
+                    budget_tokens: MIN_BUDGET_TOKENS,
+                    display: None,
+                })),
+                Some(NativeOutputConfig {
+                    effort: effort.as_str(),
+                }),
+            ),
+        }
+    }
+
     /// Resolve thinking parameters for an API request. Returns the effective
     /// temperature (forced to 1.0 when thinking is active), the thinking
     /// config for the request body, and the effective max_tokens (raised to
@@ -2877,6 +2964,10 @@ impl ModelProvider for AnthropicModelProvider {
         self.single_tool_rounds_supported
     }
 
+    fn reasoning_support(&self, model: &str) -> zeroclaw_api::model_provider::ReasoningSupport {
+        anthropic_effort_support(model)
+    }
+
     fn supports_exact_request_replay(
         &self,
         request: crate::traits::ChatRequest<'_>,
@@ -2952,6 +3043,7 @@ impl ModelProvider for AnthropicModelProvider {
             stream: None,
             thinking: None,
             fallbacks,
+            output_config: None,
         };
 
         let mut request = self
@@ -3063,8 +3155,9 @@ impl ModelProvider for AnthropicModelProvider {
             system_prompt
         };
 
+        let (thinking_params, output_config) = self.effort_thinking(model, request.thinking);
         let (effective_temperature, thinking_config, effective_max_tokens) =
-            self.resolve_thinking(request.thinking, temperature, model);
+            self.resolve_thinking(thinking_params, temperature, model);
         let thinking_display_beta = thinking_config
             .as_ref()
             .is_some_and(|config| config.display.is_some());
@@ -3106,6 +3199,7 @@ impl ModelProvider for AnthropicModelProvider {
             stream: None,
             thinking: thinking_config,
             fallbacks,
+            output_config,
         };
 
         let req = self
@@ -3310,8 +3404,9 @@ impl ModelProvider for AnthropicModelProvider {
             system_prompt
         };
 
+        let (thinking_params, output_config) = self.effort_thinking(model, request.thinking);
         let (effective_temperature, thinking_config, effective_max_tokens) =
-            self.resolve_thinking(request.thinking, temperature, model);
+            self.resolve_thinking(thinking_params, temperature, model);
         let thinking_display_beta = thinking_config
             .as_ref()
             .is_some_and(|config| config.display.is_some());
@@ -3344,6 +3439,7 @@ impl ModelProvider for AnthropicModelProvider {
                 // Streaming path (incl. this thinking `stream: None` request):
                 // never opts into server-side fallback.
                 fallbacks: None,
+                output_config,
             };
             // Serialize eagerly so the request body is owned and `'static`
             // across the async boundary.
@@ -3475,6 +3571,7 @@ impl ModelProvider for AnthropicModelProvider {
             thinking: thinking_config,
             // Streaming never opts into server-side fallback.
             fallbacks: None,
+            output_config,
         };
 
         let body = match Self::build_streaming_request(&native_request) {
@@ -4728,6 +4825,57 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     #[test]
+    fn reasoning_override_maps_to_adaptive_effort_and_thinking_budgets() {
+        use zeroclaw_api::model_provider::{NativeThinkingParams, ReasoningEffort};
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .build();
+        let scoped = |effort: ReasoningEffort, model: &str| {
+            zeroclaw_api::REASONING_EFFORT_OVERRIDE
+                .sync_scope(Some(effort), || provider.effort_thinking(model, None))
+        };
+
+        // Adaptive models: thinking on, graded levels ride in `output_config`.
+        assert_eq!(
+            anthropic_effort_support("claude-opus-4-7").levels,
+            ReasoningEffort::ALL.to_vec()
+        );
+        let (thinking, output_config) = scoped(ReasoningEffort::High, "claude-opus-4-7");
+        assert!(thinking.is_some());
+        assert_eq!(
+            serde_json::to_value(output_config).unwrap(),
+            serde_json::json!({"effort": "high"})
+        );
+        let (thinking, output_config) = scoped(ReasoningEffort::Off, "claude-opus-4-7");
+        assert!(thinking.is_none() && output_config.is_none());
+
+        // Budget models: the level becomes a token budget.
+        assert_eq!(
+            anthropic_effort_support("claude-sonnet-4-5").levels,
+            vec![
+                ReasoningEffort::Off,
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::High,
+            ]
+        );
+        let (thinking, output_config) = scoped(ReasoningEffort::Medium, "claude-sonnet-4-5");
+        assert_eq!(
+            thinking,
+            Some(NativeThinkingParams {
+                budget_tokens: 8_192,
+                display: None,
+            })
+        );
+        assert!(output_config.is_none());
+
+        // A level the model does not offer changes nothing.
+        let (thinking, output_config) = scoped(ReasoningEffort::Max, "claude-sonnet-4-5");
+        assert!(thinking.is_none() && output_config.is_none());
+        assert!(anthropic_effort_support("kimi-k2").levels.is_empty());
+    }
+
+    #[test]
     fn resolve_thinking_emits_adaptive_shape_for_4_7_families_and_decorated_ids() {
         // The config this returns is what the messages request serializes.
         // Qualified and fast-mode IDs must not fall back to `enabled`.
@@ -4824,6 +4972,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             stream: None,
             thinking: None,
             fallbacks: None,
+            output_config: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("max_tokens"));
@@ -4846,6 +4995,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             stream: None,
             thinking: None,
             fallbacks: None,
+            output_config: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(
@@ -5739,6 +5889,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             stream: None,
             thinking: None,
             fallbacks: None,
+            output_config: None,
         };
 
         let json = serde_json::to_string(&req).unwrap();
@@ -5768,6 +5919,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             stream: None,
             thinking: None,
             fallbacks: None,
+            output_config: None,
         };
 
         let json = serde_json::to_string(&req).unwrap();
@@ -10692,6 +10844,7 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\"},\"usag
                 display: Some(ThinkingDisplay::Updates),
             }),
             fallbacks: None,
+            output_config: None,
         };
 
         let body = serde_json::to_value(&request).expect("serialize");
@@ -11017,6 +11170,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 display: Some(ThinkingDisplay::Updates),
             }),
             fallbacks: None,
+            output_config: None,
         };
 
         let body = serde_json::to_value(&request).expect("serialize");

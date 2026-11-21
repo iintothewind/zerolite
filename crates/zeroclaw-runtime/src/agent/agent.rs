@@ -2063,6 +2063,12 @@ impl Agent {
         )
     }
 
+    /// Reasoning-effort levels the active provider honors for the active
+    /// model; what a surface may scope as `REASONING_EFFORT_OVERRIDE`.
+    pub fn reasoning_support(&self) -> zeroclaw_api::model_provider::ReasoningSupport {
+        self.model_provider.reasoning_support(&self.model_name)
+    }
+
     /// Capacity and proactive-trim budget for the currently selected route.
     /// This is resolved on demand so a model/provider switch cannot leave a
     /// stale snapshot in a long-lived session.
@@ -2181,7 +2187,8 @@ impl Agent {
         effective_model: &str,
     ) -> Option<String> {
         // Bypass the cache when a per-turn memory preamble the key cannot see
-        // will be injected downstream (see `memory_injection_active`), or when
+        // will be injected downstream (see `memory_injection_active`), when a
+        // per-turn thinking or effort override changes the request, or when
         // hooks/tools can change the final provider request after this point.
         if self.temperature != Some(0.0)
             || self.response_cache.is_none()
@@ -2189,6 +2196,7 @@ impl Agent {
             || zeroclaw_api::NATIVE_THINKING_OVERRIDE
                 .try_with(Option::is_some)
                 .unwrap_or(false)
+            || zeroclaw_api::reasoning_effort_override().is_some()
             || self
                 .hook_runner
                 .as_ref()

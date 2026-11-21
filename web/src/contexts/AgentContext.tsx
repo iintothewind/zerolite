@@ -36,6 +36,13 @@ import {
 import { primeModelProviderCatalog, modelProviderDisplayName } from '@/lib/modelProviders';
 import { resolveAvailableModels } from './modelPicker.logic';
 import { contextMeterStep, type ContextInputSource } from './contextMeter.logic';
+import {
+  INITIAL_EFFORT_STATE,
+  chooseEffort,
+  parseReasoningInfo,
+  publishReasoning,
+  type EffortLevel,
+} from '@/lib/effort.logic';
 import { buildHistoryTrimmedNotice } from './historyTrimNotices.logic';
 import { formatOutputTruncatedNotice } from '@/lib/outputTruncatedNotice';
 import { isPendingCall, type ToolCall } from '@/lib/toolCall';
@@ -226,6 +233,12 @@ export interface AgentContextValue {
    * `calibrated` means the number is a provider measurement anchored on the
    * unchanged prefix plus a local estimate for the unbilled tail. */
   contextInputSource: ContextInputSource;
+  /** Reasoning-effort levels the serving model offers; empty hides the picker. */
+  effortLevels: EffortLevel[];
+  /** The effort the next message is sent with. `auto` (the default) sends
+   *  none; the choice is not persisted and resets when the model changes. */
+  effort: EffortLevel;
+  setEffort: (level: EffortLevel) => void;
   /** Composer stats snapshot. Canonical rule: `docs/design/webui.md`,
    *  "Composer stats semantics". */
   liveStats: LiveStats;
@@ -324,7 +337,7 @@ export interface SessionSocket {
   connect(): void;
   disconnect(): void;
   readonly connected: boolean;
-  sendMessage(content: string): void;
+  sendMessage(content: string, effort?: string): void;
   sendApprovalResponse(requestId: string, decision: ApprovalDecision): void;
   sendQuestionResponse(requestId: string, answers: string[] | null): void;
 }
@@ -436,6 +449,14 @@ export function AgentProvider({
   const [contextTrimBudgetTokens, setContextTrimBudgetTokens] = useState<number | null>(null);
   const [contextInputTokens, setContextInputTokens] = useState<number | null>(null);
   const [contextInputSource, setContextInputSource] = useState<ContextInputSource>(null);
+  // Held in memory only: a reload starts every model at `auto`.
+  const [effortState, setEffortState] = useState(INITIAL_EFFORT_STATE);
+  const effortRef = useRef(effortState.effort);
+  effortRef.current = effortState.effort;
+  const setEffort = useCallback(
+    (level: EffortLevel) => setEffortState((state) => chooseEffort(state, level)),
+    [],
+  );
   const [tokenStats, setTokenStats] = useState<TokenStats>(emptyTokenStats);
   const [tokenRateState, setTokenRateState] = useState<{ rate: number | null; rateMuted: boolean; rateBilled: boolean }>({
     rate: null,
@@ -727,6 +748,7 @@ export function AgentProvider({
           break;
         }
         sessionStartsRef.current += 1;
+        setEffortState((state) => publishReasoning(state, parseReasoningInfo(msg.reasoning)));
         // The server holds nothing for this socket's conversation, yet the
         // transcript shows messages: the server started it over (it was
         // closed to make room for another, or a restart ended it). Those
@@ -816,6 +838,10 @@ export function AgentProvider({
 
       case 'message':
       case 'done': {
+        if (msg.type === 'done' && msg.reasoning) {
+          const published = parseReasoningInfo(msg.reasoning);
+          setEffortState((state) => publishReasoning(state, published));
+        }
         const { completion: outcome, segments } = foldTurnStream({
           type: msg.type,
           full_response: msg.full_response,
@@ -1474,7 +1500,8 @@ export function AgentProvider({
     }
     if (!wsRef.current?.connected) return;
     try {
-      wsRef.current.sendMessage(content);
+      const effort = effortRef.current;
+      wsRef.current.sendMessage(content, effort === 'auto' ? undefined : effort);
 
       setTyping(true);
       foldTurnStream({ type: 'turn_start' });
@@ -2001,6 +2028,9 @@ export function AgentProvider({
     contextTrimBudgetTokens,
     contextInputTokens,
     contextInputSource,
+    effortLevels: effortState.info.levels,
+    effort: effortState.effort,
+    setEffort,
     liveStats,
     liveTurn,
     hasEarlierTurns,

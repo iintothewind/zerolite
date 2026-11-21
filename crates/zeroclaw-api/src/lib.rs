@@ -54,4 +54,53 @@ tokio::task_local! {
     /// Native extended thinking parameters, set by the outer orchestration
     /// functions and read by `run_tool_call_loop` when building `ChatRequest`.
     pub static NATIVE_THINKING_OVERRIDE: Option<crate::model_provider::NativeThinkingParams>;
+
+    /// Reasoning effort the user chose for the current turn. Scoped by the
+    /// surface that offers the choice; read by providers when building a
+    /// request.
+    pub static REASONING_EFFORT_OVERRIDE: Option<crate::model_provider::ReasoningEffort>;
+
+    /// Set once an endpoint refused the current turn's
+    /// [`REASONING_EFFORT_OVERRIDE`]. Scoped beside it.
+    pub static REASONING_EFFORT_REJECTED: std::sync::Arc<std::sync::atomic::AtomicBool>;
+}
+
+/// Per-turn effort chosen by the user, if a surface scoped one and no
+/// endpoint refused it earlier in the turn.
+pub fn reasoning_effort_override() -> Option<model_provider::ReasoningEffort> {
+    let rejected = REASONING_EFFORT_REJECTED
+        .try_with(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+        .unwrap_or(false);
+    if rejected {
+        return None;
+    }
+    REASONING_EFFORT_OVERRIDE.try_with(|v| *v).ok().flatten()
+}
+
+/// Records that an endpoint refused the turn's effort: the rest of the turn
+/// runs without it and the surface can tell the user.
+pub fn reject_reasoning_effort() {
+    let _ = REASONING_EFFORT_REJECTED
+        .try_with(|flag| flag.store(true, std::sync::atomic::Ordering::Relaxed));
+}
+
+/// Runs `future` with a per-turn reasoning effort. `rejected` is the flag
+/// [`reject_reasoning_effort`] sets; the caller keeps a clone to read it.
+pub fn scope_reasoning_effort<F: Future>(
+    effort: Option<model_provider::ReasoningEffort>,
+    rejected: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    future: F,
+) -> impl Future<Output = F::Output> {
+    REASONING_EFFORT_OVERRIDE.scope(effort, REASONING_EFFORT_REJECTED.scope(rejected, future))
+}
+
+/// Carries the calling task's reasoning-effort scope into `future`, for a
+/// future about to be spawned: task-locals do not cross a spawn. Call it on
+/// the spawning task.
+pub fn carry_reasoning_effort<F: Future>(future: F) -> impl Future<Output = F::Output> {
+    let effort = REASONING_EFFORT_OVERRIDE.try_with(|v| *v).ok().flatten();
+    let rejected = REASONING_EFFORT_REJECTED
+        .try_with(std::sync::Arc::clone)
+        .unwrap_or_default();
+    scope_reasoning_effort(effort, rejected, future)
 }

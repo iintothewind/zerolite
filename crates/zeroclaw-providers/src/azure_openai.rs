@@ -296,11 +296,8 @@ impl AzureOpenAiModelProvider {
         )
     }
 
-    /// Return the configured `reasoning_effort` when the model accepts it
-    /// (GPT-5.x / o-series), otherwise `None`.  Mirrors the compatible
-    /// provider's `reasoning_effort_for_model` so Azure parity is maintained.
-    fn reasoning_effort_for_model(&self, model: &str) -> Option<String> {
-        let effort = self.reasoning_effort.as_ref()?;
+    /// Whether the model accepts `reasoning_effort` (GPT-5.x / o-series).
+    fn accepts_reasoning_effort(model: &str) -> bool {
         let id = model
             .rsplit('/')
             .next()
@@ -309,14 +306,27 @@ impl AzureOpenAiModelProvider {
         // gpt-5*-chat-latest are non-reasoning router models; they reject
         // reasoning_effort, so exclude them the same way compatible.rs does.
         let is_gpt5_chat_latest = id.starts_with("gpt-5") && id.ends_with("-chat-latest");
-        let is_reasoning_model = id == "o1"
+        id == "o1"
             || id.starts_with("o1-")
             || id == "o3"
             || id.starts_with("o3-")
             || id == "o4"
             || id.starts_with("o4-")
-            || (id.starts_with("gpt-5") && !is_gpt5_chat_latest);
-        is_reasoning_model.then(|| effort.clone())
+            || (id.starts_with("gpt-5") && !is_gpt5_chat_latest)
+    }
+
+    /// Return the `reasoning_effort` to send when the model accepts it,
+    /// otherwise `None`: the user's per-turn choice, else the configured
+    /// effort. Mirrors the compatible provider's `reasoning_effort_for_model`
+    /// so Azure parity is maintained.
+    fn reasoning_effort_for_model(&self, model: &str) -> Option<String> {
+        if let Some(effort) =
+            crate::reasoning::supported_effort_override(&self.reasoning_support(model))
+        {
+            return Some(effort.as_str().to_string());
+        }
+        let effort = self.reasoning_effort.as_ref()?;
+        Self::accepts_reasoning_effort(model).then(|| effort.clone())
     }
 
     async fn send_native_chat_request(
@@ -498,6 +508,14 @@ impl AzureOpenAiModelProvider {
 
 #[async_trait]
 impl ModelProvider for AzureOpenAiModelProvider {
+    fn reasoning_support(&self, model: &str) -> zeroclaw_api::model_provider::ReasoningSupport {
+        if Self::accepts_reasoning_effort(model) {
+            crate::reasoning::openai_effort_support()
+        } else {
+            zeroclaw_api::model_provider::ReasoningSupport::default()
+        }
+    }
+
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             native_tool_calling: true,
@@ -862,6 +880,32 @@ mod tests {
             p.reasoning_effort_for_model("gpt-5-chat-latest"),
             None,
             "ineligible router models still omit reasoning_effort"
+        );
+    }
+
+    #[test]
+    fn reasoning_override_replaces_configured_effort_for_eligible_models() {
+        use zeroclaw_api::model_provider::ReasoningEffort;
+        let p = AzureOpenAiModelProvider::builder("test")
+            .resource_name("resource")
+            .deployment_name("deployment")
+            .credential(Some("key"))
+            .reasoning_effort(Some("high".to_string()))
+            .build();
+        let scoped = |effort: ReasoningEffort, model: &str| {
+            zeroclaw_api::REASONING_EFFORT_OVERRIDE
+                .sync_scope(Some(effort), || p.reasoning_effort_for_model(model))
+        };
+
+        assert_eq!(
+            scoped(ReasoningEffort::Low, "gpt-5"),
+            Some("low".to_string())
+        );
+        assert_eq!(scoped(ReasoningEffort::Low, "gpt-5-chat-latest"), None);
+        // `xhigh` is not offered here: the configured effort stands.
+        assert_eq!(
+            scoped(ReasoningEffort::Xhigh, "gpt-5"),
+            Some("high".to_string())
         );
     }
 

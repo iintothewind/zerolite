@@ -1130,6 +1130,14 @@ pub struct ModelProviderConfig {
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "is_false")]
     pub reasoning_effort_passthrough: bool,
+    /// Reasoning levels this alias's backend accepts as `reasoning_effort`
+    /// (subset of off|low|medium|high|xhigh|max). When set, the web effort
+    /// picker offers exactly these (plus `auto`) and the chosen one is sent as
+    /// top-level `reasoning_effort`. Unknown names are ignored. Empty:
+    /// built-in detection, which offers every level for unknown models.
+    #[tab(Advanced)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasoning_levels: Vec<String>,
     /// Pull live token prices for this provider's models from its own
     /// OpenAI-compatible `/models` listing (the gateway is the source of truth
     /// for its prices), filling cost-tracking rates for models the operator

@@ -155,12 +155,12 @@ export class WebSocketClient {
     };
   }
 
-  /** Send a chat message to the agent. */
-  sendMessage(content: string): void {
+  /** Send a chat message to the agent, with the reasoning effort chosen for it. */
+  sendMessage(content: string, effort?: string): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       throw new Error('WebSocket is not connected');
     }
-    this.ws.send(JSON.stringify({ type: 'message', content }));
+    this.ws.send(JSON.stringify({ type: 'message', content, effort }));
   }
 
   /**

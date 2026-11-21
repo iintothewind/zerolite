@@ -45,6 +45,82 @@ impl ThinkingDisplay {
     }
 }
 
+/// A reasoning-effort level a user can pick for one turn. Not picking one
+/// (surfaces call that `auto`) leaves the configured behavior in place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    Off,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+impl ReasoningEffort {
+    /// Every level, weakest first; the order surfaces display them in.
+    pub const ALL: [Self; 6] = [
+        Self::Off,
+        Self::Low,
+        Self::Medium,
+        Self::High,
+        Self::Xhigh,
+        Self::Max,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+
+    /// Exact lowercase ids only.
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|level| level.as_str() == s)
+    }
+
+    /// Thinking budget for budget-style providers.
+    pub fn budget_tokens(self) -> Option<u32> {
+        match self {
+            Self::Low => Some(2_048),
+            Self::Medium => Some(8_192),
+            Self::High => Some(16_384),
+            Self::Off | Self::Xhigh | Self::Max => None,
+        }
+    }
+}
+
+/// The reasoning-effort levels a provider honors for one model.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ReasoningSupport {
+    /// Supported levels in [`ReasoningEffort::ALL`] order; empty when the
+    /// model exposes no per-turn control.
+    pub levels: Vec<ReasoningEffort>,
+}
+
+impl ReasoningSupport {
+    /// Sorts/dedups into [`ReasoningEffort::ALL`] order.
+    pub fn from_levels(levels: impl IntoIterator<Item = ReasoningEffort>) -> Self {
+        let given: Vec<ReasoningEffort> = levels.into_iter().collect();
+        Self {
+            levels: ReasoningEffort::ALL
+                .into_iter()
+                .filter(|level| given.contains(level))
+                .collect(),
+        }
+    }
+
+    pub fn supports(&self, effort: ReasoningEffort) -> bool {
+        self.levels.contains(&effort)
+    }
+}
+
 /// A single message in a conversation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
@@ -734,6 +810,12 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
         false
     }
 
+    /// Reasoning-effort levels this provider honors for `model` when a surface
+    /// scopes [`crate::REASONING_EFFORT_OVERRIDE`]. Empty: no per-turn control.
+    fn reasoning_support(&self, _model: &str) -> ReasoningSupport {
+        ReasoningSupport::default()
+    }
+
     /// Explicit per-request policy. Unsupported adapters retain their batch path.
     async fn chat_with_tool_round_policy(
         &self,
@@ -1039,6 +1121,10 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
 impl<T: ModelProvider + ?Sized> ModelProvider for Arc<T> {
     fn supports_single_tool_rounds(&self, model: &str) -> bool {
         self.as_ref().supports_single_tool_rounds(model)
+    }
+
+    fn reasoning_support(&self, model: &str) -> ReasoningSupport {
+        self.as_ref().reasoning_support(model)
     }
 
     async fn chat_with_tool_round_policy(
@@ -1566,5 +1652,18 @@ mod thinking_display_tests {
             !json.contains("display"),
             "expected display field to be omitted, got: {json}"
         );
+    }
+}
+
+#[cfg(test)]
+mod reasoning_support_tests {
+    use super::{ReasoningEffort as E, ReasoningSupport};
+
+    #[test]
+    fn reasoning_levels_are_ordered_and_deduplicated() {
+        let support = ReasoningSupport::from_levels([E::Max, E::Off, E::Low, E::Off]);
+        assert_eq!(support.levels, vec![E::Off, E::Low, E::Max]);
+        assert!(support.supports(E::Max));
+        assert!(!support.supports(E::Medium));
     }
 }

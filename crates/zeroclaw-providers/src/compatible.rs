@@ -20,6 +20,7 @@ use reqwest::{
 };
 use serde::{Deserialize, Serialize};
 use zeroclaw_api::media::{MarkerKind, RenderedMarker};
+use zeroclaw_api::model_provider::{ReasoningEffort, ReasoningSupport};
 use zeroclaw_api::tool_carrier::{classify, is_tool_result_carrier, rebuild_carrier};
 use zeroclaw_config::schema::{CacheTtl, ToolResultImagePolicy};
 
@@ -84,6 +85,13 @@ pub struct OpenAiCompatibleModelProvider {
     /// (GLM/Kimi/DeepSeek/Qwen-style reasoners behind OpenAI-compatible
     /// gateways commonly do).
     reasoning_effort_passthrough: bool,
+    /// Operator-declared levels the backend accepts as `reasoning_effort`.
+    /// Non-empty: the per-turn effort picker offers exactly these.
+    reasoning_levels: Vec<ReasoningEffort>,
+    /// Whether `extra_body` carries a build-time
+    /// `chat_template_kwargs.enable_thinking` from the alias's `think`, which a
+    /// per-turn `off` may override.
+    chat_template_thinking: bool,
     /// Whether stored assistant reasoning should be replayed on outbound
     /// assistant history messages. Some providers reject reasoning fields as
     /// input even though they may return them in responses.
@@ -548,6 +556,9 @@ pub struct OpenAiCompatibleBuilder {
     /// Default `false` keeps the OpenAI-reasoning-family name filter in
     /// charge of which models receive `reasoning_effort`.
     reasoning_effort_passthrough: bool,
+    /// Set by [`OpenAiCompatibleBuilder::reasoning_levels`]. Default empty:
+    /// built-in detection decides which levels a model offers.
+    reasoning_levels: Vec<ReasoningEffort>,
     /// Set to `Some(false)` by
     /// [`OpenAiCompatibleBuilder::without_assistant_reasoning_replay`]. `None`
     /// preserves the default (replay enabled).
@@ -713,6 +724,13 @@ impl OpenAiCompatibleBuilder {
     /// enable this only on backends verified to accept `reasoning_effort`.
     pub fn with_reasoning_effort_passthrough(mut self) -> Self {
         self.reasoning_effort_passthrough = true;
+        self
+    }
+
+    /// Declare the reasoning levels this backend accepts as
+    /// `reasoning_effort`; the per-turn effort picker offers exactly these.
+    pub fn reasoning_levels(mut self, levels: Vec<ReasoningEffort>) -> Self {
+        self.reasoning_levels = levels;
         self
     }
 
@@ -922,6 +940,9 @@ impl OpenAiCompatibleBuilder {
             extra_headers: self.extra_headers,
             reasoning_effort: self.reasoning_effort,
             reasoning_effort_passthrough: self.reasoning_effort_passthrough,
+            reasoning_levels: self.reasoning_levels,
+            chat_template_thinking: self.chat_template_thinking.is_some()
+                && !self.thinking_passthrough,
             replay_assistant_reasoning: self.replay_assistant_reasoning_override.unwrap_or(true),
             cache_passthrough: self.cache_passthrough,
             cache_ttl: self.cache_ttl,
@@ -1013,6 +1034,7 @@ impl OpenAiCompatibleModelProvider {
             extra_headers: std::collections::HashMap::new(),
             reasoning_effort: None,
             reasoning_effort_passthrough: false,
+            reasoning_levels: Vec::new(),
             replay_assistant_reasoning_override: None,
             cache_passthrough: false,
             cache_ttl: None,
@@ -1405,7 +1427,89 @@ impl OpenAiCompatibleModelProvider {
         self.merge_system_into_user || Self::model_requires_system_merge(model)
     }
 
+    /// Reasoning levels offered for `model`: the DeepSeek dialect's, else the
+    /// alias's configured `reasoning_levels`, else every level. The last is an
+    /// assumption about an unknown backend; a level it refuses is handled per
+    /// request by [`Self::drop_rejected_effort`].
+    fn effort_support(&self, _model: &str) -> ReasoningSupport {
+        if self.deepseek_contract {
+            // `off` needs the per-request `thinking` toggle, which thinking
+            // passthrough reserves for the gateway-translated object.
+            return ReasoningSupport::from_levels(
+                ReasoningEffort::ALL
+                    .into_iter()
+                    .filter(|level| *level != ReasoningEffort::Off || !self.thinking_passthrough),
+            );
+        }
+        if !self.reasoning_levels.is_empty() {
+            return ReasoningSupport::from_levels(self.reasoning_levels.iter().copied());
+        }
+        ReasoningSupport::from_levels(ReasoningEffort::ALL)
+    }
+
+    /// Handles an error answer to a request carrying the user's per-turn
+    /// effort: drops `reasoning_effort` from `payload` and marks the effort
+    /// refused for the rest of the turn. Every error status qualifies except
+    /// the ones that cannot be about a parameter (401, 403, 429): an unknown
+    /// backend may answer an unsupported level with anything, and the cost of
+    /// a wrong guess is one retry without the effort. Returns whether the
+    /// payload changed, i.e. whether that retry is worthwhile.
+    fn drop_rejected_effort(
+        &self,
+        model: &str,
+        status: reqwest::StatusCode,
+        payload: &mut serde_json::Value,
+    ) -> bool {
+        let Some(effort) = crate::reasoning::supported_effort_override(&self.effort_support(model))
+        else {
+            return false;
+        };
+        if matches!(
+            status,
+            reqwest::StatusCode::UNAUTHORIZED
+                | reqwest::StatusCode::FORBIDDEN
+                | reqwest::StatusCode::TOO_MANY_REQUESTS
+        ) {
+            return false;
+        }
+        let dropped = payload
+            .as_object_mut()
+            .and_then(|object| object.remove("reasoning_effort"))
+            .is_some();
+        if dropped {
+            zeroclaw_api::reject_reasoning_effort();
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Retry)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "provider": &self.name,
+                        "alias": &self.alias,
+                        "model": model,
+                        "effort": effort.as_str(),
+                        "status": status.as_u16(),
+                    })),
+                "compatible provider retrying without the per-turn reasoning effort the endpoint rejected"
+            );
+        }
+        dropped
+    }
+
     fn reasoning_effort_for_model(&self, model: &str) -> Option<String> {
+        // The user's per-turn choice replaces the configured effort. Ids go
+        // out verbatim: DeepSeek accepts `low|medium|high|xhigh|max`. `off`
+        // travels as a thinking toggle where one exists (DeepSeek, a
+        // chat-template alias), else as OpenAI's `none`.
+        if let Some(effort) =
+            crate::reasoning::supported_effort_override(&self.effort_support(model))
+        {
+            let toggled_off = self.deepseek_contract || self.chat_template_thinking;
+            return match effort {
+                ReasoningEffort::Off if toggled_off => None,
+                ReasoningEffort::Off => Some("none".to_string()),
+                graded => Some(graded.as_str().to_string()),
+            };
+        }
         let effort = self.reasoning_effort.as_ref()?;
         // DeepSeek documents `reasoning_effort` for every model, so the OpenAI
         // name filter does not apply. Its ladder tops out at `max` and the server
@@ -1427,26 +1531,7 @@ impl OpenAiCompatibleModelProvider {
         if self.reasoning_effort_passthrough {
             return Some(effort.clone());
         }
-        let id = model
-            .rsplit('/')
-            .next()
-            .unwrap_or(model)
-            .to_ascii_lowercase();
-        // gpt-5*-chat-latest (gpt-5-chat-latest, gpt-5.1-chat-latest, ...) are
-        // OpenAI's non-reasoning chat-router models; the Chat Completions API
-        // rejects reasoning_effort for them. Treat them as a distinct family, the
-        // same way the native openai.rs provider already special-cases them.
-        let is_gpt5_chat_latest = id.starts_with("gpt-5") && id.ends_with("-chat-latest");
-        let is_openai_reasoning_model = id == "o1"
-            || id.starts_with("o1-")
-            || id == "o3"
-            || id.starts_with("o3-")
-            || id == "o4"
-            || id.starts_with("o4-")
-            || (id.starts_with("gpt-5") && !is_gpt5_chat_latest);
-        let is_likely_codex_supported = id.contains("codex") && id.starts_with("gpt-");
-
-        (is_openai_reasoning_model || is_likely_codex_supported).then(|| effort.clone())
+        crate::reasoning::is_openai_reasoning_model(model).then(|| effort.clone())
     }
 
     async fn resolve_credential(&self) -> anyhow::Result<Option<String>> {
@@ -1731,28 +1816,72 @@ impl OpenAiCompatibleModelProvider {
 
     /// Effective `extra_body` for a request body: the injected `thinking`
     /// object (when any) merged under the configured `extra_body`, whose
-    /// explicit keys always win. With the flag off or no params supplied,
-    /// this is exactly the configured `extra_body` (byte-identical default).
+    /// explicit keys always win, then the user's per-turn effort toggle. With
+    /// the flag off, no params supplied and no per-turn effort, this is
+    /// exactly the configured `extra_body` (byte-identical default).
     fn request_extra_body(
         &self,
         model: &str,
         thinking: Option<zeroclaw_api::model_provider::NativeThinkingParams>,
     ) -> Option<serde_json::Value> {
-        let Some(mut merged) = self.thinking_request_object(model, thinking) else {
-            return self.extra_body.clone();
-        };
-        match self.extra_body.as_ref() {
-            None => Some(merged),
-            Some(extra) if extra.is_object() => {
-                if let (Some(base), Some(over)) = (merged.as_object_mut(), extra.as_object()) {
-                    base.extend(over.clone());
+        let body = match self.thinking_request_object(model, thinking) {
+            None => self.extra_body.clone(),
+            Some(mut merged) => match self.extra_body.as_ref() {
+                None => Some(merged),
+                Some(extra) if extra.is_object() => {
+                    if let (Some(base), Some(over)) = (merged.as_object_mut(), extra.as_object()) {
+                        base.extend(over.clone());
+                    }
+                    Some(merged)
                 }
-                Some(merged)
-            }
-            // Non-object `extra_body` cannot be key-merged; the explicit
-            // config value wins outright (preserving its existing behavior).
-            Some(extra) => Some(extra.clone()),
+                // Non-object `extra_body` cannot be key-merged; the explicit
+                // config value wins outright (preserving its existing behavior).
+                Some(extra) => Some(extra.clone()),
+            },
+        };
+        self.apply_effort_toggle(model, body)
+    }
+
+    /// Applies the user's per-turn effort to the thinking toggle carried in
+    /// `extra_body`, overriding the value baked at build time: DeepSeek's
+    /// `thinking.type` (which outranks `reasoning_effort` there, so a graded
+    /// level forces it on), or a chat-template `enable_thinking` for `off`.
+    /// `auto` and a non-object `extra_body` are left untouched.
+    fn apply_effort_toggle(
+        &self,
+        model: &str,
+        body: Option<serde_json::Value>,
+    ) -> Option<serde_json::Value> {
+        let Some(effort) = crate::reasoning::supported_effort_override(&self.effort_support(model))
+        else {
+            return body;
+        };
+        let off = effort == ReasoningEffort::Off;
+        let deepseek_toggle = self.deepseek_contract && !self.thinking_passthrough;
+        let template_toggle = self.chat_template_thinking && off;
+        if !(deepseek_toggle || template_toggle) {
+            return body;
         }
+        let mut object = match body {
+            Some(serde_json::Value::Object(object)) => object,
+            Some(other) => return Some(other),
+            None => serde_json::Map::new(),
+        };
+        if deepseek_toggle {
+            object.insert(
+                "thinking".to_string(),
+                serde_json::json!({"type": if off { "disabled" } else { "enabled" }}),
+            );
+        } else if let serde_json::Value::Object(kwargs) = object
+            .entry("chat_template_kwargs")
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+        {
+            kwargs.insert(
+                "enable_thinking".to_string(),
+                serde_json::Value::Bool(false),
+            );
+        }
+        Some(serde_json::Value::Object(object))
     }
 
     /// Effective request shape for a body that may carry thinking
@@ -4326,6 +4455,10 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         self.canonical_base_url
     }
 
+    fn reasoning_support(&self, model: &str) -> ReasoningSupport {
+        self.effort_support(model)
+    }
+
     fn capabilities(&self) -> zeroclaw_api::model_provider::ProviderCapabilities {
         zeroclaw_api::model_provider::ProviderCapabilities {
             native_tool_calling: self.native_tool_calling,
@@ -4608,7 +4741,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             tools: None,
             tool_choice: None,
             max_tokens: self.max_tokens,
-            extra_body: self.extra_body.clone(),
+            extra_body: self.request_extra_body(model, None),
         };
         // No cache breakpoints here, deliberately: this text-only helper
         // never surfaces response usage to dispatch accounting, so a
@@ -4756,6 +4889,9 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
 
             let status = response.status();
             let error = response.text().await?;
+            if !exact_request_replay && self.drop_rejected_effort(model, status, &mut payload) {
+                continue;
+            }
             if !exact_request_replay
                 && tools_count > 0
                 && super::rejects_tools_with_reasoning_effort(status, &error)
@@ -4884,6 +5020,10 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             let error = response.text().await?;
             let sanitized = super::sanitize_api_error(&error);
 
+            if !exact_request_replay && self.drop_rejected_effort(model, status, &mut payload) {
+                continue;
+            }
+
             if !exact_request_replay
                 && tools_count > 0
                 && super::rejects_tools_with_reasoning_effort(status, &error)
@@ -5005,7 +5145,8 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
 
-        let handle = ::zeroclaw_spawn::spawn!(async move {
+        // Task-locals do not cross `spawn!`; carry the per-turn effort over.
+        let handle = ::zeroclaw_spawn::spawn!(zeroclaw_api::carry_reasoning_effort(async move {
             let normalized = match provider
                 .normalize_messages_for_upstream(&messages_owned)
                 .await
@@ -5183,6 +5324,11 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     Err(_) => format!("HTTP error: {}", status),
                 };
                 if !exact_request_replay
+                    && provider.drop_rejected_effort(&model, status, &mut payload)
+                {
+                    continue;
+                }
+                if !exact_request_replay
                     && tools_count > 0
                     && super::rejects_tools_with_reasoning_effort(status, &error)
                     && ensure_reasoning_effort_none(&mut payload)
@@ -5223,7 +5369,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     break;
                 }
             }
-        });
+        }));
 
         let guard = AbortOnDrop::new(handle.abort_handle());
         stream::unfold((rx, guard), |(mut rx, guard)| async move {
@@ -5254,7 +5400,8 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         // Use a channel to bridge the async HTTP response to the stream
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
 
-        let handle = ::zeroclaw_spawn::spawn!(async move {
+        // Task-locals do not cross `spawn!`; carry the per-turn effort over.
+        let handle = ::zeroclaw_spawn::spawn!(zeroclaw_api::carry_reasoning_effort(async move {
             // Normalize image markers in the user-supplied message before
             // forwarding upstream — seefor the OpenAI-compatible
             // remote-vs-local file path problem.
@@ -5316,7 +5463,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 tools: None,
                 tool_choice: None,
                 max_tokens: provider.max_tokens,
-                extra_body: provider.extra_body.clone(),
+                extra_body: provider.request_extra_body(&model, None),
             };
             // No cache breakpoints here, deliberately: this legacy chunk
             // stream never converts the final usage chunk into a
@@ -5401,7 +5548,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     break; // Receiver dropped
                 }
             }
-        });
+        }));
 
         // Convert channel receiver to stream
         let guard = AbortOnDrop::new(handle.abort_handle());
@@ -5430,7 +5577,8 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
 
-        let handle = ::zeroclaw_spawn::spawn!(async move {
+        // Task-locals do not cross `spawn!`; carry the per-turn effort over.
+        let handle = ::zeroclaw_spawn::spawn!(zeroclaw_api::carry_reasoning_effort(async move {
             let normalized = match provider
                 .normalize_messages_for_upstream(&messages_owned)
                 .await
@@ -5470,7 +5618,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 tools: None,
                 tool_choice: None,
                 max_tokens: provider.max_tokens,
-                extra_body: provider.extra_body.clone(),
+                extra_body: provider.request_extra_body(&model, None),
             };
             // No cache breakpoints here, deliberately: this legacy chunk
             // stream never converts the final usage chunk into a
@@ -5546,7 +5694,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     break;
                 }
             }
-        });
+        }));
 
         let guard = AbortOnDrop::new(handle.abort_handle());
         stream::unfold((rx, guard), |(mut rx, guard)| async move {
@@ -8941,6 +9089,170 @@ mod tests {
 
         let value = request_body("test", "https://example.com", Some(false), None);
         assert!(value.get("thinking").is_none(), "got: {value}");
+    }
+
+    /// Request body built while the user's per-turn `effort` is scoped.
+    fn reasoning_request_body(
+        p: &OpenAiCompatibleModelProvider,
+        model: &str,
+        effort: Option<ReasoningEffort>,
+    ) -> serde_json::Value {
+        zeroclaw_api::REASONING_EFFORT_OVERRIDE.sync_scope(effort, || {
+            let req = p.build_native_tool_chat_request(
+                &[ChatMessage::user("hello")],
+                None,
+                model,
+                None,
+                false,
+                false,
+                None,
+            );
+            serde_json::to_value(&req).unwrap()
+        })
+    }
+
+    #[test]
+    fn reasoning_override_drives_deepseek_effort_and_thinking_toggle() {
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("DeepSeek")
+            .base_url("https://api.deepseek.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .reasoning_effort(Some("high".to_string()))
+            .thinking_enabled(Some(false))
+            .build();
+        assert_eq!(
+            p.reasoning_support("deepseek-flash").levels,
+            ReasoningEffort::ALL.to_vec()
+        );
+
+        let configured = reasoning_request_body(&p, "deepseek-flash", None);
+        assert_eq!(configured["reasoning_effort"], "high");
+        assert_eq!(configured["thinking"]["type"], "disabled");
+
+        let off = reasoning_request_body(&p, "deepseek-flash", Some(ReasoningEffort::Off));
+        assert!(off.get("reasoning_effort").is_none(), "got: {off}");
+        assert_eq!(off["thinking"]["type"], "disabled");
+
+        // A graded level must switch thinking on: DeepSeek's `thinking.type`
+        // outranks `reasoning_effort`.
+        let xhigh = reasoning_request_body(&p, "deepseek-flash", Some(ReasoningEffort::Xhigh));
+        assert_eq!(xhigh["reasoning_effort"], "xhigh");
+        assert_eq!(xhigh["thinking"]["type"], "enabled");
+    }
+
+    #[test]
+    fn reasoning_override_honors_configured_levels_and_ignores_unsupported_ones() {
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("test")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .reasoning_levels(vec![ReasoningEffort::Max, ReasoningEffort::Low])
+            .build();
+        let support = p.reasoning_support("glm-5p3");
+        assert_eq!(
+            support.levels,
+            vec![ReasoningEffort::Low, ReasoningEffort::Max]
+        );
+
+        let max = reasoning_request_body(&p, "glm-5p3", Some(ReasoningEffort::Max));
+        assert_eq!(max["reasoning_effort"], "max");
+
+        // `medium` is not offered for this alias: the request is the same as
+        // one without a per-turn choice.
+        assert_eq!(
+            reasoning_request_body(&p, "glm-5p3", Some(ReasoningEffort::Medium)),
+            reasoning_request_body(&p, "glm-5p3", None),
+        );
+    }
+
+    #[test]
+    fn reasoning_override_offers_every_level_to_unknown_models() {
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("test")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .build();
+        assert_eq!(
+            p.reasoning_support("glm-5p3").levels,
+            ReasoningEffort::ALL.to_vec()
+        );
+
+        let max = reasoning_request_body(&p, "glm-5p3", Some(ReasoningEffort::Max));
+        assert_eq!(max["reasoning_effort"], "max");
+        let off = reasoning_request_body(&p, "glm-5p3", Some(ReasoningEffort::Off));
+        assert_eq!(off["reasoning_effort"], "none");
+        let unset = reasoning_request_body(&p, "glm-5p3", None);
+        assert!(unset.get("reasoning_effort").is_none(), "got: {unset}");
+    }
+
+    #[test]
+    fn reasoning_rejection_drops_the_effort_for_the_rest_of_the_turn() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("test")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .build();
+        let high = Some(ReasoningEffort::High);
+        let drop_rejected = |status: reqwest::StatusCode, payload: &mut serde_json::Value| {
+            zeroclaw_api::REASONING_EFFORT_OVERRIDE
+                .sync_scope(high, || p.drop_rejected_effort("glm-5p3", status, payload))
+        };
+
+        let rejected = std::sync::Arc::new(AtomicBool::new(false));
+        zeroclaw_api::REASONING_EFFORT_REJECTED.sync_scope(rejected.clone(), || {
+            let mut payload = reasoning_request_body(&p, "glm-5p3", high);
+            // Rate limiting says nothing about the request's parameters.
+            assert!(!drop_rejected(
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+                &mut payload
+            ));
+            assert_eq!(payload["reasoning_effort"], "high");
+
+            assert!(drop_rejected(
+                reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                &mut payload
+            ));
+            assert!(payload.get("reasoning_effort").is_none(), "got: {payload}");
+            // Later requests of the same turn no longer carry the effort.
+            let later = reasoning_request_body(&p, "glm-5p3", high);
+            assert!(later.get("reasoning_effort").is_none(), "got: {later}");
+        });
+        assert!(rejected.load(Ordering::Relaxed));
+
+        // The next turn offers and sends the level again.
+        assert!(
+            p.reasoning_support("glm-5p3")
+                .supports(ReasoningEffort::High)
+        );
+        let next_turn = reasoning_request_body(&p, "glm-5p3", high);
+        assert_eq!(next_turn["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn reasoning_override_off_disables_chat_template_thinking() {
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("Custom")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .chat_template_thinking(Some(true))
+            .build();
+        assert_eq!(
+            p.reasoning_support("qwen3").levels,
+            ReasoningEffort::ALL.to_vec()
+        );
+
+        let configured = reasoning_request_body(&p, "qwen3", None);
+        assert_eq!(configured["chat_template_kwargs"]["enable_thinking"], true);
+        let off = reasoning_request_body(&p, "qwen3", Some(ReasoningEffort::Off));
+        assert_eq!(off["chat_template_kwargs"]["enable_thinking"], false);
+        assert!(off.get("reasoning_effort").is_none(), "got: {off}");
     }
 
     #[test]

@@ -27,6 +27,7 @@ pub mod opencode_session;
 pub mod openrouter;
 pub mod openrouter_catalog;
 pub mod pricing;
+mod reasoning;
 pub mod reliable;
 pub mod router;
 pub mod safeguard_notice;
@@ -697,6 +698,9 @@ pub struct ModelProviderRuntimeOptions {
     /// name filter. Propagated from
     /// `ModelProviderConfig::reasoning_effort_passthrough`.
     pub reasoning_effort_passthrough: bool,
+    /// Reasoning levels an OpenAI-compatible alias declares its backend
+    /// accepts. Propagated from `ModelProviderConfig::reasoning_levels`.
+    pub reasoning_levels: Vec<zeroclaw_api::model_provider::ReasoningEffort>,
     /// HTTP request timeout in seconds for LLM model_provider API calls.
     /// `None` uses the model_provider's built-in default (120s for compatible model_providers).
     pub provider_timeout_secs: Option<u64>,
@@ -786,6 +790,7 @@ impl Default for ModelProviderRuntimeOptions {
             reasoning_enabled: None,
             reasoning_effort: None,
             reasoning_effort_passthrough: false,
+            reasoning_levels: Vec::new(),
             provider_timeout_secs: None,
             extra_headers: std::collections::HashMap::new(),
             api_path: None,
@@ -855,6 +860,14 @@ pub fn model_provider_runtime_options_from_model_provider_entry(
         reasoning_enabled: config.runtime.reasoning_enabled,
         reasoning_effort: config.runtime.reasoning_effort.clone(),
         reasoning_effort_passthrough: entry.is_some_and(|e| e.reasoning_effort_passthrough),
+        reasoning_levels: entry
+            .map(|e| {
+                e.reasoning_levels
+                    .iter()
+                    .filter_map(|level| zeroclaw_api::model_provider::ReasoningEffort::parse(level))
+                    .collect()
+            })
+            .unwrap_or_default(),
         provider_timeout_secs: Some(entry.and_then(|e| e.timeout_secs).unwrap_or(120)),
         extra_headers: entry.map(|e| e.extra_headers.clone()).unwrap_or_default(),
         api_path: None,
@@ -938,10 +951,12 @@ pub fn options_for_provider_ref(
             // the fallback provider's capability flag. Clearing it falls back to
             // the family default (or the choke point's own resolution).
             options.vision = None;
-            // `reasoning_effort_passthrough` is a per-entry opt-in on a
-            // verified backend; a bare family has no entry and gets the
-            // default filter. The provider-agnostic `reasoning_effort` stays.
+            // `reasoning_effort_passthrough` and `reasoning_levels` are
+            // per-entry statements about a verified backend; a bare family has
+            // no entry and gets the default filter. The provider-agnostic
+            // `reasoning_effort` stays.
             options.reasoning_effort_passthrough = false;
+            options.reasoning_levels = Vec::new();
             // Tool-result image handling is provider-specific: a bare
             // fallback family must use its own default rather than inherit
             // the previous provider alias's policy.

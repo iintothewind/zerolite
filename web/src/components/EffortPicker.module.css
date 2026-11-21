@@ -1,0 +1,27 @@
+/* Invisible native range laid over the drawn track: it owns drag, touch and
+   keyboard. The thumb width is pinned so the native travel (thumb centre runs
+   from 8px to width-8px) matches the 8px inset of the drawn nodes. */
+.range {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  opacity: 0;
+  cursor: pointer;
+  appearance: none;
+  -webkit-appearance: none;
+  background: transparent;
+}
+
+.range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 16px;
+  height: 16px;
+}
+
+.range::-moz-range-thumb {
+  width: 16px;
+  height: 16px;
+  border: 0;
+}

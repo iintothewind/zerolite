@@ -255,6 +255,9 @@ export interface WsMessage {
   session_id?: string;
   resumed?: boolean;
   message_count?: number;
+  /** Reasoning-effort levels the serving model offers (`session_start`,
+   *  `done`); `rejected`: the endpoint refused the effort of the ended turn. */
+  reasoning?: { key?: string; levels?: string[]; rejected?: boolean };
   timestamp?: string;
   job_id?: string;
   success?: boolean;

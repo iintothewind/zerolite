@@ -528,6 +528,35 @@ fn resolve_reasoning_effort(model_id: &str, configured: Option<&str>) -> String 
     clamp_reasoning_effort(model_id, &raw)
 }
 
+/// Per-turn reasoning levels for `model`: the graded levels the Codex backend
+/// takes as given, i.e. the ones [`clamp_reasoning_effort`] leaves unchanged.
+fn codex_effort_support(model: &str) -> zeroclaw_api::model_provider::ReasoningSupport {
+    use zeroclaw_api::model_provider::{ReasoningEffort, ReasoningSupport};
+    ReasoningSupport::from_levels(
+        [
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+            ReasoningEffort::Xhigh,
+        ]
+        .into_iter()
+        .filter(|level| clamp_reasoning_effort(model, level.as_str()) == level.as_str()),
+    )
+}
+
+/// Effort for one request: the user's per-turn `chosen` level when the model
+/// supports it, else the configured effort.
+fn request_reasoning_effort(
+    model_id: &str,
+    chosen: Option<zeroclaw_api::model_provider::ReasoningEffort>,
+    configured: Option<&str>,
+) -> String {
+    let chosen = chosen
+        .filter(|effort| codex_effort_support(model_id).supports(*effort))
+        .map(zeroclaw_api::model_provider::ReasoningEffort::as_str);
+    resolve_reasoning_effort(model_id, chosen.or(configured))
+}
+
 pub(crate) fn nonempty_preserve(text: Option<&str>) -> Option<String> {
     text.and_then(|value| {
         if value.is_empty() {
@@ -1376,8 +1405,9 @@ impl OpenAiCodexModelProvider {
                 verbosity: "medium".to_string(),
             },
             reasoning: ResponsesReasoningOptions {
-                effort: resolve_reasoning_effort(
+                effort: request_reasoning_effort(
                     normalized_model,
+                    zeroclaw_api::reasoning_effort_override(),
                     self.reasoning_effort.as_deref(),
                 ),
                 summary: "auto".to_string(),
@@ -1487,6 +1517,10 @@ impl ModelProvider for OpenAiCodexModelProvider {
         Some(DEFAULT_CODEX_RESPONSES_URL)
     }
 
+    fn reasoning_support(&self, model: &str) -> zeroclaw_api::model_provider::ReasoningSupport {
+        codex_effort_support(model)
+    }
+
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             native_tool_calling: true,
@@ -1584,6 +1618,8 @@ impl ModelProvider for OpenAiCodexModelProvider {
         let tools = request.tools.map(|items| items.to_vec());
         let model = model.to_string();
         let count_tokens = options.count_tokens;
+        // Task-locals do not cross `spawn!`; read the per-turn effort here.
+        let effort_override = zeroclaw_api::reasoning_effort_override();
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
 
         let handle = ::zeroclaw_spawn::spawn!(async move {
@@ -1627,8 +1663,9 @@ impl ModelProvider for OpenAiCodexModelProvider {
                     verbosity: "medium".to_string(),
                 },
                 reasoning: ResponsesReasoningOptions {
-                    effort: resolve_reasoning_effort(
+                    effort: request_reasoning_effort(
                         normalized_model,
+                        effort_override,
                         provider.reasoning_effort.as_deref(),
                     ),
                     summary: "auto".to_string(),
@@ -2332,6 +2369,28 @@ mod tests {
         assert_eq!(captured.lock().unwrap().len(), 1);
 
         server_handle.abort();
+    }
+
+    #[test]
+    fn reasoning_levels_are_the_efforts_a_codex_model_takes_unclamped() {
+        use zeroclaw_api::model_provider::ReasoningEffort;
+        assert_eq!(
+            codex_effort_support("gpt-5-codex").levels,
+            vec![
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::High,
+            ]
+        );
+        assert_eq!(
+            request_reasoning_effort("gpt-5-codex", Some(ReasoningEffort::Medium), Some("low")),
+            "medium"
+        );
+        // Not offered for this model: the configured effort stands.
+        assert_eq!(
+            request_reasoning_effort("gpt-5-codex", Some(ReasoningEffort::Xhigh), Some("low")),
+            "low"
+        );
     }
 
     #[test]

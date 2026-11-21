@@ -106,7 +106,10 @@
   flex-shrink: 0;
 }
 
+/* `position: relative` anchors the effort popup to the group's right edge, so
+   it stays inside a narrow card instead of hanging off the picker chip. */
 .trailing {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 12px;

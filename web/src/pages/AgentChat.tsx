@@ -187,6 +187,9 @@ export function AgentChatInner({
     contextTrimBudgetTokens,
     contextInputTokens,
     contextInputSource,
+    effortLevels,
+    effort,
+    setEffort,
     liveStats,
     liveTurn,
     hasEarlierTurns,
@@ -1270,6 +1273,9 @@ export function AgentChatInner({
           contextTrimBudgetTokens={contextTrimBudgetTokens}
           contextInputSource={contextInputSource}
           liveStats={liveStats}
+          effortLevels={effortLevels}
+          effort={effort}
+          onEffortChange={setEffort}
           onInputChange={handleTextareaChange}
           onKeyDown={handleKeyDown}
           onCompositionStart={() => { isComposingRef.current = true; }}

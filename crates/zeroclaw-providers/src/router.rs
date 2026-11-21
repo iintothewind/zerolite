@@ -647,6 +647,13 @@ impl ModelProvider for RouterModelProvider {
             .supports_single_tool_rounds(&resolved_model)
     }
 
+    fn reasoning_support(&self, model: &str) -> zeroclaw_api::model_provider::ReasoningSupport {
+        let (index, resolved_model) = self.resolve(model);
+        self.model_providers[index]
+            .1
+            .reasoning_support(&resolved_model)
+    }
+
     fn capabilities(&self) -> crate::traits::ProviderCapabilities {
         // Mirror `supports_vision()`'s delegation to the default provider so the
         // wrapped surface's `capabilities().vision` stays consistent with

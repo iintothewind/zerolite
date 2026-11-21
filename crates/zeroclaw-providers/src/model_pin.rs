@@ -90,6 +90,10 @@ impl ModelProvider for ModelPinnedProvider {
         self.inner.supports_single_tool_rounds(&self.pinned_model)
     }
 
+    fn reasoning_support(&self, _model: &str) -> zeroclaw_api::model_provider::ReasoningSupport {
+        self.inner.reasoning_support(&self.pinned_model)
+    }
+
     fn capabilities(&self) -> super::traits::ProviderCapabilities {
         self.inner.capabilities()
     }

@@ -6,8 +6,10 @@ import {
   type RefObject,
 } from 'react';
 import ContextRing from '@/components/ContextRing';
+import EffortPicker from '@/components/EffortPicker';
 import SessionStatsRow from '@/components/SessionStatsRow';
 import { t } from '@/lib/i18n';
+import type { EffortLevel } from '@/lib/effort.logic';
 import type { LiveStats } from '@/lib/sessionStats.logic';
 import type { ContextInputSource } from '@/contexts/contextMeter.logic';
 import css from './InputBar.module.css';
@@ -34,6 +36,10 @@ interface InputBarProps {
   /** Provenance of the meter's numerator: provider / estimate / calibrated. */
   contextInputSource: ContextInputSource;
   liveStats: LiveStats;
+  /** Reasoning levels the current model supports; empty hides the picker. */
+  effortLevels: EffortLevel[];
+  effort: EffortLevel;
+  onEffortChange: (level: EffortLevel) => void;
   onInputChange: (e: ChangeEvent<HTMLTextAreaElement>) => void;
   onKeyDown: (e: KeyboardEvent<HTMLTextAreaElement>) => void;
   onCompositionStart: (e: CompositionEvent<HTMLTextAreaElement>) => void;
@@ -64,6 +70,9 @@ export function InputBar(props: InputBarProps) {
     contextTrimBudgetTokens,
     contextInputSource,
     liveStats,
+    effortLevels,
+    effort,
+    onEffortChange,
     onInputChange,
     onKeyDown,
     onCompositionStart,
@@ -157,6 +166,7 @@ export function InputBar(props: InputBarProps) {
             <SessionStatsRow stats={liveStats} compact />
           </div>
           <div className={css.trailing}>
+            <EffortPicker levels={effortLevels} value={effort} onChange={onEffortChange} />
             <ContextRing
               used={contextInputTokens}
               max={contextEffectiveWindow}

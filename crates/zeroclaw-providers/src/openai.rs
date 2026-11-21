@@ -1148,6 +1148,14 @@ impl OpenAiResponsesModelProvider {
         }
     }
 
+    /// Effort for one request: the user's per-turn choice when this model
+    /// supports it, else the configured effort.
+    fn request_reasoning_effort(&self, model: &str) -> Option<String> {
+        crate::reasoning::supported_effort_override(&self.reasoning_support(model))
+            .map(|effort| effort.as_str().to_string())
+            .or_else(|| self.reasoning_effort.clone())
+    }
+
     fn build_request(
         &self,
         instructions: Option<String>,
@@ -1159,11 +1167,8 @@ impl OpenAiResponsesModelProvider {
     ) -> ResponsesApiRequest {
         let has_tools = has_responses_tools(tools.as_deref());
         let reasoning = self
-            .reasoning_effort
-            .as_deref()
-            .map(|effort| ResponsesApiReasoning {
-                effort: effort.to_string(),
-            });
+            .request_reasoning_effort(model)
+            .map(|effort| ResponsesApiReasoning { effort });
         ResponsesApiRequest {
             model: model.to_string(),
             input,
@@ -1294,6 +1299,14 @@ impl OpenAiResponsesModelProvider {
 impl ModelProvider for OpenAiResponsesModelProvider {
     fn supports_single_tool_rounds(&self, _model: &str) -> bool {
         self.single_tool_rounds_supported
+    }
+
+    fn reasoning_support(&self, model: &str) -> zeroclaw_api::model_provider::ReasoningSupport {
+        if crate::reasoning::is_openai_reasoning_model(model) {
+            crate::reasoning::openai_effort_support()
+        } else {
+            zeroclaw_api::model_provider::ReasoningSupport::default()
+        }
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
@@ -1518,7 +1531,7 @@ impl ModelProvider for OpenAiResponsesModelProvider {
         // not task-locals, so the conversation scope is unreadable inside.
         let opencode_session = self.opencode_session_value();
         let count_tokens = options.count_tokens;
-        let reasoning_effort = self.reasoning_effort.clone();
+        let reasoning_effort = self.request_reasoning_effort(&model);
         let max_tokens = self.max_tokens;
         let client = self.streaming_client();
         let idle_timeout = super::stream_idle_timeout(self.timeout_secs);
@@ -1535,11 +1548,7 @@ impl ModelProvider for OpenAiResponsesModelProvider {
             let tools = convert_tools(tools_owned.as_deref());
             let tools_count = tools.as_ref().map_or(0, Vec::len);
             let has_tools = has_responses_tools(tools.as_deref());
-            let reasoning = reasoning_effort
-                .as_deref()
-                .map(|effort| ResponsesApiReasoning {
-                    effort: effort.to_string(),
-                });
+            let reasoning = reasoning_effort.map(|effort| ResponsesApiReasoning { effort });
             let req = ResponsesApiRequest {
                 model,
                 input,
@@ -3534,6 +3543,39 @@ mod tests {
             reasoning.get("effort").and_then(serde_json::Value::as_str),
             Some("high"),
             ".reasoning_effort(Some(\"high\")) must surface as reasoning.effort = \"high\" on the wire body"
+        );
+    }
+
+    #[test]
+    fn reasoning_override_replaces_configured_responses_effort() {
+        use zeroclaw_api::model_provider::ReasoningEffort;
+        let provider = OpenAiResponsesModelProvider::builder("openai")
+            .credential(None)
+            .reasoning_effort(Some("high".to_string()))
+            .build();
+        let body = |effort: ReasoningEffort, model: &str| {
+            zeroclaw_api::REASONING_EFFORT_OVERRIDE.sync_scope(Some(effort), || {
+                let req = provider.build_request(
+                    None,
+                    vec![serde_json::json!({"role": "user", "content": "hi"})],
+                    None,
+                    model,
+                    None,
+                    false,
+                );
+                serde_json::to_value(&req).expect("ResponsesApiRequest must serialize")
+            })
+        };
+
+        assert_eq!(
+            body(ReasoningEffort::Low, "o3")["reasoning"]["effort"],
+            "low"
+        );
+        // Not a reasoning-family name: no levels, the configured effort stands.
+        assert!(provider.reasoning_support("gpt-4o").levels.is_empty());
+        assert_eq!(
+            body(ReasoningEffort::Low, "gpt-4o")["reasoning"]["effort"],
+            "high"
         );
     }
 

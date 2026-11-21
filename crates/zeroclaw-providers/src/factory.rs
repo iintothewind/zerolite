@@ -308,6 +308,9 @@ pub fn apply_compat_options(
     if opts.reasoning_effort_passthrough {
         b = b.with_reasoning_effort_passthrough();
     }
+    if !opts.reasoning_levels.is_empty() {
+        b = b.reasoning_levels(opts.reasoning_levels.clone());
+    }
     if !opts.extra_headers.is_empty() {
         b = b.extra_headers(opts.extra_headers.clone());
     }
