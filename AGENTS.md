@@ -57,3 +57,11 @@
   `%TEMP%\zc-*`. Deploy only from `dist/bin/<triple>/zeroclaw`. Do not
   blind-`docker system prune -a`; if Docker disk is still tight, prune
   unused `rust:1-bookworm` cross-compile dangling layers only.
+- Release gate: a release is cut only after the whole workspace passes on
+  the tagged commit: `cargo test --workspace --no-fail-fast` with zero
+  failures, `cargo fmt --all --check`, `cargo clippy --workspace
+  --all-targets -- -D warnings` with zero warnings, the `--locked` release
+  build, and the dashboard checks
+  (`docs/maintainers/build-cli-binaries.md` § Release checklist, step 2).
+  Testing only the changed crates is not a release check. A failure or
+  warning found on the way is fixed and reported, not noted and shipped.

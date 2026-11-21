@@ -9,7 +9,14 @@
 Run from a clean `zerolite` checkout level with `origin/zerolite`. `X.Y.Z` is the new version.
 
 1. **Bump the version.** In `Cargo.toml`, set `[workspace.package] version` and the 26 `[workspace.dependencies]` path pins (`crates/*`, `apps/*`) to `X.Y.Z`: 27 lines. Refresh the lock with `cargo update --workspace --offline`. `git diff --numstat Cargo.lock` must read `31 31` (the 31 workspace members, version lines only) and `cargo metadata --locked --offline --format-version 1 >/dev/null` must succeed.
-2. **Verify** under the `AGENTS.md` test rules (`zeroclaw-test` image, one command at a time, `-- --test-threads=1`): the tests of the crates and modules changed since the last tag, `cargo fmt --all --check`, clippy on the touched crates, `cargo build --locked --features embedded-web,plugins-wasm-cranelift --bin zeroclaw`; for the dashboard, `npm --prefix web test` and `npm --prefix web run build`.
+2. **Verify the whole workspace (release gate).** Under the `AGENTS.md` test rules (`zeroclaw-test` image, one command at a time, `-- --test-threads=1`), all of these must pass on the commit being tagged; no release is cut otherwise:
+   - `cargo test --workspace --no-fail-fast -- --test-threads=1`: zero failures. Testing only the crates changed since the last tag is not enough: a crate nobody touched can fail for releases (zerocode tests failed unnoticed from the v0.9.0 merge until 1.3.8). A failure from the `AGENTS.md` shared-state set counts as passing only after it passes when re-run alone.
+   - `cargo fmt --all --check`.
+   - `cargo clippy --workspace --all-targets -- -D warnings`: zero warnings, test code included.
+   - `cargo build --locked --features embedded-web,plugins-wasm-cranelift --bin zeroclaw`.
+   - Dashboard: `npm --prefix web test`, `npm --prefix web run test:contexts`, `npm --prefix web run typecheck`, `npm --prefix web run build`.
+
+   A failure is fixed (or the test retired with its reason in the commit message) before the release, never noted and shipped. `## Build notes` reports the counts.
 3. **Write `docs/releases/vX.Y.Z.md`** and delete the previous release's file; the repository keeps only the notes of the release being cut. Order: summary (upstream base, config/store migration statement), `## Before you upgrade` when an operator must act, one section per change area, `## Install` (asset table), `## Build notes` (what was verified, with counts).
    The first release after the v0.9.0 merge must carry, under `## Before you upgrade`: run `zeroclaw config migrate` once (config schema version 4).
 4. **Commit** the three items above as `chore(release): prepare X.Y.Z` and push `zerolite`.
