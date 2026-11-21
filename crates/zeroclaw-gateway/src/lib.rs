@@ -2767,6 +2767,7 @@ pub async fn run_gateway_with_plugin_webhooks(
             get(api::handle_api_session_message),
         )
         .route("/api/sessions/{id}", delete(dashboard_core::session_delete).put(dashboard_core::session_rename))
+        .route("/api/sessions/{id}/turns/{turn}", delete(dashboard_core::session_turn_delete))
         .route("/api/sessions/{id}/state", get(api::handle_api_session_state))
         .route("/api/sessions/{id}/abort", post(dashboard_core::session_abort))
         .route("/api/agents/available", get(dashboard_core::agents_available))

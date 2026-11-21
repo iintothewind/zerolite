@@ -2297,6 +2297,18 @@ export function deleteSession(
   ).finally(() => invalidateInFlightGet("/api/sessions"));
 }
 
+/** Delete one persisted turn (every row, the user prompt included). Takes
+ *  the bare session id like `deleteSession`. 404: the turn is already gone. */
+export function deleteSessionTurn(
+  id: string,
+  turn: number,
+): Promise<{ deleted: boolean; session_id: string; turn: number }> {
+  return apiFetch<{ deleted: boolean; session_id: string; turn: number }>(
+    `/api/sessions/${encodeURIComponent(id)}/turns/${turn}`,
+    { method: "DELETE" },
+  ).finally(() => invalidateInFlightGet("/api/sessions"));
+}
+
 /**
  * Cancel an in-flight agent turn for a session. Idempotent — returns
  * `{ status: "no_active_response" }` when the session is idle.

@@ -35,6 +35,8 @@ export interface FlowMessage {
   /** The turn's live trajectory, attached when the turn ends. Absent on every
    *  hydrated message: a reloaded turn's group is derived from its bubbles. */
   segments?: TurnSegments;
+  /** Server turn number, when known. */
+  turn?: number;
 }
 
 export type RenderBlock =
@@ -229,6 +231,57 @@ export function countToolCalls(segments: TurnSegments): number {
  *  out to mean something else, only this function changes. */
 export function countGroupMessages(segments: TurnSegments): number {
   return segments.steps.filter((step) => step.thinking.trim() || step.text.trim()).length;
+}
+
+/** Which server turn a message belongs to, and whether that turn is still streaming. */
+export interface TurnMembership {
+  /** Server turn number of the message's exchange; null when unknown. */
+  turn: number | null;
+  /** The exchange is the turn in flight: no delete is offered. */
+  inFlight: boolean;
+}
+
+/**
+ * Split the list into exchanges — a user bubble and every message up to the
+ * next user bubble (messages before the first user bubble form their own
+ * exchange) — and give each message its exchange's server turn: the user
+ * bubble's `turn` when > 0, else the first member `turn` > 0, else null.
+ * With `typing`, the exchange led by the last user bubble is in flight.
+ *
+ * Exchange-based rather than per-message because live-streamed tool cards
+ * carry no `turn`: only the prompt and the committed answer are stamped.
+ */
+export function turnMembership(
+  messages: readonly FlowMessage[],
+  typing: boolean,
+): Map<string, TurnMembership> {
+  const exchanges: FlowMessage[][] = [];
+  for (const message of messages) {
+    if (message.role === 'user' || exchanges.length === 0) exchanges.push([]);
+    exchanges[exchanges.length - 1]!.push(message);
+  }
+  let lastUserExchange = -1;
+  exchanges.forEach((exchange, index) => {
+    if (exchange[0]!.role === 'user') lastUserExchange = index;
+  });
+
+  const membership = new Map<string, TurnMembership>();
+  exchanges.forEach((exchange, index) => {
+    // The lead (the user bubble, when there is one) is checked first.
+    const numbered = exchange.find((m) => (m.turn ?? 0) > 0);
+    const entry: TurnMembership = {
+      turn: numbered?.turn ?? null,
+      inFlight: typing && index === lastUserExchange,
+    };
+    for (const message of exchange) membership.set(message.id, entry);
+  });
+  return membership;
+}
+
+/** `messages` without every message whose exchange is server turn `turn`. */
+export function dropTurn<T extends FlowMessage>(messages: readonly T[], turn: number): T[] {
+  const membership = turnMembership(messages, false);
+  return messages.filter((message) => membership.get(message.id)?.turn !== turn);
 }
 
 /** Server rows whose tool output the group needs before it can show it:

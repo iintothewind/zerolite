@@ -108,6 +108,8 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.send_error': '发送消息失败，请重试。',
     'agent.sessions_unavailable': '确认会话存储后才能切换对话。',
     'agent.copy_message': '复制消息',
+    'agent.delete_turn': '删除本轮',
+    'agent.delete_turn_failed': '删除本轮失败。',
     'agent.connected_status': '已连接',
     'agent.disconnected_status': '已断开',
 
@@ -1648,6 +1650,8 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.model_switch_timeout': 'Model switch timed out. Please check your connection and try again.',
     'agent.clear_all': 'Clear all',
     'agent.delete_message': 'Delete message',
+    'agent.delete_turn': 'Delete turn',
+    'agent.delete_turn_failed': 'Failed to delete the turn.',
     // Multi-session chat (#7543)
     'agent.sessions': 'Conversations',
     'agent.sessions_loading': 'Loading conversations…',

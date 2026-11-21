@@ -1776,6 +1776,23 @@ pub async fn session_delete(
     }
 }
 
+/// `DELETE /api/sessions/{id}/turns/{turn}`. Not offered for a scoped
+/// session's chats, which have no stored transcript.
+pub async fn session_turn_delete(
+    State(state): State<AppState>,
+    core: Option<Extension<CoreRpc>>,
+    dashboard: Option<Extension<Arc<DashboardAuth>>>,
+    headers: HeaderMap,
+    Path((id, turn)): Path<(String, i64)>,
+) -> Response {
+    match core_caller(&state, &headers, core, dashboard, Reach::ScopedOnly) {
+        Some(_) => CoreFailure::NotFound.into_response(),
+        None => crate::api::handle_api_session_turn_delete(State(state), headers, Path((id, turn)))
+            .await
+            .into_response(),
+    }
+}
+
 /// `POST /api/sessions/{id}/abort`.
 pub async fn session_abort(
     State(state): State<AppState>,

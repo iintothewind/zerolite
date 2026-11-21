@@ -2207,6 +2207,93 @@ pub async fn handle_api_session_delete(
     }
 }
 
+/// DELETE /api/sessions/{id}/turns/{turn} — delete one persisted turn, every
+/// row of it (the user prompt included), so the model never sees it again.
+pub async fn handle_api_session_turn_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, turn)): Path<(String, i64)>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let Some(backend) = &state.session_backend else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Session persistence is disabled"})),
+        )
+            .into_response();
+    };
+
+    if turn < 1 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "turn must be a positive integer"})),
+        )
+            .into_response();
+    }
+
+    let session_key = resolve_gateway_session_key(&id, |key| backend.session_exists(key));
+
+    // Take the permit turns hold: a running turn is not cancelled, it commits
+    // first, and no socket's history refresh can straddle the delete.
+    let _session_guard = match state.session_queue.acquire(&session_key).await {
+        Ok(guard) => guard,
+        Err(crate::session_queue::SessionQueueError::QueueFull { .. }) => {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({"error": "Session queue is full"})),
+            )
+                .into_response();
+        }
+        Err(crate::session_queue::SessionQueueError::Timeout { .. }) => {
+            return (
+                StatusCode::REQUEST_TIMEOUT,
+                Json(serde_json::json!({"error": "Timed out waiting for session queue"})),
+            )
+                .into_response();
+        }
+    };
+
+    match backend.delete_turn(&session_key, turn) {
+        Ok(0) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Turn not found"})),
+        )
+            .into_response(),
+        Ok(rows) => {
+            // Live sockets rebuild their history from the store before their
+            // next turn once the generation moves.
+            state.session_queue.advance_generation(&session_key);
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "session_key": session_key,
+                        "turn": turn,
+                        "rows": rows,
+                    })),
+                "deleted session turn"
+            );
+            Json(serde_json::json!({"deleted": true, "session_id": id, "turn": turn}))
+                .into_response()
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({
+                "error": "Turn deletion is not supported by this session backend"
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to delete turn: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
 /// PUT /api/sessions/{id} — rename a gateway session
 pub async fn handle_api_session_rename(
     State(state): State<AppState>,
@@ -6815,5 +6902,107 @@ pub(crate) mod tests {
         assert_eq!(json["message"]["content"], "out");
         assert_eq!(json["message"]["kind"], "tool_result");
         assert_eq!(single(9_000_000).await.status(), StatusCode::NOT_FOUND);
+    }
+
+    async fn turn_delete_request(state: &AppState, turn: i64) -> axum::response::Response {
+        handle_api_session_turn_delete(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(("operator-1".to_string(), turn)),
+        )
+        .await
+        .into_response()
+    }
+
+    #[tokio::test]
+    async fn session_turn_delete_removes_the_turn_and_advances_generation() {
+        use zeroclaw_infra::session_backend::{RowKind, TranscriptRow};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+        );
+        let key = "gw_operator-1";
+        backend.set_session_agent_alias(key, "default").unwrap();
+        for question in ["q1", "q2", "q3"] {
+            backend
+                .append_turn(
+                    key,
+                    &[
+                        TranscriptRow {
+                            kind: RowKind::User,
+                            role: "user".into(),
+                            content: question.into(),
+                            tool_name: None,
+                            tool_call_id: None,
+                        },
+                        TranscriptRow {
+                            kind: RowKind::Assistant,
+                            role: "assistant".into(),
+                            content: format!("answer {question}"),
+                            tool_name: None,
+                            tool_call_id: None,
+                        },
+                    ],
+                )
+                .unwrap()
+                .unwrap();
+        }
+        let state = test_state_with_session_backend(config, backend.clone());
+        let before = state.session_queue.generation(key);
+
+        let response = turn_delete_request(&state, 2).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["deleted"], true);
+        assert_eq!(json["session_id"], "operator-1");
+        assert_eq!(json["turn"], 2);
+        assert!(state.session_queue.generation(key) > before);
+        let context: Vec<_> = backend
+            .load_context(key)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.content)
+            .collect();
+        assert_eq!(context, ["q1", "answer q1", "q3", "answer q3"]);
+
+        assert_eq!(
+            turn_delete_request(&state, 2).await.status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            turn_delete_request(&state, 0).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn session_turn_delete_on_jsonl_backend_is_not_implemented() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        backend
+            .append(
+                "gw_operator-1",
+                &zeroclaw_providers::ChatMessage::user("hello"),
+            )
+            .unwrap();
+        let state = test_state_with_session_backend(config, backend);
+
+        assert_eq!(
+            turn_delete_request(&state, 1).await.status(),
+            StatusCode::NOT_IMPLEMENTED
+        );
     }
 }

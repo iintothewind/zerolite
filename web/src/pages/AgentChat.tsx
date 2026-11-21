@@ -39,6 +39,7 @@ import SessionPicker from '@/components/SessionPicker';
 import InputBar from '@/components/InputBar';
 import {
   groupMessages,
+  turnMembership,
   pendingOutputIds,
   splitLiveTurn,
   type RenderBlock,
@@ -173,6 +174,8 @@ export function AgentChatInner({
     switchModel,
     modelLoading,
     deleteMessage,
+    deleteTurn,
+    sessionPersistence,
     clearAllMessages,
     startNewSession,
     sessionId,
@@ -357,6 +360,10 @@ export function AgentChatInner({
     () => groupMessages(messages, { showToolActivity, liveSteps: live.groupSteps }),
     [messages, showToolActivity, live.groupSteps],
   );
+
+  // Which server turn each message belongs to, and which one is streaming:
+  // what decides whether a block's delete removes the whole turn.
+  const membership = useMemo(() => turnMembership(messages, typing), [messages, typing]);
 
   // Transcript pane + reader-intent state. The follow decision lives in a ref
   // (written by the scroll listener below) so a streamed update never needs a
@@ -767,6 +774,25 @@ export function AgentChatInner({
     deleteMessage(msgId);
   }, [deleteMessage]);
 
+  const handleDeleteTurn = useCallback((msgId: string) => {
+    void deleteTurn(msgId);
+  }, [deleteTurn]);
+
+  // Turn numbers name stored rows only when the gateway keeps transcripts.
+  const serverTurns = sessionPersistence === true && !conversationPerSocket;
+  /** The delete a block offers: the whole server turn when it belongs to a
+   *  committed one, the bubble alone when it has no server turn, nothing for
+   *  the streaming turn or for a turn/group block with no number (deleting
+   *  one bubble of a turn would leave the rest of it behind). */
+  const deleteHandlerFor = (block: RenderBlock): ((id: string) => void) | undefined => {
+    if (block.kind === 'notice') return handleDeleteMessage;
+    if (block.kind === 'plain' && block.message.ephemeral) return handleDeleteMessage;
+    const m = membership.get(block.kind === 'group' ? block.id : block.message.id);
+    if (m?.inFlight) return undefined;
+    if (serverTurns && m?.turn != null) return handleDeleteTurn;
+    return block.kind === 'user' || block.kind === 'plain' ? handleDeleteMessage : undefined;
+  };
+
   const handleClearAll = useCallback(() => {
     clearAllMessages();
   }, [clearAllMessages]);
@@ -1135,15 +1161,18 @@ export function AgentChatInner({
           </div>
         )}
 
-        {blocks.map((block, idx) =>
-          block.kind === 'group' ? (
+        {blocks.map((block, idx) => {
+          const onDelete = deleteHandlerFor(block);
+          return block.kind === 'group' ? (
             <GroupItem
               key={block.id}
+              id={block.id}
               segments={block.segments}
               idx={idx}
               compact={compact}
               collapsed={!expandedGroups[block.id]}
               onToggle={() => openGroup(block.id, block.segments)}
+              onDelete={onDelete}
             />
           ) : (
             <MessageItem
@@ -1153,7 +1182,10 @@ export function AgentChatInner({
               compact={compact}
               isCopied={copiedId === block.message.id}
               onCopy={handleCopy}
-              onDelete={handleDeleteMessage}
+              onDelete={onDelete}
+              deleteLabel={
+                onDelete === handleDeleteTurn ? t('agent.delete_turn') : t('agent.delete_message')
+              }
               segments={block.kind === 'turn' ? block.segments : undefined}
               groupCollapsed={!expandedGroups[block.message.id]}
               onToggleGroup={
@@ -1162,8 +1194,8 @@ export function AgentChatInner({
                   : undefined
               }
             />
-          ),
-        )}
+          );
+        })}
 
         {typing && (
           <div className={`flex items-start animate-fade-in ${compact ? 'gap-1.5' : 'gap-2'}`}>
@@ -1300,7 +1332,11 @@ interface MessageItemProps {
   compact: boolean;
   isCopied: boolean;
   onCopy: (id: string, content: string) => void;
-  onDelete: (id: string) => void;
+  /** Absent: the block offers no delete (the streaming turn, or a turn the
+   *  server has not numbered). */
+  onDelete?: (id: string) => void;
+  /** Accessible name of the delete button: a bubble or a whole turn. */
+  deleteLabel?: string;
   /** The turn's step trajectory, when this message is a turn's answer — live
    *  or derived from a reloaded turn's bubbles. Rendered as a collapsed group
    *  above the answer; the answer itself never goes inside the group. */
@@ -1324,6 +1360,7 @@ const MessageItem = memo(function MessageItem({
   isCopied,
   onCopy,
   onDelete,
+  deleteLabel,
   segments,
   groupCollapsed,
   onToggleGroup,
@@ -1435,14 +1472,16 @@ const MessageItem = memo(function MessageItem({
                 <Copy className="h-3 w-3" />
               )}
             </button>
-            <button
-              type="button"
-              onClick={() => onDelete(msg.id)}
-              aria-label={t('agent.delete_message')}
-              className="rounded-[var(--radius-sm)] p-0.5 text-pc-text-muted transition-colors hover:text-status-error"
-            >
-              <X className="h-3 w-3" />
-            </button>
+            {onDelete && (
+              <button
+                type="button"
+                onClick={() => onDelete(msg.id)}
+                aria-label={deleteLabel}
+                className="rounded-[var(--radius-sm)] p-0.5 text-pc-text-muted transition-colors hover:text-status-error"
+              >
+                <X className="h-3 w-3" />
+              </button>
+            )}
           </div>
         </div>
       </div>
@@ -1451,24 +1490,29 @@ const MessageItem = memo(function MessageItem({
 });
 
 /** A turn with tool calls and no answer bubble (stopped, failed, or ended on
- *  a tool call): the group alone, in the agent row layout. No copy/delete
- *  strip — there is no bubble to act on. */
+ *  a tool call): the group alone, in the agent row layout. No copy strip —
+ *  there is no bubble to copy; with `onDelete`, a delete-only strip removes
+ *  the whole turn. */
 const GroupItem = memo(function GroupItem({
+  id,
   segments,
   idx,
   compact,
   collapsed,
   onToggle,
+  onDelete,
 }: {
+  id: string;
   segments: TurnSegments;
   idx: number;
   compact: boolean;
   collapsed: boolean;
   onToggle: () => void;
+  onDelete?: (id: string) => void;
 }) {
   return (
     <div
-      className={`flex items-start pb-3 animate-slide-in-left ${compact ? 'gap-1.5' : 'gap-2'}`}
+      className={`${onDelete ? 'group relative hover:z-20 ' : ''}flex items-start pb-3 animate-slide-in-left ${compact ? 'gap-1.5' : 'gap-2'}`}
       style={{ animationDelay: `${Math.min(idx * 30, 200)}ms` }}
     >
       {!compact && (
@@ -1478,6 +1522,26 @@ const GroupItem = memo(function GroupItem({
       )}
       <div className={`relative min-w-0 ${stepsHaveChatImage(segments.steps) ? 'msg-has-image max-w-[85%]' : 'max-w-[85%]'}`}>
         <ToolCallGroup segments={segments} compact={compact} collapsed={collapsed} onToggle={onToggle} />
+        {onDelete && (
+          <div className="absolute top-full left-0 z-10 opacity-0 transition-opacity duration-100 group-hover:opacity-100">
+            <div className="absolute bottom-full left-0 right-0 h-6" aria-hidden />
+            <div
+              className="mt-0.5 flex items-center gap-1 whitespace-nowrap rounded-[var(--radius-sm)] border border-pc-border px-1"
+              style={{
+                background: 'color-mix(in srgb, var(--pc-bg-elevated) 94%, transparent)',
+              }}
+            >
+              <button
+                type="button"
+                onClick={() => onDelete(id)}
+                aria-label={t('agent.delete_turn')}
+                className="rounded-[var(--radius-sm)] p-0.5 text-pc-text-muted transition-colors hover:text-status-error"
+              >
+                <X className="h-3 w-3" />
+              </button>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

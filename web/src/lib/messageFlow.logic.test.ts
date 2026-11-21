@@ -5,9 +5,11 @@ import type { StepSegment, TurnSegments } from './turnSegments.ts';
 import {
   countGroupMessages,
   countToolCalls,
+  dropTurn,
   groupMessages,
   pendingOutputIds,
   splitLiveTurn,
+  turnMembership,
   type FlowMessage,
   type RenderBlock,
 } from './messageFlow.logic.ts';
@@ -341,4 +343,71 @@ test('grouping does not mutate the input list', () => {
   const snapshot = JSON.stringify(messages);
   groupMessages(messages);
   assert.equal(JSON.stringify(messages), snapshot);
+});
+
+// ── Turn membership and deletion ────────────────────────────────────────────
+
+/** A reloaded tool turn: every row carries its server turn. */
+const hydratedTurn = (turn: number): FlowMessage[] => [
+  msg({ id: `u${turn}`, role: 'user', content: `q${turn}`, turn }),
+  msg({ id: `n${turn}`, content: 'looking', turn }),
+  msg({ id: `c${turn}a`, toolCall: { name: 'shell', id: `call${turn}a` }, turn }),
+  msg({ id: `c${turn}b`, toolCall: { name: 'shell', id: `call${turn}b` }, turn }),
+  msg({ id: `a${turn}`, content: `answer ${turn}`, turn }),
+];
+
+test('every message of a hydrated turn maps to its turn, and dropping it leaves no residue', () => {
+  const list = [
+    ...hydratedTurn(1),
+    msg({ id: 'u2', role: 'user', content: 'q2', turn: 2 }),
+    msg({ id: 'a2', content: 'answer 2', turn: 2 }),
+  ];
+  const membership = turnMembership(list, false);
+  for (const id of ['u1', 'n1', 'c1a', 'c1b', 'a1']) {
+    assert.deepEqual(membership.get(id), { turn: 1, inFlight: false });
+  }
+  const rest = dropTurn(list, 1);
+  assert.deepEqual(rest.map((m) => m.id), ['u2', 'a2']);
+  assert.deepEqual(kinds(groupMessages(rest)), ['user', 'plain']);
+});
+
+test('a live-watched turn is dropped whole though its loose cards carry no turn', () => {
+  const list = [
+    msg({ id: 'u1', role: 'user', content: 'q', turn: 1 }),
+    msg({ id: 't1', toolCall: { name: 'shell', id: 'c1' } }),
+    msg({ id: 't2', toolCall: { name: 'shell', id: 'c2' } }),
+    msg({
+      id: 'carrier',
+      content: '',
+      segments: segments({ steps: [toolStep('c1'), toolStep('c2')] }),
+      turn: 1,
+    }),
+  ];
+  const blocks = groupMessages(list);
+  assert.deepEqual(kinds(blocks), ['user', 'group']);
+  const group = blocks[1]!;
+  assert.equal(group.kind, 'group');
+  assert.equal(turnMembership(list, false).get(ids([group])[0]!)?.turn, 1);
+  assert.deepEqual(dropTurn(list, 1), []);
+});
+
+test('typing marks only the last prompt-led exchange in flight; unnumbered ones map to null', () => {
+  const list = [
+    ...hydratedTurn(1),
+    msg({ id: 'u2', role: 'user', content: 'streaming' }),
+    msg({ id: 't2', toolCall: { name: 'shell', id: 'c2' } }),
+  ];
+  const live = turnMembership(list, true);
+  assert.deepEqual(live.get('a1'), { turn: 1, inFlight: false });
+  assert.deepEqual(live.get('u2'), { turn: null, inFlight: true });
+  assert.deepEqual(live.get('t2'), { turn: null, inFlight: true });
+  assert.equal(turnMembership(list, false).get('u2')?.inFlight, false);
+});
+
+test('dropping two turns in a row keeps the remaining turn in order', () => {
+  const list = [...hydratedTurn(1), ...hydratedTurn(2), ...hydratedTurn(3)];
+  assert.deepEqual(
+    dropTurn(dropTurn(list, 1), 3).map((m) => m.id),
+    hydratedTurn(2).map((m) => m.id),
+  );
 });

@@ -1531,6 +1531,41 @@ impl SessionBackend for SqliteSessionBackend {
         Ok(true)
     }
 
+    fn delete_turn(&self, session_key: &str, turn: i64) -> std::io::Result<usize> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(std::io::Error::other)?;
+        let chat_rows: i64 = tx
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM sessions
+                     WHERE session_key = ?1 AND turn = ?2 AND {CHAT_KINDS}"
+                ),
+                params![session_key, turn],
+                |row| row.get(0),
+            )
+            .map_err(std::io::Error::other)?;
+        // The `sessions_ad` trigger clears the index rows. Turn numbers are
+        // not renumbered: clients address later turns by their numbers.
+        let removed = tx
+            .execute(
+                "DELETE FROM sessions WHERE session_key = ?1 AND turn = ?2",
+                params![session_key, turn],
+            )
+            .map_err(std::io::Error::other)?;
+        if removed > 0 {
+            tx.execute(
+                "UPDATE session_metadata SET message_count = MAX(message_count - ?1, 0)
+                 WHERE session_key = ?2",
+                params![chat_rows, session_key],
+            )
+            .map_err(std::io::Error::other)?;
+        }
+        tx.commit().map_err(std::io::Error::other)?;
+        Ok(removed)
+    }
+
     fn with_session_owner(
         &self,
         session_key: &str,
@@ -4506,6 +4541,39 @@ mod tests {
         );
         assert!(!backend.session_exists("ghost"));
         assert!(backend.append_turn("s", &[]).is_err());
+    }
+
+    #[test]
+    fn delete_turn_removes_every_row_and_keeps_numbering() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        backend.set_session_agent_alias("s", "default").unwrap();
+        for (q, a) in [("q1", "a1"), ("q2", "a2"), ("q3", "a3")] {
+            backend.append_turn("s", &tool_turn(q, "out", a)).unwrap();
+        }
+        let turn_rows = tool_turn("q", "o", "a").len();
+
+        assert_eq!(backend.delete_turn("s", 2).unwrap(), turn_rows);
+
+        let context: Vec<_> = backend
+            .load_context("s")
+            .unwrap()
+            .into_iter()
+            .map(|m| m.content)
+            .collect();
+        assert_eq!(context, ["q1", "a1", "q3", "a3"]);
+        let page = backend.load_turn_page("s", None, 20, false);
+        assert!(!page.is_empty());
+        assert!(page.iter().all(|row| row.turn != 2));
+        assert_eq!(backend.get_session_metadata("s").unwrap().message_count, 4);
+
+        assert_eq!(backend.delete_turn("s", 2).unwrap(), 0);
+        assert_eq!(backend.delete_turn("ghost", 1).unwrap(), 0);
+        let next = backend
+            .append_turn("s", &tool_turn("q4", "out", "a4"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.turn, Some(4));
     }
 
     #[test]

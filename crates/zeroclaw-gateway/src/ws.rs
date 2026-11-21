@@ -5645,6 +5645,61 @@ data: {\"type\":\"message_stop\"}\n\n",
     }
 
     #[test]
+    fn deleted_turn_is_not_sent_to_the_provider() {
+        run_ws_regression(
+            "ws-delete-turn",
+            deleted_turn_is_not_sent_to_the_provider_inner,
+        );
+    }
+
+    async fn deleted_turn_is_not_sent_to_the_provider_inner() {
+        // Deleting one turn of an idle socket's session moves the session
+        // generation, so the same socket rebuilds its history before its next
+        // turn and the provider never sees the deleted prompt again.
+        let mut fixture = ParkedTurnFixture::spawn().await;
+        let session_id = "delete-turn";
+        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+        let (mut client, _) = fixture.connect(session_id).await;
+        for prompt in ["first prompt", "second prompt"] {
+            fixture.start_parked_turn(&mut client, prompt).await;
+            fixture.release_next();
+            while next_text_frame(&mut client).await["type"] != "done" {}
+            fixture.wait_for_turn_to_settle(&session_key).await;
+        }
+
+        let response = crate::api::handle_api_session_turn_delete(
+            axum::extract::State(fixture.state.clone()),
+            HeaderMap::new(),
+            axum::extract::Path((session_id.to_string(), 1)),
+        )
+        .await
+        .into_response();
+        assert!(
+            response.status().is_success(),
+            "turn delete: {}",
+            response.status()
+        );
+
+        send_chat(&mut client, "follow-up").await;
+        let request = fixture.next_provider_request().await;
+        let texts: Vec<String> = provider_messages(&request)
+            .into_iter()
+            .map(|(_, text)| text)
+            .collect();
+        assert!(
+            !texts.iter().any(|text| text.contains("first prompt")),
+            "the deleted turn must not reach the provider: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|text| text.contains("second prompt")),
+            "the remaining turn still does: {texts:?}"
+        );
+        fixture.release_next();
+        drop(client);
+        fixture.shutdown();
+    }
+
+    #[test]
     fn delete_waits_for_a_running_turn_before_removing_its_transcript() {
         run_ws_regression(
             "ws-delete-serialized",

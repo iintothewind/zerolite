@@ -229,6 +229,8 @@ class FakeSessionRuntime implements AgentSessionRuntime {
   readonly storedRows = new Map<number, SessionMessageRow>();
   readonly messagePlans = new Map<string, MessageFactory[]>();
   readonly deletePlans = new Map<string, DeleteFactory[]>();
+  readonly deleteTurnCalls: Array<{ sessionId: string; turn: number }> = [];
+  readonly deleteTurnPlans = new Map<string, DeleteFactory[]>();
   readonly renameDeferred = new Map<string, Deferred<{ session_id: string; name: string }>>();
   mintedIds: string[] = [];
 
@@ -266,6 +268,12 @@ class FakeSessionRuntime implements AgentSessionRuntime {
     return plan ? plan() : Promise.resolve({ deleted: true });
   }
 
+  deleteTurn(sessionId: string, turn: number): Promise<{ deleted: boolean }> {
+    this.deleteTurnCalls.push({ sessionId, turn });
+    const plan = this.deleteTurnPlans.get(`${sessionId}:${turn}`)?.shift();
+    return plan ? plan() : Promise.resolve({ deleted: true });
+  }
+
   rename(sessionId: string, name: string): Promise<{ session_id: string; name: string }> {
     this.renameCalls.push({ id: sessionId, name });
     return this.renameDeferred.get(sessionId)?.promise
@@ -288,6 +296,13 @@ class FakeSessionRuntime implements AgentSessionRuntime {
     const plans = this.deletePlans.get(sessionId) ?? [];
     plans.push(plan);
     this.deletePlans.set(sessionId, plans);
+  }
+
+  queueDeleteTurn(sessionId: string, turn: number, plan: DeleteFactory): void {
+    const key = `${sessionId}:${turn}`;
+    const plans = this.deleteTurnPlans.get(key) ?? [];
+    plans.push(plan);
+    this.deleteTurnPlans.set(key, plans);
   }
 }
 
@@ -1921,6 +1936,208 @@ test('a hydrated conversation folds each tool turn into one collapsed group', as
   await settle();
   assert.deepEqual(runtime.getMessageCalls, [{ sessionId: 'A', messageId: 4 }]);
   assert.match(renderedText(mounted), /tool out/);
+  await unmount(mounted.renderer);
+});
+
+// ── Deleting a committed turn ───────────────────────────────────────────────
+
+/** Turn 1 used a tool; `answered` decides whether it ended with an answer
+ *  (a `turn` block) or without one (a `group` block). Turn 2 is tool-free. */
+function twoTurnTranscript(answered: boolean): SessionMessagesResponse {
+  return {
+    session_id: 'A',
+    session_persistence: true,
+    messages: [
+      row({ id: 1, turn: 1, kind: 'user', content: 'first prompt' }),
+      row({ id: 2, turn: 1, kind: 'step', content: 'looking around' }),
+      row({ id: 3, turn: 1, kind: 'tool_call', content: '{}', tool_name: 'shell', tool_call_id: 'c1' }),
+      row({ id: 4, turn: 1, kind: 'tool_result', content: null, content_bytes: 3, tool_name: 'shell', tool_call_id: 'c1' }),
+      ...(answered ? [row({ id: 5, turn: 1, kind: 'assistant', content: 'first answer' })] : []),
+      row({ id: 6, turn: 2, kind: 'user', content: 'second prompt' }),
+      row({ id: 7, turn: 2, kind: 'assistant', content: 'second answer' }),
+    ],
+  };
+}
+
+async function mountTranscript(
+  runtime: FakeSessionRuntime,
+  transcript: SessionMessagesResponse,
+): Promise<MountedChat> {
+  runtime.queueMessages('A', () => Promise.resolve(transcript));
+  storage.setItem('zeroclaw_show_tool_activity', '1');
+  const mounted = await mountChat(runtime, true);
+  storage.removeItem('zeroclaw_show_tool_activity');
+  await openSocket(runtime, 0);
+  await settle();
+  return mounted;
+}
+
+function labelled(mounted: MountedChat, label: string): ReactTestInstance[] {
+  return mounted.renderer.root
+    .findAllByType('button')
+    .filter((button) => button.props['aria-label'] === label);
+}
+
+async function click(button: ReactTestInstance | undefined): Promise<void> {
+  assert.ok(button);
+  await act(async () => { button.props.onClick(); });
+  await settle();
+}
+
+const turnsLeft = (mounted: MountedChat) =>
+  [...new Set(mounted.context().messages.map((m) => m.turn))];
+
+test('deleting a tool turn from its group removes the whole turn here and on the server', async () => {
+  const runtime = new FakeSessionRuntime();
+  const mounted = await mountTranscript(runtime, twoTurnTranscript(false));
+  // Block order: turn 1's prompt, its group, turn 2's prompt, its answer.
+  const buttons = labelled(mounted, 'Delete turn');
+  assert.equal(buttons.length, 4, 'every committed block offers the turn delete');
+  assert.equal(labelled(mounted, 'Delete message').length, 0);
+
+  await click(buttons[1]);
+
+  assert.deepEqual(runtime.deleteTurnCalls, [{ sessionId: 'A', turn: 1 }]);
+  assert.deepEqual(
+    mounted.context().messages.map((m) => m.content),
+    ['second prompt', 'second answer'],
+  );
+  const text = renderedText(mounted);
+  assert.equal(/first prompt|tool calls/.test(text), false, `no residue: ${text}`);
+  await unmount(mounted.renderer);
+});
+
+test('deleting a tool-free turn from its answer removes the prompt too', async () => {
+  const runtime = new FakeSessionRuntime();
+  const mounted = await mountTranscript(runtime, twoTurnTranscript(true));
+  // Block order: turn 1's prompt, its turn block, turn 2's prompt, its answer.
+  const buttons = labelled(mounted, 'Delete turn');
+  assert.equal(buttons.length, 4);
+
+  await click(buttons[3]);
+
+  assert.deepEqual(runtime.deleteTurnCalls, [{ sessionId: 'A', turn: 2 }]);
+  assert.deepEqual(turnsLeft(mounted), [1]);
+  assert.equal(/second (prompt|answer)/.test(renderedText(mounted)), false);
+  await unmount(mounted.renderer);
+});
+
+test('deleting from a prompt bubble removes its whole turn; an unnumbered prompt deletes alone', async () => {
+  const runtime = new FakeSessionRuntime();
+  const mounted = await mountTranscript(runtime, twoTurnTranscript(true));
+
+  await click(labelled(mounted, 'Delete turn')[0]);
+
+  assert.deepEqual(runtime.deleteTurnCalls, [{ sessionId: 'A', turn: 1 }]);
+  assert.deepEqual(turnsLeft(mounted), [2]);
+
+  // A turn the gateway did not number: its bubbles delete one at a time,
+  // locally.
+  const socket = runtime.sockets[0]!;
+  await act(async () => { mounted.context().sendMessage('unsaved prompt'); });
+  await act(async () => {
+    socket.emitMessage({ type: 'agent_start', session_id: 'A' });
+    socket.emitMessage({ type: 'chunk', content: 'unsaved answer' });
+    socket.emitMessage({ type: 'done', full_response: 'unsaved answer' });
+  });
+  await settle();
+  const bubbleDeletes = labelled(mounted, 'Delete message');
+  assert.equal(bubbleDeletes.length, 2, 'the unnumbered prompt and answer');
+
+  await click(bubbleDeletes[0]);
+
+  assert.deepEqual(runtime.deleteTurnCalls, [{ sessionId: 'A', turn: 1 }]);
+  assert.deepEqual(
+    mounted.context().messages.map((m) => m.content),
+    ['second prompt', 'second answer', 'unsaved answer'],
+  );
+  await unmount(mounted.renderer);
+});
+
+test('a failed turn delete keeps the turn and says so; a 404 counts as deleted', async () => {
+  const runtime = new FakeSessionRuntime();
+  const mounted = await mountTranscript(runtime, twoTurnTranscript(true));
+  const before = mounted.context().messages;
+  runtime.queueDeleteTurn('A', 1, () =>
+    Promise.reject(new HttpError(500, '{"error":"boom"}')));
+
+  await click(labelled(mounted, 'Delete turn')[0]);
+
+  assert.equal(mounted.context().messages, before, 'nothing removed');
+  assert.equal(mounted.context().error, 'Failed to delete the turn.');
+
+  runtime.queueDeleteTurn('A', 1, () =>
+    Promise.reject(new HttpError(404, '{"error":"Turn not found"}')));
+  await click(labelled(mounted, 'Delete turn')[0]);
+
+  assert.deepEqual(turnsLeft(mounted), [2]);
+  await unmount(mounted.renderer);
+});
+
+test('the streaming turn offers no delete; once committed with a number it deletes whole', async () => {
+  const runtime = new FakeSessionRuntime();
+  const mounted = await mountTranscript(runtime, {
+    session_id: 'A',
+    session_persistence: true,
+    messages: [
+      row({ id: 1, turn: 1, kind: 'user', content: 'first prompt' }),
+      row({ id: 2, turn: 1, kind: 'assistant', content: 'first answer' }),
+    ],
+  });
+  const socket = runtime.sockets[0]!;
+  await act(async () => { mounted.context().sendMessage('analyze this'); });
+  await act(async () => {
+    socket.emitMessage({ type: 'agent_start', session_id: 'A' });
+    socket.emitMessage({ type: 'chunk', content: 'checking the file' });
+    socket.emitMessage({ type: 'tool_call', id: 'call_1', name: 'shell', args: {} });
+  });
+  await settle();
+
+  assert.equal(labelled(mounted, 'Delete turn').length, 2, 'only the committed turn');
+  assert.equal(labelled(mounted, 'Delete message').length, 0, 'nothing on the streaming one');
+  const streaming = mounted.context().messages.filter((m) => m.turn === undefined);
+  assert.ok(streaming.length > 0);
+  for (const message of streaming) {
+    await act(async () => { await mounted.context().deleteTurn(message.id); });
+  }
+  assert.deepEqual(runtime.deleteTurnCalls, []);
+
+  await act(async () => {
+    socket.emitMessage({ type: 'tool_result', id: 'call_1', name: 'shell', output: 'out' });
+    socket.emitMessage({ type: 'done', full_response: '', turn: 2 });
+  });
+  await settle();
+  const buttons = labelled(mounted, 'Delete turn');
+  assert.equal(buttons.length, 4, 'the committed live turn now offers it too');
+
+  await click(buttons[3]);
+
+  assert.deepEqual(runtime.deleteTurnCalls, [{ sessionId: 'A', turn: 2 }]);
+  assert.deepEqual(
+    mounted.context().messages.map((m) => m.content),
+    ['first prompt', 'first answer'],
+    'the loose cards and the trajectory carrier went with it',
+  );
+  await unmount(mounted.renderer);
+});
+
+test('without stored transcripts a committed turn offers no delete', async () => {
+  const runtime = new FakeSessionRuntime();
+  const mounted = await mountTranscript(runtime, messagesResponse('A', false));
+  const socket = runtime.sockets[0]!;
+  await act(async () => { mounted.context().sendMessage('analyze this'); });
+  await act(async () => {
+    socket.emitMessage({ type: 'agent_start', session_id: 'A' });
+    socket.emitMessage({ type: 'tool_call', id: 'call_1', name: 'shell', args: {} });
+    socket.emitMessage({ type: 'tool_result', id: 'call_1', name: 'shell', output: 'out' });
+    socket.emitMessage({ type: 'chunk', content: 'the answer' });
+    socket.emitMessage({ type: 'done', full_response: 'the answer', turn: 1 });
+  });
+  await settle();
+
+  assert.match(renderedText(mounted), /1 tool calls/, 'the turn committed as a turn block');
+  assert.equal(labelled(mounted, 'Delete turn').length, 0);
+  assert.equal(labelled(mounted, 'Delete message').length, 1, 'the prompt bubble only');
   await unmount(mounted.renderer);
 });
 

@@ -513,6 +513,16 @@ pub trait SessionBackend: Send + Sync {
         Ok(false)
     }
 
+    /// Delete every row of turn `turn` (user row included) from `session_key`.
+    /// Returns the number of rows removed; 0 when the session or the turn does
+    /// not exist. Backends without turn numbers return `Unsupported`.
+    fn delete_turn(&self, _session_key: &str, _turn: i64) -> std::io::Result<usize> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "turn deletion unsupported",
+        ))
+    }
+
     fn clear_agent_attribution(&self, _agent_alias: &str) -> std::io::Result<usize> {
         Ok(0)
     }

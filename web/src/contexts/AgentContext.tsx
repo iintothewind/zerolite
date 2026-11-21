@@ -31,6 +31,7 @@ import {
   getSessionMessage,
   abortSession,
   deleteSession,
+  deleteSessionTurn,
   renameSession,
 } from '@/lib/api';
 import { primeModelProviderCatalog, modelProviderDisplayName } from '@/lib/modelProviders';
@@ -65,6 +66,7 @@ import {
   type TurnStreamState,
 } from '@/contexts/turnStream.logic';
 import { uncommittedLocalTail } from '@/contexts/chatHydration.logic';
+import { dropTurn, turnMembership } from '@/lib/messageFlow.logic';
 import {
   applyDone,
   applyUsage,
@@ -175,6 +177,9 @@ export interface AgentContextValue {
   /** Re-fetch model list from server. Useful after user edits config externally. */
   refreshModels: () => void;
   deleteMessage: (id: string) => void;
+  /** Delete the whole committed turn `messageId` belongs to, here and in the
+   *  gateway transcript. No-op for an in-flight or unnumbered turn. */
+  deleteTurn: (messageId: string) => Promise<void>;
   clearAllMessages: () => void;
   /** Conversation currently on screen for this agent (issue #7543). */
   sessionId: string;
@@ -354,6 +359,7 @@ export interface AgentSessionRuntime {
   ): Promise<SessionMessagesResponse>;
   getMessage(sessionId: string, messageId: number): Promise<SessionMessageResponse>;
   delete(sessionId: string): Promise<{ deleted: boolean }>;
+  deleteTurn(sessionId: string, turn: number): Promise<{ deleted: boolean }>;
   rename(sessionId: string, name: string): Promise<{ session_id: string; name: string }>;
   mintId(): string;
 }
@@ -363,6 +369,7 @@ const defaultSessionRuntime: AgentSessionRuntime = {
   getMessages: getSessionMessages,
   getMessage: getSessionMessage,
   delete: deleteSession,
+  deleteTurn: deleteSessionTurn,
   rename: renameSession,
   mintId: newSessionId,
 };
@@ -491,6 +498,8 @@ export function AgentProvider({
   // newer socket owns. See the onClose handler in attachSocketCallbacks.
   const approvalSocketVersionRef = useRef<number | null>(null);
   const localMessageMutationVersionRef = useRef(0);
+  // Server turns whose delete request is out, so a second click waits.
+  const pendingTurnDeletesRef = useRef(new Set<number>());
   // Rebuild callbacks intentionally retain the dependency shape already on
   // master. These mirrors still make their async work use the latest session
   // and injected runtime after a conversation switch.
@@ -1651,6 +1660,34 @@ export function AgentProvider({
     setMessages((prev) => prev.filter((m) => m.id !== id));
   }, []);
 
+  const deleteTurn = useCallback(async (messageId: string) => {
+    const membership = turnMembership(messagesRef.current, typingRef.current).get(messageId);
+    if (!membership || membership.inFlight || membership.turn === null) return;
+    if (perSocket || sessionPersistenceRef.current !== true) return;
+    const turn = membership.turn;
+    const sid = activeSessionIdRef.current;
+    if (pendingTurnDeletesRef.current.has(turn)) return;
+    pendingTurnDeletesRef.current.add(turn);
+    try {
+      await sessionRuntimeRef.current.deleteTurn(sid, turn);
+    } catch (err) {
+      // 404: the turn is already gone on the server, the outcome asked for.
+      const status = err instanceof ApiError || err instanceof HttpError ? err.status : undefined;
+      if (status !== 404) {
+        if (activeSessionIdRef.current === sid) setError(t('agent.delete_turn_failed'));
+        return;
+      }
+    } finally {
+      pendingTurnDeletesRef.current.delete(turn);
+    }
+    if (activeSessionIdRef.current !== sid) return;
+    // By turn number, not ids: a hydration may have replaced the ids
+    // meanwhile. The version bump discards a hydration fetched before the
+    // delete landed.
+    localMessageMutationVersionRef.current += 1;
+    setMessages((prev) => dropTurn(prev, turn));
+  }, [perSocket]);
+
   /**
    * Wipe the rendered transcript and any in-flight streaming state. Bumping the
    * mutation version fences off a racing hydration fetch so it can't repopulate
@@ -1994,6 +2031,7 @@ export function AgentProvider({
     modelLoading,
     refreshModels: () => setModelInfoVersion((v) => v + 1),
     deleteMessage,
+    deleteTurn,
     clearAllMessages,
     sessionId,
     hydrated: hydratedSessionId === sessionId,
