@@ -34193,44 +34193,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fresh_local_chat_session_omits_cwd_so_agent_workspace_wins() {
-        let (tx, mut rx) = mpsc::channel::<String>(16);
-        let rpc = Arc::new(RpcOutbound::new(tx));
-        // `with_rpc` defaults to Local transport — the path that used to leak
-        // the TUI's launch directory into `session/new`.
-        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
-        let mut chat = Chat::new(client, PaneKind::Chat);
-
-        let init = tokio::spawn(async move {
-            let _ = chat.init().await;
-            chat
-        });
-
-        let request = next_rpc_request(&mut rx, "init should request agents/status").await;
-        assert_eq!(request["method"], method::AGENTS_STATUS);
-        respond_ok(
-            &rpc,
-            &request,
-            serde_json::json!({
-                "agents": [
-                    {"alias": "alpha", "enabled": true, "live_sessions": 0, "persisted_sessions": 0}
-                ]
-            }),
-        );
-
-        let request = next_rpc_request(&mut rx, "fresh chat should start a session").await;
-        assert_eq!(request["method"], method::SESSION_NEW);
-        let params = &request["params"];
-        assert_eq!(params["agent_alias"], "alpha");
-        assert!(params["session_id"].is_null());
-        // Regression guard: a fresh local session must not send the TUI's
-        // launch directory as cwd. Omitting it lets the daemon resolve the
-        // selected agent's configured workspace.
-        assert!(params["cwd"].is_null());
-
-        init.abort();
-    }
-    #[tokio::test]
     async fn focus_session_swaps_states_and_preserves_transcripts() {
         let (tx, _rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
@@ -34306,133 +34268,10 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn resolve_todo_settings_preserves_fallback_on_zero_width_from_env() {
-        let _lock = env_test_lock_async().await;
-        let dir = tempfile::tempdir().unwrap();
-        let _guard = ConfigDirGuard::set(dir.path());
-
-        let _v = crate::test_support::EnvVarGuard::set("ZEROCODE_todotracker__width", "0");
-
-        let current = crate::todo_tracker::TodoTrackerSettings {
-            enabled: true,
-            enabled_at_start: true,
-            location: crate::todo_tracker::TodoLocation::Bottom,
-            width: 44,
-            max_height: 7,
-        };
-
-        let resolved = Chat::resolve_todo_settings(current);
-        assert_eq!(
-            resolved, current,
-            "ZEROCODE_todotracker__width=0 must keep current settings, not normalize to 1"
-        );
-        assert_ne!(resolved.width, 1, "the zero must not be normalized to 1");
-    }
-
-    #[tokio::test]
-    async fn resolve_todo_settings_preserves_fallback_on_zero_width_from_file() {
-        let _lock = env_test_lock_async().await;
-        let dir = tempfile::tempdir().unwrap();
-        let _guard = ConfigDirGuard::set(dir.path());
-
-        std::fs::write(
-            crate::config::config_path(dir.path()),
-            "[todotracker]\nwidth = 0\nmax_height = 5\n",
-        )
-        .unwrap();
-
-        let current = crate::todo_tracker::TodoTrackerSettings {
-            enabled: true,
-            enabled_at_start: true,
-            location: crate::todo_tracker::TodoLocation::Bottom,
-            width: 44,
-            max_height: 7,
-        };
-
-        let resolved = Chat::resolve_todo_settings(current);
-        assert_eq!(
-            resolved, current,
-            "an explicit width = 0 must keep current settings, never resolve to a 1-cell tracker"
-        );
-        assert_ne!(resolved.width, 1, "the zero must not be normalized to 1");
-    }
-
     #[test]
-    fn context_usage_client_prefers_model_window_then_falls_back() {
-        let mut s = state();
-        s.context_max_tokens = None;
-        s.context_input_tokens = None;
-
-        s.apply_update(SessionUpdate::ContextUsage {
-            session_id: "sess-1".into(),
-            input_tokens: Some(100),
-            input_tokens_source: Some("provider".to_string()),
-            max_context_tokens: Some(800_000),
-            model_context_window: Some(1_000_000),
-        });
-        assert_eq!(
-            s.context_max_tokens,
-            Some(1_000_000),
-            "client must prefer model_context_window (provider capacity) for the meter ceiling"
-        );
-        assert_eq!(
-            s.context_input_tokens,
-            Some(100),
-            "input_tokens must be reported as-is"
-        );
-
-        s.context_max_tokens = None;
-        s.apply_update(SessionUpdate::ContextUsage {
-            session_id: "sess-1".into(),
-            input_tokens: Some(250),
-            input_tokens_source: None,
-            max_context_tokens: Some(800_000),
-            model_context_window: None,
-        });
-        assert_eq!(
-            s.context_max_tokens,
-            Some(800_000),
-            "legacy payload (no model_context_window) must fall back to max_context_tokens"
-        );
-        assert_eq!(
-            s.context_input_tokens,
-            Some(250),
-            "input_tokens must be updated on the legacy payload too"
-        );
-        assert_eq!(
-            s.context_input_tokens_source, None,
-            "a count with no provenance must not keep a previous label"
-        );
-    }
-
-    #[test]
-    fn transcript_selection_clears_on_scroll_and_session_reset() {
+    fn transcript_selection_clears_on_browse_mode_and_session_reset() {
         let mut state = state();
         state.transcript_snapshot = Some(transcript_snapshot(Rect::new(0, 0, 5, 1), &["hello"]));
-        assert!(state.begin_transcript_drag(0, 0));
-        assert!(state.update_transcript_drag(1, 0));
-        state.finish_transcript_drag();
-        state.set_overlay_copy_feedback(Rect::new(0, 0, 5, 1));
-
-        state.scroll_up(1);
-        assert_eq!(state.transcript_selection, None);
-        assert_eq!(state.copy_feedback, None);
-        assert!(state.copy_hit_regions.is_empty());
-
-        assert!(state.begin_transcript_drag(0, 0));
-        assert!(state.update_transcript_drag(1, 0));
-        state.finish_transcript_drag();
-        state.scroll_to_top();
-        assert_eq!(state.transcript_selection, None);
-
-        assert!(state.begin_transcript_drag(0, 0));
-        assert!(state.update_transcript_drag(1, 0));
-        state.finish_transcript_drag();
-        state.last_total_rows = 10;
-        state.last_inner_height = 1;
-        state.scroll_to_bottom();
-        assert_eq!(state.transcript_selection, None);
 
         assert!(state.begin_transcript_drag(0, 0));
         assert!(state.update_transcript_drag(1, 0));

@@ -4900,14 +4900,16 @@ mod tests {
         assert_eq!(visible + 2, 7); // 5 content rows + 2 borders
     }
     #[test]
-    fn derived_slash_command_set_matches_expected_twelve_entries() {
+    fn derived_slash_command_set_matches_the_catalogue() {
         let expected: Vec<&str> = vec![
             "/attach",
             "/attachments",
             "/browse",
+            "/change-directory",
             "/clear-queue",
             "/detach",
             "/help",
+            "/load-session",
             "/model",
             "/model-provider",
             "/new",
